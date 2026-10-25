@@ -707,3 +707,78 @@ pub fn apply(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
     }
     Ok(done)
 }
+
+/// What an adapter's user-level file holds: the composition sync writes (the GUI shows it line by line).
+pub fn user_composed(stacks: &Stacks, adapter: &dyn Adapter) -> Composed {
+    compose::compose(stacks, &context(stacks, adapter, adapter.audience(), Layers::Global))
+}
+
+/// What an adapter's untracked file in a repo holds, before the tracked-instructions preamble.
+pub fn repo_composed(stacks: &Stacks, repo: &str, adapter: &dyn Adapter) -> Composed {
+    let layers = Layers::Repo {
+        repo: repo.into(),
+        project: stacks.repo_project(repo),
+        sub: None,
+        global: false,
+    };
+    compose::compose(stacks, &context(stacks, adapter, adapter.audience(), layers))
+}
+
+/// `check`'s view of the user-level targets: a warning for each that differs from a fresh composition, and the
+/// plan's notes (known gaps, pending imports) as info. Nothing without a private stack.
+pub fn drift_findings(stacks: &Stacks) -> Vec<crate::Finding> {
+    use crate::Finding;
+    if stacks.private.is_none() {
+        return Vec::new();
+    }
+    match plan(stacks, &Options { repo: None, user_only: true }) {
+        Ok(plan) => {
+            let mut out: Vec<Finding> = plan
+                .items
+                .iter()
+                .filter(|i| i.changes())
+                .map(|i| {
+                    Finding::warning(
+                        "drift",
+                        format!("{}: {:?} (`lords sync` shows the diff)", i.target, i.action),
+                    )
+                    .at(&i.path, None)
+                })
+                .collect();
+            out.extend(plan.notes.iter().map(|n| Finding::info("sync-note", n.clone())));
+            out
+        }
+        Err(e) => vec![Finding::warning("drift", format!("no sync plan: {e}"))],
+    }
+}
+
+/// `sync --apply` as one step: import every memory store (one commit each), plan again from the updated stacks,
+/// then apply with backups under `backup_dir`. Returns what changed. The CLI and the GUI both call this.
+pub fn import_and_apply(
+    public: &Path,
+    private: Option<&Path>,
+    opts: &Options,
+    backup_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let mut done = Vec::new();
+    let stacks = Stacks::load(public, private)?;
+    if let Some(p) = &stacks.private {
+        if !p.manifest.memory_stores.is_empty() {
+            for r in crate::ops::import(p, None, true)? {
+                if let Some(c) = r.commit {
+                    done.push(format!("imported memory from {}: commit {c}", r.store));
+                }
+            }
+        }
+    }
+    let stacks = Stacks::load(public, private)?;
+    done.extend(apply(&plan(&stacks, opts)?, backup_dir)?);
+    Ok(done)
+}
+
+/// Where `--apply` keeps this run's backups: `~/.lords-command/backups/<date>-<pid>`.
+pub fn backup_dir() -> Result<PathBuf, String> {
+    let home = crate::config::home().ok_or("no home dir")?;
+    let stamp = format!("{}-{}", crate::ops::today(), std::process::id());
+    Ok(home.join(".lords-command").join("backups").join(stamp))
+}

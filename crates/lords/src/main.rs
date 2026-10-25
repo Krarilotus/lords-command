@@ -107,8 +107,17 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     let public_only = a.flag("--public");
     let strict = a.flag("--strict");
     let json = a.flag("--json");
-    let p = paths(&mut a)?;
+    let explicit = a.words.iter().any(|w| w == "--public-stack");
+    let mut p = paths(&mut a)?;
     a.done()?;
+    // `--public` checks the repo it runs in (the pre-push check), not whatever config.txt points at.
+    if public_only && !explicit {
+        let here =
+            std::env::current_dir().ok().and_then(|d| git::toplevel(&d)).map(|t| t.join("stack"));
+        if let Some(stack) = here.filter(|s| s.join("stack.toml").is_file()) {
+            p.public = stack;
+        }
+    }
     let private = p.private.as_deref().map(Stack::load).transpose()?;
     let rules = public_rules(&p.public, private.as_ref());
     if public_only {
@@ -142,32 +151,8 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     Ok(!check::has_errors(&findings, strict))
 }
 
-/// Deployed user-level targets that differ from a fresh composition (repo files: `lords sync --repo`).
 fn drift(stacks: &Stacks) -> Vec<Finding> {
-    if stacks.private.is_none() {
-        return Vec::new();
-    }
-    let opts = sync::Options { repo: None, user_only: true };
-    match sync::plan(stacks, &opts) {
-        Ok(plan) => {
-            let mut out: Vec<Finding> = plan
-                .items
-                .iter()
-                .filter(|i| i.changes())
-                .map(|i| {
-                    Finding::warning(
-                        "drift",
-                        format!("{}: {:?} (`lords sync` shows the diff)", i.target, i.action),
-                    )
-                    .at(&i.path, None)
-                })
-                .collect();
-            // Known gaps the plan sees (e.g. a profile that hides repos' AGENTS.md) are shown, never hidden.
-            out.extend(plan.notes.iter().map(|n| Finding::info("sync-note", n.clone())));
-            out
-        }
-        Err(e) => vec![Finding::warning("drift", format!("no sync plan: {e}"))],
-    }
+    sync::drift_findings(stacks)
 }
 
 fn cmd_sync(mut a: Args) -> Result<bool, String> {
@@ -177,9 +162,9 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     let repo = a.value("--repo")?;
     let p = paths(&mut a)?;
     a.done()?;
-    let mut stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    let stacks = Stacks::load(&p.public, p.private.as_deref())?;
     let opts = sync::Options { repo, user_only };
-    let mut plan = sync::plan(&stacks, &opts)?;
+    let plan = sync::plan(&stacks, &opts)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_default());
     } else {
@@ -191,22 +176,8 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         }
         return Ok(true);
     }
-    // Memory first, so the index points at the notes as they are now; then plan again from the new stack.
-    if let Some(private) = &stacks.private {
-        if !private.manifest.memory_stores.is_empty() {
-            for r in ops::import(private, None, true)? {
-                if let Some(c) = r.commit {
-                    println!("imported memory from {}: commit {c}", r.store);
-                }
-            }
-            stacks = Stacks::load(&p.public, p.private.as_deref())?;
-            plan = sync::plan(&stacks, &opts)?;
-        }
-    }
-    let home = lords_core::config::home().ok_or("no home dir")?;
-    let stamp = format!("{}-{}", ops::today(), std::process::id());
-    let backups = home.join(".lords-command").join("backups").join(stamp);
-    for line in sync::apply(&plan, &backups)? {
+    let backups = sync::backup_dir()?;
+    for line in sync::import_and_apply(&p.public, p.private.as_deref(), &opts, &backups)? {
         println!("{line}");
     }
     println!("backups: {}", backups.display());

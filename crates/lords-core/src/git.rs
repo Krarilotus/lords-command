@@ -60,3 +60,36 @@ pub fn commit(dir: &Path, paths: &[&Path], message: &str) -> Result<Option<Strin
     run(dir, &c)?;
     Ok(Some(run(dir, &["rev-parse", "--short", "HEAD"])?.trim().to_string()))
 }
+
+/// One commit in a file's history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Commit {
+    pub hash: String,
+    pub date: String,
+    pub subject: String,
+}
+
+/// A file's history, newest first, following renames.
+pub fn log(dir: &Path, file: &Path) -> Result<Vec<Commit>, String> {
+    let file = file.to_string_lossy();
+    let out =
+        run(dir, &["log", "--follow", "--date=short", "--format=%h%x1f%ad%x1f%s", "--", &file])?;
+    Ok(out
+        .lines()
+        .filter_map(|l| {
+            let mut parts = l.split('\u{1f}');
+            Some(Commit {
+                hash: parts.next()?.to_string(),
+                date: parts.next()?.to_string(),
+                subject: parts.next().unwrap_or("").to_string(),
+            })
+        })
+        .collect())
+}
+
+/// What one commit changed in a file, as a patch.
+pub fn show(dir: &Path, hash: &str, file: &Path) -> Result<String, String> {
+    let file = file.to_string_lossy();
+    run(dir, &["show", "--format=", "--follow", hash, "--", &file])
+        .or_else(|_| run(dir, &["show", "--format=", hash, "--", &file]))
+}

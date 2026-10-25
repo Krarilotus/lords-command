@@ -1,0 +1,16 @@
+[package]
+name = "lords-command"
+description = "Lords Command: a small native window over your agent stacks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+lords-core = { path = "../lords-core" }
+serde_json = "1"
+
+[build-dependencies]
+winresource = { version = "0.1", default-features = false }

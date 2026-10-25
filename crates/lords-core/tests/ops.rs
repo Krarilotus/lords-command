@@ -203,3 +203,48 @@ fn promote_refuses_memories_and_undeclared_layers() {
         .contains("declare project `beta`"));
     assert!(promote(&s, "memory.m", Promote::Clean, &Rules::public(), false).is_err());
 }
+
+// Spec (brief, GUI: "editing with metadata fields"; design: Entry metadata): an edit changes only the fields it
+// names and the text, keeps every other line, and commits; it refuses an inherited entry's text, a memory's
+// text, an undeclared topic, and anything that would leave the entry unloadable (then nothing changes).
+#[test]
+fn edit_changes_named_fields_and_refuses_what_would_break() {
+    let f = Fixture::new();
+    let original =
+        entry("rule.e", "global", "private", "# kept comment\ntopics: [x]\n", "Old text.\n");
+    f.write("priv/global/rules/e.md", &original);
+    f.write("priv/global/memory/m.md", &entry("memory.m", "global", "private", "", "Note.\n"));
+    f.git_init("priv");
+    let change = lords_core::ops::Edit {
+        title: Some("A better title".into()),
+        audience: Some(vec!["opus".into(), "sol".into()]),
+        body: Some("New text.\n".into()),
+        ..Default::default()
+    };
+    assert!(lords_core::ops::edit(&f.stacks(), "rule.e", &change, true).unwrap().is_some());
+    let now = f.read("priv/global/rules/e.md");
+    assert!(
+        now.contains("# kept comment\ntopics: [x]\n") && now.ends_with("---\nNew text.\n"),
+        "{now}"
+    );
+    let s = f.stacks();
+    let e = s.find("rule.e").unwrap();
+    assert_eq!(e.meta.title, "A better title");
+    assert_eq!(git(&f.priv_root(), &["log", "-1", "--format=%s"]).trim(), "Edit rule.e");
+
+    let refuse = |id: &str, change: lords_core::ops::Edit| {
+        lords_core::ops::edit(&f.stacks(), id, &change, false).is_err()
+    };
+    let body = |b: &str| lords_core::ops::Edit { body: Some(b.into()), ..Default::default() };
+    assert!(refuse("memory.m", body("x")), "a memory's text");
+    assert!(refuse(
+        "rule.e",
+        lords_core::ops::Edit { topics: Some(vec!["nope".into()]), ..Default::default() }
+    ));
+    let before = f.read("priv/global/rules/e.md");
+    assert!(refuse(
+        "rule.e",
+        lords_core::ops::Edit { audience: Some(vec!["nobody".into()]), ..Default::default() }
+    ));
+    assert_eq!(f.read("priv/global/rules/e.md"), before, "a broken edit is put back");
+}

@@ -1,0 +1,5 @@
+# Copy to config.txt beside lords-command.exe (or into ~/.lords-command/). `~` is your home dir.
+# The public stack: this repo's stack/ dir, or your own clone of it.
+public = ~/lords-command/stack
+# Your private stack: intent with private details, memories, project and repo rules, sync targets.
+private = ~/lords-command-private

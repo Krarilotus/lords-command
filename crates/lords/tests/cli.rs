@@ -210,3 +210,25 @@ fn check_lists_the_hidden_agents_md_gap_until_excluded() {
     let out = text(&env.lords(d, &args));
     assert!(!out.contains("hides AGENTS.md"), "{out}");
 }
+
+// Spec (orchestrator, 25 Oct: `lords check --public` makes the pre-push check mechanical): run inside a repo with
+// a stack/, it checks that repo, even when config.txt names another public stack.
+#[test]
+fn check_public_checks_the_repo_it_runs_in() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let elsewhere = d.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::write(elsewhere.join("stack.toml"), "name = \"x\"\nvisibility = \"public\"\n").unwrap();
+    let cfg = d.join("home/.lords-command");
+    fs::create_dir_all(&cfg).unwrap();
+    fs::write(cfg.join("config.txt"), format!("public = {}\n", elsewhere.display())).unwrap();
+    let repo = env.repo();
+    fs::create_dir_all(repo.join("stack")).unwrap();
+    fs::write(repo.join("stack/stack.toml"), "name = \"here\"\nvisibility = \"public\"\n").unwrap();
+    let sep = std::path::MAIN_SEPARATOR;
+    fs::write(repo.join("notes.md"), format!("see C:{sep}{}{sep}alice{sep}x\n", "Users")).unwrap();
+    let o = env.lords(&repo, &["check", "--public"]);
+    let out = text(&o);
+    assert!(!o.status.success() && out.contains("notes.md"), "{out}");
+}

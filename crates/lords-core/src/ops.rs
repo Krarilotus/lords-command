@@ -474,3 +474,109 @@ fn split_part(e: &Entry, lines: &str) -> (String, String) {
     );
     (format!("{stem}.private.md"), text)
 }
+
+// ---------------------------------------------------------------- edit
+
+/// What an edit changes; `None` leaves a field as it is.
+#[derive(Clone, Debug, Default)]
+pub struct Edit {
+    pub title: Option<String>,
+    pub audience: Option<Vec<String>>,
+    pub topics: Option<Vec<String>>,
+    pub body: Option<String>,
+}
+
+fn yaml_list(items: &[String]) -> String {
+    format!("[{}]", items.join(", "))
+}
+
+/// Changes an entry's title, audience, topics or text, then checks that it still loads and commits. Refused: an
+/// inherited entry's text (it stays verbatim), a memory's text (the agent's write path owns it), and topics the
+/// entry's stack doesn't declare.
+pub fn edit(
+    stacks: &Stacks,
+    id: &str,
+    change: &Edit,
+    commit: bool,
+) -> Result<Option<String>, String> {
+    let e = stacks.find(id).ok_or_else(|| format!("no entry `{id}`"))?;
+    if change.body.is_some() {
+        if matches!(e.meta.origin, Origin::Inherited(_)) {
+            return Err(
+                "an inherited entry stays verbatim; adapt it into a new entry to change its text"
+                    .into(),
+            );
+        }
+        if e.meta.kind == Kind::Memory {
+            return Err(
+                "a memory's text belongs to the agent that wrote it; promote it to change it"
+                    .into(),
+            );
+        }
+    }
+    let stack = stacks.stack(e.stack).expect("the entry's stack is loaded");
+    if let Some(topics) = &change.topics {
+        let declared = |t: &String| {
+            stacks.public.manifest.topics.contains(t)
+                || (e.stack == Visibility::Private && stack.manifest.topics.contains(t))
+        };
+        if let Some(t) = topics.iter().find(|t| !declared(t)) {
+            return Err(format!("topic `{t}` isn't in the {} stack's topics list", e.stack));
+        }
+    }
+    let mut keys: Vec<(&str, Option<String>)> = Vec::new();
+    if let Some(t) = &change.title {
+        keys.push(("title", Some(quote(t))));
+    }
+    if let Some(a) = &change.audience {
+        keys.push(("audience", Some(yaml_list(a))));
+    }
+    if let Some(t) = &change.topics {
+        keys.push(("topics", (!t.is_empty()).then(|| yaml_list(t))));
+    }
+    let files: Vec<PathBuf> = if e.meta_file == e.body_file {
+        vec![e.meta_file.clone()]
+    } else {
+        vec![e.meta_file.clone(), e.body_file.clone()]
+    };
+    let before: Vec<Vec<u8>> = files.iter().map(|f| fs::read(f).unwrap_or_default()).collect();
+    let restore = || {
+        for (f, b) in files.iter().zip(&before) {
+            let _ = fs::write(f, b);
+        }
+    };
+    if !keys.is_empty() {
+        set_meta_keys(&e.meta_file, &keys)?;
+    }
+    if let Some(body) = &change.body {
+        let text = fs::read_to_string(&e.body_file).map_err(|err| err.to_string())?;
+        let new = if e.body_file == e.meta_file {
+            let parts = frontmatter::split(&text);
+            let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+            format!("---{nl}{}---{nl}{body}", parts.yaml.unwrap_or(""))
+        } else {
+            body.clone()
+        };
+        fs::write(&e.body_file, new).map_err(|err| err.to_string())?;
+    }
+    // The entry must still load, with no new problem in its files; otherwise put them back.
+    let reloaded = Stack::load(&stack.root);
+    let broken = match &reloaded {
+        Err(err) => Some(err.clone()),
+        Ok(s) if s.find(id).is_none() => Some("the entry no longer loads".into()),
+        Ok(s) => s
+            .problems
+            .iter()
+            .find(|p| p.file.as_ref().is_some_and(|f| files.contains(f)))
+            .map(|p| p.message.clone()),
+    };
+    if let Some(why) = broken {
+        restore();
+        return Err(format!("that edit would break `{id}` ({why}); nothing changed"));
+    }
+    if commit && is_repo(&stack.root) {
+        let rels: Vec<&Path> = files.iter().map(|f| rel(&stack.root, f)).collect();
+        return git::commit(&stack.root, &rels, &format!("Edit {id}"));
+    }
+    Ok(None)
+}
