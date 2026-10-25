@@ -331,3 +331,112 @@ fn r4_06_no_spelling_reaches_std_fs_or_process() {
     let fine = "// std::fs::write is fsguard's\nlet s = \"std::process\";\nuse std::io::Write;\nuse std::path::Path;";
     assert_eq!(forbidden("crates/lords-core/src/sync.rs", fine), Vec::<String>::new());
 }
+
+// Spec (Sol review r5, R5-03; decision 3: the resolved compiler check closes aliases and raw identifiers, and this
+// text layer "additionally refuses any `allow`/`expect` of `clippy::disallowed_*`, `clippy::style` or
+// `clippy::all` outside `fsguard.rs`/`process.rs`, whitespace normalised"): each way to switch the resolved check
+// off in an ordinary source is found; in a door it is allowed.
+#[test]
+fn r5_03_nothing_switches_the_resolved_check_off() {
+    let cases = [
+        ("allow, disallowed_methods", "#[allow(clippy::disallowed_methods)]\nfn f() {}"),
+        ("inner allow, disallowed_types", "#![allow(clippy::disallowed_types)]"),
+        ("expect", "#[expect(clippy::disallowed_methods)]\nfn f() {}"),
+        ("spaced", "# [ allow ( clippy :: disallowed_methods ) ]\nfn f() {}"),
+        ("the style group", "#![allow(clippy::style)]"),
+        ("all of clippy", "#![allow(clippy::all)]"),
+        ("in a list", "#[allow(unused, clippy::disallowed_methods)]\nfn f() {}"),
+        ("through cfg_attr", "#[cfg_attr(test, allow(clippy::disallowed_types))]\nfn f() {}"),
+        ("every warning", "#![allow(warnings)]"),
+        ("code clippy never sees", "#[cfg(not(clippy))]\nfn f() {}"),
+    ];
+    let missed: Vec<&str> = cases
+        .iter()
+        .filter(|(_, code)| forbidden("crates/lords-core/src/sync.rs", code).is_empty())
+        .map(|(w, _)| *w)
+        .collect();
+    assert!(missed.is_empty(), "not caught: {missed:?}");
+    let door = "#![allow(clippy::disallowed_methods, clippy::disallowed_types)]";
+    assert_eq!(forbidden("crates/lords-core/src/fsguard.rs", door), Vec::<String>::new());
+    assert_eq!(forbidden("crates/lords-core/src/process.rs", door), Vec::<String>::new());
+}
+
+/// The workspace root.
+fn workspace() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+}
+
+// Spec (decision 3: "clippy `disallowed-types` for `std::fs::{File, OpenOptions, DirBuilder}` and
+// `std::process::Command`, plus `disallowed-methods` for every free function in `std::fs` and the
+// `std::os::{windows,unix}::fs` link functions"): clippy.toml names each, and no Cargo.toml loosens them.
+#[test]
+fn r5_03_the_resolved_check_names_every_door() {
+    let text = fs::read_to_string(workspace().join("clippy.toml")).unwrap_or_default();
+    let config: toml::Table = toml::from_str(&text).unwrap_or_default();
+    let paths = |key: &str| -> Vec<String> {
+        config
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.get("path").and_then(|p| p.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let (types, methods) = (paths("disallowed-types"), paths("disallowed-methods"));
+    for t in
+        ["std::fs::File", "std::fs::OpenOptions", "std::fs::DirBuilder", "std::process::Command"]
+    {
+        assert!(types.iter().any(|x| x == t), "disallowed-types lacks {t}: {types:?}");
+    }
+    let fs_free = [
+        "canonicalize",
+        "copy",
+        "create_dir",
+        "create_dir_all",
+        "exists",
+        "hard_link",
+        "metadata",
+        "read",
+        "read_dir",
+        "read_link",
+        "read_to_string",
+        "remove_dir",
+        "remove_dir_all",
+        "remove_file",
+        "rename",
+        "set_permissions",
+        "soft_link",
+        "symlink_metadata",
+        "write",
+    ];
+    for m in fs_free.iter().map(|f| format!("std::fs::{f}")).chain(
+        [
+            "std::os::windows::fs::symlink_file",
+            "std::os::windows::fs::symlink_dir",
+            "std::os::unix::fs::symlink",
+        ]
+        .map(String::from),
+    ) {
+        assert!(methods.contains(&m), "disallowed-methods lacks {m}");
+    }
+    for krate in ["", "crates/lords-core/", "crates/lords/", "crates/lords-command/"] {
+        let manifest = fs::read_to_string(workspace().join(format!("{krate}Cargo.toml"))).unwrap();
+        let squeezed: String = manifest.chars().filter(|c| !c.is_whitespace()).collect();
+        for loosened in ["disallowed_methods=", "disallowed_types=", "style=", "all="] {
+            assert!(!squeezed.contains(loosened), "{krate}Cargo.toml sets {loosened}");
+        }
+    }
+}
+
+// Spec (decision 3: "make clippy `-D warnings` a required part of the repo's commit check"): the repo's commit
+// check runs clippy with `-D warnings`, and the privacy pre-commit hook runs the commit check first.
+#[test]
+fn r5_03_the_commit_check_runs_clippy() {
+    let check =
+        fs::read_to_string(workspace().join("tools").join("commit-check.sh")).unwrap_or_default();
+    assert!(check.contains("cargo clippy") && check.contains("-D warnings"), "{check}");
+    let hook = lords_core::hooks::script(Path::new("C:/lords/lords.exe"), false);
+    assert!(hook.contains("tools/commit-check.sh"), "{hook}");
+}

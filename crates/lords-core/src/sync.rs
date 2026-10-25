@@ -2358,3 +2358,34 @@ fn repo_size_findings(stacks: &Stacks) -> Vec<crate::Finding> {
     out.extend(copies);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Spec (Sol review r4, R4-04; r5, decision 7: "a `cfg(test)` seam that injects `Unsupported` at `hard_link`.
+    // Assert the final path is absent or the old file is back with its bytes and attributes"): an owner update
+    // whose link fails leaves the old file in place, its bytes and attributes as they were, and nothing beside it.
+    #[test]
+    fn a_failed_link_puts_the_owner_file_back_whole() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (path, home) = (dir.path().join("out").join("owner.md"), dir.path().join("home"));
+        // Read-only and hidden (Windows), read-only (elsewhere).
+        let marked =
+            fsguard::Attrs::parse(if cfg!(windows) { "attrs:3" } else { "attrs:124" }).unwrap();
+        fsguard::put_file_as(&path, b"OLD\n", Some(&marked)).unwrap();
+        let before = fsguard::attrs(&path).unwrap();
+        assert_eq!(before, marked);
+        let mut item = Item::new("t", path.clone(), Action::Update);
+        item.current = Some("OLD\n".into());
+        item.proposed = Some("NEW\n".into());
+        item.want = Some(fsguard::sha(b"NEW\n"));
+        fsguard::fail_links(true);
+        let result = owner_update(&item, &mut Run::new(&home));
+        fsguard::fail_links(false);
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(fsguard::read(&path).unwrap().as_deref(), Some(&b"OLD\n"[..]));
+        assert_eq!(fsguard::attrs(&path).unwrap(), before);
+        assert_eq!(fsguard::list_dir(path.parent().unwrap()).map(|v| v.len()).ok(), Some(1));
+    }
+}
