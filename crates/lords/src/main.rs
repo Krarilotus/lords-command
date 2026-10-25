@@ -5,7 +5,7 @@ use lords_core::config::Config;
 use lords_core::model::Visibility;
 use lords_core::ops::{self, Promote, Retire};
 use lords_core::privacy::{self, Rules};
-use lords_core::{git, hooks, Finding, Severity, Stack, Stacks};
+use lords_core::{git, hooks, sync, Finding, Severity, Stack, Stacks};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -21,6 +21,7 @@ usage:
   lords privacy FILE...
   lords hooks install [--repo DIR] [--secrets-only] [--force]
   lords hash PATH
+  lords sync [--user | --repo NAME] [--json] [--apply]
 
 stacks: --public-stack DIR, --private-stack DIR, else config.txt (beside the exe, or ~/.lords-command/),
 else the public stack is <this git repo>/stack.
@@ -131,13 +132,135 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
         return Ok(!check::has_errors(&findings, strict));
     }
     let stacks = Stacks { public: Stack::load(&p.public)?, private };
-    let findings = check::check(&stacks, &rules);
+    let mut findings = check::check(&stacks, &rules);
+    findings.extend(drift(&stacks));
     print_findings(&findings, json);
     if !json {
         let n = |v| stacks.stack(v).map(|s| s.entries.len()).unwrap_or(0);
         println!("{} public and {} private entries", n(Visibility::Public), n(Visibility::Private));
     }
     Ok(!check::has_errors(&findings, strict))
+}
+
+/// Deployed user-level targets that differ from a fresh composition (repo files: `lords sync --repo`).
+fn drift(stacks: &Stacks) -> Vec<Finding> {
+    if stacks.private.is_none() {
+        return Vec::new();
+    }
+    let opts = sync::Options { repo: None, user_only: true };
+    match sync::plan(stacks, &opts) {
+        Ok(plan) => plan
+            .items
+            .iter()
+            .filter(|i| i.changes())
+            .map(|i| {
+                Finding::warning(
+                    "drift",
+                    format!("{}: {:?} (`lords sync` shows the diff)", i.target, i.action),
+                )
+                .at(&i.path, None)
+            })
+            .collect(),
+        Err(e) => vec![Finding::warning("drift", format!("no sync plan: {e}"))],
+    }
+}
+
+fn cmd_sync(mut a: Args) -> Result<bool, String> {
+    let apply = a.flag("--apply");
+    let json = a.flag("--json");
+    let user_only = a.flag("--user");
+    let repo = a.value("--repo")?;
+    let p = paths(&mut a)?;
+    a.done()?;
+    let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    let plan = sync::plan(&stacks, &sync::Options { repo, user_only })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_default());
+    } else {
+        print_plan(&plan);
+    }
+    if !apply {
+        if !json {
+            println!("dry run: nothing written (`--apply` writes, after backing up every target)");
+        }
+        return Ok(true);
+    }
+    let home = lords_core::config::home().ok_or("no home dir")?;
+    let stamp = format!("{}-{}", ops::today(), std::process::id());
+    let backups = home.join(".lords-command").join("backups").join(stamp);
+    for line in sync::apply(&plan, &backups)? {
+        println!("{line}");
+    }
+    println!("backups: {}", backups.display());
+    Ok(true)
+}
+
+/// One block per distinct change; the same change in many worktrees is printed once with the others listed.
+fn print_plan(plan: &sync::Plan) {
+    let mut shown: Vec<(String, String, String, Vec<PathBuf>)> = Vec::new();
+    for i in &plan.items {
+        let action = format!("{:?}", i.action);
+        let file = i.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        let key_diff = i.diff.replace(&i.path.display().to_string(), &file);
+        let key = format!("{}|{action}|{}", i.target, i.notes.join(";"));
+        match shown.iter_mut().find(|(k, d, _, _)| *k == key && *d == key_diff) {
+            Some((_, _, _, more)) => more.push(i.path.clone()),
+            None => {
+                println!(
+                    "
+== {} :: {} :: {action}",
+                    i.target,
+                    i.path.display()
+                );
+                if let Some(to) = &i.link_to {
+                    println!("   -> {}", to.display());
+                }
+                for n in &i.notes {
+                    println!("   note: {n}");
+                }
+                if !i.diff.is_empty() {
+                    print!("{}", i.diff);
+                }
+                shown.push((key, key_diff, action, Vec::new()));
+            }
+        }
+    }
+    for (key, _, action, more) in &shown {
+        if !more.is_empty() {
+            let target = key.split('|').next().unwrap_or("");
+            println!(
+                "
+== {target} :: the same {action} in {} more place(s):",
+                more.len()
+            );
+            for m in more.iter().take(5) {
+                println!("   {}", m.display());
+            }
+            if more.len() > 5 {
+                println!("   … and {} more", more.len() - 5);
+            }
+        }
+    }
+    for n in &plan.notes {
+        println!(
+            "
+note: {n}"
+        );
+    }
+    let count =
+        |f: &dyn Fn(&sync::Action) -> bool| plan.items.iter().filter(|i| f(&i.action)).count();
+    println!(
+        "
+{} item(s): {} to change, {} in sync, {} report-only, {} conflict(s)",
+        plan.items.len(),
+        count(&|a| !matches!(
+            a,
+            sync::Action::InSync | sync::Action::Report | sync::Action::Conflict
+        )),
+        count(&|a| *a == sync::Action::InSync),
+        count(&|a| *a == sync::Action::Report),
+        count(&|a| *a == sync::Action::Conflict)
+    );
 }
 
 fn cmd_import(mut a: Args) -> Result<bool, String> {
@@ -308,6 +431,7 @@ fn main() -> ExitCode {
         "privacy" => cmd_privacy(a),
         "hooks" => cmd_hooks(a),
         "hash" => cmd_hash(a),
+        "sync" => cmd_sync(a),
         other => Err(format!("unknown command `{other}`\n\n{USAGE}")),
     };
     match result {

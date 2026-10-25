@@ -24,15 +24,21 @@ pub struct Project {
     pub title: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Repo {
     #[serde(default)]
     pub project: Option<String>,
     #[serde(default)]
     pub checkouts: Vec<String>,
+    #[serde(default = "yes")]
+    pub worktrees: bool,
     #[serde(default)]
     pub families: Vec<String>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -44,6 +50,9 @@ pub struct Target {
     pub path: String,
     #[serde(default)]
     pub audience: Vec<String>,
+    /// `replace`: the whole file becomes the managed block. Default `keep`.
+    #[serde(default)]
+    pub own_text: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

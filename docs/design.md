@@ -138,26 +138,45 @@ A **finding** is a matched span: file, line, pattern class and the matched text.
 Targets are declared in the private `stack.toml`, since their paths are private. The public repo ships the generic
 defaults (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.claude/skills`, `~/.codex/skills`).
 
+Which file each family actually loads, and in what order, is in [load-order.md](load-order.md) (docs and live runs,
+25 Oct 2026). Sync is built on exactly those facts.
+
 **Instruction files.** The composed text goes between `<!-- lords-command:begin -->` and `<!-- lords-command:end -->`.
-Text outside the markers is the owner's and stays untouched. *Drift* means the block differs from a fresh composition,
-or the file changed outside the tool.
-- **User-level files** (one per agent family and profile) get public global plus private global.
-- **A repo target** (`lords sync --repo <name>`) gets the full composition for that repo: public global, private
-  global, project, repo, and path.
-- **Tracked repo files.** A repo's tracked `AGENTS.md` is shared with everyone who clones it, so it receives only
-  entries that are public. The full composition goes into an untracked file the family reads, listed in
-  `.git/info/exclude`. *To verify in milestone 3:* which untracked file each family reads per repo (Claude:
-  `CLAUDE.local.md`; Codex: `AGENTS.override.md`).
+- Text outside the markers is the owner's and stays untouched, unless the target sets `own_text = "replace"` (used
+  once a file's old text has moved into entries).
+- *Drift* means the file differs from a fresh composition; `check` reports it for the user-level targets.
+
+**User-level files** (one per family and per Claude profile in use) get public global plus private global.
+
+**A repo** (`lords sync --repo <name>`) gets its project, repo and path layers in untracked files: the global
+layers already come from the user-level files.
+- Every checkout and worktree gets the file each family reads after the tracked ones: `CLAUDE.local.md` (Claude) and
+  `AGENTS.override.md` (Codex).
+- Both names go into the repo's shared `.git/info/exclude`, so worktrees stay clean.
+- For Claude, a `CLAUDE.local.md` also stops the tracked `AGENTS.md` from loading; for Codex, the override replaces
+  it. So agents with a stack read the stack's repo text, whichever branch's `AGENTS.md` a worktree has. A tracked file
+  of either name is a conflict, and nothing is applied.
+
+**A repo's tracked `AGENTS.md`** is never written: it changes by a commit on the repo's own branches. Sync reports
+what the public layers (public global, project and repo) would make of it, so the maintainer can commit that.
 
 **Skills** go into each family's skills dir as directory links (junctions on Windows, symlinks elsewhere), never
-copies. Each link records its owner in a `.lords-command` marker, so sync touches only what it made.
+copies. A link is the tool's if it points into a stack. Sync creates, re-points and removes only those links, and
+leaves every other dir alone. A real dir where a link should go is moved to the backup first, and its diff is shown.
 
-**Where each line comes from.** Sync writes a map next to its state (`~/.lords-command/out/<target>.map.json`):
-output line → entry id → stack, file and line. The GUI uses it. The agent files carry only the text, plus one header
-comment naming the source.
+**Backups.** `--apply` copies or moves each file and dir it replaces to `~/.lords-command/backups/<date>-<run>/`.
+It refuses a plan with any conflict.
 
-**Audience.** Sol and Astra both read `~/.codex`, so a user-level Codex file can't tell them apart. Entries for only
-one of them are composed into a labelled subsection ("Sol:", "Astra:"). Opus is the Claude family.
+**Where each line comes from.** Composition keeps a map: output line → entry id → stack, file and line. The GUI
+shows it; `sync --json` prints it. The agent files carry only the text, plus one header comment naming the source.
+
+**Audience.** Sol and Astra both read `~/.codex`, so a user-level Codex file can't tell them apart. An entry for
+only one of them is labelled ("(Sol only)") where it stands. Opus is the Claude family.
+
+**Open: two Claude profiles.** With `CLAUDE_CONFIG_DIR` pointing at a second profile, `~/.claude/CLAUDE.md` still
+loads as an ancestor project file wherever the working dir is under home. If both profile files carry the global
+text, sessions under home read it twice, and the non-empty ancestor file keeps hiding repos' `AGENTS.md`. Which
+profile file holds the text is the owner's choice per machine (private `stack.toml`).
 
 ## Import and memory
 

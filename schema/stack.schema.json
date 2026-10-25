@@ -24,7 +24,8 @@
         "type": "object",
         "properties": {
           "project": { "type": "string" },
-          "checkouts": { "type": "array", "items": { "type": "string" }, "description": "private only: local checkout and worktree roots" },
+          "checkouts": { "type": "array", "items": { "type": "string" }, "description": "private only: local checkouts; sync writes each one's untracked agent files" },
+          "worktrees": { "type": "boolean", "default": true, "description": "also every worktree of each checkout (git worktree list)" },
           "families": { "type": "array", "items": { "enum": ["claude", "codex"] }, "default": ["claude", "codex"] }
         },
         "additionalProperties": false
@@ -41,7 +42,8 @@
           "family": { "enum": ["claude", "codex"] },
           "kind": { "enum": ["instructions", "skills"] },
           "path": { "type": "string", "description": "~ expands to the home dir" },
-          "audience": { "type": "array", "items": { "enum": ["opus", "sol", "astra"] } }
+          "audience": { "type": "array", "items": { "enum": ["opus", "sol", "astra"] } },
+          "own_text": { "enum": ["keep", "replace"], "default": "keep", "description": "instructions: keep the text outside the managed block, or replace the whole file with it" }
         },
         "additionalProperties": false
       }

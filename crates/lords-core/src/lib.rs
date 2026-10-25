@@ -2,7 +2,9 @@
 //! The CLI and the GUI both call this; neither shells out to the other.
 
 pub mod check;
+pub mod compose;
 pub mod config;
+pub mod diff;
 pub mod finding;
 pub mod frontmatter;
 pub mod git;
@@ -13,6 +15,7 @@ pub mod overlap;
 pub mod privacy;
 pub mod schema;
 pub mod stack;
+pub mod sync;
 
 pub use finding::{Finding, Severity};
 pub use stack::{Stack, Stacks};
