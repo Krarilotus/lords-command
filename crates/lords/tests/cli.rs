@@ -166,6 +166,42 @@ fn a_broken_private_stack_fails_the_check() {
     assert!(o.status.success() && text(&o).contains("no private stack"), "{}", text(&o));
 }
 
+// Spec (Sol review r2, R2-12: "An unreadable config silently disables the private privacy rules"): a config.txt
+// that is there but can't be read or decoded fails the privacy check and names the file; with none the check runs
+// and says what it skipped.
+#[test]
+fn an_unreadable_config_fails_the_privacy_check() {
+    let env = Env::new();
+    let repo = env.repo();
+    fs::write(repo.join("notes.md"), "clean\n").unwrap();
+    env.git(&repo, &["add", "-A"]);
+    let o = env.lords(&repo, &["privacy", "--staged"]);
+    assert!(o.status.success() && text(&o).contains("no private stack"), "{}", text(&o));
+
+    let cfg = env.dir.path().join("home").join(".lords-command");
+    fs::create_dir_all(&cfg).unwrap();
+    fs::write(cfg.join("config.txt"), b"private = \xff\xfe\n").unwrap();
+    let o = env.lords(&repo, &["privacy", "--staged"]);
+    assert!(!o.status.success() && text(&o).contains("config.txt"), "{}", text(&o));
+}
+
+// Spec (Sol review r2, R2-25: "Combining --message with --staged silently skips the message"): `privacy --staged
+// --message FILE` scans the staged files and the message.
+#[test]
+fn staged_and_message_are_both_scanned() {
+    let env = Env::new();
+    let repo = env.repo();
+    fs::write(repo.join("notes.md"), "clean\n").unwrap();
+    env.git(&repo, &["add", "-A"]);
+    let file = env.dir.path().join("MSG");
+    fs::write(&file, format!("Ask {}", ["owner", "example.org"].join("@"))).unwrap();
+    let o = env.lords(&repo, &["privacy", "--staged", "--message", file.to_str().unwrap()]);
+    assert!(!o.status.success() && text(&o).contains("contact"), "{}", text(&o));
+    fs::write(&file, "clean\n").unwrap();
+    let o = env.lords(&repo, &["privacy", "--staged", "--message", file.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", text(&o));
+}
+
 // Spec (hooks install): it never replaces a hook it didn't write unless asked, and then keeps a backup; it
 // refuses a repo whose local core.hooksPath would bypass .git/hooks.
 #[test]

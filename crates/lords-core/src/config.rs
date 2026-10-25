@@ -36,8 +36,14 @@ pub fn parse(text: &str) -> BTreeMap<String, String> {
 }
 
 impl Config {
-    pub fn read(path: &Path) -> Option<Config> {
-        let text = fs::read_to_string(path).ok()?;
+    /// The config in `path`, None if there is none. One that is there but can't be read or decoded is an error:
+    /// read as none, it would silently drop the private stack and with it the deny and fleet checks.
+    pub fn read(path: &Path) -> Result<Option<Config>, String> {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("{} can't be read: {e}", path.display())),
+        };
         let keys = parse(&text);
         let dir = path.parent().unwrap_or(Path::new("."));
         let resolve = |k: &str| {
@@ -50,18 +56,30 @@ impl Config {
                 }
             })
         };
-        Some(Config {
+        Ok(Some(Config {
             public: resolve("public"),
             private: resolve("private"),
             source: Some(path.to_path_buf()),
-        })
+        }))
     }
 
-    /// The config beside the running exe, else the one in the home dir, else empty.
-    pub fn discover() -> Config {
+    /// The config beside the running exe, else the one in the home dir, else empty. The first one that is there
+    /// but can't be read is an error.
+    pub fn load() -> Result<Config, String> {
         let beside =
             std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("config.txt")));
         let in_home = home().map(|h| h.join(".lords-command").join("config.txt"));
-        beside.into_iter().chain(in_home).find_map(|p| Config::read(&p)).unwrap_or_default()
+        for path in beside.into_iter().chain(in_home) {
+            if let Some(cfg) = Config::read(&path)? {
+                return Ok(cfg);
+            }
+        }
+        Ok(Config::default())
+    }
+
+    /// As `load`, with a config that can't be read taken as none: only for views that show stacks. Checks use
+    /// `load`.
+    pub fn discover() -> Config {
+        Config::load().unwrap_or_default()
     }
 }
