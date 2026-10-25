@@ -40,7 +40,8 @@
           "worktrees": { "type": "boolean", "default": true, "description": "also every worktree of each checkout (git worktree list)" },
           "worktree_roots": { "type": "array", "items": { "type": "string" }, "description": "only worktrees under these dirs get files; the rest are skipped and listed" },
           "adapters": { "type": "array", "items": { "type": "string" }, "description": "adapter ids that get this repo's files (default: all)" },
-          "skills": { "type": "array", "items": { "type": "string" }, "description": "skill dirs tracked in the repo (paths in a checkout): indexed in place, never linked or moved" }
+          "skills": { "type": "array", "items": { "type": "string" }, "description": "skill dirs tracked in the repo (paths in a checkout): indexed in place, never linked or moved" },
+          "default_role": { "type": "string", "description": "the role of a session here that no brief names one for: its entries go inline in the place's files" }
         },
         "additionalProperties": false
       }
@@ -55,7 +56,8 @@
         "properties": {
           "path": { "type": "string" },
           "project": { "type": "string" },
-          "adapters": { "type": "array", "items": { "type": "string" } }
+          "adapters": { "type": "array", "items": { "type": "string" } },
+          "default_role": { "type": "string", "description": "as for a repo" }
         },
         "additionalProperties": false
       }

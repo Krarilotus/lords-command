@@ -276,3 +276,135 @@ fn compose_prints_what_a_harness_reads() {
         "a role file needs --repo"
     );
 }
+
+/// A repo `r` (one commit) declared in a private stack with one rule, worktrees under `wts`; the hook installed.
+fn repo_with_post_checkout(env: &Env) -> (PathBuf, PathBuf, PathBuf) {
+    let d = env.dir.path();
+    let (public, private, repo) = (d.join("pub"), d.join("priv"), d.join("repo"));
+    fs::create_dir_all(public.join("global/rules")).unwrap();
+    fs::create_dir_all(private.join("global/rules")).unwrap();
+    fs::write(
+        public.join("stack.toml"),
+        "name = \"pub\"\nvisibility = \"public\"\nroles = [\"coder\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        private.join("stack.toml"),
+        format!(
+            "name = \"priv\"\nvisibility = \"private\"\nroles = [\"coder\"]\n[repos.r]\ncheckouts = ['{}']\nworktree_roots = ['{}']\nadapters = [\"claude\"]\n",
+            repo.display(),
+            d.join("wts").display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        private.join("global/rules/r.md"),
+        "---\nid: rule.r\nkind: rule\ntitle: r\naudience: [all]\nroles: [coder]\nscope: global\nstatus: active\nvisibility: private\norigin:\n  type: own\n---\nTest before merging.\n",
+    )
+    .unwrap();
+    let repo = env.repo();
+    fs::write(repo.join("README.md"), "a repo\n").unwrap();
+    env.git(&repo, &["add", "-A"]);
+    assert!(env.git(&repo, &["commit", "-q", "-m", "start"]).status.success());
+    let o = env.lords(
+        &repo,
+        &[
+            "hooks",
+            "install",
+            "--post-checkout",
+            "--public-stack",
+            public.to_str().unwrap(),
+            "--private-stack",
+            private.to_str().unwrap(),
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let log = repo_log(&repo);
+    (repo, d.join("wts"), log)
+}
+
+fn repo_log(repo: &Path) -> PathBuf {
+    repo.join(".git").join("lords-post-checkout.log")
+}
+
+/// Waits up to 60 s for `path` (the hook writes in the background).
+fn appears(path: &Path) -> bool {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < until {
+        if path.is_file() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    false
+}
+
+// Spec (orchestrator, 25 Oct: "`lords hooks install` writes the managed repo's own .git/hooks/post-checkout … It
+// acts only on a new worktree (old HEAD all zeros) and runs `lords sync --repo X --place <that worktree> --apply`
+// for that one place. It must never fail or slow the checkout … If a repo already has a post-checkout hook, chain
+// it, don't replace it"): a new worktree gets its place file; a branch checkout runs no sync and returns at once;
+// a hook that was there before still runs, and its exit status is kept.
+#[test]
+fn a_new_worktree_gets_its_place_files_from_the_post_checkout_hook() {
+    let env = Env::new();
+    // A hook that was there first: it is chained, not replaced.
+    let hooks = env.dir.path().join("repo/.git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::write(
+        hooks.join("post-checkout"),
+        "#!/bin/sh\necho ran >> \"$(git rev-parse --git-common-dir)/before.log\"\n",
+    )
+    .unwrap();
+    let (repo, wts, log) = repo_with_post_checkout(&env);
+    assert!(hooks.join("post-checkout.before-lords").is_file(), "the old hook is kept");
+
+    let wt = wts.join("one");
+    let o = env.git(&repo, &["worktree", "add", "-q", "-b", "one", wt.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(
+        appears(&wt.join("CLAUDE.local.md")),
+        "log: {}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    let place = fs::read_to_string(wt.join("CLAUDE.local.md")).unwrap();
+    assert!(
+        place.contains(
+            "
+Test before merging.
+"
+        ),
+        "{place}"
+    );
+    assert!(
+        !wt.join("AGENTS.override.md").exists(),
+        "the stack gives this repo Claude's files only"
+    );
+    assert!(fs::read_to_string(repo.join(".git/before.log")).unwrap().contains("ran"));
+
+    let before = fs::read_to_string(&log).unwrap();
+    let start = std::time::Instant::now();
+    let o = env.git(&wt, &["checkout", "-q", "-b", "two"]);
+    let took = start.elapsed();
+    assert!(o.status.success(), "{}", text(&o));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(fs::read_to_string(&log).unwrap(), before, "a branch checkout runs no sync");
+    eprintln!("branch checkout with the hook: {took:?}");
+}
+
+// Spec (above: "including the case where lords is missing"): with the lords binary gone, `git worktree add` still
+// succeeds and the hook only logs that it wrote nothing.
+#[test]
+fn a_missing_lords_never_fails_the_checkout() {
+    let env = Env::new();
+    let (repo, wts, log) = repo_with_post_checkout(&env);
+    let hook = repo.join(".git/hooks/post-checkout");
+    let script = fs::read_to_string(&hook).unwrap();
+    let exe = script.lines().find_map(|l| l.strip_prefix("exe=")).unwrap().to_string();
+    fs::write(&hook, script.replace(&exe, "'/nowhere/lords.exe'")).unwrap();
+
+    let wt = wts.join("one");
+    let o = env.git(&repo, &["worktree", "add", "-q", "-b", "one", wt.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(!wt.join("CLAUDE.local.md").exists());
+    assert!(fs::read_to_string(&log).unwrap().contains("lords not found at /nowhere/lords.exe"));
+}

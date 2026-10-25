@@ -93,6 +93,7 @@ fn the_composed_view_maps_each_line_to_its_source() {
             by_reference: false,
             role_dir: None,
             relative_to: None,
+            default_role: None,
         },
     );
     let v = view::composed(&s, &c);

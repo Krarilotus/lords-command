@@ -181,6 +181,20 @@ on demand); rules for every development role stay inline. Rules, facts, status a
 one line naming the checkout's role files and how many each carries. The role files carry the full text. Index hooks
 are cut at a word, at 100 characters.
 
+**A place's default role.** A session nobody briefed (a thread the owner starts) doesn't know its role. A place's
+`default_role` (stack.toml) is that role: its entries and notes go inline in the place's files, labelled; the
+role-files line stays for briefed agents of the other roles.
+
+**New worktrees.** `lords hooks install --post-checkout` writes the repo's own `.git/hooks/post-checkout` (the
+common dir, so every worktree runs it). On a new worktree (old HEAD all zeros) it runs `lords sync --repo X --place
+<worktree> --apply` in the background, time-boxed, and only logs (`<common dir>/lords-post-checkout.log`); any
+other checkout returns at once. A hook that was there before runs first and keeps its exit status. `--place`
+writes that one worktree's files, without importing or retiring.
+
+**Shadowed `AGENTS.md`.** Claude reads an ancestor dir's `CLAUDE.local.md` and then skips a nested repo's own
+`AGENTS.md` (docs/load-order.md). `check` lists every worktree that gets no files of its own but lies inside a place
+(`agents-shadowed`, info).
+
 **Index lines name each dir once.** An index (intent, skills, memory) groups its lines by dir: one line names the
 dir, absolute (`In <dir>, as <name>.md:`), and each line under it gives its file only when the name doesn't. Paths
 stay absolute: relative paths were dropped (orchestrator, 25 Oct), since with each dir named once they saved about

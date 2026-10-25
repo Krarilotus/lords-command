@@ -99,7 +99,7 @@ fn a_workspace_gets_its_layer_without_git() {
     assert_eq!(errors(&f.check()), Vec::<&str>::new(), "{:#?}", f.check());
     let p = plan(
         &f.stacks(),
-        &Options { repo: Some("harness".into()), user_only: false, adapter: None },
+        &Options { repo: Some("harness".into()), user_only: false, adapter: None, place: None },
     )
     .unwrap();
     let claude = proposed(&p, &dir.join("CLAUDE.local.md"));
@@ -256,6 +256,7 @@ fn evidence_stays_beside_the_rule() {
         by_reference: false,
         role_dir: None,
         relative_to: None,
+        default_role: None,
     };
     let text = lords_core::compose::compose(&s, &ctx).text;
     assert!(text.contains("One writer per file.") && !text.contains("Two lanes"), "{text}");

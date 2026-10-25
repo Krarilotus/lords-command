@@ -55,6 +55,11 @@ Claude loads (`file_path`, `memory_type`, `load_reason`), so these don't rest on
   naming a notes dir outside the workspace (`In \`<dir>\`, as \`<name>.md\`:`) and `- name: hook` lines under it;
   asked a question only one note answers, it read `<dir>\<name>.md` and answered. Without the index (control), it
   answered "unknown".
+- **An ancestor dir's `CLAUDE.local.md` loads in a nested git repo, and hides that repo's own `AGENTS.md`** (25 Oct,
+  `~/.claude/CLAUDE.md` excluded): the hook logged it (`memory_type: Local`), and the model knew its marker but not
+  the repo's `AGENTS.md` marker. Without the ancestor file (control) it knew the `AGENTS.md` marker.
+- **The `InstructionsLoaded` hook doesn't log `AGENTS.md`**, even when it loads (the control above): check
+  `AGENTS.md` by a marker word.
 - **Claude's auto-memory dir** is one per git repository, shared by its worktrees (the docs: "derived from the git
   repository").
 

@@ -42,6 +42,9 @@ pub struct Repo {
     /// Skill dirs tracked in the repo (paths in a checkout): indexed in place, never linked, copied or moved.
     #[serde(default)]
     pub skills: Vec<String>,
+    /// The role a session here has when no brief names one: its entries go inline in the place's files.
+    #[serde(default)]
+    pub default_role: Option<String>,
 }
 
 /// A working dir that is no git repo (e.g. a harness dir): it gets the same untracked files as a repo checkout.
@@ -53,6 +56,9 @@ pub struct Workspace {
     pub project: Option<String>,
     #[serde(default)]
     pub adapters: Vec<String>,
+    /// As for a repo: the role of a session here without a brief.
+    #[serde(default)]
+    pub default_role: Option<String>,
 }
 
 fn yes() -> bool {

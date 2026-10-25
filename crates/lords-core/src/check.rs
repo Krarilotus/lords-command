@@ -152,6 +152,23 @@ fn ids(stacks: &Stacks, out: &mut Vec<Finding>) {
 }
 
 fn declared(stacks: &Stacks, out: &mut Vec<Finding>) {
+    // A place's default role is a declared development role (product runs never read a place's files).
+    let roles = crate::sync::declared_roles(stacks);
+    for s in stacks.all() {
+        let m = &s.manifest;
+        let repos = m.repos.iter().map(|(n, r)| (format!("repo {n}"), &r.default_role));
+        let workspaces =
+            m.workspaces.iter().map(|(n, w)| (format!("workspace {n}"), &w.default_role));
+        for (place, role) in repos.chain(workspaces) {
+            let Some(role) = role else { continue };
+            if !roles.contains(role) || role == crate::compose::PRODUCT_ROLE {
+                out.push(Finding::error(
+                    "role-undeclared",
+                    format!("{place}: default_role `{role}` is no declared development role"),
+                ));
+            }
+        }
+    }
     for e in stacks.entries() {
         // Topics are a controlled list: the entry's own stack declares them (a public entry, the public stack).
         let known = |t: &String| {

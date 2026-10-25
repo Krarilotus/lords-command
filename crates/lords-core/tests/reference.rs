@@ -21,6 +21,70 @@ fn proposed(p: &lords_core::sync::Plan, path: &Path) -> String {
     p.items.iter().find(|i| i.path == path).and_then(|i| i.proposed.clone()).unwrap_or_default()
 }
 
+// Spec (orchestrator, 25 Oct: "`default_role` per place … The default role's entries go inline in the place
+// file, and the role-files line stays for briefed agents"): with `default_role = "coder"`, a rule for coders only
+// is inline (labelled), a rule for orchestrators only stays behind the role-files line, and so do their notes.
+#[test]
+fn a_places_default_role_reads_its_entries_inline() {
+    let f = Fixture::new();
+    let rule = |id: &str, roles: &str, text: &str| {
+        entry(id, "project:beta", "private", &format!("roles: [{roles}]\n"), text)
+    };
+    f.write("priv/project/beta/rules/c.md", &rule("rule.c", "coder", "Coders test first.\n"));
+    f.write("priv/project/beta/rules/o.md", &rule("rule.o", "orchestrator", "Merge in order.\n"));
+    f.write(
+        "priv/project/beta/memory/cn.md",
+        &entry("memory.cn", "project:beta", "private", "roles: [coder]\n", "Note.\n"),
+    );
+    let checkout = f.path("checkout");
+    f.write("checkout/README.md", "a repo\n");
+    f.git_init("checkout");
+    manifest(&f, &checkout);
+    let toml = std::fs::read_to_string(f.path("priv/stack.toml")).unwrap();
+    f.write("priv/stack.toml", &format!("{toml}default_role = \"coder\"\n"));
+    let p = plan(&f.stacks(), &Options::default()).unwrap();
+    let place = proposed(&p, &checkout.join("CLAUDE.local.md"));
+    assert!(place.contains("(coder only)\nCoders test first."), "{place}");
+    assert!(place.contains("- cn: memory.cn"), "the default role's notes are indexed: {place}");
+    assert!(
+        !place.contains("Merge in order.")
+            && place.contains("has them in full: `role-orchestrator.md` (1)."),
+        "{place}"
+    );
+}
+
+// Spec (orchestrator, 25 Oct: "List them in check's info as 'AGENTS.md shadowed by an ancestor place file'"):
+// a worktree outside `worktree_roots` that has an AGENTS.md and lies inside a workspace place is listed; a
+// worktree that gets its own files is not.
+#[test]
+fn check_lists_worktrees_whose_agents_md_an_ancestor_place_hides() {
+    let f = Fixture::new();
+    f.write("repo/AGENTS.md", "Repo rules.\n");
+    f.git_init("repo");
+    let (repo, ws) = (f.path("repo"), f.path("ws"));
+    std::fs::create_dir_all(&ws).unwrap();
+    for (dir, branch) in [("ws/inside", "a"), ("wts/own", "b")] {
+        git(&repo, &["worktree", "add", "-q", "-b", branch, f.path(dir).to_str().unwrap()]);
+    }
+    f.write(
+        "priv/stack.toml",
+        &format!(
+            "name = \"priv\"\nvisibility = \"private\"\nroles = [\"coder\"]\n[repos.r]\ncheckouts = ['{}']\nworktree_roots = ['{}']\n[workspaces.w]\npath = '{}'\n",
+            repo.display(),
+            f.path("wts").display(),
+            ws.display()
+        ),
+    );
+    let found = lords_core::sync::shadow_findings(&f.stacks());
+    let messages: Vec<&str> = found.iter().map(|x| x.message.as_str()).collect();
+    assert!(
+        messages.len() == 1
+            && messages[0]
+                .contains("inside: AGENTS.md shadowed by an ancestor place file (workspace w"),
+        "{messages:?}"
+    );
+}
+
 // Spec (orchestrator, 25 Oct: Claude's files now, Codex's "only after the grouped-form marker run passes"): a plan
 // for one adapter holds that adapter's place file and none of the other's; the role files, which agents of every
 // adapter read, are planned either way.
@@ -133,6 +197,7 @@ fn relative_paths_are_one_switch() {
             by_reference: true,
             role_dir: Some(checkout.join(".lords")),
             relative_to: relative.then(|| checkout.clone()),
+            default_role: None,
         };
         lords_core::compose::compose(&f.stacks(), &ctx).text
     };

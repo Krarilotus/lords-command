@@ -17,6 +17,7 @@ fn global(audience: Vec<Audience>) -> Context {
         by_reference: false,
         role_dir: None,
         relative_to: None,
+        default_role: None,
     }
 }
 
@@ -126,6 +127,7 @@ fn repo_layers_take_their_project_and_repo() {
             by_reference: false,
             role_dir: None,
             relative_to: None,
+            default_role: None,
         },
     );
     assert_eq!(c.ids, ["rule.p", "fact.r", "fact.s"]);
@@ -140,6 +142,7 @@ fn repo_layers_take_their_project_and_repo() {
             by_reference: false,
             role_dir: None,
             relative_to: None,
+            default_role: None,
         },
     );
     assert_eq!(c.ids, ["rule.g", "rule.p", "fact.r"]);
@@ -283,7 +286,8 @@ fn repo_targets_write_untracked_files_in_every_worktree() {
         main.display()
     );
     f.write("priv/stack.toml", &manifest);
-    let opts = Options { repo: Some("beta-core".into()), user_only: false, adapter: None };
+    let opts =
+        Options { repo: Some("beta-core".into()), user_only: false, adapter: None, place: None };
     let p = plan(&f.stacks(), &opts).unwrap();
     let creates: Vec<String> = p
         .items
@@ -411,6 +415,7 @@ fn the_memory_index_goes_to_places_never_to_the_user_level() {
                 by_reference: false,
                 role_dir: None,
                 relative_to: None,
+                default_role: None,
             },
         )
         .text
@@ -544,7 +549,7 @@ fn worktree_roots_limit_the_worktrees_and_tracked_instructions_still_load() {
     f.write("priv/stack.toml", &manifest);
     let p = plan(
         &f.stacks(),
-        &Options { repo: Some("beta-core".into()), user_only: false, adapter: None },
+        &Options { repo: Some("beta-core".into()), user_only: false, adapter: None, place: None },
     )
     .unwrap();
     let written: Vec<String> = p
@@ -585,6 +590,7 @@ fn role_ctx(roles: Option<Vec<&str>>) -> Context {
         by_reference: false,
         role_dir: None,
         relative_to: None,
+        default_role: None,
     }
 }
 

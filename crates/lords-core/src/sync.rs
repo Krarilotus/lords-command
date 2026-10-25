@@ -93,6 +93,8 @@ pub struct Options {
     /// Only this adapter's files (its targets, and its file and skill links in each place); role files, which
     /// every adapter's agents read, are always planned. `None`: every adapter.
     pub adapter: Option<String>,
+    /// With `repo`: only this one checkout or worktree of it (a new worktree's files, from its post-checkout hook).
+    pub place: Option<PathBuf>,
 }
 
 fn audience_of(names: &[String], adapter: &dyn Adapter) -> Vec<Audience> {
@@ -167,6 +169,7 @@ fn context(
         by_reference: false,
         role_dir: None,
         relative_to: None,
+        default_role: None,
     }
 }
 
@@ -532,6 +535,7 @@ pub fn role_composed(stacks: &Stacks, layers: Layers, role: &str) -> Composed {
         by_reference: false,
         role_dir: None,
         relative_to: None,
+        default_role: None,
     };
     compose::compose(stacks, &ctx)
 }
@@ -631,6 +635,7 @@ fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Pl
         by_reference: false,
         role_dir: None,
         relative_to: None,
+        default_role: None,
     };
     let skills: Vec<&Entry> = compose::applicable(stacks, &skill_ctx)
         .into_iter()
@@ -717,6 +722,7 @@ fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Pl
             by_reference: false,
             role_dir: None,
             relative_to: None,
+            default_role: None,
         };
         let composed = compose::compose(stacks, &ctx);
         let proposed = compose::place_block(&current, &composed.text, false);
@@ -737,9 +743,20 @@ fn repo_items(
     name: &str,
     repo: &stack::Repo,
     only: Option<&str>,
+    only_path: Option<&Path>,
     plan: &mut Plan,
 ) {
-    let (paths, skipped) = checkouts(repo);
+    let (mut paths, skipped) = checkouts(repo);
+    if let Some(one) = only_path {
+        paths.retain(|p| norm(p) == norm(one));
+        if paths.is_empty() {
+            plan.notes.push(format!(
+                "repo {name}: {} is none of its checkouts or worktrees under worktree_roots",
+                display(one)
+            ));
+            return;
+        }
+    }
     if paths.is_empty() {
         plan.notes.push(format!("repo {name}: no checkouts declared"));
         return;
@@ -855,13 +872,22 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
             if opts.repo.as_deref().is_some_and(|r| r != name) {
                 continue;
             }
-            repo_items(stacks, name, repo, opts.adapter.as_deref(), &mut plan);
+            repo_items(
+                stacks,
+                name,
+                repo,
+                opts.adapter.as_deref(),
+                opts.place.as_deref(),
+                &mut plan,
+            );
         }
         for (name, w) in &private.manifest.workspaces {
             if opts.repo.as_deref().is_some_and(|r| r != name) {
                 continue;
             }
-            workspace_items(stacks, name, w, opts.adapter.as_deref(), &mut plan);
+            if opts.place.is_none() {
+                workspace_items(stacks, name, w, opts.adapter.as_deref(), &mut plan);
+            }
         }
         if let Some(r) = &opts.repo {
             if !private.manifest.repos.contains_key(r)
@@ -980,12 +1006,33 @@ pub fn repo_composed(stacks: &Stacks, place: &str, adapter: &dyn Adapter) -> Com
     compose::compose(stacks, &ctx)
 }
 
+/// The repo whose checkout (the first one or any other) is `dir`.
+pub fn repo_named_by_checkout(stacks: &Stacks, dir: &Path) -> Option<String> {
+    let private = stacks.private.as_ref()?;
+    private
+        .manifest
+        .repos
+        .iter()
+        .find(|(_, r)| r.checkouts.iter().any(|c| norm(&expand_home(c)) == norm(dir)))
+        .map(|(n, _)| n.clone())
+}
+
 /// A place's first checkout (a repo) or its dir (a workspace).
 pub fn first_path(stacks: &Stacks, place: &str) -> Option<PathBuf> {
     let private = stacks.private.as_ref()?;
     match private.manifest.repos.get(place) {
         Some(repo) => repo.checkouts.first().map(|c| expand_home(c)),
         None => private.manifest.workspaces.get(place).map(|w| expand_home(&w.path)),
+    }
+}
+
+/// The role a session in a place has when no brief names one (stack.toml `default_role`).
+fn place_default_role(stacks: &Stacks, layers: &Layers) -> Option<String> {
+    let manifest = &stacks.private.as_ref()?.manifest;
+    match layers {
+        Layers::Repo { repo, .. } => manifest.repos.get(repo)?.default_role.clone(),
+        Layers::Workspace { name, .. } => manifest.workspaces.get(name)?.default_role.clone(),
+        Layers::Global => None,
     }
 }
 
@@ -997,9 +1044,11 @@ fn place_context(
     layers: Layers,
     checkout: Option<&Path>,
 ) -> Context {
+    let default_role = place_default_role(stacks, &layers);
     let mut ctx = context(stacks, adapter, adapter.audience(), layers);
     ctx.by_reference = true;
     ctx.role_dir = checkout.map(|c| c.join(ROLE_DIR));
+    ctx.default_role = default_role;
     if adapter.relative_paths() {
         ctx.relative_to = checkout.map(Path::to_path_buf);
     }
@@ -1062,6 +1111,7 @@ pub fn drift_findings(stacks: &Stacks) -> Vec<crate::Finding> {
                 }
             }
             out.extend(repo_size_findings(stacks));
+            out.extend(shadow_findings(stacks));
             out.extend(verbatim_findings(stacks));
             out.extend(plan.notes.iter().map(|n| Finding::info("sync-note", n.clone())));
             out
@@ -1159,6 +1209,51 @@ pub fn verbatim_findings(stacks: &Stacks) -> Vec<crate::Finding> {
     out
 }
 
+/// Worktrees that get no place files of their own (outside `worktree_roots`) but lie inside another place that
+/// gets a Claude file: Claude reads that ancestor file and then skips the worktree's own `AGENTS.md`
+/// (docs/load-order.md). Info, one per worktree.
+pub fn shadow_findings(stacks: &Stacks) -> Vec<crate::Finding> {
+    let Some(private) = &stacks.private else { return Vec::new() };
+    let claude = |ids: &[String]| ids.is_empty() || ids.iter().any(|a| a == "claude");
+    let mut places: Vec<(String, PathBuf)> = Vec::new();
+    for (name, w) in private.manifest.workspaces.iter().filter(|(_, w)| claude(&w.adapters)) {
+        places.push((format!("workspace {name}"), expand_home(&w.path)));
+    }
+    let mut skipped_all: Vec<(String, PathBuf)> = Vec::new();
+    for (name, repo) in &private.manifest.repos {
+        let (paths, skipped) = checkouts(repo);
+        if claude(&repo.adapters) {
+            places.extend(paths.into_iter().map(|p| (format!("repo {name}"), p)));
+        }
+        skipped_all.extend(skipped.into_iter().map(|w| (format!("repo {name}"), w)));
+    }
+    let mut out = Vec::new();
+    for (repo, w) in skipped_all {
+        if !w.join("AGENTS.md").is_file() {
+            continue;
+        }
+        let wn = norm(&w);
+        let ancestor = places.iter().find(|(_, p)| {
+            let pn = norm(p);
+            wn != pn && wn.starts_with(&format!("{}/", pn.trim_end_matches('/')))
+        });
+        if let Some((place, p)) = ancestor {
+            out.push(
+                crate::Finding::info(
+                    "agents-shadowed",
+                    format!(
+                        "{repo}: worktree {}: AGENTS.md shadowed by an ancestor place file ({place}, {})",
+                        adapters::slashes(&w),
+                        adapters::slashes(&p.join("CLAUDE.local.md"))
+                    ),
+                )
+                .at(w.join("AGENTS.md"), None),
+            );
+        }
+    }
+    out
+}
+
 /// One file sync writes, measured as written (absolute paths, the first checkout's tracked text).
 #[derive(Clone, Debug, Serialize)]
 pub struct Size {
@@ -1175,6 +1270,8 @@ pub struct Size {
     /// Bytes by part: "tracked AGENTS.md", "header" (markers and the lines before the first heading), then each
     /// heading.
     pub sections: Vec<(String, usize)>,
+    /// Whether sync writes it yet (the place's `adapters`); measured either way.
+    pub enabled: bool,
 }
 
 impl Size {
@@ -1220,6 +1317,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
             reads: text.len(),
             limit: adapter.byte_limit(),
             sections: sections(&text, &text),
+            enabled: true,
         });
     }
     let mut places: Vec<(String, String, &[String])> = Vec::new();
@@ -1231,10 +1329,9 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
     }
     for (label, name, ids) in places {
         let Some(dir) = first_path(stacks, &name) else { continue };
+        // Every adapter is measured, also one the place doesn't get yet: the line holds before it is switched on.
         for adapter in adapters::ALL.iter().copied() {
-            if !ids.is_empty() && !ids.iter().any(|a| a == adapter.id()) {
-                continue;
-            }
+            let enabled = ids.is_empty() || ids.iter().any(|a| a == adapter.id());
             let (text, composed) =
                 place_text(stacks, place_layers(stacks, &name, false), adapter, &dir);
             let rendered = adapter.render(&composed);
@@ -1245,6 +1342,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
                 reads: text.len() + user[adapter.id()],
                 limit: adapter.byte_limit(),
                 sections: sections(&text, &rendered),
+                enabled,
             });
         }
         for role in declared_roles(stacks) {
@@ -1256,6 +1354,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
                 reads: 0,
                 limit: None,
                 sections: sections(&text, &text),
+                enabled: true,
             });
         }
     }

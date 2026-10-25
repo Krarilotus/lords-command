@@ -22,7 +22,8 @@ usage:
   lords privacy FILE...
   lords hooks install [--repo DIR] [--secrets-only] [--force]
   lords hash PATH
-  lords sync [--user | --repo NAME] [--adapter ID] [--json] [--apply]
+  lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--json] [--apply]
+  lords hooks install --post-checkout [--repo DIR]   a new worktree gets its place files (`sync --place`)
   lords compose [--repo NAME [--role ROLE]] [--adapter ID] [--json]   what a harness reads there, with sources
   lords sizes [--json]   every file sync writes, by section; fails past the warning line
 
@@ -145,7 +146,9 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
         }
         return Ok(!check::has_errors(&findings, strict));
     }
-    let stacks = Stacks { public: Stack::load(&p.public)?, private };
+    // Loaded as sync loads them (the repos' own skills are entries too), so check measures what sync writes.
+    drop(private);
+    let stacks = Stacks::load(&p.public, p.private.as_deref())?;
     let mut findings = check::check(&stacks, &rules);
     findings.extend(drift(&stacks));
     print_findings(&findings, json);
@@ -166,8 +169,12 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     let user_only = a.flag("--user");
     let repo = a.value("--repo")?;
     let adapter = a.value("--adapter")?;
+    let place = a.value("--place")?.map(PathBuf::from);
     let p = paths(&mut a)?;
     a.done()?;
+    if place.is_some() && repo.is_none() {
+        return Err("--place needs --repo (a checkout or worktree of that repo)".into());
+    }
     if let Some(id) = adapter.as_deref().filter(|id| lords_core::adapters::get(id).is_none()) {
         return Err(format!(
             "unknown adapter `{id}` (known: {})",
@@ -175,7 +182,7 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         ));
     }
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
-    let opts = sync::Options { repo, user_only, adapter };
+    let opts = sync::Options { repo, user_only, adapter, place };
     let plan = sync::plan(&stacks, &opts)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_default());
@@ -189,6 +196,13 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         return Ok(true);
     }
     let backups = sync::backup_dir()?;
+    // One worktree (its post-checkout hook): only its files, no import or retiring, which commit to the stack.
+    if opts.place.is_some() {
+        for line in sync::apply(&plan, &backups)? {
+            println!("{line}");
+        }
+        return Ok(true);
+    }
     for line in sync::import_and_apply(&p.public, p.private.as_deref(), &opts, &backups)? {
         println!("{line}");
     }
@@ -422,6 +436,40 @@ fn cmd_hooks(mut a: Args) -> Result<bool, String> {
         .unwrap_or(std::env::current_dir().map_err(|e| e.to_string())?);
     let secrets_only = a.flag("--secrets-only");
     let force = a.flag("--force");
+    if a.flag("--post-checkout") {
+        let explicit_public = a.value("--public-stack")?.map(PathBuf::from);
+        let explicit_private = a.value("--private-stack")?.map(PathBuf::from);
+        let cfg = Config::discover();
+        let public = explicit_public
+            .clone()
+            .or(cfg.public)
+            .ok_or("no public stack: pass --public-stack or set it in config.txt")?;
+        let private = explicit_private
+            .clone()
+            .or(cfg.private)
+            .ok_or("no private stack: the repos are declared there")?;
+        a.done()?;
+        let stacks = Stacks::load(&public, Some(&private))?;
+        let top = git::toplevel(&repo).ok_or("not in a git repo")?;
+        let name = sync::repo_named_by_checkout(&stacks, &top).ok_or_else(|| {
+            format!("{} is no checkout of a repo in the private stack.toml", top.display())
+        })?;
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let args = hooks::SyncArgs {
+            repo: name.clone(),
+            public_stack: explicit_public.map(|p| std::path::absolute(&p).unwrap_or(p)),
+            private_stack: explicit_private.map(|p| std::path::absolute(&p).unwrap_or(p)),
+        };
+        let r = hooks::install_post_checkout(&top, &exe, &args)?;
+        println!("installed {} (repo {name})", r.hook.display());
+        if let Some(b) = r.backup {
+            println!("the hook that was there runs first, from {}", b.display());
+        }
+        if let Some(g) = r.global_hooks_path {
+            println!("note: global core.hooksPath = {g}; its dispatcher must run .git/hooks/post-checkout for this to take effect");
+        }
+        return Ok(true);
+    }
     a.done()?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let r = hooks::install(&repo, &exe, secrets_only, force)?;
@@ -499,7 +547,8 @@ fn cmd_sizes(mut a: Args) -> Result<bool, String> {
             }
             _ => String::new(),
         };
-        println!("{} {}: {} bytes{reads}", s.place, s.file, s.bytes);
+        let later = if s.enabled { "" } else { " (not written yet: the place's adapters)" };
+        println!("{} {}: {} bytes{reads}{later}", s.place, s.file, s.bytes);
         let parts: Vec<String> = s.sections.iter().map(|(n, b)| format!("{n} {b}")).collect();
         println!("  {}", parts.join(", "));
     }
