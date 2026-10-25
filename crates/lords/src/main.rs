@@ -23,6 +23,7 @@ usage:
   lords hooks install [--repo DIR] [--secrets-only] [--force]
   lords hash PATH
   lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--json] [--apply]
+  lords sync --restore BACKUP_DIR   undo one apply from its backups (its manifest), last change first
   lords hooks install --post-checkout [--repo DIR]   a new worktree gets its place files (`sync --place`)
   lords compose [--repo NAME [--role ROLE]] [--adapter ID] [--json]   what a harness reads there, with sources
   lords sizes [--json]   every file sync writes, by section; fails past the warning line
@@ -164,6 +165,13 @@ fn drift(stacks: &Stacks) -> Vec<Finding> {
 }
 
 fn cmd_sync(mut a: Args) -> Result<bool, String> {
+    if let Some(dir) = a.value("--restore")? {
+        a.done()?;
+        for line in sync::restore(Path::new(&dir))? {
+            println!("{line}");
+        }
+        return Ok(true);
+    }
     let apply = a.flag("--apply");
     let json = a.flag("--json");
     let user_only = a.flag("--user");

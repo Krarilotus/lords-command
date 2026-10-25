@@ -615,21 +615,59 @@ pub fn with_preamble(text: &str, pre: &str) -> String {
     }
 }
 
-/// Puts a block into a file's text: between existing markers, else appended. `replace` drops the text outside.
-pub fn place_block(current: &str, block: &str, replace: bool) -> String {
-    if replace {
-        return block.to_string();
+/// Where a file's managed block is: from the start of its begin-marker line to the end of its end-marker line's
+/// text, before that line's own line ending. Markers count only as whole lines (a sentence quoting one is owner
+/// text). Anything but one begin line before one end line is an error: the file is no longer ours to edit.
+fn block_span(text: &str) -> Result<Option<(usize, usize)>, String> {
+    let (mut begins, mut ends) = (Vec::new(), Vec::new());
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        let content = line.trim_end_matches('\n').trim_end_matches('\r');
+        // A byte-order mark before the first line belongs to the owner's text, not to the marker.
+        let bom =
+            if at == 0 && content.starts_with('\u{feff}') { '\u{feff}'.len_utf8() } else { 0 };
+        let content = &content[bom..];
+        if content == BEGIN {
+            begins.push(at + bom);
+        }
+        if content == END {
+            ends.push(at + bom + content.len());
+        }
+        at += line.len();
     }
-    if let (Some(b), Some(e)) = (current.find(BEGIN), current.find(END)) {
-        if b < e {
-            let after = &current[e + END.len()..];
+    match (begins.as_slice(), ends.as_slice()) {
+        ([], []) => Ok(None),
+        ([b], [e]) if b < e => Ok(Some((*b, *e))),
+        _ => Err(format!(
+            "{} begin and {} end marker lines, not one managed block; fix the file by hand, sync leaves it alone",
+            begins.len(),
+            ends.len()
+        )),
+    }
+}
+
+/// Puts a block into a file's text: between its marker lines, else appended. `replace` drops the text outside.
+/// Every byte outside the block stays as it was, the line ending after the end marker (or its absence) included.
+/// An error when the file's markers are broken, or the block itself carries marker lines (a quoted tracked file).
+pub fn place_block(current: &str, block: &str, replace: bool) -> Result<String, String> {
+    if !block.is_empty() && block_span(block)?.is_none() {
+        return Err("the composed block has no marker lines".into());
+    }
+    if replace {
+        return Ok(block.to_string());
+    }
+    if let Some((b, e)) = block_span(current)? {
+        let after = &current[e..];
+        if block.is_empty() {
             let after =
                 after.strip_prefix("\r\n").or_else(|| after.strip_prefix('\n')).unwrap_or(after);
-            return format!("{}{block}{after}", &current[..b]);
+            return Ok(format!("{}{after}", &current[..b]));
         }
+        let body = block.strip_suffix('\n').unwrap_or(block);
+        return Ok(format!("{}{body}{after}", &current[..b]));
     }
     if block.is_empty() || current.is_empty() {
-        return format!("{current}{block}");
+        return Ok(format!("{current}{block}"));
     }
     let sep = if current.ends_with("\n\n") {
         ""
@@ -638,13 +676,19 @@ pub fn place_block(current: &str, block: &str, replace: bool) -> String {
     } else {
         "\n\n"
     };
-    format!("{current}{sep}{block}")
+    Ok(format!("{current}{sep}{block}"))
 }
 
-/// The managed block currently in a file, if any.
+/// The managed block currently in a file, if it has exactly one.
 pub fn current_block(text: &str) -> Option<&str> {
-    let b = text.find(BEGIN)?;
-    let e = text[b..].find(END)? + b + END.len();
-    let e = if text[e..].starts_with('\n') { e + 1 } else { e };
-    Some(&text[b..e])
+    let (b, e) = block_span(text).ok()??;
+    let after = &text[e..];
+    let nl = if after.starts_with("\r\n") {
+        2
+    } else if after.starts_with('\n') {
+        1
+    } else {
+        0
+    };
+    Some(&text[b..e + nl])
 }

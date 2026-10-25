@@ -192,11 +192,18 @@ fn instruction_targets_keep_owner_text_and_report_drift() {
             && k.ends_with(&format!("{END}\n"))
     );
     assert!(f.read("home/replace/AGENTS.md").starts_with(BEGIN));
-    let saved: Vec<String> = fs::read_dir(&backups)
-        .unwrap()
-        .flatten()
-        .map(|e| fs::read_to_string(e.path()).unwrap())
-        .collect();
+    // The replaced files are kept under `files/` in the run's backup dir (beside its manifest).
+    fn files(dir: &std::path::Path, out: &mut Vec<String>) {
+        for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+            if e.path().is_dir() {
+                files(&e.path(), out);
+            } else {
+                out.push(fs::read_to_string(e.path()).unwrap());
+            }
+        }
+    }
+    let mut saved = Vec::new();
+    files(&backups.join("files"), &mut saved);
     assert_eq!(
         saved.len(),
         2,
@@ -248,8 +255,8 @@ fn skills_are_links_into_the_stack() {
     );
     assert!(fs::read_link(dir.join("spec-tests")).is_ok(), "a link, not a copy");
     assert_eq!(f.read("home/skills/mine/SKILL.md"), "mine\n");
-    let backed: Vec<_> = fs::read_dir(f.path("backups")).unwrap().flatten().collect();
-    assert_eq!(backed.len(), 1);
+    let manifest = f.read("backups/manifest.tsv");
+    assert_eq!(manifest.lines().filter(|l| l.starts_with("dir\t")).count(), 1, "{manifest}");
     assert!(plan(&f.stacks(), &opts).unwrap().items.iter().all(|i| i.action == Action::InSync));
 
     let side = f.read("pub/global/skills/old/lords.yaml");

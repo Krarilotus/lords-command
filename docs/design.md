@@ -214,11 +214,24 @@ line of `AGENTS.md`, in order, in the override, and the include in the local fil
 what the public layers (public global, project and repo) would make of it, so the maintainer can commit that.
 
 **Skills** go into each adapter's skills dir as directory links (junctions on Windows, symlinks elsewhere), never
-copies. A link is the tool's if it points into a stack. Sync creates, re-points and removes only those links, and
-leaves every other dir alone. A real dir where a link should go is moved to the backup first, and its diff is shown.
+copies. A link is the tool's if it points inside a stack (dir by dir, resolved). Sync creates, re-points and removes
+only those links, and only the link itself, never recursively. A real dir is the tool's only if it is a copy of a
+stack skill: its SKILL.md names it, it holds no link, and no file the stack's copy lacks. Every other dir stays. A real
+dir where a link should go is moved to the backup first, and its diff is shown. Walks never follow a link.
 
-**Backups.** `--apply` copies or moves each file and dir it replaces to `~/.lords-command/backups/<date>-<run>/`.
-It refuses a plan with any conflict.
+**What apply may touch** (the Sol review of 25 Oct): only the configured path, as a plain file. A target that is a
+link, or lies below one, is a conflict; so is one sync can't read as UTF-8, and a file whose marker lines aren't one
+begin line before one end line (markers count only as whole lines). Writes go through a new file renamed over the
+target, so nothing is ever half-written and a hardlink keeps its old bytes. Every byte outside the managed block
+stays, the line ending after the end marker included; a settings file changes only in its one key. Apply first
+checks every path is still as planned and refuses the whole plan otherwise. One apply runs at a time
+(`backups/apply.lock`).
+
+**Backups.** Each `--apply` gets a new dir, `~/.lords-command/backups/<date>-<pid>-<n>/`: replaced files under
+`files/` and moved dirs under `dirs/`, each at its whole path, and `manifest.tsv`, one line per change written before
+the change (including where each removed link pointed, and each file and link it created). `lords sync --restore
+<dir>` undoes it, last change first, leaving anything changed since. It refuses a plan with any conflict, before any
+stack file changes; import and retirement run only on a clean git checkout of their stack.
 
 **Where each line comes from.** Composition keeps a map: output line → entry id → stack, file and line. The GUI
 shows it; `sync --json` prints it. The agent files carry only the text, plus one header comment naming the source.

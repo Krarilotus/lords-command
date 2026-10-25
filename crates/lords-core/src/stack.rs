@@ -599,16 +599,28 @@ pub fn sorted_children(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// Every plain file under `dir`. Links (junctions, symlinks) are never followed, so a walk stays inside `dir` and
+/// ends (Sol review, finding 18); `has_links` says whether there were any.
 pub fn all_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for c in sorted_children(dir) {
-        if c.is_dir() {
-            out.extend(all_files(&c));
-        } else {
-            out.push(c);
+        match fs::symlink_metadata(&c) {
+            Ok(m) if m.file_type().is_symlink() => {}
+            Ok(m) if m.is_dir() => out.extend(all_files(&c)),
+            Ok(m) if m.is_file() => out.push(c),
+            _ => {}
         }
     }
     out
+}
+
+/// Whether `dir` holds a link anywhere below it (not following links).
+pub fn has_links(dir: &Path) -> bool {
+    sorted_children(dir).iter().any(|c| match fs::symlink_metadata(c) {
+        Ok(m) if m.file_type().is_symlink() => true,
+        Ok(m) if m.is_dir() => has_links(c),
+        _ => false,
+    })
 }
 
 pub fn file_name(p: &Path) -> String {

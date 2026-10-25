@@ -210,7 +210,7 @@ fn one_checkout_gets_a_file_per_role() {
     assert!(fs::read_to_string(checkout.join(".git/info/exclude"))
         .unwrap()
         .lines()
-        .any(|l| l == ".lords/"));
+        .any(|l| l == "/.lords/role-coder.md"));
     assert_eq!(
         git(&checkout, &["status", "--porcelain"]),
         "",

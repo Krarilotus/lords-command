@@ -68,7 +68,7 @@ fn development_skills_install_per_checkout() {
     );
     let exclude = fs::read_to_string(checkout.join(".git/info/exclude")).unwrap();
     assert!(
-        exclude.lines().any(|l| l == ".claude/skills/spec-tests")
+        exclude.lines().any(|l| l == "/.claude/skills/spec-tests")
             && !exclude.lines().any(|l| l == ".claude/skills" || l == ".claude/skills/"),
         "{exclude}"
     );
@@ -111,7 +111,8 @@ fn an_old_user_level_copy_of_a_development_skill_is_retired() {
     let f = Fixture::new();
     skill(&f, "spec-tests", "roles: [coder]\n");
     let dir = f.path("home/skills");
-    f.write("home/skills/spec-tests/SKILL.md", "an old copy\n");
+    // An older copy of the stack's skill: its SKILL.md names it, and it has no file the stack's copy lacks.
+    f.write("home/skills/spec-tests/SKILL.md", "---\nname: spec-tests\n---\nAn old copy.\n");
     f.write("home/skills/frontend-design/SKILL.md", "not ours\n");
     // An inherited, third-party skill in the stack: the user's own copy of it stays.
     f.write("pub/global/skills/vendor/SKILL.md", "---\nname: vendor\n---\nx\n");
@@ -133,6 +134,23 @@ fn an_old_user_level_copy_of_a_development_skill_is_retired() {
     assert_eq!(action("vendor"), None, "an inherited skill's user copy stays");
     apply(&p, &f.path("backups")).unwrap();
     assert!(!dir.join("spec-tests").exists() && dir.join("frontend-design/SKILL.md").exists());
-    let backed: Vec<_> = fs::read_dir(f.path("backups")).unwrap().flatten().collect();
-    assert_eq!(backed.len(), 1, "the copy is in the backup");
+    let manifest = f.read("backups/manifest.tsv");
+    assert_eq!(manifest.lines().filter(|l| l.starts_with("dir\t")).count(), 1, "{manifest}");
+    assert!(
+        texts_under(&f.path("backups/dirs")).iter().any(|t| t.contains("An old copy.")),
+        "the copy is in the backup"
+    );
+}
+
+/// Every file's text under `dir`, recursively.
+fn texts_under(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        if e.path().is_dir() {
+            out.extend(texts_under(&e.path()));
+        } else {
+            out.push(fs::read_to_string(e.path()).unwrap_or_default());
+        }
+    }
+    out
 }

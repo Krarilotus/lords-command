@@ -207,7 +207,7 @@ fn sync_retires_an_expired_entry_and_no_file_carries_it() {
                     .as_ref()
                     .unwrap()
                     .reason
-                    .starts_with("expired: until 2000-01-01 passed"),
+                    .starts_with("expired: until 2000-01-01 reached"),
             "{id}"
         );
     }

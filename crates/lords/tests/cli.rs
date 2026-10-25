@@ -381,7 +381,16 @@ Test before merging.
     );
     assert!(fs::read_to_string(repo.join(".git/before.log")).unwrap().contains("ran"));
 
-    let before = fs::read_to_string(&log).unwrap();
+    // The new worktree's sync runs in the background: wait until its log stops growing.
+    let mut before = fs::read_to_string(&log).unwrap();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let now = fs::read_to_string(&log).unwrap();
+        if now == before {
+            break;
+        }
+        before = now;
+    }
     let start = std::time::Instant::now();
     let o = env.git(&wt, &["checkout", "-q", "-b", "two"]);
     let took = start.elapsed();

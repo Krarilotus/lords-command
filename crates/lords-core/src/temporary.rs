@@ -9,8 +9,8 @@ use crate::stack::Stacks;
 pub fn ended(e: &Entry, stacks: &Stacks, today: &str) -> Option<String> {
     let t = e.meta.temporary.as_ref()?;
     if let Some(until) = &t.until {
-        if today > until.as_str() {
-            return Some(format!("until {until} passed"));
+        if today >= until.as_str() {
+            return Some(format!("until {until} reached"));
         }
     }
     if let Some(w) = &t.when {

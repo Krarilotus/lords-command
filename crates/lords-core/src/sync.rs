@@ -52,6 +52,10 @@ pub struct Item {
     /// For `Link`, `Relink` and `ReplaceDir`: the stack dir the link points at.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_to: Option<PathBuf>,
+    /// For `Relink` and `Unlink`: where the link points now (checked again before apply touches it, and kept in
+    /// the run's backups so the link can be put back).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_from: Option<PathBuf>,
     pub diff: String,
     pub notes: Vec<String>,
     #[serde(skip)]
@@ -67,6 +71,7 @@ impl Item {
             current: None,
             proposed: None,
             link_to: None,
+            link_from: None,
             diff: String::new(),
             notes: Vec::new(),
             sources: Vec::new(),
@@ -109,8 +114,60 @@ fn audience_of(names: &[String], adapter: &dyn Adapter) -> Vec<Audience> {
     }
 }
 
+/// Best-effort text of a file sync only reads (a skill's SKILL.md for a diff, a tracked file it carries).
 fn read(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok()
+}
+
+/// A target's text: `None` when nothing is there. Anything sync can't read as UTF-8 text is an error, never taken
+/// for a missing file (Sol review, finding 2): sync then leaves it alone.
+fn read_target(path: &Path) -> Result<Option<String>, String> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("can't read it: {e}")),
+        Ok(m) if m.is_dir() => return Err("a dir is where a file goes".into()),
+        Ok(_) => {}
+    }
+    let bytes = fs::read(path).map_err(|e| format!("can't read it: {e}"))?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| "not UTF-8 text (UTF-16 or binary?); sync doesn't edit it".into())
+}
+
+/// Why sync may not write `path`, if it may not: the path is a link, or a link in a dir above it would send the
+/// write somewhere else (Sol review, finding 5). Sync writes only plain files at the path it was given.
+pub fn write_guard(path: &Path) -> Result<(), String> {
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!("{} is a link; sync writes only plain files", display(path)));
+    }
+    for dir in path.ancestors().skip(1) {
+        if fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+            let to = link_target(dir).map(|t| display(&t)).unwrap_or_else(|| "elsewhere".into());
+            return Err(format!(
+                "{} is a link (to {to}), so a write below it would land there",
+                display(dir)
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn conflict(target: &str, path: &Path, note: impl Into<String>) -> Item {
+    let mut item = Item::new(target, path.to_path_buf(), Action::Conflict);
+    item.notes.push(note.into());
+    item
+}
+
+/// The item that puts `block` into the file at `path`, keeping the owner's text around it (or replacing it).
+fn block_item(target: &str, path: &Path, block: &str, replace: bool, composed: &Composed) -> Item {
+    let current = match read_target(path) {
+        Ok(c) => c.unwrap_or_default(),
+        Err(e) => return conflict(target, path, e),
+    };
+    match compose::place_block(&current, block, replace) {
+        Ok(proposed) => file_item(target, path, proposed, composed),
+        Err(e) => conflict(target, path, e),
+    }
 }
 
 fn display(p: &Path) -> String {
@@ -119,7 +176,13 @@ fn display(p: &Path) -> String {
 
 /// An item that makes `path` hold `proposed` (or says it already does).
 fn file_item(target: &str, path: &Path, proposed: String, composed: &Composed) -> Item {
-    let current = read(path);
+    if let Err(e) = write_guard(path) {
+        return conflict(target, path, e);
+    }
+    let current = match read_target(path) {
+        Ok(c) => c,
+        Err(e) => return conflict(target, path, e),
+    };
     let action = match &current {
         None if proposed.is_empty() => Action::InSync,
         None => Action::Create,
@@ -203,7 +266,7 @@ fn instructions_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec
     ctx.roles = roles_of(t);
     let composed = compose::compose(stacks, &ctx);
     let replace = t.own_text.as_deref() == Some("replace");
-    let current = read(&path).unwrap_or_default();
+    let current = read_target(&path).ok().flatten().unwrap_or_default();
     let text = adapter.render(&composed);
     let mut items = Vec::new();
     let block = match &t.via {
@@ -218,8 +281,9 @@ fn instructions_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec
                 ));
                 return vec![item];
             };
+            // The shared file keeps its owner's text too (Sol review, finding 4).
             let mut s =
-                file_item(&format!("shared text ({})", t.name), &shared, text.clone(), &composed);
+                block_item(&format!("shared text ({})", t.name), &shared, &text, false, &composed);
             size_note(&mut s, adapter, &text);
             items.push(s);
             if composed.text.is_empty() {
@@ -229,8 +293,7 @@ fn instructions_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec
             }
         }
     };
-    let proposed = compose::place_block(&current, &block, replace);
-    let mut item = file_item(&t.name, &path, proposed, &composed);
+    let mut item = block_item(&t.name, &path, &block, replace, &composed);
     if t.via.is_none() {
         size_note(&mut item, adapter, &text);
     }
@@ -247,6 +310,122 @@ fn norm(p: &Path) -> String {
     strip_verbatim(p)
 }
 
+/// `text` (a JSON object) with its top-level `key` set to `value`, every other byte as it was: the key's old value
+/// is replaced in place, or the key is added after the last member in the file's own line ending and indent (Sol
+/// review, P2 finding 20). An error when `text` isn't one JSON object.
+fn json_set_key(text: &str, key: &str, value: &serde_json::Value) -> Result<String, String> {
+    let b = text.as_bytes();
+    let ws = |mut i: usize| {
+        while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\r' | b'\n') {
+            i += 1;
+        }
+        i
+    };
+    // The end of the string starting at `i` (a quote).
+    let string_end = |mut i: usize| -> Result<usize, String> {
+        i += 1;
+        while i < b.len() {
+            match b[i] {
+                b'\\' => i += 2,
+                b'"' => return Ok(i + 1),
+                _ => i += 1,
+            }
+        }
+        Err("an unterminated string".into())
+    };
+    // The end of the value starting at `i`.
+    let value_end = |mut i: usize| -> Result<usize, String> {
+        let mut depth = 0usize;
+        while i < b.len() {
+            match b[i] {
+                b'"' => {
+                    i = string_end(i)?;
+                    if depth == 0 {
+                        return Ok(i);
+                    }
+                    continue;
+                }
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' if depth == 0 => return Ok(i),
+                b'}' | b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(i + 1);
+                    }
+                }
+                b',' if depth == 0 => return Ok(i),
+                _ => {}
+            }
+            i += 1;
+        }
+        Err("an unterminated value".into())
+    };
+    let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
+    let open = ws(bom);
+    if b.get(open) != Some(&b'{') {
+        return Err("not a JSON object".into());
+    }
+    // (key, key start, value start, value end) of each top-level member.
+    let mut members: Vec<(String, usize, usize, usize)> = Vec::new();
+    let mut i = ws(open + 1);
+    let close = loop {
+        match b.get(i) {
+            Some(b'}') => break i,
+            Some(b'"') => {
+                let k_end = string_end(i)?;
+                let k: String = serde_json::from_str(&text[i..k_end]).map_err(|e| e.to_string())?;
+                let colon = ws(k_end);
+                if b.get(colon) != Some(&b':') {
+                    return Err("a member without a colon".into());
+                }
+                let v_start = ws(colon + 1);
+                let v_end = value_end(v_start)?;
+                let v_trim = text[v_start..v_end].trim_end().len() + v_start;
+                members.push((k, i, v_start, v_trim));
+                i = ws(v_end);
+                match b.get(i) {
+                    Some(b',') => i = ws(i + 1),
+                    Some(b'}') => {}
+                    _ => return Err("a member not followed by , or }".into()),
+                }
+            }
+            _ => return Err("not a JSON object".into()),
+        }
+    };
+    let new_value = serde_json::to_string(value).map_err(|e| e.to_string())?;
+    let out = if let Some((_, _, vs, ve)) = members.iter().find(|m| m.0 == key) {
+        format!("{}{new_value}{}", &text[..*vs], &text[*ve..])
+    } else {
+        let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+        let member = format!("\"{key}\": {new_value}");
+        match members.last() {
+            Some((_, _, _, last_end)) => {
+                // The indent of the first member's line, when it starts that line.
+                let first = members[0].1;
+                let line_start = text[..first].rfind('\n').map_or(0, |n| n + 1);
+                let lead = &text[line_start..first];
+                let indent = if lead.chars().all(|c| c == ' ' || c == '\t') { lead } else { "  " };
+                format!("{},{nl}{indent}{member}{}", &text[..*last_end], &text[*last_end..])
+            }
+            None => format!("{}{nl}  {member}{nl}{}", &text[..open + 1], &text[close..]),
+        }
+    };
+    // The result must be the same object with only `key` changed.
+    let (before, after): (serde_json::Value, serde_json::Value) = (
+        serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?,
+        serde_json::from_str(out.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?,
+    );
+    let (mut x, mut y) = (before, after.clone());
+    if let (Some(x), Some(y)) = (x.as_object_mut(), y.as_object_mut()) {
+        x.remove(key);
+        y.remove(key);
+    }
+    if x != y || after.get(key) != Some(value) {
+        return Err("editing the key would change other keys; left alone".into());
+    }
+    Ok(out)
+}
+
 /// A settings target: the adapter's exclude list in a JSON settings file holds every path in `exclude`. Only
 /// that one key changes; the rest of the file keeps its keys and order.
 fn settings_item(t: &Target, adapter: &dyn Adapter) -> Item {
@@ -256,16 +435,16 @@ fn settings_item(t: &Target, adapter: &dyn Adapter) -> Item {
         item.notes.push(format!("adapter {} has no exclude setting", adapter.id()));
         return item;
     };
-    let current = read(&path);
-    let mut value: serde_json::Value = match current.as_deref().map(serde_json::from_str) {
-        None => serde_json::json!({}),
-        Some(Ok(v @ serde_json::Value::Object(_))) => v,
-        Some(_) => {
-            let mut item = Item::new(&t.name, path, Action::Conflict);
-            item.notes.push("not a JSON object; left alone".into());
-            return item;
-        }
+    let current = match read_target(&path) {
+        Ok(c) => c,
+        Err(e) => return conflict(&t.name, &path, e),
     };
+    let mut value: serde_json::Value =
+        match current.as_deref().map(|c| serde_json::from_str(c.trim_start_matches('\u{feff}'))) {
+            None => serde_json::json!({}),
+            Some(Ok(v @ serde_json::Value::Object(_))) => v,
+            Some(_) => return conflict(&t.name, &path, "not a JSON object; left alone"),
+        };
     let list =
         value.as_object_mut().expect("an object").entry(key).or_insert(serde_json::json!([]));
     let Some(list) = list.as_array_mut() else {
@@ -281,9 +460,14 @@ fn settings_item(t: &Target, adapter: &dyn Adapter) -> Item {
             added = true;
         }
     }
+    let list = serde_json::Value::Array(list.clone());
     let proposed = match (&current, added) {
         (Some(c), false) => c.clone(),
-        _ => serde_json::to_string_pretty(&value).expect("JSON serialises") + "\n",
+        (Some(c), true) => match json_set_key(c, key, &list) {
+            Ok(text) => text,
+            Err(e) => return conflict(&t.name, &path, e),
+        },
+        (None, _) => serde_json::to_string_pretty(&value).expect("JSON serialises") + "\n",
     };
     file_item(&t.name, &path, proposed, &Composed::default())
 }
@@ -325,6 +509,11 @@ fn link_target(path: &Path) -> Option<PathBuf> {
     })
 }
 
+/// Whether `link` is a link that points at `to`.
+pub fn link_points_at(link: &Path, to: &Path) -> bool {
+    link_target(link).is_some_and(|t| same_place(&t, to))
+}
+
 fn same_place(a: &Path, b: &Path) -> bool {
     match (fs::canonicalize(a), fs::canonicalize(b)) {
         (Ok(x), Ok(y)) => x == y,
@@ -337,11 +526,64 @@ fn strip_verbatim(p: &Path) -> String {
     s.trim_start_matches("//?/").trim_start_matches("/??/").to_ascii_lowercase()
 }
 
+/// A path as compared for containment: resolved where it exists, else cleaned lexically (`.` and `..` folded).
+fn resolved(p: &Path) -> String {
+    if let Ok(c) = fs::canonicalize(p) {
+        return strip_verbatim(&c).trim_end_matches('/').to_string();
+    }
+    let mut clean = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                clean.pop();
+            }
+            c => clean.push(c.as_os_str()),
+        }
+    }
+    strip_verbatim(&clean).trim_end_matches('/').to_string()
+}
+
+/// Whether `p` lies inside `root` (or is it), dir by dir: a sibling whose name merely starts with the root's is
+/// outside (Sol review, finding 9).
+fn inside(p: &Path, root: &Path) -> bool {
+    let (p, root) = (resolved(p), resolved(root));
+    p == root || p.starts_with(&format!("{root}/"))
+}
+
 fn in_a_stack(stacks: &Stacks, p: &Path) -> bool {
-    let p = strip_verbatim(p);
-    stacks.all().any(|s| {
-        let root = fs::canonicalize(&s.root).unwrap_or(s.root.clone());
-        p.starts_with(&strip_verbatim(&root)) || p.starts_with(&strip_verbatim(&s.root))
+    stacks.all().any(|s| inside(p, &s.root))
+}
+
+/// Whether `dir` is an installed copy of a skill the stacks made (own or adapted) called `name`: a real dir, no
+/// links in it, a SKILL.md that names it, and no file the stack's copy doesn't have. A dir that merely shares the
+/// name stays the owner's (Sol review, finding 10).
+fn copy_of_ours(stacks: &Stacks, dir: &Path, name: &str) -> bool {
+    if !fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+        return false;
+    }
+    let named = read(&dir.join(stack::SKILL_FILE)).is_some_and(|t| {
+        crate::frontmatter::split(&t).yaml.is_some_and(|y| {
+            y.lines().any(|l| {
+                l.strip_prefix("name:")
+                    .is_some_and(|v| v.trim().trim_matches(['"', char::from(39)]) == name)
+            })
+        })
+    });
+    if !named || stack::has_links(dir) {
+        return false;
+    }
+    let files: Vec<PathBuf> = stack::all_files(dir)
+        .iter()
+        .filter_map(|f| f.strip_prefix(dir).ok().map(Path::to_path_buf))
+        .collect();
+    stacks.entries().any(|e| {
+        e.meta.kind == Kind::Skill
+            && matches!(e.meta.origin, crate::model::Origin::Own | crate::model::Origin::Adapted(_))
+            && e.id().trim_start_matches("skill.") == name
+            && e.meta_file.parent().is_some_and(|src| {
+                files.iter().all(|r| src.join(r).is_file() || r == Path::new(stack::SIDECAR))
+            })
     })
 }
 
@@ -366,22 +608,13 @@ fn skills_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec<Item>
         if wanted_names.contains(&name) {
             continue;
         }
-        let copy_of_ours = || {
-            child.is_dir()
-                && stacks.entries().any(|e| {
-                    e.meta.kind == Kind::Skill
-                        && matches!(
-                            e.meta.origin,
-                            crate::model::Origin::Own | crate::model::Origin::Adapted(_)
-                        )
-                        && e.id().trim_start_matches("skill.") == name
-                })
-        };
         match link_target(&child) {
             Some(to) if in_a_stack(stacks, &to) => {
-                items.push(Item::new(&t.name, child.clone(), Action::Unlink))
+                let mut item = Item::new(&t.name, child.clone(), Action::Unlink);
+                item.link_from = Some(to);
+                items.push(item);
             }
-            None if copy_of_ours() => {
+            None if copy_of_ours(stacks, &child, &name) => {
                 let mut item = Item::new(&t.name, child.clone(), Action::RemoveDir);
                 item.notes.push(
                     "a copy of a stack skill that no longer installs here; backed up, then removed"
@@ -408,6 +641,7 @@ fn link_item(stacks: &Stacks, target: &str, link: &Path, e: &Entry) -> Item {
         let mut item = Item::new(target, link.clone(), Action::Link);
         item.link_to = Some(src.clone());
         if let Some(to) = link_target(&link) {
+            item.link_from = Some(to.clone());
             item.action = if same_place(&to, &src) {
                 Action::InSync
             } else if in_a_stack(stacks, &to) {
@@ -446,6 +680,55 @@ fn link_item(stacks: &Stacks, target: &str, link: &Path, e: &Entry) -> Item {
         }
         item
     }
+}
+
+/// The header line above the exclude patterns sync owns in a repo's `.git/info/exclude`.
+const EXCLUDE_HEADER: &str = "# Lords Command: agent files written by sync";
+
+/// Whether an exclude line is one sync writes: the exact anchored paths it writes now, and the broader forms
+/// earlier versions wrote under the same header.
+fn ours(line: &str) -> bool {
+    let l = line.trim().trim_start_matches('/');
+    ["CLAUDE.local.md", "AGENTS.override.md"].contains(&l)
+        || l.starts_with(&format!("{ROLE_DIR}/"))
+        || l.starts_with(".claude/skills/")
+}
+
+/// A repo's exclude file with sync's section holding exactly `files`: exact paths from the worktree's root, so a
+/// file of the same name deeper down, or the owner's own file beside them, stays visible to git (Sol review, P2
+/// finding 21). Every other line keeps its place and bytes; sync's earlier sections under its header merge into
+/// one.
+fn excludes_text(current: &str, files: &[String]) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut in_ours = false;
+    for line in current.split_inclusive('\n') {
+        let content = line.trim_end_matches('\n').trim_end_matches('\r');
+        if content == EXCLUDE_HEADER {
+            in_ours = true;
+            continue;
+        }
+        if in_ours && ours(content) {
+            continue;
+        }
+        in_ours = false;
+        kept.push(line);
+    }
+    let mut out: String = kept.concat();
+    let mut want: Vec<&String> = files.iter().collect();
+    want.sort();
+    want.dedup();
+    if !want.is_empty() {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(EXCLUDE_HEADER);
+        out.push('\n');
+        for f in want {
+            out.push_str(f);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Every checkout and (if asked) worktree of a repo, and the worktrees skipped for lying outside
@@ -615,13 +898,11 @@ fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Pl
                 plan.items.push(item);
                 continue;
             }
-            let current = read(&path).unwrap_or_default();
             let (text, composed) = place_text(stacks, place.layers(false), adapter, p);
-            let proposed = compose::place_block(&current, &text, false);
-            let mut item = file_item(&target, &path, proposed, &composed);
+            let mut item = block_item(&target, &path, &text, false, &composed);
             size_note(&mut item, adapter, &text);
             plan.items.push(item);
-            add_exclude(p, file);
+            add_exclude(p, &format!("/{file}"));
         }
     }
     // Development skills, linked into each checkout for harnesses that read a skills dir there. Each link's exact
@@ -665,7 +946,29 @@ fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Pl
                     continue;
                 }
                 plan.items.push(link_item(stacks, &target, &p.join(&rel), e));
-                add_exclude(p, &rel);
+                add_exclude(p, &format!("/{rel}"));
+            }
+            // A link of ours here for a skill that no longer applies (ended, retired, another place's) goes
+            // (Sol review, finding 19); anything else in the dir is the repo's or the owner's.
+            let wanted: Vec<String> =
+                skills.iter().map(|e| e.id().trim_start_matches("skill.").to_string()).collect();
+            for child in stack::sorted_children(&p.join(dir)) {
+                let name = stack::file_name(&child);
+                if wanted.contains(&name) {
+                    continue;
+                }
+                if let Some(to) = link_target(&child).filter(|to| in_a_stack(stacks, to)) {
+                    let mut item = Item::new(
+                        &format!("{} (skill {name})", place.label),
+                        child,
+                        Action::Unlink,
+                    );
+                    item.link_from = Some(to);
+                    item.notes
+                        .push("a link of ours for a skill that no longer applies here".into());
+                    plan.items.push(item);
+                    add_exclude(p, &format!("/{dir}/{name}"));
+                }
             }
         }
     }
@@ -674,32 +977,25 @@ fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Pl
         let composed = role_composed(stacks, place.layers(true), &role);
         for p in place.paths.iter().filter(|p| p.is_dir()) {
             let path = p.join(ROLE_DIR).join(role_file(&role));
-            let current = read(&path).unwrap_or_default();
-            let proposed = compose::place_block(&current, &composed.text, false);
-            plan.items.push(file_item(
+            plan.items.push(block_item(
                 &format!("{} (role {role})", place.label),
                 &path,
-                proposed,
+                &composed.text,
+                false,
                 &composed,
             ));
-            add_exclude(p, &format!("{ROLE_DIR}/"));
+            add_exclude(p, &format!("/{ROLE_DIR}/{}", role_file(&role)));
         }
     }
     for (ex, files) in excludes {
-        let current = read(&ex).unwrap_or_default();
-        let have: Vec<&str> = current.lines().map(str::trim).collect();
-        let missing: Vec<&String> = files.iter().filter(|f| !have.contains(&f.as_str())).collect();
-        let mut proposed = current.clone();
-        if !missing.is_empty() {
-            if !proposed.is_empty() && !proposed.ends_with('\n') {
-                proposed.push('\n');
+        let current = match read_target(&ex) {
+            Ok(c) => c.unwrap_or_default(),
+            Err(e) => {
+                plan.items.push(conflict(&format!("{} (git exclude)", place.label), &ex, e));
+                continue;
             }
-            proposed.push_str("# Lords Command: agent files written by sync\n");
-            for f in &missing {
-                proposed.push_str(f);
-                proposed.push('\n');
-            }
-        }
+        };
+        let proposed = excludes_text(&current, &files);
         plan.items.push(file_item(
             &format!("{} (git exclude)", place.label),
             &ex,
@@ -725,14 +1021,16 @@ fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Pl
             default_role: None,
         };
         let composed = compose::compose(stacks, &ctx);
-        let proposed = compose::place_block(&current, &composed.text, false);
-        let mut item = file_item(
-            &format!("{} (tracked AGENTS.md)", place.label),
-            &tracked,
-            proposed,
-            &composed,
-        );
-        item.action = if item.current == item.proposed { Action::InSync } else { Action::Report };
+        let label = format!("{} (tracked AGENTS.md)", place.label);
+        let mut item = match compose::place_block(&current, &composed.text, false) {
+            Ok(proposed) => file_item(&label, &tracked, proposed, &composed),
+            Err(e) => conflict(&label, &tracked, e),
+        };
+        item.action = match item.action {
+            Action::Conflict => Action::Report,
+            _ if item.current == item.proposed => Action::InSync,
+            _ => Action::Report,
+        };
         item.notes.push("tracked: changes by a commit on the repo's branch, never by sync; agents with a stack read the untracked files instead".into());
         plan.items.push(item);
     }
@@ -902,10 +1200,6 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
 
 // ---------------------------------------------------------------- apply
 
-fn backup_name(path: &Path) -> String {
-    strip_verbatim(path).replace([':', '/'], "_").trim_matches('_').to_string()
-}
-
 fn make_link(link: &Path, to: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -932,59 +1226,338 @@ fn make_link(link: &Path, to: &Path) -> Result<(), String> {
     }
 }
 
+/// Removes a link (a junction, or a symlink) and never what it points at: a non-recursive removal of the link
+/// itself, refused when `link` is no link (Sol review, finding 8; the 25 Oct incident: a recursive delete through a
+/// junction emptied the stack's skill dirs).
 fn remove_link(link: &Path) -> Result<(), String> {
-    // A junction is removed as a dir, a symlink as a file; neither touches what it points at.
+    if !fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!("{} is no link; sync removes only links it owns", link.display()));
+    }
     fs::remove_dir(link)
         .or_else(|_| fs::remove_file(link))
         .map_err(|e| format!("{}: {e}", link.display()))
 }
 
-/// Carries out every changing item of a plan. Each file or dir it replaces is first copied or moved under
-/// `backup_dir`. Returns one line per change.
+/// Writes `bytes` to `path` through a new file beside it, renamed over the target: a reader sees the old file or
+/// the new one, never a part (Sol review, finding 7), and a hardlink to the old file keeps the old bytes (finding 5).
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let dir = path.parent().ok_or_else(|| format!("{}: no parent dir", path.display()))?;
+    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.lords-{}.tmp", std::process::id()));
+    let written = (|| -> std::io::Result<()> {
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    })();
+    let done = written.and_then(|()| fs::rename(&tmp, path));
+    if let Err(e) = done {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("{}: {e}", path.display()));
+    }
+    Ok(())
+}
+
+/// Where a backed-up path goes inside a run's backup dir: its whole path, dir by dir (`C:\a\b` is `C/a/b`), so two
+/// different paths never share a backup (Sol review, finding 1).
+fn mirror(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::Prefix(p) => {
+                let s: String = p
+                    .as_os_str()
+                    .to_string_lossy()
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                out.push(if s.is_empty() { "root".to_string() } else { s });
+            }
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => out.push("__up__"),
+            Component::Normal(n) => out.push(n),
+        }
+    }
+    out
+}
+
+/// One apply's backups: the replaced bytes, moved dirs and removed links, and a manifest (`manifest.tsv`, one line
+/// per change, written before the change) that `restore` reads back.
+struct Backups {
+    dir: PathBuf,
+    manifest: fs::File,
+}
+
+/// A manifest line's fields: tabs and line breaks in paths would break the format, so a path with one is refused.
+fn field(p: &Path) -> Result<String, String> {
+    let s = p.to_string_lossy().into_owned();
+    if s.contains(['\t', '\n', '\r']) {
+        return Err(format!("{s:?}: a tab or line break in a path; sync won't touch it"));
+    }
+    Ok(s)
+}
+
+impl Backups {
+    /// A new, empty dir: an existing one (a second apply reusing it) is refused, so no backup is overwritten.
+    fn open(dir: &Path) -> Result<Backups, String> {
+        if let Some(parent) = dir.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        fs::create_dir(dir).map_err(|e| {
+            format!("backup dir {}: {e} (each apply needs a new one)", dir.display())
+        })?;
+        let manifest = fs::File::create(dir.join("manifest.tsv"))
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+        Ok(Backups { dir: dir.to_path_buf(), manifest })
+    }
+
+    fn record(&mut self, fields: &[String]) -> Result<(), String> {
+        use std::io::Write;
+        writeln!(self.manifest, "{}", fields.join("\t"))
+            .and_then(|()| self.manifest.sync_all())
+            .map_err(|e| format!("{}: {e}", self.dir.display()))
+    }
+
+    /// Keeps `bytes`, what `path` held, before it is replaced.
+    fn file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), String> {
+        let rel = Path::new("files").join(mirror(path));
+        write_atomic(&self.dir.join(&rel), bytes)?;
+        self.record(&["file".into(), field(path)?, field(&rel)?])
+    }
+
+    /// Where the dir at `path` moves to, recorded first.
+    fn dir_for(&mut self, path: &Path) -> Result<PathBuf, String> {
+        let rel = Path::new("dirs").join(mirror(path));
+        let to = self.dir.join(&rel);
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        self.record(&["dir".into(), field(path)?, field(&rel)?])?;
+        Ok(to)
+    }
+
+    /// A link about to be removed, and where it pointed.
+    fn link(&mut self, path: &Path, to: &Path) -> Result<(), String> {
+        self.record(&["link".into(), field(path)?, field(to)?])
+    }
+
+    /// A file or link apply is about to create, which a restore removes again (a file only while it still holds
+    /// what apply wrote).
+    fn created(&mut self, path: &Path, what: &str, detail: &str) -> Result<(), String> {
+        self.record(&[format!("created-{what}"), field(path)?, detail.to_string()])
+    }
+}
+
+/// One apply at a time on this machine (a user's sync and a post-checkout hook's): a lock file beside the
+/// backups, waited for up to `secs` seconds.
+struct ApplyLock(PathBuf);
+
+impl ApplyLock {
+    fn take(dir: &Path, secs: u64) -> Result<ApplyLock, String> {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let lock = dir.join("apply.lock");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            match fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    let _ = writeln!(f, "pid {}", std::process::id());
+                    return Ok(ApplyLock(lock));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if std::time::Instant::now() >= until {
+                        return Err(format!(
+                            "another apply holds {} ({}); if none is running, delete that file",
+                            lock.display(),
+                            fs::read_to_string(&lock).unwrap_or_default().trim()
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => return Err(format!("{}: {e}", lock.display())),
+            }
+        }
+    }
+}
+
+impl Drop for ApplyLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn sha(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Whether an item's path is still as the plan saw it; apply refuses the whole plan otherwise (Sol review, finding
+/// 3: an edit after planning is never overwritten or lost).
+fn unchanged(item: &Item) -> Result<(), String> {
+    let stale = |what: &str| {
+        Err(format!(
+            "{}: {what} since the plan; plan again (nothing was changed)",
+            item.path.display()
+        ))
+    };
+    let meta = fs::symlink_metadata(&item.path).ok();
+    let is_link = meta.as_ref().is_some_and(|m| m.file_type().is_symlink());
+    match item.action {
+        Action::Create | Action::Update => {
+            write_guard(&item.path)?;
+            let now =
+                read_target(&item.path).map_err(|e| format!("{}: {e}", item.path.display()))?;
+            if now != item.current {
+                return stale("changed");
+            }
+        }
+        Action::Link => {
+            write_guard(&item.path)?;
+            if meta.is_some() {
+                return stale("something appeared");
+            }
+        }
+        Action::Relink | Action::Unlink => {
+            let now = link_target(&item.path);
+            if !is_link || now.as_deref().map(norm) != item.link_from.as_deref().map(norm) {
+                return stale("the link changed");
+            }
+        }
+        Action::ReplaceDir | Action::RemoveDir => {
+            if !meta.as_ref().is_some_and(|m| m.is_dir()) || is_link {
+                return stale("the dir changed");
+            }
+        }
+        Action::InSync | Action::Report | Action::Conflict | Action::RetireEntry => {}
+    }
+    Ok(())
+}
+
+/// Carries out every changing item of a plan, after checking each path is still as planned. Everything it
+/// replaces or removes is first kept in `backup_dir` (a new dir), with a manifest that `restore` undoes it from.
+/// Returns one line per change.
 pub fn apply(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
-    let mut done = Vec::new();
     if plan.items.iter().any(|i| i.action == Action::Conflict) {
         return Err("the plan has conflicts; resolve them first (nothing was changed)".into());
     }
-    for item in plan.items.iter().filter(|i| i.changes()) {
-        let backup = backup_dir.join(backup_name(&item.path));
+    let changing: Vec<&Item> = plan.items.iter().filter(|i| i.changes()).collect();
+    let root = backup_dir.parent().unwrap_or(backup_dir);
+    let _lock = ApplyLock::take(root, 60)?;
+    for item in &changing {
+        unchanged(item)?;
+    }
+    let mut done = Vec::new();
+    if changing.iter().all(|i| i.action == Action::RetireEntry) {
+        return Ok(done);
+    }
+    let mut backups = Backups::open(backup_dir)?;
+    for item in changing {
+        let path = &item.path;
         match item.action {
-            Action::Create | Action::Update => {
-                if let Some(cur) = &item.current {
-                    fs::create_dir_all(backup_dir).map_err(|e| e.to_string())?;
-                    fs::write(&backup, cur).map_err(|e| e.to_string())?;
-                }
-                if let Some(parent) = item.path.parent() {
-                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                }
-                fs::write(&item.path, item.proposed.as_deref().unwrap_or(""))
-                    .map_err(|e| format!("{}: {e}", item.path.display()))?;
+            Action::Create => {
+                let new = item.proposed.as_deref().unwrap_or("");
+                backups.created(path, "file", &sha(new.as_bytes()))?;
+                write_atomic(path, new.as_bytes())?;
+            }
+            Action::Update => {
+                backups.file(path, item.current.as_deref().unwrap_or("").as_bytes())?;
+                write_atomic(path, item.proposed.as_deref().unwrap_or("").as_bytes())?;
             }
             Action::Link | Action::Relink | Action::ReplaceDir => {
                 let to = item.link_to.as_ref().expect("a link item has a target");
                 if item.action == Action::Relink {
-                    remove_link(&item.path)?;
+                    let old = item.link_from.as_ref().expect("a relink knows the old target");
+                    backups.link(path, old)?;
+                    remove_link(path)?;
                 }
                 if item.action == Action::ReplaceDir {
-                    fs::create_dir_all(backup_dir).map_err(|e| e.to_string())?;
-                    fs::rename(&item.path, &backup)
-                        .map_err(|e| format!("{}: {e}", item.path.display()))?;
+                    let dest = backups.dir_for(path)?;
+                    fs::rename(path, &dest).map_err(|e| format!("{}: {e}", path.display()))?;
                 }
-                if let Some(parent) = item.path.parent() {
+                if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
-                make_link(&item.path, to)?;
+                backups.created(path, "link", &field(to)?)?;
+                make_link(path, to)?;
             }
-            Action::Unlink => remove_link(&item.path)?,
+            Action::Unlink => {
+                let old = item.link_from.as_ref().expect("an unlink knows the old target");
+                backups.link(path, old)?;
+                remove_link(path)?;
+            }
             Action::RemoveDir => {
-                fs::create_dir_all(backup_dir).map_err(|e| e.to_string())?;
-                fs::rename(&item.path, &backup)
-                    .map_err(|e| format!("{}: {e}", item.path.display()))?;
+                let dest = backups.dir_for(path)?;
+                fs::rename(path, &dest).map_err(|e| format!("{}: {e}", path.display()))?;
             }
             // Retired by import_and_apply before this runs; nothing to write here.
             Action::InSync | Action::Report | Action::Conflict | Action::RetireEntry => continue,
         }
-        done.push(format!("{:?} {}", item.action, item.path.display()));
+        done.push(format!("{:?} {}", item.action, path.display()));
+    }
+    Ok(done)
+}
+
+/// Undoes one apply from its backup dir, last change first: created files (while they still hold what apply
+/// wrote) and links go, replaced bytes come back, moved dirs move back and removed links are made again. Anything
+/// that has changed since is left as it is and listed. Returns one line per step.
+pub fn restore(backup_dir: &Path) -> Result<Vec<String>, String> {
+    let manifest = fs::read_to_string(backup_dir.join("manifest.tsv"))
+        .map_err(|e| format!("{}: {e}", backup_dir.display()))?;
+    let root = backup_dir.parent().unwrap_or(backup_dir);
+    let _lock = ApplyLock::take(root, 60)?;
+    let mut done = Vec::new();
+    for line in manifest.lines().rev() {
+        let f: Vec<&str> = line.split('\t').collect();
+        let (kind, path) = match f.as_slice() {
+            [k, p, ..] => (*k, PathBuf::from(p)),
+            _ => continue,
+        };
+        let detail = f.get(2).copied().unwrap_or("");
+        let step = match kind {
+            "created-file" => match fs::read(&path) {
+                Ok(b) if sha(&b) == detail => {
+                    fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                    format!("removed {}", path.display())
+                }
+                Ok(_) => format!("kept {} (changed since apply)", path.display()),
+                Err(_) => format!("{} is gone already", path.display()),
+            },
+            "created-link" => match link_target(&path) {
+                Some(to) if norm(&to) == norm(Path::new(detail)) => {
+                    remove_link(&path)?;
+                    format!("unlinked {}", path.display())
+                }
+                _ => format!("kept {} (not the link apply made)", path.display()),
+            },
+            "file" => {
+                let bytes = fs::read(backup_dir.join(detail))
+                    .map_err(|e| format!("{}: {e}", backup_dir.join(detail).display()))?;
+                write_guard(&path)?;
+                write_atomic(&path, &bytes)?;
+                format!("restored {}", path.display())
+            }
+            "dir" => {
+                if fs::symlink_metadata(&path).is_ok() {
+                    format!("kept {} (something is there now)", path.display())
+                } else {
+                    fs::rename(backup_dir.join(detail), &path)
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    format!("moved back {}", path.display())
+                }
+            }
+            "link" => {
+                if fs::symlink_metadata(&path).is_ok() {
+                    format!("kept {} (something is there now)", path.display())
+                } else {
+                    make_link(&path, Path::new(detail))?;
+                    format!("relinked {} to {detail}", path.display())
+                }
+            }
+            other => format!("unknown manifest line `{other}`, skipped"),
+        };
+        done.push(step);
     }
     Ok(done)
 }
@@ -1120,8 +1693,17 @@ pub fn drift_findings(stacks: &Stacks) -> Vec<crate::Finding> {
     }
 }
 
-/// `sync --apply` as one step: import every memory store (one commit each), plan again from the updated stacks,
-/// then apply with backups under `backup_dir`. Returns what changed. The CLI and the GUI both call this.
+/// Whether `root` is inside a git checkout and nothing under it is uncommitted: then git holds every byte that
+/// an import or a retirement replaces there.
+fn clean_git(root: &Path) -> bool {
+    git::run(root, &["status", "--porcelain", "--", "."]).is_ok_and(|s| s.trim().is_empty())
+}
+
+/// `sync --apply` as one step: import every memory store (one commit each), retire ended temporary entries (one
+/// commit each), plan again from the updated stacks, then apply with backups under `backup_dir`. A plan that
+/// can't apply stops it before any stack file changes, and import and retire run only on a clean git checkout of
+/// their stack (Sol review, finding 6); otherwise they're skipped with a note (ended entries stay out of every
+/// file anyway). Returns what changed. The CLI and the GUI both call this.
 pub fn import_and_apply(
     public: &Path,
     private: Option<&Path>,
@@ -1130,21 +1712,51 @@ pub fn import_and_apply(
 ) -> Result<Vec<String>, String> {
     let mut done = Vec::new();
     let stacks = Stacks::load(public, private)?;
+    let first = plan(&stacks, opts)?;
+    if let Some(c) = first.items.iter().find(|i| i.action == Action::Conflict) {
+        return Err(format!(
+            "the plan has conflicts, e.g. {}: {}; resolve them first (nothing was changed)",
+            c.path.display(),
+            c.notes.join("; ")
+        ));
+    }
     if let Some(p) = &stacks.private {
         if !p.manifest.memory_stores.is_empty() {
-            for r in crate::ops::import(p, None, true)? {
-                if let Some(c) = r.commit {
-                    done.push(format!("imported memory from {}: commit {c}", r.store));
+            if clean_git(&p.root) {
+                for r in crate::ops::import(p, None, true)? {
+                    if let Some(c) = r.commit {
+                        done.push(format!("imported memory from {}: commit {c}", r.store));
+                    }
                 }
+            } else {
+                done.push(format!(
+                    "memory import skipped: {} has uncommitted changes or no git",
+                    p.root.display()
+                ));
             }
         }
     }
     // Ended temporary entries leave the stacks' context for good: retired, with a commit each.
     let stacks = Stacks::load(public, private)?;
-    for (id, commit) in crate::ops::retire_expired(&stacks, &crate::ops::today(), true)? {
+    let today = crate::ops::today();
+    let ended = crate::temporary::expired(&stacks, &today);
+    let dirty: Vec<String> = stacks
+        .all()
+        .filter(|s| ended.iter().any(|(e, _)| e.stack == s.visibility()) && !clean_git(&s.root))
+        .map(|s| s.root.display().to_string())
+        .collect();
+    if dirty.is_empty() {
+        for (id, commit) in crate::ops::retire_expired(&stacks, &today, true)? {
+            done.push(format!(
+                "retired expired {id}{}",
+                commit.map(|c| format!(": commit {c}")).unwrap_or_default()
+            ));
+        }
+    } else {
         done.push(format!(
-            "retired expired {id}{}",
-            commit.map(|c| format!(": commit {c}")).unwrap_or_default()
+            "retiring {} ended entr(y/ies) skipped: {} has uncommitted changes or no git; no file composes them",
+            ended.len(),
+            dirty.join(", ")
         ));
     }
     let stacks = Stacks::load(public, private)?;
@@ -1152,11 +1764,20 @@ pub fn import_and_apply(
     Ok(done)
 }
 
-/// Where `--apply` keeps this run's backups: `~/.lords-command/backups/<date>-<pid>`.
+/// Where `--apply` keeps this run's backups: `~/.lords-command/backups/<date>-<pid>-<n>`, a dir no earlier run
+/// used (Sol review, finding 1: two applies in one process never share one).
 pub fn backup_dir() -> Result<PathBuf, String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
     let home = crate::config::home().ok_or("no home dir")?;
-    let stamp = format!("{}-{}", crate::ops::today(), std::process::id());
-    Ok(home.join(".lords-command").join("backups").join(stamp))
+    let root = home.join(".lords-command").join("backups");
+    loop {
+        let n = RUNS.fetch_add(1, Ordering::SeqCst);
+        let dir = root.join(format!("{}-{}-{n}", crate::ops::today(), std::process::id()));
+        if !dir.exists() {
+            return Ok(dir);
+        }
+    }
 }
 
 /// Whether every line of `tracked` appears in `file`, in order (other lines may come between).
