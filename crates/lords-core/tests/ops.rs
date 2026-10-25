@@ -129,11 +129,11 @@ fn import_keeps_a_retirement_when_the_agent_edits_the_file() {
     std::fs::write(src.join("a.md"), "---\nname: a\n---\nA\n").unwrap();
     import(&Stack::load(&f.priv_root()).unwrap(), None, true).unwrap();
     let stacks = lords_core::Stacks::load(&f.pub_root(), Some(&f.priv_root())).unwrap();
-    retire(&stacks, &retire_args("memory.a", "now a rule", None)).unwrap();
+    retire(&stacks, &retire_args("memory.agent.a", "now a rule", None)).unwrap();
     std::fs::write(src.join("a.md"), "---\nname: a\n---\nA, edited\n").unwrap();
     import(&Stack::load(&f.priv_root()).unwrap(), None, true).unwrap();
     let s = f.stacks();
-    let a = s.find("memory.a").unwrap();
+    let a = s.find("memory.agent.a").unwrap();
     assert!(!a.active());
     assert_eq!(a.body, "A, edited\n");
 }

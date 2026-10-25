@@ -301,8 +301,8 @@ fn a_memory_store_derives_ids_and_skips_its_index() {
     let s = f.stacks();
     assert_eq!(errors(&f.check()), Vec::<&str>::new(), "{:#?}", f.check());
     let ids: Vec<&str> = s.entries().map(|e| e.id()).collect();
-    assert_eq!(ids, ["memory.plain", "memory.x"]);
-    let x = s.find("memory.x").unwrap();
+    assert_eq!(ids, ["memory.agent.plain", "memory.agent.x"]);
+    let x = s.find("memory.agent.x").unwrap();
     assert_eq!(x.meta.title, "paste prompts");
     assert_eq!(
         x.meta.origin,
@@ -370,4 +370,22 @@ fn roles_come_from_a_controlled_list() {
         &entry("rule.a", "global", "private", "roles: [admiral]\n", "x\n"),
     );
     assert!(has(&f.check(), "role-undeclared", "rule.a"));
+}
+
+// Spec (design: Memory, "Agents keep their own memory dirs as the write path"): a note whose frontmatter isn't
+// strict YAML (an unquoted colon, which the agent's harness reads fine) still loads from a store, line by line;
+// outside a store such frontmatter stays an error.
+#[test]
+fn an_agents_loose_frontmatter_still_loads_in_a_store() {
+    let f = Fixture::new();
+    f.write(
+        "priv/global/memory/agent/lords.defaults.yaml",
+        "kind: memory\nscope: global\naudience: [all]\nstatus: active\nvisibility: private\norigin:\n  type: imported\n  store: agent\n",
+    );
+    let loose = "---\nname: facts\ndescription: Facts: what we know vs beliefs\n---\nbody\n";
+    f.write("priv/global/memory/agent/facts.md", loose);
+    assert_eq!(errors(&f.check()), Vec::<&str>::new(), "{:#?}", f.check());
+    assert_eq!(f.stacks().find("memory.agent.facts").unwrap().meta.title, "Facts: what we know vs beliefs");
+    f.write("priv/global/rules/r.md", &loose.replace("name: facts", "id: rule.r\nkind: rule"));
+    assert!(errors(&f.check()).contains(&"schema"));
 }

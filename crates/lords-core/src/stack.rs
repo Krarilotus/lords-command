@@ -258,7 +258,12 @@ impl Stack {
             }
         };
         let parts = frontmatter::split(&text);
-        let own = match parts.yaml.map(parse_yaml).transpose() {
+        // A file in a memory store is the agent's own: if its frontmatter isn't strict YAML (an unquoted colon
+        // the agent's harness reads fine), read it line by line instead of refusing it.
+        let parsed = parts.yaml.map(|y| {
+            parse_yaml(y).or_else(|e| if defaults.is_some() { Ok(lenient(y)) } else { Err(e) })
+        });
+        let own = match parsed.transpose() {
             Ok(v) => v.unwrap_or_default(),
             Err(e) => {
                 self.problems.push(Finding::error("schema", e).at(file, Some(1)));
@@ -490,7 +495,14 @@ fn derive_store_fields(merged: &mut Map<String, Value>, file: &Path) {
     let kind = merged.get("kind").and_then(Value::as_str).unwrap_or("memory").to_string();
     // The id comes from the file name, not the agent's `name`: an agent may reword a name, and an id never
     // changes meaning. A renamed file arrives as a new note; the old one stays.
-    merged.entry("id").or_insert_with(|| Value::String(format!("{kind}.{}", slug(&stem))));
+    // With the store's name in it, the id is unique across stores (two agents may both write `notes.md`).
+    let store = merged
+        .get("origin")
+        .and_then(|o| o.get("store"))
+        .and_then(Value::as_str)
+        .map(|s| format!("{}.", slug(s)))
+        .unwrap_or_default();
+    merged.entry("id").or_insert_with(|| Value::String(format!("{kind}.{store}{}", slug(&stem))));
     if !merged.contains_key("title") {
         let title = merged.get("description").and_then(Value::as_str).unwrap_or(&name);
         let title: String = title.chars().take(120).collect();
@@ -515,6 +527,21 @@ pub fn slug(s: &str) -> String {
         }
     }
     out.trim_end_matches('-').to_string()
+}
+
+/// Top-level `key: value` lines as strings (nested lines are skipped): for agent-written frontmatter that strict
+/// YAML refuses.
+fn lenient(text: &str) -> Map<String, Value> {
+    let mut out = Map::new();
+    for line in text.lines().filter(|l| !l.starts_with([' ', '\t', '-', '#'])) {
+        if let Some((k, v)) = line.split_once(':') {
+            let v = v.trim().trim_matches(['"', '\'']);
+            if !k.trim().is_empty() && !v.is_empty() {
+                out.insert(k.trim().to_string(), Value::String(v.to_string()));
+            }
+        }
+    }
+    out
 }
 
 fn parse_yaml(text: &str) -> Result<Map<String, Value>, String> {

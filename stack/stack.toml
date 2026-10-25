@@ -1,3 +1,9 @@
 # The public stack: generic rules, templates and skills anyone can install. See docs/design.md.
 name = "lords-command"
 visibility = "public"
+roles = ["orchestrator", "coder", "helper", "reviewer", "product"]
+topics = [
+  "attribution", "git", "commits", "cleanup", "disk", "containers", "delegation", "review", "testing", "scope",
+  "debugging", "evidence", "design", "performance", "documentation", "privacy", "security", "skills", "memory",
+  "prompts", "research", "notes", "process", "status", "reporting", "owner-decisions",
+]
