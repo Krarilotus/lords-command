@@ -1,0 +1,1 @@
+# Exact texts the privacy check accepts (false positives), one per line.

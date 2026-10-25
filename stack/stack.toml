@@ -1,0 +1,3 @@
+# The public stack: generic rules, templates and skills anyone can install. See docs/design.md.
+name = "lords-command"
+visibility = "public"

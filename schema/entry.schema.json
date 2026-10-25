@@ -29,7 +29,7 @@
       "type": "object",
       "required": ["date", "reason"],
       "properties": {
-        "date": { "type": "string", "format": "date" },
+        "date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
         "reason": { "type": "string", "minLength": 1 }
       },
       "additionalProperties": false
@@ -42,7 +42,7 @@
         "required": ["quote", "date"],
         "properties": {
           "quote": { "type": "string", "minLength": 1 },
-          "date": { "type": "string", "format": "date" },
+          "date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
           "by": { "type": "string", "default": "owner" },
           "source": { "type": "string", "description": "where the quote was recorded" }
         },

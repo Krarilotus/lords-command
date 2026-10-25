@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/lords-core", "crates/lords"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Krarilotus/lords-command"
+publish = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
