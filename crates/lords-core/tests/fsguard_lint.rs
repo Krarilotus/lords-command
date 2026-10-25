@@ -240,3 +240,32 @@ fn r3_08_the_lint_catches_every_spelling() {
         Vec::<String>::new()
     );
 }
+
+// Spec (Sol review r4, R4-06, orchestrator 25 Oct: "Outside `fsguard.rs` and the one process door, no runtime
+// source may reach `std::fs` or `std::process` by any spelling (aliases, grouped `use`, `use std as`)"): each of
+// these, in an ordinary source, is found, the two counterexamples of the review first.
+#[test]
+fn r4_06_no_spelling_reaches_std_fs_or_process() {
+    let cases = [
+        ("a builder the old list lacked", "std::fs::DirBuilder::new().create(p)?;"),
+        ("a renamed Command", "use std::process::Command as C;\nC::new(\"powershell\").status()?;"),
+        ("std itself renamed", "use std as s;\ns::fs::write(p, b)?;"),
+        ("std renamed with a leading ::", "use ::std as s;"),
+        ("std renamed as a crate", "extern crate std as s;"),
+        ("fs in a grouped use", "use std::{fs, io};\nfs::metadata(p)?;"),
+        ("process in a grouped use", "use std::{collections::BTreeMap, process};"),
+        ("the module renamed in a group", "use std::{fs as f};"),
+        ("a read", "let t = std::fs::read_to_string(p)?;"),
+        ("a platform fs extension", "std::os::windows::fs::symlink_dir(a, b)?;"),
+        ("the process id, through std", "let pid = std::process::id();"),
+    ];
+    let missed: Vec<&str> = cases
+        .iter()
+        .filter(|(_, code)| forbidden("crates/lords-core/src/sync.rs", code).is_empty())
+        .map(|(w, _)| *w)
+        .collect();
+    assert!(missed.is_empty(), "not caught: {missed:?}");
+    // A comment or a string that names them is not code that reaches them; other std modules are fine.
+    let fine = "// std::fs::write is fsguard's\nlet s = \"std::process\";\nuse std::io::Write;\nuse std::path::Path;";
+    assert_eq!(forbidden("crates/lords-core/src/sync.rs", fine), Vec::<String>::new());
+}
