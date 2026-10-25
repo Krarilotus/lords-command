@@ -23,6 +23,7 @@ usage:
   lords hooks install [--repo DIR] [--secrets-only] [--force]
   lords hash PATH
   lords sync [--user | --repo NAME] [--json] [--apply]
+  lords compose [--repo NAME [--role ROLE]] [--adapter ID] [--json]   what a harness reads there, with sources
 
 stacks: --public-stack DIR, --private-stack DIR, else config.txt (beside the exe, or ~/.lords-command/),
 else the public stack is <this git repo>/stack.
@@ -424,6 +425,39 @@ fn cmd_hooks(mut a: Args) -> Result<bool, String> {
     Ok(true)
 }
 
+/// What an adapter reads in one place: the user level, a repo or workspace's shared files, or one role's file.
+fn cmd_compose(mut a: Args) -> Result<bool, String> {
+    let json = a.flag("--json");
+    let place = a.value("--repo")?;
+    let role = a.value("--role")?;
+    let adapter_id = a.value("--adapter")?.unwrap_or_else(|| "codex".into());
+    let p = paths(&mut a)?;
+    a.done()?;
+    let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    let adapter = lords_core::adapters::get(&adapter_id).ok_or_else(|| {
+        format!(
+            "unknown adapter `{adapter_id}` (known: {})",
+            lords_core::adapters::ids().join(", ")
+        )
+    })?;
+    let composed = match (&place, &role) {
+        (Some(place), Some(role)) => {
+            sync::role_composed(&stacks, sync::place_layers(&stacks, place, true), role)
+        }
+        (Some(place), None) => sync::repo_composed(&stacks, place, adapter),
+        (None, None) => sync::user_composed(&stacks, adapter),
+        (None, Some(_)) => return Err("--role needs --repo (role files live in a place)".into()),
+    };
+    if json {
+        let view = lords_core::view::composed(&stacks, &composed);
+        println!("{}", serde_json::to_string_pretty(&view).unwrap_or_default());
+    } else {
+        print!("{}", adapter.render(&composed));
+        eprintln!("{} bytes", adapter.render(&composed).len());
+    }
+    Ok(true)
+}
+
 fn cmd_hash(mut a: Args) -> Result<bool, String> {
     let p = a.positional().ok_or("hash needs a path")?;
     a.done()?;
@@ -448,6 +482,7 @@ fn main() -> ExitCode {
         "hooks" => cmd_hooks(a),
         "hash" => cmd_hash(a),
         "sync" => cmd_sync(a),
+        "compose" => cmd_compose(a),
         other => Err(format!("unknown command `{other}`\n\n{USAGE}")),
     };
     match result {

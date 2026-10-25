@@ -18,7 +18,7 @@ origin:
   type: own
 topics: [debugging, process]
 ---
-Something that failed (a job, gate, proof, hook or review) is not run again until you have kept its raw output, named
-its cause and fixed that cause, without generalising beyond it. One small, bounded repair within your own task is fine.
-A second failure for the same cause stops the retries: hand it, with the evidence, to whoever owns the cause. Never
-weaken a guard, skip a check or invent evidence to keep work moving.
+Don't rerun what failed (a job, gate, proof, hook or review) until you have kept its raw output, named its cause and
+fixed that cause, without generalising beyond it; one small, bounded repair within your own task is fine. A second
+failure for the same cause stops the retries: hand it, with the evidence, to the cause's owner. Never weaken a guard,
+skip a check or invent evidence to keep work moving.

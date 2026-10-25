@@ -233,3 +233,44 @@ fn check_public_checks_the_repo_it_runs_in() {
     let out = text(&o);
     assert!(!o.status.success() && out.contains("notes.md"), "{out}");
 }
+
+// Spec (README: "lords compose … what a harness reads there, with sources"): the user level prints the composed
+// text, the JSON form maps each line to its entry, and a role file needs a place.
+#[test]
+fn compose_prints_what_a_harness_reads() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (public, private) = (d.join("pub"), d.join("priv"));
+    fs::create_dir_all(public.join("global/rules")).unwrap();
+    fs::create_dir_all(&private).unwrap();
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    fs::write(private.join("stack.toml"), "name = \"priv\"\nvisibility = \"private\"\n").unwrap();
+    fs::write(
+        public.join("global/rules/a.md"),
+        "---\nid: rule.a\nkind: rule\ntitle: A\naudience: [all]\nscope: global\nstatus: active\nvisibility: public\norigin:\n  type: own\n---\nRule A holds.\n",
+    )
+    .unwrap();
+    let args = [
+        "compose",
+        "--public-stack",
+        public.to_str().unwrap(),
+        "--private-stack",
+        private.to_str().unwrap(),
+    ];
+    let o = env.lords(d, &args);
+    assert!(
+        o.status.success() && String::from_utf8_lossy(&o.stdout).contains("Rule A holds."),
+        "{}",
+        text(&o)
+    );
+    let o = env.lords(d, &[&args[..], &["--json"]].concat());
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        out.contains("\"text\": \"Rule A holds.\"") && out.contains("\"id\": \"rule.a\""),
+        "{out}"
+    );
+    assert!(
+        !env.lords(d, &[&args[..], &["--role", "coder"]].concat()).status.success(),
+        "a role file needs --repo"
+    );
+}

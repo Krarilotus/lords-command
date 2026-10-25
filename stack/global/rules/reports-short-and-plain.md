@@ -14,6 +14,6 @@ origin:
   type: own
 topics: [reporting]
 ---
-Report when you have a result or a question, not progress. Lead with the outcome and what it means, then the evidence
-(commit and job ids, numbers), what is left and any decision you need, in plain words and in about 150 words. Logs,
-hashes and transcripts stay in linked files. Don't repeat an automatic completion notice with a manual message.
+Report when you have a result or a question, not progress: the outcome and what it means first, then the evidence
+(commit and job ids, numbers), what is left and any decision you need, in plain words and about 150 words. Logs,
+hashes and transcripts stay in linked files. Don't repeat an automatic completion notice by hand.
