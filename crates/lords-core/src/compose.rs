@@ -44,9 +44,25 @@ fn role_pointer(notes: &[&Entry]) -> Option<String> {
 
 /// One memory index line: name, its one-line hook, and the file to read.
 pub fn index_line(e: &Entry) -> String {
-    let name =
-        e.meta.name.clone().unwrap_or_else(|| e.id().trim_start_matches("memory.").to_string());
-    let hook = e.meta.description.as_deref().unwrap_or(&e.meta.title);
+    // A skill's own SKILL.md frontmatter names and describes it, as the harness shows it.
+    let own = |key: &str| -> Option<String> {
+        let yaml = crate::frontmatter::split(&e.body).yaml?;
+        yaml.lines().find_map(|l| {
+            l.strip_prefix(key)
+                .and_then(|rest| rest.strip_prefix(':'))
+                .map(|v| v.trim().trim_matches(['"', '\'']).to_string())
+        })
+    };
+    let skill = e.meta.kind == Kind::Skill;
+    let name = e
+        .meta
+        .name
+        .clone()
+        .or_else(|| skill.then(|| own("name")).flatten())
+        .unwrap_or_else(|| e.id().trim_start_matches("memory.").to_string());
+    let described =
+        e.meta.description.clone().or_else(|| skill.then(|| own("description")).flatten());
+    let hook = described.as_deref().unwrap_or(&e.meta.title);
     let path = e.body_file.to_string_lossy().into_owned();
     let path = if cfg!(windows) { path.replace('/', "\\") } else { path };
     if hook.trim().is_empty() || hook == name {
@@ -79,11 +95,10 @@ pub enum Layers {
     Workspace { name: String, project: Option<String>, global: bool },
 }
 
-/// Whether an entry suits every run on the machine, so it may go to user-level files: a global entry for every
-/// role (no `roles`) that is no memory note. Skills install user-level as before.
+/// Whether an entry suits every run on the machine, so it may go to user-level files and skill dirs: a global
+/// entry for every role (no `roles`) that is no memory note. A skill with roles installs per checkout instead.
 pub fn user_level(e: &Entry) -> bool {
-    matches!(e.scope, Scope::Global)
-        && (e.meta.kind == Kind::Skill || (e.meta.roles.is_empty() && e.meta.kind != Kind::Memory))
+    matches!(e.scope, Scope::Global) && e.meta.roles.is_empty() && e.meta.kind != Kind::Memory
 }
 
 #[derive(Clone, Debug)]
@@ -283,20 +298,21 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             }
         }
     }
-    // Skills tracked in this repo: listed where they are (backbone requirement BB-8), so every harness can find them.
+    // The skills of this place: the repo's own (backbone requirement BB-8, listed where they are) and the stack's development
+    // skills (installed per checkout for harnesses that read a skills dir); listed so every harness finds them.
     let here: Vec<&Entry> = live
         .iter()
         .copied()
         .filter(|e| {
             e.meta.kind == Kind::Skill
-                && matches!(e.meta.origin, crate::model::Origin::InRepo { .. })
+                && (matches!(e.meta.origin, crate::model::Origin::InRepo { .. }) || !user_level(e))
         })
         .collect();
     if !here.is_empty() {
         if !lines.is_empty() {
             lines.push(String::new());
         }
-        lines.push("# Skills in this repo".into());
+        lines.push("# Skills here".into());
         lines.push(String::new());
         for e in here {
             lines.push(index_line(e));

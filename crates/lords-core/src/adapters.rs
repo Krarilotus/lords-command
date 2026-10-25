@@ -32,6 +32,11 @@ pub trait Adapter: Sync {
     fn repo_preamble(&self, _checkout: &Path) -> Option<String> {
         None
     }
+    /// Where a checkout's own skills live for this harness, if it reads such a dir (sync links development
+    /// skills there).
+    fn repo_skills_dir(&self) -> Option<&'static str> {
+        None
+    }
     /// The settings key that lists instruction files the harness must skip, if it has one.
     fn excludes_key(&self) -> Option<&'static str> {
         None
@@ -70,6 +75,10 @@ impl Adapter for ClaudeCode {
 
     fn excludes_key(&self) -> Option<&'static str> {
         Some("claudeMdExcludes")
+    }
+
+    fn repo_skills_dir(&self) -> Option<&'static str> {
+        Some(".claude/skills")
     }
 
     /// With another profile (`CLAUDE_CONFIG_DIR`), `~/.claude/CLAUDE.md` still loads as an ancestor project file

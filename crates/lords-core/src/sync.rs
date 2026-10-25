@@ -342,9 +342,37 @@ fn skills_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec<Item>
     let mut items = Vec::new();
     for e in &wanted {
         let name = e.id().trim_start_matches("skill.").to_string();
-        let src = e.meta_file.parent().expect("a sidecar has a dir").to_path_buf();
-        let link = dir.join(&name);
-        let mut item = Item::new(&t.name, link.clone(), Action::Link);
+        items.push(link_item(stacks, &t.name, &dir.join(&name), e));
+    }
+    let wanted_names: Vec<String> =
+        wanted.iter().map(|e| e.id().trim_start_matches("skill.").to_string()).collect();
+    let mut unmanaged = Vec::new();
+    for child in stack::sorted_children(&dir) {
+        let name = stack::file_name(&child);
+        if wanted_names.contains(&name) {
+            continue;
+        }
+        match link_target(&child) {
+            Some(to) if in_a_stack(stacks, &to) => {
+                items.push(Item::new(&t.name, child.clone(), Action::Unlink))
+            }
+            _ => unmanaged.push(name),
+        }
+    }
+    if !unmanaged.is_empty() {
+        let mut item = Item::new(&t.name, dir.clone(), Action::InSync);
+        item.notes.push(format!("not from a stack, left alone: {}", unmanaged.join(", ")));
+        items.push(item);
+    }
+    items
+}
+
+/// The item that makes `link` a link to skill `e`'s dir in its stack (or says it already is).
+fn link_item(stacks: &Stacks, target: &str, link: &Path, e: &Entry) -> Item {
+    let link = link.to_path_buf();
+    let src = e.meta_file.parent().expect("a sidecar has a dir").to_path_buf();
+    {
+        let mut item = Item::new(target, link.clone(), Action::Link);
         item.link_to = Some(src.clone());
         if let Some(to) = link_target(&link) {
             item.action = if same_place(&to, &src) {
@@ -383,29 +411,8 @@ fn skills_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec<Item>
             item.action = Action::Conflict;
             item.notes.push("a file where the skill's link goes".into());
         }
-        items.push(item);
+        item
     }
-    let wanted_names: Vec<String> =
-        wanted.iter().map(|e| e.id().trim_start_matches("skill.").to_string()).collect();
-    let mut unmanaged = Vec::new();
-    for child in stack::sorted_children(&dir) {
-        let name = stack::file_name(&child);
-        if wanted_names.contains(&name) {
-            continue;
-        }
-        match link_target(&child) {
-            Some(to) if in_a_stack(stacks, &to) => {
-                items.push(Item::new(&t.name, child.clone(), Action::Unlink))
-            }
-            _ => unmanaged.push(name),
-        }
-    }
-    if !unmanaged.is_empty() {
-        let mut item = Item::new(&t.name, dir.clone(), Action::InSync);
-        item.notes.push(format!("not from a stack, left alone: {}", unmanaged.join(", ")));
-        items.push(item);
-    }
-    items
 }
 
 /// Every checkout and (if asked) worktree of a repo, and the worktrees skipped for lying outside
@@ -496,6 +503,15 @@ pub fn role_composed(stacks: &Stacks, layers: Layers, role: &str) -> Composed {
     compose::compose(stacks, &ctx)
 }
 
+/// The adapters a place's files are written for (default: every adapter); unknown ids are skipped.
+fn place_adapters(place: &Place) -> Vec<&'static dyn Adapter> {
+    if place.adapters.is_empty() {
+        adapters::ALL.to_vec()
+    } else {
+        place.adapters.iter().filter_map(|id| adapters::get(id)).collect()
+    }
+}
+
 fn place_items(stacks: &Stacks, place: &Place, plan: &mut Plan) {
     let mut chosen: Vec<&dyn Adapter> = Vec::new();
     if place.adapters.is_empty() {
@@ -575,6 +591,44 @@ fn place_items(stacks: &Stacks, place: &Place, plan: &mut Plan) {
             size_note(&mut item, adapter, &text);
             plan.items.push(item);
             add_exclude(p, file);
+        }
+    }
+    // Development skills, linked into each checkout for harnesses that read a skills dir there. Each link's exact
+    // path is excluded, never the dir, so skills the repo tracks there stay visible to git.
+    let skill_ctx = Context {
+        audience: vec![Audience::Opus, Audience::Sol, Audience::Astra],
+        layers: place.layers(false),
+        public_only: false,
+        skip_stores: Vec::new(),
+        roles: None,
+    };
+    let skills: Vec<&Entry> = compose::applicable(stacks, &skill_ctx)
+        .into_iter()
+        .filter(|e| {
+            e.meta.kind == Kind::Skill
+                && !matches!(e.meta.origin, crate::model::Origin::InRepo { .. })
+        })
+        .collect();
+    let skill_dirs: Vec<&str> =
+        place_adapters(place).iter().filter_map(|a| a.repo_skills_dir()).collect();
+    for dir in skill_dirs {
+        for p in place.paths.iter().filter(|p| p.is_dir()) {
+            for e in &skills {
+                let name = e.id().trim_start_matches("skill.").to_string();
+                let rel = format!("{dir}/{name}");
+                let target = format!("{} (skill {name})", place.label);
+                if !place.workspace
+                    && git::run(p, &["ls-files", &rel]).is_ok_and(|o| !o.trim().is_empty())
+                {
+                    let mut item = Item::new(&target, p.join(&rel), Action::Conflict);
+                    item.notes
+                        .push(format!("the repo tracks a skill at {rel}; rename one of them"));
+                    plan.items.push(item);
+                    continue;
+                }
+                plan.items.push(link_item(stacks, &target, &p.join(&rel), e));
+                add_exclude(p, &rel);
+            }
         }
     }
     // One composed file per role, at a stable untracked path, for briefs to point at (backbone requirement BB-3).

@@ -286,7 +286,7 @@ fn repo_skills_are_indexed_in_place() {
     }
     let p = plan(&s, &Options::default()).unwrap();
     assert!(proposed(&p, &checkout.join("AGENTS.override.md"))
-        .contains("# Skills in this repo\n\n- review: review a lane's diff (`"));
+        .contains("# Skills here\n\n- review: review a lane's diff (`"));
     assert!(
         p.items.iter().all(|i| !i.path.starts_with(&skills_dir) || i.action != Action::Link),
         "never linked"

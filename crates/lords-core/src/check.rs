@@ -118,6 +118,7 @@ pub fn check(stacks: &Stacks, public_rules: &Rules) -> Vec<Finding> {
     links(stacks, &mut out);
     provenance(stacks, &mut out);
     overlap::check(stacks, &mut out);
+    skill_clashes(stacks, &mut out);
     privacy_of_entries(stacks, public_rules, &mut out);
     for n in &public_rules.notes {
         out.push(Finding::info("privacy-scope", n.clone()));
@@ -346,6 +347,34 @@ fn provenance(stacks: &Stacks, out: &mut Vec<Finding>) {
                     Finding::error("inherited-changed", format!("an inherited entry must stay verbatim: sha256 is {now}, recorded {recorded}"))
                         .at(&e.meta_file, None)
                         .entry(e.id()),
+                );
+            }
+        }
+    }
+}
+
+/// A development skill that sync would link into a repo where the repo already tracks a skill of that name.
+fn skill_clashes(stacks: &Stacks, out: &mut Vec<Finding>) {
+    for t in stacks.entries().filter(|e| matches!(e.meta.origin, Origin::InRepo { .. })) {
+        let tracked = t.id().rsplit('.').next().unwrap_or_default();
+        for s in stacks.entries().filter(|e| {
+            e.active()
+                && e.meta.kind == crate::model::Kind::Skill
+                && !matches!(e.meta.origin, Origin::InRepo { .. })
+                && !crate::compose::user_level(e)
+                && coapply(stacks, &e.scope, &t.scope)
+        }) {
+            if s.id().trim_start_matches("skill.") == tracked {
+                out.push(
+                    Finding::error(
+                        "skill-clash",
+                        format!(
+                            "the repo tracks a skill named `{tracked}` ({}); rename one",
+                            t.id()
+                        ),
+                    )
+                    .at(&s.meta_file, None)
+                    .entry(s.id()),
                 );
             }
         }
