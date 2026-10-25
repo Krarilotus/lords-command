@@ -34,8 +34,8 @@ impl Fixture {
     pub fn new() -> Fixture {
         isolate_git();
         let f = Fixture { dir: TempDir::new().unwrap() };
-        f.write("pub/stack.toml", "name = \"pub\"\nvisibility = \"public\"\n[projects.alpha]\n[repos.alpha-core]\nproject = \"alpha\"\n");
-        f.write("priv/stack.toml", "name = \"priv\"\nvisibility = \"private\"\n[projects.beta]\n[repos.beta-core]\nproject = \"beta\"\n");
+        f.write("pub/stack.toml", "name = \"pub\"\nvisibility = \"public\"\ntopics = [\"delegation\", \"timing\", \"t\"]\n[projects.alpha]\n[repos.alpha-core]\nproject = \"alpha\"\n");
+        f.write("priv/stack.toml", "name = \"priv\"\nvisibility = \"private\"\ntopics = [\"x\"]\n[projects.beta]\n[repos.beta-core]\nproject = \"beta\"\n");
         f
     }
 

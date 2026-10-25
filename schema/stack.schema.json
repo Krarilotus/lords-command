@@ -7,6 +7,12 @@
   "required": ["name", "visibility"],
   "properties": {
     "name": { "type": "string" },
+    "topics": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+      "description": "the controlled list of topics entries may tag; a public entry may use only the public stack's topics"
+    },
     "visibility": { "enum": ["public", "private"] },
     "projects": {
       "type": "object",

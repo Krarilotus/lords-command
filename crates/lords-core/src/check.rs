@@ -146,6 +146,22 @@ fn ids(stacks: &Stacks, out: &mut Vec<Finding>) {
 
 fn declared(stacks: &Stacks, out: &mut Vec<Finding>) {
     for e in stacks.entries() {
+        // Topics are a controlled list: the entry's own stack declares them (a public entry, the public stack).
+        let known = |t: &String| {
+            stacks.public.manifest.topics.contains(t)
+                || (e.stack == Visibility::Private
+                    && stacks.private.as_ref().is_some_and(|p| p.manifest.topics.contains(t)))
+        };
+        for t in e.meta.topics.iter().filter(|t| !known(t)) {
+            out.push(
+                Finding::error(
+                    "topic-undeclared",
+                    format!("topic `{t}` is not in the {} stack's topics list", e.stack),
+                )
+                .at(&e.meta_file, None)
+                .entry(e.id()),
+            );
+        }
         let missing = match &e.scope {
             Scope::Project(p) if !stacks.declares_project(p) => Some(format!("project `{p}`")),
             Scope::Repo(r) | Scope::Path { repo: r, .. } if !stacks.declares_repo(r) => {

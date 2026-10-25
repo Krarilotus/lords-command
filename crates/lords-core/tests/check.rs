@@ -285,8 +285,9 @@ fn privacy_findings_depend_on_the_stack() {
     assert!(has(&f.check(), "privacy", "fact.c"));
 }
 
-// Spec (On-disk layout): a memory store keeps files verbatim; its defaults supply shared fields, the file's
-// `name` gives the id, and an index (MEMORY.md) is not an entry.
+// Spec (On-disk layout; design: ids never change meaning): a memory store keeps files verbatim; its defaults
+// supply shared fields, the file name gives the id (an agent may reword `name`), and an index (MEMORY.md) is not
+// an entry.
 #[test]
 fn a_memory_store_derives_ids_and_skips_its_index() {
     let f = Fixture::new();
@@ -300,8 +301,8 @@ fn a_memory_store_derives_ids_and_skips_its_index() {
     let s = f.stacks();
     assert_eq!(errors(&f.check()), Vec::<&str>::new(), "{:#?}", f.check());
     let ids: Vec<&str> = s.entries().map(|e| e.id()).collect();
-    assert_eq!(ids, ["memory.plain", "memory.prompts-in-chat"]);
-    let x = s.find("memory.prompts-in-chat").unwrap();
+    assert_eq!(ids, ["memory.plain", "memory.x"]);
+    let x = s.find("memory.x").unwrap();
     assert_eq!(x.meta.title, "paste prompts");
     assert_eq!(
         x.meta.origin,
@@ -320,4 +321,27 @@ fn a_skill_needs_its_sidecar_and_matching_id() {
     assert_eq!(errors(&f.check()), ["layout"]);
     f.write("pub/global/skills/s/lords.yaml", &side.replace("skill.t", "skill.s"));
     assert_eq!(errors(&f.check()), Vec::<&str>::new());
+}
+
+// Spec (design: Entry metadata, topics; owner, 25 Oct: "topics as a controlled list in stack.toml"): an entry
+// may tag only declared topics; a public entry only the public stack's, so the public stack stands alone.
+#[test]
+fn topics_come_from_a_controlled_list() {
+    let f = Fixture::new();
+    f.write(
+        "pub/global/rules/a.md",
+        &entry("rule.a", "global", "public", "topics: [timing]\n", "x\n"),
+    );
+    f.write(
+        "priv/global/rules/b.md",
+        &entry("rule.b", "global", "private", "topics: [x, timing]\n", "y\n"),
+    );
+    assert_eq!(errors(&f.check()), Vec::<&str>::new());
+    f.write("pub/global/rules/a.md", &entry("rule.a", "global", "public", "topics: [x]\n", "x\n"));
+    assert!(has(&f.check(), "topic-undeclared", "rule.a"), "x is declared only privately");
+    f.write(
+        "pub/global/rules/a.md",
+        &entry("rule.a", "global", "public", "topics: [typo]\n", "x\n"),
+    );
+    assert!(has(&f.check(), "topic-undeclared", "rule.a"));
 }

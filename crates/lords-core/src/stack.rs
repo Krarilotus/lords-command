@@ -82,6 +82,9 @@ pub struct PrivacyConfig {
 pub struct Manifest {
     pub name: String,
     pub visibility: Visibility,
+    /// The controlled list of topics (design: Entry metadata).
+    #[serde(default)]
+    pub topics: Vec<String>,
     #[serde(default)]
     pub projects: BTreeMap<String, Project>,
     #[serde(default)]
@@ -368,8 +371,8 @@ impl Stack {
     }
 }
 
-/// When a store's defaults supply the metadata, a memory file's own `name` and `description` give its id
-/// and title, and its file name completes an imported origin.
+/// When a store's defaults supply the metadata, a memory file's name gives its id, its `description` (else
+/// `name`) its title, and the file name completes an imported origin.
 fn derive_store_fields(merged: &mut Map<String, Value>, file: &Path) {
     let stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let name = merged
@@ -378,7 +381,9 @@ fn derive_store_fields(merged: &mut Map<String, Value>, file: &Path) {
         .map(str::to_string)
         .unwrap_or_else(|| stem.clone());
     let kind = merged.get("kind").and_then(Value::as_str).unwrap_or("memory").to_string();
-    merged.entry("id").or_insert_with(|| Value::String(format!("{kind}.{}", slug(&name))));
+    // The id comes from the file name, not the agent's `name`: an agent may reword a name, and an id never
+    // changes meaning. A renamed file arrives as a new note; the old one stays.
+    merged.entry("id").or_insert_with(|| Value::String(format!("{kind}.{}", slug(&stem))));
     if !merged.contains_key("title") {
         let title = merged.get("description").and_then(Value::as_str).unwrap_or(&name);
         let title: String = title.chars().take(120).collect();

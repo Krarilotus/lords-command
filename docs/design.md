@@ -88,7 +88,7 @@ it replaces.
 
 | Field | Values | Notes |
 |---|---|---|
-| `id` | `<kind>.<slug>` | unique across both stacks; never reused after retirement |
+| `id` | `<kind>.<slug>` | unique across both stacks; never changes meaning and is never reused (retire instead); a memory's comes from its file name |
 | `kind` | intent, rule, role, fact, status, template, skill, memory | `fact` is new: host, machine and repo facts, neither rules nor memories |
 | `title` | text | one line, for lists and the GUI |
 | `audience` | list of opus, sol, astra, all | |
@@ -97,10 +97,14 @@ it replaces.
 | `visibility` | public, private | must match the stack |
 | `basis` | list of {quote, date, by} | the owner's words behind the entry, where there are any |
 | `origin` | own; adapted or inherited with repo, commit, path, licence (+ `changes` for adapted); imported with the store and file | inherited means verbatim |
-| `topics` | tags | drive conflict and duplicate detection |
+| `topics` | tags from the `topics` list in `stack.toml` | a controlled list (a public entry uses only the public stack's); drive conflict and duplicate detection |
 | `overrides`, `extends` | entry ids | see Layers |
 | `order` | integer | optional, for ordering within a section |
 | `links` | paths or ids | checked for dangling targets |
+
+The model is a graph: entries are nodes with stable ids, and every relation between them is a typed field
+(`overrides`, `extends`, `superseded_by`, `links`, `basis`), never a position in prose. So an RDF export (for the
+owner's own engine) can be added later as a pure function of the entries, with no reshaping.
 
 An entry's file in git *is* its history: the GUI shows `git log --follow` and diffs per entry. Nothing is deleted.
 `retire` sets the status, and a retired entry stays in the tree. Composition skips it, and `check` flags anything
