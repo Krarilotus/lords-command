@@ -3,7 +3,6 @@ id: rule.delete-only-what-you-created
 kind: rule
 title: Delete only what you created, by its recorded path
 audience: [all]
-roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 visibility: public
