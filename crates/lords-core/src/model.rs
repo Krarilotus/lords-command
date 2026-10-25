@@ -132,7 +132,17 @@ pub enum Origin {
     Own,
     Adapted(Source),
     Inherited(Source),
-    Imported { store: String, file: String },
+    Imported {
+        store: String,
+        file: String,
+    },
+    /// A skill tracked in a repo, indexed where it is (never linked, copied or moved): the repo, its path in the
+    /// checkout, and the hash of its files now.
+    InRepo {
+        repo: String,
+        path: String,
+        sha256: String,
+    },
 }
 
 impl Origin {
@@ -142,6 +152,7 @@ impl Origin {
             Origin::Adapted(_) => "adapted",
             Origin::Inherited(_) => "inherited",
             Origin::Imported { .. } => "imported",
+            Origin::InRepo { .. } => "in repo",
         }
     }
 
@@ -151,6 +162,17 @@ impl Origin {
             _ => None,
         }
     }
+}
+
+/// A case behind an entry: what happened, when, and where it is recorded. Kept beside the rule, never in the
+/// composed text (the rule stays a short principle).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Evidence {
+    pub summary: String,
+    pub date: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -172,6 +194,8 @@ pub struct Meta {
     pub visibility: Visibility,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub basis: Vec<Basis>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<Evidence>,
     pub origin: Origin,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub topics: Vec<String>,
@@ -197,7 +221,12 @@ pub enum Scope {
     Global,
     Project(String),
     Repo(String),
-    Path { repo: String, sub: String },
+    /// A working directory that is no git repo (e.g. a harness dir), declared in stack.toml `workspaces`.
+    Workspace(String),
+    Path {
+        repo: String,
+        sub: String,
+    },
 }
 
 impl Scope {
@@ -211,6 +240,9 @@ impl Scope {
         if let Some(r) = s.strip_prefix("repo:") {
             return (!r.is_empty()).then(|| Scope::Repo(r.to_string()));
         }
+        if let Some(w) = s.strip_prefix("workspace:") {
+            return (!w.is_empty()).then(|| Scope::Workspace(w.to_string()));
+        }
         let rest = s.strip_prefix("path:")?;
         let (repo, sub) = rest.split_once(':')?;
         (!repo.is_empty() && !sub.is_empty())
@@ -223,7 +255,7 @@ impl Scope {
             Scope::Global if visibility == Visibility::Public => 0,
             Scope::Global => 1,
             Scope::Project(_) => 2,
-            Scope::Repo(_) => 3,
+            Scope::Repo(_) | Scope::Workspace(_) => 3,
             Scope::Path { .. } => 4,
         }
     }
@@ -242,6 +274,7 @@ impl fmt::Display for Scope {
             Scope::Global => f.write_str("global"),
             Scope::Project(p) => write!(f, "project:{p}"),
             Scope::Repo(r) => write!(f, "repo:{r}"),
+            Scope::Workspace(w) => write!(f, "workspace:{w}"),
             Scope::Path { repo, sub } => write!(f, "path:{repo}:{sub}"),
         }
     }

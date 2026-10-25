@@ -39,6 +39,20 @@ pub struct Repo {
     /// The adapters that get this repo's files (default: every adapter).
     #[serde(default)]
     pub adapters: Vec<String>,
+    /// Skill dirs tracked in the repo (paths in a checkout): indexed in place, never linked, copied or moved.
+    #[serde(default)]
+    pub skills: Vec<String>,
+}
+
+/// A working dir that is no git repo (e.g. a harness dir): it gets the same untracked files as a repo checkout.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Workspace {
+    pub path: String,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub adapters: Vec<String>,
 }
 
 fn yes() -> bool {
@@ -105,6 +119,9 @@ pub struct Manifest {
     pub projects: BTreeMap<String, Project>,
     #[serde(default)]
     pub repos: BTreeMap<String, Repo>,
+    /// private only: non-git working dirs.
+    #[serde(default)]
+    pub workspaces: BTreeMap<String, Workspace>,
     #[serde(default)]
     pub targets: Vec<Target>,
     #[serde(default)]
@@ -156,7 +173,8 @@ impl Stack {
         let private_parts = !m.targets.is_empty()
             || !m.memory_stores.is_empty()
             || m.privacy.fleet_config.is_some()
-            || m.repos.values().any(|r| !r.checkouts.is_empty());
+            || m.repos.values().any(|r| !r.checkouts.is_empty())
+            || !m.workspaces.is_empty();
         if private_parts {
             self.problems.push(
                 Finding::error("public-manifest", "targets, memory stores, checkouts and the fleet config belong in the private stack")
@@ -377,12 +395,85 @@ impl Stack {
         self.entries.iter().find(|e| e.id() == id)
     }
 
+    /// backbone requirement BB-8: skills tracked in a repo (stack.toml `skills` on a repo) are entries where they are: id
+    /// `skill.<repo>.<dir>`, origin in-repo with their path and hash. Nothing is copied into the stack, and sync
+    /// never links them.
+    fn index_repo_skills(&mut self) {
+        let repos: Vec<(String, Repo)> =
+            self.manifest.repos.iter().map(|(n, r)| (n.clone(), r.clone())).collect();
+        for (name, repo) in repos {
+            let Some(checkout) = repo.checkouts.first().map(|c| crate::config::expand_home(c))
+            else {
+                continue;
+            };
+            for rel in &repo.skills {
+                for dir in sorted_children(&checkout.join(rel))
+                    .into_iter()
+                    .filter(|d| d.join(SKILL_FILE).is_file())
+                {
+                    let file = dir.join(SKILL_FILE);
+                    let body = fs::read_to_string(&file).unwrap_or_default();
+                    let front = frontmatter::split(&body)
+                        .yaml
+                        .map(parse_yaml)
+                        .and_then(Result::ok)
+                        .unwrap_or_default();
+                    let text = |k: &str| front.get(k).and_then(Value::as_str).map(str::to_string);
+                    let dir_name = file_name(&dir);
+                    let path = format!("{}/{dir_name}", rel.trim_end_matches(['/', '\\']));
+                    let meta = Meta {
+                        id: format!("skill.{}.{}", slug(&name), slug(&dir_name)),
+                        kind: Kind::Skill,
+                        title: text("description")
+                            .unwrap_or_else(|| dir_name.clone())
+                            .chars()
+                            .take(120)
+                            .collect(),
+                        audience: vec![crate::model::Audience::All],
+                        roles: Vec::new(),
+                        scope: format!("repo:{name}"),
+                        status: crate::model::Status::Active,
+                        superseded_by: None,
+                        retired: None,
+                        visibility: self.visibility(),
+                        basis: Vec::new(),
+                        evidence: Vec::new(),
+                        origin: crate::model::Origin::InRepo {
+                            repo: name.clone(),
+                            path,
+                            sha256: crate::check::dir_hash(&dir),
+                        },
+                        topics: Vec::new(),
+                        overrides: Vec::new(),
+                        extends: Vec::new(),
+                        order: None,
+                        links: Vec::new(),
+                        name: text("name").or(Some(dir_name.clone())),
+                        description: text("description"),
+                        metadata: None,
+                    };
+                    self.entries.push(Entry {
+                        meta,
+                        scope: Scope::Repo(name.clone()),
+                        stack: self.visibility(),
+                        meta_file: file.clone(),
+                        body_file: file,
+                        body,
+                        body_line: 1,
+                        files: all_files(&dir),
+                    });
+                }
+            }
+        }
+    }
+
     /// The layer dir for a scope (path scopes live in their repo's dir).
     pub fn layer_dir(&self, scope: &Scope) -> PathBuf {
         match scope {
             Scope::Global => self.root.join("global"),
             Scope::Project(p) => self.root.join("project").join(p),
             Scope::Repo(r) | Scope::Path { repo: r, .. } => self.root.join("repo").join(r),
+            Scope::Workspace(w) => self.root.join("workspace").join(w),
         }
     }
 }
@@ -458,6 +549,11 @@ fn layer_dirs(root: &Path) -> Vec<(PathBuf, Scope)> {
             out.push((r.clone(), Scope::Repo(file_name(&r))));
         }
     }
+    for w in sorted_children(&root.join("workspace")) {
+        if w.is_dir() {
+            out.push((w.clone(), Scope::Workspace(file_name(&w))));
+        }
+    }
     out
 }
 
@@ -499,7 +595,10 @@ impl Stacks {
                 public.root.display()
             ));
         }
-        let private = private.map(Stack::load).transpose()?;
+        let mut private = private.map(Stack::load).transpose()?;
+        if let Some(p) = private.as_mut() {
+            p.index_repo_skills();
+        }
         if let Some(p) = &private {
             if p.visibility() != Visibility::Private {
                 return Err(format!(
@@ -542,5 +641,14 @@ impl Stacks {
 
     pub fn declares_repo(&self, r: &str) -> bool {
         self.all().any(|s| s.manifest.repos.contains_key(r))
+    }
+
+    pub fn declares_workspace(&self, w: &str) -> bool {
+        self.all().any(|s| s.manifest.workspaces.contains_key(w))
+    }
+
+    /// The project a workspace belongs to.
+    pub fn workspace_project(&self, w: &str) -> Option<String> {
+        self.all().find_map(|s| s.manifest.workspaces.get(w).and_then(|x| x.project.clone()))
     }
 }

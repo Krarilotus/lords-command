@@ -68,11 +68,22 @@ const SECTIONS: [(Kind, &str); 5] = [
 /// Which layers a composition takes.
 #[derive(Clone, Debug)]
 pub enum Layers {
-    /// User-level files: public and private global.
+    /// User-level files, which every run on the machine reads (product turns too, backbone requirement BB-5): only global entries
+    /// for every role, and no memory. See `user_level`.
     Global,
-    /// A repo's own files: its project, the repo, and (with a sub-path) path entries covering it; with
-    /// `global`, the global layers too (a file that must stand alone, like a tracked AGENTS.md).
+    /// A repo's own files: its project, the repo, path entries covering `sub`, and the global entries the user
+    /// level leaves out (role-specific ones and memory). With `global`, every global entry (a file that must
+    /// stand alone: a tracked AGENTS.md, a role file a brief points to).
     Repo { repo: String, project: Option<String>, sub: Option<String>, global: bool },
+    /// A working dir with no git repo (e.g. a harness dir): like a repo, with its own workspace layer.
+    Workspace { name: String, project: Option<String>, global: bool },
+}
+
+/// Whether an entry suits every run on the machine, so it may go to user-level files: a global entry for every
+/// role (no `roles`) that is no memory note. Skills install user-level as before.
+pub fn user_level(e: &Entry) -> bool {
+    matches!(e.scope, Scope::Global)
+        && (e.meta.kind == Kind::Skill || (e.meta.roles.is_empty() && e.meta.kind != Kind::Memory))
 }
 
 #[derive(Clone, Debug)]
@@ -114,8 +125,11 @@ pub struct Composed {
 
 fn in_layers(e: &Entry, layers: &Layers) -> bool {
     match (layers, &e.scope) {
-        (Layers::Global, Scope::Global) => true,
-        (Layers::Global, _) => false,
+        (Layers::Global, _) => user_level(e),
+        (Layers::Workspace { project, .. }, Scope::Project(p)) => project.as_deref() == Some(p),
+        (Layers::Workspace { name, .. }, Scope::Workspace(w)) => w == name,
+        (Layers::Workspace { global, .. }, Scope::Global) => *global || !user_level(e),
+        (Layers::Workspace { .. }, _) => false,
         (Layers::Repo { project, .. }, Scope::Project(p)) => project.as_deref() == Some(p),
         (Layers::Repo { repo, .. }, Scope::Repo(r)) => r == repo,
         (Layers::Repo { repo, sub, .. }, Scope::Path { repo: r, sub: s }) => {
@@ -124,7 +138,8 @@ fn in_layers(e: &Entry, layers: &Layers) -> bool {
                     .as_deref()
                     .is_some_and(|here| here == s || here.starts_with(&format!("{s}/")))
         }
-        (Layers::Repo { global, .. }, Scope::Global) => *global,
+        (Layers::Repo { global, .. }, Scope::Global) => *global || !user_level(e),
+        (Layers::Repo { .. }, Scope::Workspace(_)) => false,
     }
 }
 
@@ -135,12 +150,18 @@ fn reaches(e: &Entry, audience: &[Audience]) -> bool {
 /// The label for an entry meant for only some of a target's audiences (Sol and Astra share one file).
 /// The label for an entry meant for only some of a file's readers: the agents (Sol and Astra share one file)
 /// and, where the file's role is unknown, the roles.
-fn only_for(e: &Entry, ctx: &Context) -> Option<String> {
+/// The role that product runs have (backbone requirement BB-4). Place files never reach product runs (BB-5), so an entry for every
+/// other role needs no role label there.
+pub const PRODUCT_ROLE: &str = "product";
+
+fn only_for(e: &Entry, ctx: &Context, development: &[String]) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(agents) = only_agents(e, &ctx.audience) {
         parts.push(agents);
     }
-    if ctx.roles.is_none() && !e.meta.roles.is_empty() {
+    let every_development_role =
+        !development.is_empty() && development.iter().all(|r| e.meta.roles.contains(r));
+    if ctx.roles.is_none() && !e.meta.roles.is_empty() && !every_development_role {
         parts.push(e.meta.roles.join(", "));
     }
     (!parts.is_empty()).then(|| parts.join("; "))
@@ -186,6 +207,14 @@ fn for_role(e: &Entry, ctx: &Context) -> bool {
 }
 
 pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
+    let mut development: Vec<String> = stacks
+        .all()
+        .flat_map(|s| s.manifest.roles.iter())
+        .filter(|r| *r != PRODUCT_ROLE)
+        .cloned()
+        .collect();
+    development.sort();
+    development.dedup();
     let all = applicable(stacks, ctx);
     let overridden: BTreeSet<&str> =
         all.iter().flat_map(|e| e.meta.overrides.iter().map(String::as_str)).collect();
@@ -206,7 +235,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
 
     let mut lines: Vec<String> = Vec::new();
     let push_entry = |e: &Entry, lines: &mut Vec<String>, out: &mut Composed| {
-        if let Some(who) = only_for(e, ctx) {
+        if let Some(who) = only_for(e, ctx, &development) {
             lines.push(format!("({who} only)"));
         }
         for (i, l) in e.body.trim_matches('\n').lines().enumerate() {
@@ -252,6 +281,33 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             for x in ext {
                 push_entry(x, &mut lines, &mut out);
             }
+        }
+    }
+    // Skills tracked in this repo: listed where they are (backbone requirement BB-8), so every harness can find them.
+    let here: Vec<&Entry> = live
+        .iter()
+        .copied()
+        .filter(|e| {
+            e.meta.kind == Kind::Skill
+                && matches!(e.meta.origin, crate::model::Origin::InRepo { .. })
+        })
+        .collect();
+    if !here.is_empty() {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("# Skills in this repo".into());
+        lines.push(String::new());
+        for e in here {
+            lines.push(index_line(e));
+            out.sources.push(Source {
+                line: lines.len(),
+                id: e.id().to_string(),
+                stack: e.stack,
+                file: e.body_file.clone(),
+                file_line: 1,
+            });
+            out.ids.push(e.id().to_string());
         }
     }
     // Memory: an index, not text. Each harness reads the notes on demand (docs/load-order.md); a note binds

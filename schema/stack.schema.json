@@ -39,7 +39,23 @@
           "checkouts": { "type": "array", "items": { "type": "string" }, "description": "private only: local checkouts; sync writes each one's untracked agent files" },
           "worktrees": { "type": "boolean", "default": true, "description": "also every worktree of each checkout (git worktree list)" },
           "worktree_roots": { "type": "array", "items": { "type": "string" }, "description": "only worktrees under these dirs get files; the rest are skipped and listed" },
-          "adapters": { "type": "array", "items": { "type": "string" }, "description": "adapter ids that get this repo's files (default: all)" }
+          "adapters": { "type": "array", "items": { "type": "string" }, "description": "adapter ids that get this repo's files (default: all)" },
+          "skills": { "type": "array", "items": { "type": "string" }, "description": "skill dirs tracked in the repo (paths in a checkout): indexed in place, never linked or moved" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "workspaces": {
+      "type": "object",
+      "description": "private only: working dirs that are no git repo; they get the same untracked files as a checkout",
+      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9._-]*$" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+          "path": { "type": "string" },
+          "project": { "type": "string" },
+          "adapters": { "type": "array", "items": { "type": "string" } }
         },
         "additionalProperties": false
       }

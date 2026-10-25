@@ -144,6 +144,10 @@ fn hover_of(e: &Entry) -> String {
             "\ninherited from {} @ {} ({}), {}",
             s.repo, s.commit, s.path, s.licence
         )),
+        Origin::InRepo { repo, path, sha256 } => h.push_str(&format!(
+            "\ntracked in repo {repo} at {path} (sha256 {})",
+            &sha256[..12.min(sha256.len())]
+        )),
         Origin::Imported { store, file } => {
             h.push_str(&format!("\nimported from memory store {store}: {file}"))
         }
@@ -570,6 +574,22 @@ impl App {
                 }
                 ui.end_row();
             }
+            for ev in &e.meta.evidence {
+                ui.label(mono("evidence", dim(TEXT)));
+                ui.vertical(|ui| {
+                    ui.label(mono(format!("{} ({})", ev.summary, ev.date), TEXT));
+                    for l in &ev.links {
+                        if ui.add(Button::new(mono(l, BLUE)).frame(false)).clicked() {
+                            if check::is_id(l) {
+                                relation_click = Some(l.clone());
+                            } else {
+                                open(l);
+                            }
+                        }
+                    }
+                });
+                ui.end_row();
+            }
             for b in &e.meta.basis {
                 ui.label(mono("basis", dim(TEXT)));
                 ui.label(mono(
@@ -809,7 +829,7 @@ impl App {
             .stacks
             .as_ref()
             .and_then(|s| s.private.as_ref())
-            .map(|p| p.manifest.repos.keys().cloned().collect())
+            .map(|p| p.manifest.repos.keys().chain(p.manifest.workspaces.keys()).cloned().collect())
             .unwrap_or_default();
         let (public, private) = (paths.public.clone(), paths.private.clone());
         ui.horizontal(|ui| {
@@ -939,8 +959,11 @@ impl App {
 
     fn compose_view(&mut self, ui: &mut egui::Ui) {
         let Some(stacks) = &self.stacks else { return };
-        let repos: Vec<String> =
-            stacks.private.iter().flat_map(|p| p.manifest.repos.keys().cloned()).collect();
+        let repos: Vec<String> = stacks
+            .private
+            .iter()
+            .flat_map(|p| p.manifest.repos.keys().chain(p.manifest.workspaces.keys()).cloned())
+            .collect();
         ui.horizontal(|ui| {
             ComboBox::from_id_salt("adapter")
                 .selected_text(mono(self.compose_adapter, TEXT))

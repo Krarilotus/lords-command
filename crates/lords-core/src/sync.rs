@@ -337,6 +337,7 @@ fn skills_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec<Item>
     let wanted: Vec<&Entry> = compose::applicable(stacks, &ctx)
         .into_iter()
         .filter(|e| e.meta.kind == Kind::Skill)
+        .filter(|e| !matches!(e.meta.origin, crate::model::Origin::InRepo { .. }))
         .collect();
     let mut items = Vec::new();
     for e in &wanted {
@@ -441,21 +442,207 @@ fn checkouts(repo: &stack::Repo) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (out, skipped)
 }
 
-fn repo_items(stacks: &Stacks, name: &str, repo: &stack::Repo, plan: &mut Plan) {
-    let project = stacks.repo_project(name);
+/// Where sync writes a place's files: a repo (its checkouts and worktrees) or a workspace (one dir, no git).
+struct Place<'a> {
+    label: String,
+    name: String,
+    workspace: bool,
+    project: Option<String>,
+    adapters: &'a [String],
+    paths: Vec<PathBuf>,
+}
+
+impl Place<'_> {
+    /// The layers a place's files take; `global`: every global entry (a file that must stand alone).
+    fn layers(&self, global: bool) -> Layers {
+        if self.workspace {
+            Layers::Workspace { name: self.name.clone(), project: self.project.clone(), global }
+        } else {
+            Layers::Repo {
+                repo: self.name.clone(),
+                project: self.project.clone(),
+                sub: None,
+                global,
+            }
+        }
+    }
+}
+
+/// Every declared role, both stacks, sorted.
+pub fn declared_roles(stacks: &Stacks) -> Vec<String> {
+    let mut roles: Vec<String> = stacks.all().flat_map(|s| s.manifest.roles.clone()).collect();
+    roles.sort();
+    roles.dedup();
+    roles
+}
+
+/// The dir of the role files in a checkout (backbone requirement BB-3: a brief points at one).
+pub const ROLE_DIR: &str = ".lords";
+
+pub fn role_file(role: &str) -> String {
+    format!("role-{role}.md")
+}
+
+/// Everything someone in `role` follows in a place, standing alone: every global entry for the role, the project,
+/// the place, and the memory index; for every agent family (lines for only some are labelled).
+pub fn role_composed(stacks: &Stacks, layers: Layers, role: &str) -> Composed {
+    let ctx = Context {
+        audience: vec![Audience::Opus, Audience::Sol, Audience::Astra],
+        layers,
+        public_only: false,
+        skip_stores: Vec::new(),
+        roles: Some(vec![role.to_string()]),
+    };
+    compose::compose(stacks, &ctx)
+}
+
+fn place_items(stacks: &Stacks, place: &Place, plan: &mut Plan) {
     let mut chosen: Vec<&dyn Adapter> = Vec::new();
-    if repo.adapters.is_empty() {
+    if place.adapters.is_empty() {
         chosen.extend(adapters::ALL.iter().copied());
     }
-    for id in &repo.adapters {
+    for id in place.adapters {
         match adapters::get(id) {
             Some(a) => chosen.push(a),
             None => plan.notes.push(format!(
-                "repo {name}: unknown adapter `{id}` (known: {})",
+                "{}: unknown adapter `{id}` (known: {})",
+                place.label,
                 adapters::ids().join(", ")
             )),
         }
     }
+    let path_entries = stacks
+        .entries()
+        .filter(|e| {
+            e.active()
+                && !place.workspace
+                && matches!(&e.scope, crate::model::Scope::Path { repo: r, .. } if *r == place.name)
+        })
+        .count();
+    if path_entries > 0 {
+        plan.notes.push(format!(
+            "{}: {path_entries} path-scoped entries are not written yet",
+            place.label
+        ));
+    }
+    let mut excludes: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    let mut add_exclude = |p: &Path, what: &str| {
+        if place.workspace {
+            return;
+        }
+        if let Ok(common) =
+            git::run(p, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        {
+            let ex = PathBuf::from(common.trim()).join("info").join("exclude");
+            match excludes.iter_mut().find(|(e, _)| *e == ex) {
+                Some((_, files)) if !files.iter().any(|f| f == what) => {
+                    files.push(what.to_string())
+                }
+                Some(_) => {}
+                None => excludes.push((ex, vec![what.to_string()])),
+            }
+        }
+    };
+    for adapter in chosen {
+        let file = adapter.repo_file();
+        let ctx = context(stacks, adapter, adapter.audience(), place.layers(false));
+        let composed = compose::compose(stacks, &ctx);
+        let text = adapter.render(&composed);
+        for p in &place.paths {
+            let target = format!("{} ({file})", place.label);
+            let path = p.join(file);
+            if !p.is_dir() {
+                let mut item = Item::new(&target, path, Action::Conflict);
+                item.notes.push("checkout not found".into());
+                plan.items.push(item);
+                continue;
+            }
+            if !place.workspace && git::run(p, &["ls-files", "--error-unmatch", file]).is_ok() {
+                let mut item = Item::new(&target, path, Action::Conflict);
+                item.notes
+                    .push(format!("{file} is tracked here; sync writes only untracked files"));
+                plan.items.push(item);
+                continue;
+            }
+            let current = read(&path).unwrap_or_default();
+            // The dir's own instructions still load: the adapter says how (an include, or the text inline).
+            let text = match adapter.repo_preamble(p) {
+                Some(pre) if !text.is_empty() => compose::with_preamble(&text, &pre),
+                _ => text.clone(),
+            };
+            let proposed = compose::place_block(&current, &text, false);
+            let mut item = file_item(&target, &path, proposed, &composed);
+            size_note(&mut item, adapter, &text);
+            plan.items.push(item);
+            add_exclude(p, file);
+        }
+    }
+    // One composed file per role, at a stable untracked path, for briefs to point at (backbone requirement BB-3).
+    for role in declared_roles(stacks) {
+        let composed = role_composed(stacks, place.layers(true), &role);
+        for p in place.paths.iter().filter(|p| p.is_dir()) {
+            let path = p.join(ROLE_DIR).join(role_file(&role));
+            let current = read(&path).unwrap_or_default();
+            let proposed = compose::place_block(&current, &composed.text, false);
+            plan.items.push(file_item(
+                &format!("{} (role {role})", place.label),
+                &path,
+                proposed,
+                &composed,
+            ));
+            add_exclude(p, &format!("{ROLE_DIR}/"));
+        }
+    }
+    for (ex, files) in excludes {
+        let current = read(&ex).unwrap_or_default();
+        let have: Vec<&str> = current.lines().map(str::trim).collect();
+        let missing: Vec<&String> = files.iter().filter(|f| !have.contains(&f.as_str())).collect();
+        let mut proposed = current.clone();
+        if !missing.is_empty() {
+            if !proposed.is_empty() && !proposed.ends_with('\n') {
+                proposed.push('\n');
+            }
+            proposed.push_str("# Lords Command: agent files written by sync\n");
+            for f in &missing {
+                proposed.push_str(f);
+                proposed.push('\n');
+            }
+        }
+        plan.items.push(file_item(
+            &format!("{} (git exclude)", place.label),
+            &ex,
+            proposed,
+            &Composed::default(),
+        ));
+    }
+    if place.workspace {
+        return;
+    }
+    // The tracked AGENTS.md of the first checkout: what the public layers would make it. Shown, never written.
+    let tracked = place.paths[0].join("AGENTS.md");
+    if let Some(current) = read(&tracked) {
+        let ctx = Context {
+            audience: vec![Audience::Opus, Audience::Sol, Audience::Astra],
+            layers: place.layers(true),
+            public_only: true,
+            skip_stores: Vec::new(),
+            roles: None,
+        };
+        let composed = compose::compose(stacks, &ctx);
+        let proposed = compose::place_block(&current, &composed.text, false);
+        let mut item = file_item(
+            &format!("{} (tracked AGENTS.md)", place.label),
+            &tracked,
+            proposed,
+            &composed,
+        );
+        item.action = if item.current == item.proposed { Action::InSync } else { Action::Report };
+        item.notes.push("tracked: changes by a commit on the repo's branch, never by sync; agents with a stack read the untracked files instead".into());
+        plan.items.push(item);
+    }
+}
+
+fn repo_items(stacks: &Stacks, name: &str, repo: &stack::Repo, plan: &mut Plan) {
     let (paths, skipped) = checkouts(repo);
     if paths.is_empty() {
         plan.notes.push(format!("repo {name}: no checkouts declared"));
@@ -469,108 +656,27 @@ fn repo_items(stacks: &Stacks, name: &str, repo: &stack::Repo, plan: &mut Plan) 
             list.join(", ")
         ));
     }
-    let path_entries = stacks
-        .entries()
-        .filter(|e| {
-            e.active() && matches!(&e.scope, crate::model::Scope::Path { repo: r, .. } if r == name)
-        })
-        .count();
-    if path_entries > 0 {
-        plan.notes
-            .push(format!("repo {name}: {path_entries} path-scoped entries are not written yet"));
-    }
-    let mut excludes: Vec<(PathBuf, Vec<&str>)> = Vec::new();
-    for adapter in chosen {
-        let file = adapter.repo_file();
-        let layers =
-            Layers::Repo { repo: name.into(), project: project.clone(), sub: None, global: false };
-        let ctx = context(stacks, adapter, adapter.audience(), layers);
-        let composed = compose::compose(stacks, &ctx);
-        let text = adapter.render(&composed);
-        for p in &paths {
-            let target = format!("repo {name} ({file})");
-            let path = p.join(file);
-            if !p.is_dir() {
-                let mut item = Item::new(&target, path, Action::Conflict);
-                item.notes.push("checkout not found".into());
-                plan.items.push(item);
-                continue;
-            }
-            if git::run(p, &["ls-files", "--error-unmatch", file]).is_ok() {
-                let mut item = Item::new(&target, path, Action::Conflict);
-                item.notes
-                    .push(format!("{file} is tracked here; sync writes only untracked files"));
-                plan.items.push(item);
-                continue;
-            }
-            let current = read(&path).unwrap_or_default();
-            // The checkout's tracked instructions still load: the adapter says how (an include, or inline).
-            let text = match adapter.repo_preamble(p) {
-                Some(pre) if !text.is_empty() => compose::with_preamble(&text, &pre),
-                _ => text.clone(),
-            };
-            let proposed = compose::place_block(&current, &text, false);
-            let mut item = file_item(&target, &path, proposed, &composed);
-            size_note(&mut item, adapter, &text);
-            plan.items.push(item);
-            if let Ok(common) =
-                git::run(p, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
-            {
-                let ex = PathBuf::from(common.trim()).join("info").join("exclude");
-                match excludes.iter_mut().find(|(e, _)| *e == ex) {
-                    Some((_, files)) if !files.contains(&file) => files.push(file),
-                    Some(_) => {}
-                    None => excludes.push((ex, vec![file])),
-                }
-            }
-        }
-    }
-    for (ex, files) in excludes {
-        let current = read(&ex).unwrap_or_default();
-        let have: Vec<&str> = current.lines().map(str::trim).collect();
-        let missing: Vec<&str> = files.into_iter().filter(|f| !have.contains(f)).collect();
-        let mut proposed = current.clone();
-        if !missing.is_empty() {
-            if !proposed.is_empty() && !proposed.ends_with('\n') {
-                proposed.push('\n');
-            }
-            proposed.push_str("# Lords Command: agent files written by sync\n");
-            for f in &missing {
-                proposed.push_str(f);
-                proposed.push('\n');
-            }
-        }
-        plan.items.push(file_item(
-            &format!("repo {name} (git exclude)"),
-            &ex,
-            proposed,
-            &Composed::default(),
-        ));
-    }
-    // The tracked AGENTS.md of the first checkout: what the public layers would make it. Shown, never written.
-    let first = &paths[0];
-    let tracked = first.join("AGENTS.md");
-    if let Some(current) = read(&tracked) {
-        let ctx = Context {
-            audience: vec![Audience::Opus, Audience::Sol, Audience::Astra],
-            layers: Layers::Repo {
-                repo: name.into(),
-                project: project.clone(),
-                sub: None,
-                global: true,
-            },
-            public_only: true,
-            skip_stores: Vec::new(),
-            roles: None,
-        };
-        let composed = compose::compose(stacks, &ctx);
-        let proposed = compose::place_block(&current, &composed.text, false);
-        let mut item =
-            file_item(&format!("repo {name} (tracked AGENTS.md)"), &tracked, proposed, &composed);
-        item.action = if item.current == item.proposed { Action::InSync } else { Action::Report };
-        item.notes.push("tracked: changes by a commit on the repo's branch, never by sync; agents with a stack read the untracked files instead".into());
-        plan.items.push(item);
-    }
+    let place = Place {
+        label: format!("repo {name}"),
+        name: name.to_string(),
+        workspace: false,
+        project: stacks.repo_project(name),
+        adapters: &repo.adapters,
+        paths,
+    };
+    place_items(stacks, &place, plan);
+}
+
+fn workspace_items(stacks: &Stacks, name: &str, w: &stack::Workspace, plan: &mut Plan) {
+    let place = Place {
+        label: format!("workspace {name}"),
+        name: name.to_string(),
+        workspace: true,
+        project: w.project.clone(),
+        adapters: &w.adapters,
+        paths: vec![expand_home(&w.path)],
+    };
+    place_items(stacks, &place, plan);
 }
 
 pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
@@ -634,9 +740,17 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
             }
             repo_items(stacks, name, repo, &mut plan);
         }
+        for (name, w) in &private.manifest.workspaces {
+            if opts.repo.as_deref().is_some_and(|r| r != name) {
+                continue;
+            }
+            workspace_items(stacks, name, w, &mut plan);
+        }
         if let Some(r) = &opts.repo {
-            if !private.manifest.repos.contains_key(r) {
-                return Err(format!("no repo `{r}` in the private stack.toml"));
+            if !private.manifest.repos.contains_key(r)
+                && !private.manifest.workspaces.contains_key(r)
+            {
+                return Err(format!("no repo or workspace `{r}` in the private stack.toml"));
             }
         }
     }
@@ -732,14 +846,20 @@ pub fn user_composed(stacks: &Stacks, adapter: &dyn Adapter) -> Composed {
 }
 
 /// What an adapter's untracked file in a repo holds, before the tracked-instructions preamble.
-pub fn repo_composed(stacks: &Stacks, repo: &str, adapter: &dyn Adapter) -> Composed {
-    let layers = Layers::Repo {
-        repo: repo.into(),
-        project: stacks.repo_project(repo),
-        sub: None,
-        global: false,
-    };
-    compose::compose(stacks, &context(stacks, adapter, adapter.audience(), layers))
+pub fn repo_composed(stacks: &Stacks, place: &str, adapter: &dyn Adapter) -> Composed {
+    compose::compose(
+        stacks,
+        &context(stacks, adapter, adapter.audience(), place_layers(stacks, place, false)),
+    )
+}
+
+/// A repo's or a workspace's layers, by name.
+pub fn place_layers(stacks: &Stacks, place: &str, global: bool) -> Layers {
+    if stacks.declares_workspace(place) && !stacks.declares_repo(place) {
+        Layers::Workspace { name: place.into(), project: stacks.workspace_project(place), global }
+    } else {
+        Layers::Repo { repo: place.into(), project: stacks.repo_project(place), sub: None, global }
+    }
 }
 
 /// `check`'s view of the user-level targets: a warning for each that differs from a fresh composition, and the
@@ -771,6 +891,7 @@ pub fn drift_findings(stacks: &Stacks) -> Vec<crate::Finding> {
                 }
             }
             out.extend(repo_size_findings(stacks));
+            out.extend(verbatim_findings(stacks));
             out.extend(plan.notes.iter().map(|n| Finding::info("sync-note", n.clone())));
             out
         }
@@ -807,6 +928,56 @@ pub fn backup_dir() -> Result<PathBuf, String> {
     let home = crate::config::home().ok_or("no home dir")?;
     let stamp = format!("{}-{}", crate::ops::today(), std::process::id());
     Ok(home.join(".lords-command").join("backups").join(stamp))
+}
+
+/// Whether every line of `tracked` appears in `file`, in order (other lines may come between).
+pub fn keeps_in_order(tracked: &str, file: &str) -> Result<(), (usize, String)> {
+    let mut lines = file.lines().map(|l| l.trim_end_matches('\r'));
+    for (i, t) in tracked.lines().map(|l| l.trim_end_matches('\r')).enumerate() {
+        if !lines.any(|l| l == t) {
+            return Err((i + 1, t.to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// backbone requirement BB-2: a file that hides a dir's own `AGENTS.md` must not drop a line of it. Codex's override carries it
+/// verbatim, every line in order; Claude's local file includes it with `@AGENTS.md`. Checked in every checkout
+/// and worktree sync writes, and in every workspace.
+pub fn verbatim_findings(stacks: &Stacks) -> Vec<crate::Finding> {
+    let Some(private) = &stacks.private else { return Vec::new() };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for repo in private.manifest.repos.values() {
+        dirs.extend(checkouts(repo).0);
+    }
+    dirs.extend(private.manifest.workspaces.values().map(|w| expand_home(&w.path)));
+    let mut out = Vec::new();
+    for d in dirs {
+        let Some(tracked) = read(&d.join("AGENTS.md")) else { continue };
+        if let Some(over) = read(&d.join("AGENTS.override.md")) {
+            if let Err((n, line)) = keeps_in_order(&tracked, &over) {
+                out.push(
+                    crate::Finding::error(
+                        "verbatim",
+                        format!("AGENTS.override.md drops line {n} of AGENTS.md (or its order): `{line}`; `lords sync` rewrites it"),
+                    )
+                    .at(d.join("AGENTS.override.md"), None),
+                );
+            }
+        }
+        if let Some(local) = read(&d.join("CLAUDE.local.md")) {
+            if !local.lines().any(|l| l.trim() == "@AGENTS.md") {
+                out.push(
+                    crate::Finding::error(
+                        "verbatim",
+                        "CLAUDE.local.md hides AGENTS.md without including it (`@AGENTS.md`)",
+                    )
+                    .at(d.join("CLAUDE.local.md"), None),
+                );
+            }
+        }
+    }
+    out
 }
 
 /// What one session in a repo reads together (the user-level text, the repo's own, and the tracked-instructions

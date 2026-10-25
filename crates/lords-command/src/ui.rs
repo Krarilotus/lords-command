@@ -60,6 +60,7 @@ pub fn origin(o: &Origin) -> (&'static str, Color32) {
         Origin::Adapted(_) => ("◐", AMBER),
         Origin::Inherited(_) => ("○", BLUE),
         Origin::Imported { .. } => ("↧", TEXT),
+        Origin::InRepo { .. } => ("⌂", BLUE),
     }
 }
 
@@ -84,6 +85,7 @@ pub fn layer(scope: &Scope) -> (String, Color32) {
         Scope::Global => ("GL".into(), HUES[4]),
         Scope::Project(p) => (two(p).to_uppercase(), hue_of(p)),
         Scope::Repo(r) => (two(r).to_lowercase(), hue_of(r)),
+        Scope::Workspace(w) => (format!("~{}", two(w).chars().next().unwrap_or('?')), hue_of(w)),
         Scope::Path { repo, .. } => {
             (format!("{}/", two(repo).chars().next().unwrap_or('?')), hue_of(repo))
         }
@@ -258,6 +260,8 @@ pub fn legend(ui: &mut egui::Ui) {
         ("◐", AMBER, "adapted (source on hover, click opens it)"),
         ("○", BLUE, "inherited, verbatim"),
         ("↧", TEXT, "imported memory"),
+        ("⌂", BLUE, "a skill tracked in its repo, indexed in place"),
+        (" ~h ", HUES[4], "a workspace (a working dir with no git repo)"),
         (" GL ", HUES[4], "global layer; PR project; re repo"),
         ("─", TEXT, "active"),
         ("┄", TEXT, "retired"),

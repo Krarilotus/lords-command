@@ -16,6 +16,11 @@ pub fn coapply(stacks: &Stacks, a: &Scope, b: &Scope) -> bool {
     match (a, b) {
         (Scope::Global, _) | (_, Scope::Global) => true,
         (Scope::Project(p), Scope::Project(q)) => p == q,
+        (Scope::Project(p), Scope::Workspace(w)) | (Scope::Workspace(w), Scope::Project(p)) => {
+            stacks.workspace_project(w).as_deref() == Some(p)
+        }
+        (Scope::Workspace(a), Scope::Workspace(b)) => a == b,
+        (Scope::Workspace(_), _) | (_, Scope::Workspace(_)) => false,
         (Scope::Project(p), s) | (s, Scope::Project(p)) => {
             s.repo().and_then(project_of).as_deref() == Some(p)
         }
@@ -180,6 +185,9 @@ fn declared(stacks: &Stacks, out: &mut Vec<Finding>) {
         }
         let missing = match &e.scope {
             Scope::Project(p) if !stacks.declares_project(p) => Some(format!("project `{p}`")),
+            Scope::Workspace(w) if !stacks.declares_workspace(w) => {
+                Some(format!("workspace `{w}`"))
+            }
             Scope::Repo(r) | Scope::Path { repo: r, .. } if !stacks.declares_repo(r) => {
                 Some(format!("repo `{r}`"))
             }
@@ -262,7 +270,7 @@ fn links(stacks: &Stacks, out: &mut Vec<Finding>) {
     let md_link = regex::Regex::new(r"\]\(([^)\s]+)\)").expect("pattern compiles");
     for e in stacks.entries() {
         let dir = e.body_file.parent().unwrap_or(Path::new("."));
-        for l in &e.meta.links {
+        for l in e.meta.links.iter().chain(e.meta.evidence.iter().flat_map(|x| x.links.iter())) {
             if is_id(l) {
                 match stacks.find(l) {
                     None => out.push(
@@ -287,7 +295,7 @@ fn links(stacks: &Stacks, out: &mut Vec<Finding>) {
                     ),
                     Some(_) => {}
                 }
-            } else if !dir.join(l).exists() {
+            } else if !l.contains("://") && !dir.join(l).exists() {
                 out.push(
                     Finding::error("dangling", format!("link `{l}`: no such file"))
                         .at(&e.meta_file, None)

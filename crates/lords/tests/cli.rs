@@ -128,15 +128,16 @@ fn this_repo_passes_check_public_and_every_file_is_scanned() {
 }
 
 // Spec (owner, 25 Oct: Claude's auto-memory "stays the write path, and `import` gives it history"; sync makes it
-// readable for the other harnesses "without a manual promotion"): `sync --apply` first imports what the agent
-// wrote since the last import, with a commit, then writes an index that points at the imported note.
+// readable for the other harnesses "without a manual promotion"; backbone requirement BB-5: the index goes to repo and workspace
+// files): `sync --apply` first imports what the agent wrote since the last import, with a commit, then writes the
+// workspace's files, whose index points at the imported note.
 #[test]
 fn sync_apply_imports_new_memory_before_writing_the_index() {
     let env = Env::new();
     let d = env.dir.path();
-    let (public, private, mem, home) =
-        (d.join("pub"), d.join("priv"), d.join("agent-memory"), d.join("home"));
-    for p in [&public, &private, &mem] {
+    let (public, private, mem, work) =
+        (d.join("pub"), d.join("priv"), d.join("agent-memory"), d.join("work"));
+    for p in [&public, &private, &mem, &work] {
         fs::create_dir_all(p).unwrap();
     }
     fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
@@ -144,9 +145,9 @@ fn sync_apply_imports_new_memory_before_writing_the_index() {
         private.join("stack.toml"),
         format!(
             "name = \"priv\"\nvisibility = \"private\"\n[[memory_stores]]\nname = \"agent\"\npath = '{}'\nscope = \"global\"\n\
-             [[targets]]\nname = \"codex\"\nadapter = \"codex\"\nkind = \"instructions\"\npath = '{}'\n",
+             [workspaces.work]\npath = '{}'\nadapters = [\"codex\"]\n",
             mem.display(),
-            home.join("AGENTS.md").display()
+            work.display()
         ),
     )
     .unwrap();
@@ -165,11 +166,11 @@ fn sync_apply_imports_new_memory_before_writing_the_index() {
     ];
     let dry = env.lords(d, &args);
     assert!(text(&dry).contains("memory store agent: 1 new"), "{}", text(&dry));
-    assert!(!home.join("AGENTS.md").exists(), "a dry run writes nothing");
+    assert!(!work.join("AGENTS.override.md").exists(), "a dry run writes nothing");
 
     let o = env.lords(d, &[&args[..], &["--apply"]].concat());
     assert!(o.status.success(), "{}", text(&o));
-    let agents = fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    let agents = fs::read_to_string(work.join("AGENTS.override.md")).unwrap();
     assert!(agents.contains("- note: the hook line (`"), "{agents}");
     assert!(
         agents.contains("global") && agents.contains("note.md`)"),

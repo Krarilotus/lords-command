@@ -343,12 +343,13 @@ fn memory_store(f: &Fixture, dir: &str, scope: &str, store: &str, audience: &str
     );
 }
 
-// Spec (owner, 25 Oct: memory "still work[s] for claude but also [is] accessible for Codex"; design: Memory):
-// every adapter's output carries a memory index, one line per note with its name, its one-line hook and the
-// file to read; filtered by layer and audience; a store the harness loads by itself is left out of that
-// harness's index; the index is not rule text.
+// Spec (owner, 25 Oct: memory "still work[s] for claude but also [is] accessible for Codex"; backbone requirement BB-5 as the
+// orchestrator answered it: user-level files carry "no memory index and no private notes"; design: Memory): no
+// user-level file has a memory index; a place's files do, one line per note with its name, its one-line hook and
+// the file to read, filtered by layer and audience; a store a harness loads by itself is left out of that
+// harness's index; the index is not the notes' text.
 #[test]
-fn every_adapter_gets_a_memory_index_except_for_its_native_store() {
+fn the_memory_index_goes_to_places_never_to_the_user_level() {
     let f = Fixture::new();
     f.write("pub/global/rules/a.md", &entry("rule.a", "global", "public", "", "Rule A.\n"));
     memory_store(&f, "priv/global/memory/agent", "global", "agent", "all");
@@ -371,21 +372,19 @@ fn every_adapter_gets_a_memory_index_except_for_its_native_store() {
     f.write("priv/stack.toml", &manifest);
     fs::create_dir_all(&home).unwrap();
     let p = plan(&f.stacks(), &Options { user_only: true, ..Options::default() }).unwrap();
-    let text =
-        |name: &str| p.items.iter().find(|i| i.target == name).unwrap().proposed.clone().unwrap();
-    let codex = text("codex");
-    let prompts = f.path("priv/global/memory/agent/prompts.md");
-    let line = format!(
-        "- prompts-in-chat: paste prompts as code blocks (`{}`)",
-        prompts.display().to_string().replace('/', std::path::MAIN_SEPARATOR_STR)
-    );
-    assert!(codex.contains(&format!("# Memory\n\nNotes agents wrote down earlier. Read a note's file when its topic comes up; notes are not rules.\n\n{line}\n")), "{codex}");
-    assert!(!codex.contains("Body that stays in the file"), "an index, not the note's text");
-    assert!(!codex.contains("bench-layout"), "a project note isn't in the user-level index");
-    assert!(!codex.contains("- index"), "the store's own index file is not a note");
-    assert!(!text("claude").contains("# Memory"), "claude loads the agent store by itself");
+    for i in &p.items {
+        let text = i.proposed.clone().unwrap_or_default();
+        assert!(
+            !text.contains("# Memory") && !text.contains("prompts-in-chat"),
+            "user level: {text}"
+        );
+        assert!(
+            text.contains("Rule A."),
+            "a rule for every role and every run stays at the user level"
+        );
+    }
 
-    let repo = |audience| {
+    let place = |audience, skip: Vec<String>| {
         let layers = Layers::Repo {
             repo: "beta-core".into(),
             project: Some("beta".into()),
@@ -394,14 +393,26 @@ fn every_adapter_gets_a_memory_index_except_for_its_native_store() {
         };
         compose(
             &f.stacks(),
-            &Context { audience, layers, public_only: false, skip_stores: vec![], roles: None },
+            &Context { audience, layers, public_only: false, skip_stores: skip, roles: None },
         )
         .text
     };
-    assert!(repo(vec![Audience::Opus]).contains("- bench-layout: benches by purpose"));
+    let codex = place(vec![Audience::Sol, Audience::Astra], vec![]);
+    let prompts = f.path("priv/global/memory/agent/prompts.md");
+    let line = format!(
+        "- prompts-in-chat: paste prompts as code blocks (`{}`)",
+        prompts.display().to_string().replace('/', std::path::MAIN_SEPARATOR_STR)
+    );
+    assert!(codex.contains(&format!("# Memory\n\nNotes agents wrote down earlier. Read a note's file when its topic comes up; notes are not rules.\n\n{line}\n")), "{codex}");
+    assert!(!codex.contains("Body that stays in the file"), "an index, not the note's text");
+    assert!(!codex.contains("- index"), "the store's own index file is not a note");
+    assert!(!codex.contains("Rule A."), "a user-level rule isn't repeated in the place's files");
+    assert!(!codex.contains("bench-layout"), "audience opus only");
+    let claude = place(vec![Audience::Opus], vec!["agent".into()]);
     assert!(
-        !repo(vec![Audience::Sol, Audience::Astra]).contains("bench-layout"),
-        "audience opus only"
+        claude.contains("- bench-layout: benches by purpose")
+            && !claude.contains("prompts-in-chat"),
+        "{claude}"
     );
 }
 
@@ -536,10 +547,16 @@ fn worktree_roots_limit_the_worktrees_and_tracked_instructions_still_load() {
     assert!(codex.contains("-->\nTracked text.\n\n# Facts\n\nHosts through the fleet."), "{codex}");
 }
 
+/// A place's files (role entries and memory never reach the user level, backbone requirement BB-5).
 fn role_ctx(roles: Option<Vec<&str>>) -> Context {
     Context {
         audience: vec![Audience::Sol, Audience::Astra],
-        layers: Layers::Global,
+        layers: Layers::Repo {
+            repo: "alpha-core".into(),
+            project: Some("alpha".into()),
+            sub: None,
+            global: false,
+        },
         public_only: false,
         skip_stores: vec![],
         roles: roles.map(|r| r.into_iter().map(String::from).collect()),

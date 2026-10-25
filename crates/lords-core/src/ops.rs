@@ -319,6 +319,11 @@ pub fn promote(
         Scope::Project(p) if !public.manifest.projects.contains_key(p) => {
             Some(format!("project `{p}`"))
         }
+        Scope::Workspace(w) => {
+            return Err(format!(
+                "`{id}` belongs to workspace `{w}`; workspaces are private, so it stays private"
+            ))
+        }
         Scope::Repo(r) | Scope::Path { repo: r, .. } if !public.manifest.repos.contains_key(r) => {
             Some(format!("repo `{r}`"))
         }

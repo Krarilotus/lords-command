@@ -39,6 +39,7 @@ The secret part of the privacy check runs on both.
 | 1 | private global | `global` (in the private stack) | all of the owner's work |
 | 2 | project or domain | `project:<name>` | every repo of that project |
 | 3 | repo | `repo:<name>` | one repository |
+| 3 | workspace | `workspace:<name>` | one working dir that is no git repo (e.g. a harness dir) |
 | 4 | path | `path:<repo>:<subpath>` | a subtree of one repository |
 
 Projects and repos are declared in a stack's `stack.toml`; a repo names its project, if it has one. A local checkout
@@ -97,7 +98,8 @@ it replaces.
 | `status` | active, retired | retired needs `retired.date` and `retired.reason`, and `superseded_by` when there is a successor |
 | `visibility` | public, private | must match the stack |
 | `basis` | list of {quote, date, by} | the owner's words behind the entry, where there are any |
-| `origin` | own; adapted or inherited with repo, commit, path, licence (+ `changes` for adapted); imported with the store and file | inherited means verbatim |
+| `evidence` | list of {summary, date, links} | the cases behind the entry (incidents, measurements); kept beside it, never composed, so the rule stays a short principle; links are checked |
+| `origin` | own; adapted or inherited with repo, commit, path, licence (+ `changes` for adapted); imported with the store and file; in-repo with repo, path and hash | inherited means verbatim; in-repo: a skill tracked in a repo (`skills = [...]` on the repo), indexed where it is, never linked, copied or moved, and listed in that repo's files |
 | `topics` | tags from the `topics` list in `stack.toml` | a controlled list (a public entry uses only the public stack's); drive conflict and duplicate detection |
 | `overrides`, `extends` | entry ids | see Layers |
 | `order` | integer | optional, for ordering within a section |
@@ -151,10 +153,17 @@ Each target names an **adapter** (below). Which file each harness actually loads
   once a file's old text has moved into entries).
 - *Drift* means the file differs from a fresh composition; `check` reports it for the user-level targets.
 
-**User-level files** (one per adapter and per profile in use) get public global plus private global.
+**User-level files** (one per adapter and per profile in use) reach every run on the machine, product runs
+included (another project may start agent turns for its users with the owner's harness home). So they carry only
+what suits any run: global entries for every role (no `roles`), and no memory. Development-process rules (tagged
+with development roles) and the memory index go to the files of repos and workspaces, which product runs never load.
 
-**A repo** (`lords sync --repo <name>`) gets its project, repo and path layers in untracked files: the global
-layers already come from the user-level files.
+**A workspace** is a working dir with no git repo (`[workspaces.<name>] path = …` in the private stack.toml). It gets
+the same untracked files as a checkout, takes the `workspace:<name>` layer, and needs no git exclude.
+
+**A repo or workspace** (`lords sync --repo <name>`) gets, in untracked files, the global entries the user level
+leaves out (development roles, memory), its project, and its own layer. Several agents may share one checkout: nothing
+assumes a worktree per agent.
 - Every checkout gets files, and so does every worktree under the repo's `worktree_roots` (the others are skipped
   and listed). Each gets the file its adapter's harness reads after the tracked ones: `CLAUDE.local.md` (Claude) and
   `AGENTS.override.md` (Codex).
@@ -163,6 +172,14 @@ layers already come from the user-level files.
   starts with `@AGENTS.md` (a `CLAUDE.local.md` alone would hide it), and Codex's override carries its text inline
   (the override replaces it, and Codex doesn't expand includes). A tracked file of either name is a conflict, and
   nothing is applied.
+
+**Role files.** Every checkout and workspace also gets `.lords/role-<role>.md` for each declared role (excluded from
+git): everything that role follows there, standing alone (global, project, the place, notes), so a brief can point at
+the file and carry only the task. The role `product` gets no development rule.
+
+**Nothing of a tracked `AGENTS.md` is dropped.** Codex's override carries it verbatim, then the stack's layers;
+Claude's local file includes it with `@AGENTS.md`. `check` verifies both in every checkout and workspace: every
+line of `AGENTS.md`, in order, in the override, and the include in the local file.
 
 **A repo's tracked `AGENTS.md`** is never written: it changes by a commit on the repo's own branches. Sync reports
 what the public layers (public global, project and repo) would make of it, so the maintainer can commit that.

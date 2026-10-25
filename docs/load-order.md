@@ -83,8 +83,10 @@ The adapters (`crates/lords-core/src/adapters.rs`) encode these facts.
 
 | Target (adapter) | File written | Why |
 |---|---|---|
-| user level (claude) | the profile's `CLAUDE.md` (each profile in use) | the user file |
-| user level (codex) | `$CODEX_HOME/AGENTS.md` | the global file |
+| user level (claude) | the profile's `CLAUDE.md` (each profile in use) | the user file; only what suits any run (product runs read it too) |
+| user level (codex) | `$CODEX_HOME/AGENTS.md` | the global file; likewise |
+| a workspace (any adapter) | the same untracked files as a checkout, in its dir | a dir with no git repo; Codex then reads only the cwd's file (no project root) |
+| a repo or workspace, per role | `.lords/role-<role>.md` | not loaded by a harness by itself: a brief points at it |
 | a repo (claude) | untracked `CLAUDE.local.md` in every checkout and worktree under `worktree_roots`: `@AGENTS.md` first, then the repo's layers | a `CLAUDE.local.md` alone would stop the tracked `AGENTS.md` from loading; the include keeps it |
 | a repo (codex) | untracked `AGENTS.override.md`: the tracked `AGENTS.md` text inline, then the repo's layers | the override replaces the tracked file, and Codex doesn't expand includes |
 | a repo's tracked `AGENTS.md` | nothing: reported only | it changes by a commit on the repo's own branches, which sync never makes |
