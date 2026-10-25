@@ -8,7 +8,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-# The renderer is chosen here only (the code is renderer-agnostic); glow is interim until the CPU rasteriser.
+# The renderer is chosen here only (the code is renderer-agnostic); glow until measurement picks the one app's renderer.
 eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 lords-core = { path = "../lords-core" }
 serde_json = "1"
