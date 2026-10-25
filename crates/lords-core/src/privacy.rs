@@ -78,24 +78,28 @@ impl Rules {
         self
     }
 
-    /// Adds the private stack's deny-list and fleet hosts, or notes that they are missing.
-    pub fn with_private(mut self, private: Option<&Stack>) -> Rules {
+    /// Adds the private stack's deny-list and fleet hosts. Without a private stack, or a deny-list, that is noted;
+    /// a deny-list or fleet config that is there but can't be read is an error, so the check fails closed.
+    pub fn with_private(mut self, private: Option<&Stack>) -> Result<Rules, String> {
         let Some(private) = private else {
             self.notes.push("no private stack: the deny and fleet classes were not checked".into());
-            return self;
+            return Ok(self);
         };
         self = self.with_allow_from(&private.root);
-        match fs::read_to_string(private.root.join("privacy").join("deny.txt")) {
-            Ok(text) => self.deny.extend(list_lines(&text).map(|t| t.to_ascii_lowercase())),
-            Err(_) => self.notes.push("the private stack has no privacy/deny.txt".into()),
+        let deny = private.root.join("privacy").join("deny.txt");
+        match fs::read_to_string(&deny) {
+            Ok(text) => self.deny.extend(list_lines(&text).map(fold_term)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.notes.push("the private stack has no privacy/deny.txt".into())
+            }
+            Err(e) => return Err(format!("{}: {e}", deny.display())),
         }
         if let Some(cfg) = &private.manifest.privacy.fleet_config {
-            match fleet_hosts(&expand_home(cfg)) {
-                Ok(hosts) => self.hosts.extend(hosts),
-                Err(e) => self.notes.push(format!("fleet config not read: {e}")),
-            }
+            let hosts = fleet_hosts(&expand_home(cfg))
+                .map_err(|e| format!("fleet config not read: {e}"))?;
+            self.hosts.extend(hosts);
         }
-        self
+        Ok(self)
     }
 }
 
@@ -112,11 +116,11 @@ pub fn fleet_hosts(path: &Path) -> Result<Vec<String>, String> {
     for table in ["host", "machine"] {
         if let Some(toml::Value::Table(hosts)) = value.get(table) {
             for (name, h) in hosts {
-                out.insert(name.to_ascii_lowercase());
+                out.insert(fold_term(name));
                 if let Some(target) =
                     h.get("link").and_then(|l| l.get("target")).and_then(|t| t.as_str())
                 {
-                    out.insert(target.to_ascii_lowercase());
+                    out.insert(fold_term(target));
                 }
             }
         }
@@ -158,9 +162,53 @@ fn patterns() -> &'static [Pattern] {
     })
 }
 
-/// A long assigned value counts as a secret only if it mixes letters and digits (not a word or a path part).
+/// A long value assigned to a secret-named key counts as a secret if it mixes letters and digits, or is letters
+/// only and either very long or changes case often (a token, not a word, an identifier or a path part).
 fn looks_random(s: &str) -> bool {
-    s.chars().any(|c| c.is_ascii_digit()) && s.chars().any(|c| c.is_ascii_alphabetic())
+    if s.chars().any(|c| c.is_ascii_digit()) {
+        return s.chars().any(|c| c.is_ascii_alphabetic());
+    }
+    if !s.chars().all(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let b = s.as_bytes();
+    let changes =
+        b.windows(2).filter(|w| w[0].is_ascii_uppercase() != w[1].is_ascii_uppercase()).count();
+    b.len() >= 32 || (b.len() >= 20 && changes * 3 >= b.len())
+}
+
+/// Text as deny and fleet terms are compared: Unicode lower case, compatibility-decomposed (NFKD), each run of
+/// whitespace one space. Each folded byte keeps the byte range of the char it came from.
+fn fold(text: &str) -> (String, Vec<(usize, usize)>) {
+    let nfkd = icu_normalizer::DecomposingNormalizerBorrowed::new_nfkd();
+    let mut out = String::with_capacity(text.len());
+    let mut from = Vec::with_capacity(text.len());
+    let mut push = |out: &mut String, c: char, origin: (usize, usize)| {
+        out.push(c);
+        from.extend(std::iter::repeat_n(origin, c.len_utf8()));
+    };
+    for (i, c) in text.char_indices() {
+        let origin = (i, c.len_utf8());
+        if c.is_whitespace() {
+            if !out.ends_with(' ') {
+                push(&mut out, ' ', origin);
+            }
+        } else if c.is_ascii() {
+            push(&mut out, c.to_ascii_lowercase(), origin);
+        } else {
+            for d in nfkd.normalize_iter(c.to_lowercase()) {
+                for l in d.to_lowercase() {
+                    push(&mut out, l, origin);
+                }
+            }
+        }
+    }
+    (out, from)
+}
+
+/// A deny or fleet term folded as `fold` folds text.
+pub fn fold_term(term: &str) -> String {
+    fold(term.trim()).0
 }
 
 pub fn scan(text: &str, rules: &Rules) -> Vec<Hit> {
@@ -186,27 +234,35 @@ pub fn scan(text: &str, rules: &Rules) -> Vec<Hit> {
                 });
             }
         }
-        let lower = line.to_ascii_lowercase();
-        for (class, terms) in [(Class::Fleet, &rules.hosts), (Class::Deny, &rules.deny)] {
-            if rules.classes.contains(&class) {
-                for term in terms.iter().filter(|t| !t.is_empty()) {
-                    for (start, _) in lower.match_indices(term.as_str()) {
-                        let end = start + term.len();
-                        let before = lower[..start].chars().next_back();
-                        let after = lower[end..].chars().next();
-                        let word =
-                            |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
-                        if !word(before) && !word(after) {
-                            hits.push(Hit {
-                                class,
-                                line: n,
-                                start,
-                                end,
-                                text: line[start..end].to_string(),
-                            });
-                        }
-                    }
+    }
+    // Terms match on the whole folded text, so a phrase wrapped across lines is found; the hit is placed on the
+    // line it starts on, its span ending at that line's end at most.
+    let (folded, from) = fold(text);
+    let starts: Vec<usize> =
+        std::iter::once(0).chain(text.match_indices('\n').map(|(i, _)| i + 1)).collect();
+    for (class, terms) in [(Class::Fleet, &rules.hosts), (Class::Deny, &rules.deny)] {
+        if !rules.classes.contains(&class) {
+            continue;
+        }
+        for term in terms.iter().map(|t| fold_term(t)).filter(|t| !t.is_empty()) {
+            for (start, _) in folded.match_indices(term.as_str()) {
+                let end = start + term.len();
+                let before = folded[..start].chars().next_back();
+                let after = folded[end..].chars().next();
+                let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+                if word(before) || word(after) {
+                    continue;
                 }
+                let (s, e) = (from[start].0, from[end - 1].0 + from[end - 1].1);
+                let i = starts.partition_point(|&l| l <= s) - 1;
+                let line = text[starts[i]..].lines().next().unwrap_or("");
+                hits.push(Hit {
+                    class,
+                    line: i + 1,
+                    start: s - starts[i],
+                    end: (e - starts[i]).min(line.len()),
+                    text: text[s..e].to_string(),
+                });
             }
         }
     }
@@ -240,26 +296,97 @@ pub fn strip(text: &str, hits: &[Hit]) -> String {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Scan {
     pub files_scanned: usize,
-    /// Files not scanned because they are not text; listed so nothing is skipped silently.
+    /// Files that are not text: scanned only as far as their bytes read as text; listed so nothing passes silently.
     pub binary: Vec<PathBuf>,
+    /// Staged binary files the repo doesn't mark `lords-binary` in .gitattributes: the staged check refuses them.
+    pub unmarked: Vec<PathBuf>,
+    /// A hit on line 0 is in the file's name.
     pub hits: Vec<(PathBuf, Hit)>,
 }
 
-fn is_text(bytes: &[u8]) -> Option<&str> {
-    if bytes.iter().take(8000).any(|&b| b == 0) {
+/// The attribute that allows a staged binary file (`*.png lords-binary` in .gitattributes).
+pub const BINARY_ATTR: &str = "lords-binary";
+
+/// A file's bytes as text to scan, and whether they are text. UTF-8 without NUL bytes and UTF-16 with a byte order
+/// mark are text. Anything else is scanned as its lossy UTF-8 reading plus its printable ASCII runs with NUL bytes
+/// dropped (which also reads UTF-16 without a byte order mark).
+pub fn decode(bytes: &[u8]) -> (String, bool) {
+    let utf16 = |be: bool| {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| {
+                if be {
+                    u16::from_be_bytes([c[0], c[1]])
+                } else {
+                    u16::from_le_bytes([c[0], c[1]])
+                }
+            })
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    match bytes {
+        [0xff, 0xfe, ..] => return (utf16(false), true),
+        [0xfe, 0xff, ..] => return (utf16(true), true),
+        _ => {}
+    }
+    match utf8(bytes) {
+        Some(text) => (text.to_string(), true),
+        None => (byte_text(bytes), false),
+    }
+}
+
+fn utf8(bytes: &[u8]) -> Option<&str> {
+    if bytes.contains(&0) {
         return None;
     }
     std::str::from_utf8(bytes).ok()
 }
 
+/// What can be read in bytes that aren't text: the lossy UTF-8 reading and the printable ASCII runs.
+fn byte_text(bytes: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    let mut run = String::new();
+    for &b in bytes.iter().filter(|&&b| b != 0).chain([&b'\n']) {
+        if b == b'\t' || (0x20..0x7f).contains(&b) {
+            run.push(char::from(b));
+            continue;
+        }
+        if run.len() >= 4 {
+            text.push('\n');
+            text.push_str(&run);
+        }
+        run.clear();
+    }
+    text
+}
+
 impl Scan {
-    fn add(&mut self, path: PathBuf, bytes: &[u8], rules: &Rules) {
-        match is_text(bytes) {
-            Some(text) => {
-                self.files_scanned += 1;
-                self.hits.extend(scan(text, rules).into_iter().map(|h| (path.clone(), h)));
+    /// Scans one file's content (not its name: see `add_name`).
+    pub fn add(&mut self, path: PathBuf, bytes: &[u8], rules: &Rules) {
+        let (text, is_text) = decode(bytes);
+        let mut hits = scan(&text, rules);
+        if utf8(bytes).is_none() {
+            // A UTF-16 byte order mark can also be a binary file's first bytes: its byte runs are scanned too.
+            if is_text {
+                hits.extend(scan(&byte_text(bytes), rules));
             }
-            None => self.binary.push(path),
+            // The readings overlap: one hit per text.
+            let mut seen = BTreeSet::new();
+            hits.retain(|h| seen.insert((h.class, h.text.clone())));
+        }
+        if is_text {
+            self.files_scanned += 1;
+        } else {
+            self.binary.push(path.clone());
+        }
+        self.hits.extend(hits.into_iter().map(|h| (path.clone(), h)));
+    }
+
+    /// Scans a file's repo-relative path, as text: a name can leak as much as content.
+    pub fn add_name(&mut self, path: &Path, rules: &Rules) {
+        let name = path.to_string_lossy().replace('\\', "/");
+        for h in scan(&name, rules) {
+            self.hits.push((path.to_path_buf(), Hit { line: 0, ..h }));
         }
     }
 }
@@ -282,18 +409,38 @@ pub fn scan_tree(repo: &Path, rules: &Rules) -> Result<Scan, String> {
     let mut scan = Scan::default();
     for rel in tree_files(repo)? {
         let bytes = fs::read(repo.join(&rel)).map_err(|e| format!("{}: {e}", rel.display()))?;
+        scan.add_name(&rel, rules);
         scan.add(rel, &bytes, rules);
     }
     Ok(scan)
 }
 
-/// The staged version of every added, copied, modified or renamed file: what the commit would contain.
+/// The staged version of every added, copied, modified or renamed file, and its path: what the commit would
+/// contain. Binary files the staged .gitattributes doesn't mark `lords-binary` are listed in `unmarked`.
 pub fn scan_staged(repo: &Path, rules: &Rules) -> Result<Scan, String> {
     let names = git::run(repo, &["diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"])?;
     let mut scan = Scan::default();
     for rel in names.split('\0').filter(|s| !s.is_empty()) {
         let bytes = git::bytes(repo, &["show", &format!(":{rel}")])?;
+        scan.add_name(Path::new(rel), rules);
         scan.add(PathBuf::from(rel), &bytes, rules);
+    }
+    if !scan.binary.is_empty() {
+        let mut args = vec!["check-attr", "--cached", "-z", BINARY_ATTR, "--"];
+        let paths: Vec<String> =
+            scan.binary.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        args.extend(paths.iter().map(String::as_str));
+        let out = git::run(repo, &args)?;
+        // `-z` output: path, attribute, value, each NUL-terminated.
+        let fields: Vec<&str> = out.split('\0').collect();
+        let marked: BTreeSet<&str> =
+            fields.chunks(3).filter(|f| f.len() == 3 && f[2] == "set").map(|f| f[0]).collect();
+        scan.unmarked = scan
+            .binary
+            .iter()
+            .filter(|p| !marked.contains(p.to_string_lossy().as_ref()))
+            .cloned()
+            .collect();
     }
     Ok(scan)
 }
@@ -315,11 +462,14 @@ pub struct HistoryScan {
 
 /// Every commit reachable from any ref, as `git log -p` shows it: its message and its whole patch (file names
 /// included). What a later commit removed is still in the history, so a clean tree proves nothing about it.
+/// Binary files are shown as text (`--text`) and NUL bytes dropped, so their readable parts and UTF-16 text are
+/// scanned too; what a binary format compresses can't be.
 pub fn scan_history(repo: &Path, rules: &Rules) -> Result<HistoryScan, String> {
     let out = git::run(
         repo,
-        &["log", "--all", "-p", "--no-color", "--no-ext-diff", "--format=%x1e%H%n%B%x1f"],
-    )?;
+        &["log", "--all", "-p", "--text", "--no-color", "--no-ext-diff", "--format=%x1e%H%n%B%x1f"],
+    )?
+    .replace('\0', "");
     let mut scan = HistoryScan::default();
     for record in out.split('\u{1e}').filter(|r| !r.trim().is_empty()) {
         let (head, patch) = record.split_once('\u{1f}').unwrap_or((record, ""));

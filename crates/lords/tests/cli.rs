@@ -79,6 +79,93 @@ fn the_hook_refuses_a_private_commit_and_passes_a_clean_one() {
     assert!(o.status.success(), "{}", text(&o));
 }
 
+// Spec (Sol review 25 Oct, finding 12: "One NUL byte disables staged privacy scanning"): a staged file that isn't
+// text is refused by name, even with nothing found in it, unless the repo marks it `lords-binary` in
+// .gitattributes; one with a private detail after a NUL byte is refused as a finding.
+#[test]
+fn a_staged_binary_is_refused_unless_marked() {
+    let env = Env::new();
+    let repo = env.repo();
+    fs::write(repo.join("blob.dat"), b"\x00\x01\x02\xff\xfe\x00").unwrap();
+    env.git(&repo, &["add", "-A"]);
+    let o = env.lords(&repo, &["privacy", "--staged"]);
+    assert!(!o.status.success() && text(&o).contains("blob.dat"), "{}", text(&o));
+
+    fs::write(repo.join(".gitattributes"), "*.dat binary lords-binary\n").unwrap();
+    env.git(&repo, &["add", "-A"]);
+    let o = env.lords(&repo, &["privacy", "--staged"]);
+    assert!(o.status.success(), "{}", text(&o));
+
+    let leak = [b"\x00".as_slice(), ["alice", "example.org"].join("@").as_bytes()].concat();
+    fs::write(repo.join("blob.dat"), leak).unwrap();
+    env.git(&repo, &["add", "-A"]);
+    let o = env.lords(&repo, &["privacy", "--staged"]);
+    assert!(!o.status.success() && text(&o).contains("contact"), "{}", text(&o));
+}
+
+// Spec (Sol review 25 Oct, finding 14: "The installed hook cannot prevent private commit messages"): `hooks
+// install` also writes a commit-msg hook, so a clean commit with a private message is refused; `privacy --message`
+// checks a message file.
+#[test]
+fn the_hook_refuses_a_private_commit_message() {
+    let env = Env::new();
+    let repo = env.repo();
+    let o = env.lords(&repo, &["hooks", "install"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(repo.join(".git/hooks/commit-msg").is_file(), "{}", text(&o));
+
+    fs::write(repo.join("notes.md"), "clean\n").unwrap();
+    env.git(&repo, &["add", "notes.md"]);
+    let msg = format!("Ask {}", ["alice", "example.org"].join("@"));
+    let o = env.git(&repo, &["commit", "-q", "-m", &msg]);
+    assert!(!o.status.success() && text(&o).contains("contact"), "{}", text(&o));
+    assert!(!env.git(&repo, &["rev-parse", "--verify", "-q", "HEAD"]).status.success());
+    assert!(env.git(&repo, &["commit", "-q", "-m", "clean"]).status.success());
+
+    let file = env.dir.path().join("MSG");
+    fs::write(&file, &msg).unwrap();
+    assert!(!env.lords(&repo, &["privacy", "--message", file.to_str().unwrap()]).status.success());
+    fs::write(&file, "clean\n").unwrap();
+    assert!(env.lords(&repo, &["privacy", "--message", file.to_str().unwrap()]).status.success());
+}
+
+// Spec (Sol review 25 Oct, finding 15: "A broken configured private stack silently weakens the hook's rules"): a
+// configured private stack that doesn't load, or whose fleet config can't be read, fails the check; with no private
+// stack configured the check runs and says what it skipped.
+#[test]
+fn a_broken_private_stack_fails_the_check() {
+    let env = Env::new();
+    let repo = env.repo();
+    fs::write(repo.join("notes.md"), "clean\n").unwrap();
+    env.git(&repo, &["add", "-A"]);
+    let missing = env.dir.path().join("missing-private");
+    let o =
+        env.lords(&repo, &["privacy", "--staged", "--private-stack", missing.to_str().unwrap()]);
+    assert!(!o.status.success(), "{}", text(&o));
+
+    let private = env.dir.path().join("priv");
+    fs::create_dir_all(&private).unwrap();
+    let fleet = env.dir.path().join("no-fleet.toml");
+    fs::write(
+        private.join("stack.toml"),
+        format!(
+            "name = \"priv\"\nvisibility = \"private\"\n[privacy]\nfleet_config = '{}'\n",
+            fleet.display()
+        ),
+    )
+    .unwrap();
+    let o =
+        env.lords(&repo, &["privacy", "--staged", "--private-stack", private.to_str().unwrap()]);
+    assert!(!o.status.success() && text(&o).contains("no-fleet.toml"), "{}", text(&o));
+    fs::write(&fleet, "[host.alpha]\n").unwrap();
+    let o =
+        env.lords(&repo, &["privacy", "--staged", "--private-stack", private.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", text(&o));
+
+    let o = env.lords(&repo, &["privacy", "--staged"]);
+    assert!(o.status.success() && text(&o).contains("no private stack"), "{}", text(&o));
+}
+
 // Spec (hooks install): it never replaces a hook it didn't write unless asked, and then keeps a backup; it
 // refuses a repo whose local core.hooksPath would bypass .git/hooks.
 #[test]

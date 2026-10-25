@@ -127,10 +127,15 @@ A **finding** is a matched span: file, line, pattern class and the matched text.
 | fleet | host names read from the fleet config that the private `stack.toml` names | public |
 | deny | each line of the private `privacy/deny.txt` (names, projects, hosts, phrases) | public |
 
-- **It runs** in `check` and as the public repo's pre-commit hook. That hook lives in `.git/hooks/` (installed by
-  `lords hooks install`), never through `core.hooksPath`, so a global hooks path that dispatches to the repo's own
-  hooks (such as an attribution guard) keeps working.
+- **It runs** in `check` and as the public repo's pre-commit and commit-msg hooks. They live in `.git/hooks/`
+  (installed by `lords hooks install`), never through `core.hooksPath`, so a global hooks path that dispatches to
+  the repo's own hooks (such as an attribution guard) keeps working.
+- **What it reads:** each staged file's content and its path, and the commit message. Deny and fleet terms match in
+  any case (Unicode lower case, NFKD), a phrase across line breaks too. UTF-16 with a byte order mark is read as
+  text; other non-text files are scanned as far as their bytes read as text, and the staged check refuses them unless
+  `.gitattributes` marks them `lords-binary` (e.g. `*.png binary lords-binary`).
 - **Without a private stack** (CI, a stranger's clone), the deny and fleet classes are skipped. The check says so.
+  A private stack that is configured but doesn't load, or a deny-list or fleet config that can't be read, fails it.
 - `privacy/allow.txt` lists accepted false positives as exact strings.
 - **Promotion** (private → public) is one explicit command, `lords promote <id>`:
   1. it runs the check on the entry;

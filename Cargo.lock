@@ -1670,6 +1670,7 @@ dependencies = [
 name = "lords-core"
 version = "0.1.0"
 dependencies = [
+ "icu_normalizer",
  "jsonschema",
  "regex",
  "serde",

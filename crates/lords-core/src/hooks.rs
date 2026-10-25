@@ -1,4 +1,5 @@
-//! `hooks install`: the privacy check as a repo's pre-commit hook, in `.git/hooks` (design: Privacy).
+//! `hooks install`: the privacy check as a repo's pre-commit and commit-msg hooks, in `.git/hooks` (design:
+//! Privacy).
 //! Never through `core.hooksPath`: a global hooks path whose dispatcher runs the repo's own hooks keeps working.
 
 use crate::git;
@@ -20,12 +21,21 @@ pub fn script(lords_exe: &Path, secrets_only: bool) -> String {
     format!("#!/bin/sh\n{MARKER} of the staged files (installed by `lords hooks install`).\nexec \"{exe}\" privacy --staged{flag}\n")
 }
 
+/// The commit-msg hook: git passes the message file as `$1`.
+pub fn commit_msg_script(lords_exe: &Path, secrets_only: bool) -> String {
+    let exe = lords_exe.to_string_lossy().replace('\\', "/");
+    let flag = if secrets_only { " --secrets-only" } else { "" };
+    format!("#!/bin/sh\n{MARKER} of the commit message (installed by `lords hooks install`).\nexec \"{exe}\" privacy --message \"$1\"{flag}\n")
+}
+
+/// Installs the pre-commit and commit-msg hooks. A hook there that isn't ours stops both, unless `force`, which
+/// backs each one up first.
 pub fn install(
     repo: &Path,
     lords_exe: &Path,
     secrets_only: bool,
     force: bool,
-) -> Result<Installed, String> {
+) -> Result<Vec<Installed>, String> {
     if let Ok(local) = git::run(repo, &["config", "--local", "--get", "core.hooksPath"]) {
         return Err(format!(
             "this repo sets core.hooksPath = {} locally, so .git/hooks would not run; unset it or point it at a dispatcher first",
@@ -35,31 +45,43 @@ pub fn install(
     let common = git::run(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
     let dir = PathBuf::from(common.trim()).join("hooks");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let hook = dir.join("pre-commit");
-    let mut backup = None;
-    if let Ok(existing) = fs::read_to_string(&hook) {
-        if !existing.contains(MARKER) {
-            if !force {
-                return Err(format!(
-                    "{} exists and isn't ours; --force backs it up and replaces it",
-                    hook.display()
-                ));
-            }
-            let b = dir.join(format!("pre-commit.bak-{}", crate::ops::today()));
-            fs::rename(&hook, &b).map_err(|e| e.to_string())?;
-            backup = Some(b);
+    let hooks = [
+        ("pre-commit", script(lords_exe, secrets_only)),
+        ("commit-msg", commit_msg_script(lords_exe, secrets_only)),
+    ];
+    let foreign = |name: &str| {
+        fs::read_to_string(dir.join(name)).is_ok_and(|existing| !existing.contains(MARKER))
+    };
+    if !force {
+        if let Some((name, _)) = hooks.iter().find(|(name, _)| foreign(name)) {
+            return Err(format!(
+                "{} exists and isn't ours; --force backs it up and replaces it",
+                dir.join(name).display()
+            ));
         }
-    }
-    fs::write(&hook, script(lords_exe, secrets_only)).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
     }
     let global_hooks_path = git::run(repo, &["config", "--global", "--get", "core.hooksPath"])
         .ok()
         .map(|s| s.trim().to_string());
-    Ok(Installed { hook, backup, global_hooks_path })
+    let mut installed = Vec::new();
+    for (name, text) in hooks {
+        let hook = dir.join(name);
+        let mut backup = None;
+        if foreign(name) {
+            let b = dir.join(format!("{name}.bak-{}", crate::ops::today()));
+            fs::rename(&hook, &b).map_err(|e| e.to_string())?;
+            backup = Some(b);
+        }
+        fs::write(&hook, text).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))
+                .map_err(|e| e.to_string())?;
+        }
+        installed.push(Installed { hook, backup, global_hooks_path: global_hooks_path.clone() });
+    }
+    Ok(installed)
 }
 
 // ---------------------------------------------------------------- post-checkout

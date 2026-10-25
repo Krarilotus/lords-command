@@ -17,8 +17,8 @@ lords check [--public] [--strict] [--json]   every check over both stacks; --pub
 lords import [--store NAME]                  agents' memory dirs into the private stack, committed
 lords retire ID --reason TEXT [--superseded-by ID]
 lords promote ID [--strip | --split]         private → public, only once nothing private is left
-lords hooks install [--secrets-only]         the privacy check as this repo's pre-commit hook
-lords privacy --staged | FILE...
+lords hooks install [--secrets-only]         the privacy check as this repo's pre-commit and commit-msg hooks
+lords privacy --staged | --message FILE | FILE...
 lords hash PATH                              the sha256 an inherited entry records
 ```
 
