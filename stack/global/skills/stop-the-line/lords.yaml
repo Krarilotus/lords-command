@@ -1,0 +1,17 @@
+id: skill.stop-the-line
+kind: skill
+title: "Stop the line: find the cause before any further change"
+audience: [all]
+roles: [orchestrator, coder, helper, reviewer]
+scope: global
+status: active
+visibility: public
+origin:
+  type: adapted
+  repo: https://github.com/addyosmani/agent-skills
+  commit: aeac41d4d005999432bb7312f7ff06383a91d59d
+  path: skills/debugging-and-error-recovery/SKILL.md
+  licence: MIT
+  copyright: Copyright (c) 2025 Addy Osmani
+  changes: "Condensed from 300 lines to eight ordered steps and a never-list; adds fix-at-the-owning-layer, no reruns before the cause is named, and error output as data; drops the shell recipes."
+topics: [debugging, process]

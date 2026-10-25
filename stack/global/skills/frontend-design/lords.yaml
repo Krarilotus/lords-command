@@ -1,0 +1,16 @@
+id: skill.frontend-design
+kind: skill
+title: Frontend design (Anthropic's skill, verbatim)
+audience: [all]
+roles: [orchestrator, coder, helper, reviewer]
+scope: global
+status: active
+visibility: public
+origin:
+  type: inherited
+  repo: https://github.com/anthropics/skills
+  commit: 41bbe19d1a1a7eaab5e7bb9050a417e5c6cffc8f
+  path: skills/frontend-design
+  licence: LICENSE.txt
+  sha256: 7e9c2af00fd5b3144f49ce6fb1b16037b392ab9c2f049423b0b6114d99381ba2
+topics: [design]

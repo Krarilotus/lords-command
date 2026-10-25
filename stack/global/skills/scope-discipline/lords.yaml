@@ -1,0 +1,17 @@
+id: skill.scope-discipline
+kind: skill
+title: "Scope discipline: change only what the task needs, in thin verified slices"
+audience: [all]
+roles: [orchestrator, coder, helper]
+scope: global
+status: active
+visibility: public
+origin:
+  type: adapted
+  repo: https://github.com/addyosmani/agent-skills
+  commit: aeac41d4d005999432bb7312f7ff06383a91d59d
+  path: skills/incremental-implementation/SKILL.md
+  licence: MIT
+  copyright: Copyright (c) 2025 Addy Osmani
+  changes: "Condensed from 249 lines to six rules plus a noticed-but-not-touching report; adds search-before-write and the big-file limit; drops checklists, rationalisations and agent tips."
+topics: [scope, process]

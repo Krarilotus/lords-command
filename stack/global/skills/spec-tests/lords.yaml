@@ -1,0 +1,17 @@
+id: skill.spec-tests
+kind: skill
+title: "Spec tests: every test states specified behaviour and fails without its change"
+audience: [all]
+roles: [orchestrator, coder, helper, reviewer]
+scope: global
+status: active
+visibility: public
+origin:
+  type: adapted
+  repo: https://github.com/addyosmani/agent-skills
+  commit: aeac41d4d005999432bb7312f7ff06383a91d59d
+  path: skills/test-driven-development/SKILL.md
+  licence: MIT
+  copyright: Copyright (c) 2025 Addy Osmani
+  changes: "Reframed from TDD (398 lines) to tests of specified behaviour: a spec line per test, a required red check, a tautology list; drops the pyramid, browser testing and stack discovery."
+topics: [testing]

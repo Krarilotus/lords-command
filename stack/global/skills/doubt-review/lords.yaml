@@ -1,0 +1,17 @@
+id: skill.doubt-review
+kind: skill
+title: "Doubt review: an unbiased fault-finding review that withholds your conclusion"
+audience: [all]
+roles: [orchestrator, coder]
+scope: global
+status: active
+visibility: public
+origin:
+  type: adapted
+  repo: https://github.com/addyosmani/agent-skills
+  commit: aeac41d4d005999432bb7312f7ff06383a91d59d
+  path: skills/doubt-driven-development/SKILL.md
+  licence: MIT
+  copyright: Copyright (c) 2025 Addy Osmani
+  changes: "Condensed from 243 lines to five steps for orchestrators and leads; the reviewer gets artifact and contract only; drops the CLI recipes for other model families."
+topics: [review]
