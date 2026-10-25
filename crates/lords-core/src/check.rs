@@ -452,8 +452,11 @@ fn privacy_of_entries(stacks: &Stacks, public_rules: &Rules, out: &mut Vec<Findi
     }
 }
 
+/// A hit on line 0 is in the file's name.
 pub fn privacy_finding(file: &Path, h: &privacy::Hit) -> Finding {
-    Finding::error("privacy", format!("{}: `{}`", h.class.name(), h.text)).at(file, Some(h.line))
+    let place = if h.line == 0 { " in the file name" } else { "" };
+    Finding::error("privacy", format!("{}{place}: `{}`", h.class.name(), h.text))
+        .at(file, Some(h.line).filter(|&l| l > 0))
 }
 
 /// `check --public`: the whole public repo tree, every file git would commit, scanned with all classes.

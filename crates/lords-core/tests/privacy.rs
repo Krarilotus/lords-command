@@ -85,7 +85,7 @@ fn strip_replaces_only_the_spans() {
 // Spec (Privacy): without a private stack the deny and fleet classes can't run, and that is reported.
 #[test]
 fn a_missing_private_stack_is_reported() {
-    let r = Rules::public().with_private(None);
+    let r = Rules::public().with_private(None).unwrap();
     assert_eq!(r.notes.len(), 1);
 }
 
@@ -119,4 +119,103 @@ fn the_history_scan_finds_what_the_tree_no_longer_shows() {
     git(&clean, &["add", "-A"]);
     git(&clean, &["commit", "-q", "-m", "fine"]);
     assert!(lords_core::privacy::scan_history(&clean, &rules).unwrap().hits.is_empty());
+}
+
+// Spec (Sol review 25 Oct, finding 16: "Unicode case variants bypass deny and fleet matches"): deny and fleet
+// terms match whatever the case, in any script, and a decomposed spelling matches the composed term.
+#[test]
+fn deny_and_fleet_terms_match_unicode_case_and_normal_forms() {
+    let mut r = Rules::public();
+    r.deny = vec!["m\u{fc}ller".into()];
+    assert_eq!(classes("Ask M\u{dc}LLER first.", &r), vec![Class::Deny]);
+    assert_eq!(classes("Ask Mu\u{308}ller first.", &r), vec![Class::Deny]);
+    let f = Fixture::new();
+    let p = f.write("fleet.toml", "[host.\"\u{d6}STE\"]\ncores = 2\n");
+    r.hosts = fleet_hosts(&p).unwrap();
+    assert_eq!(classes("built on \u{f6}ste", &r), vec![Class::Fleet]);
+}
+
+// Spec (Sol review 25 Oct, finding 17: "Alphabetic API tokens are explicitly excluded"): a long letters-only value
+// assigned to a secret-named key is a secret; one ordinary word joined up stays prose.
+#[test]
+fn a_letters_only_token_after_a_secret_key_is_a_secret() {
+    let r = Rules::public();
+    let token = ["QwErTyUiOpAsDfGh", "JkLzXcVbNmAbCdEf"].concat();
+    assert_eq!(classes(&format!("api_key = '{token}'"), &r), vec![Class::Secret]);
+    assert_eq!(
+        classes(&format!("password: {}", "abcdefghijklmnopqrstuvwxyzabcdefgh"), &r),
+        vec![Class::Secret]
+    );
+    assert_eq!(classes("token = \"anunbrokenwordwithoutdigits\"", &r), vec![]);
+    assert_eq!(classes("token: TokenizerConfiguration", &r), vec![]);
+    assert_eq!(classes("secret: some_long_variable_name", &r), vec![]);
+}
+
+// Spec (Sol review 25 Oct, finding 25: "A CRLF-wrapped deny phrase bypasses scanning"): a multi-word deny term
+// matches across any whitespace run, a line break (CRLF included) too.
+#[test]
+fn a_deny_phrase_matches_across_line_breaks() {
+    let mut r = Rules::public();
+    r.deny = vec!["secret project".into()];
+    assert_eq!(classes("our secret\r\nproject here", &r), vec![Class::Deny]);
+    assert_eq!(classes("our Secret \t\n  Project here", &r), vec![Class::Deny]);
+    assert_eq!(classes("a secret\n\nprojector", &r), vec![]);
+}
+
+/// A repo with `files` staged (not committed).
+fn staged_repo(f: &Fixture, files: &[(&str, &[u8])]) -> std::path::PathBuf {
+    let repo = f.path("staged");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    for (name, bytes) in files {
+        std::fs::write(repo.join(name), bytes).unwrap();
+    }
+    git(&repo, &["add", "-A"]);
+    repo
+}
+
+// Spec (Sol review 25 Oct, finding 12: "One NUL byte disables staged privacy scanning"): a staged file with a NUL
+// byte or invalid UTF-8 is still scanned, UTF-16 with a byte order mark is decoded and scanned as text, and the
+// history scan sees binary patches too.
+#[test]
+fn binary_and_utf16_content_is_still_scanned() {
+    let f = Fixture::new();
+    let mail = email("alice");
+    let nul = [b"\0".as_slice(), mail.as_bytes(), b"\n"].concat();
+    let bad = [b"\xff\xfe\xfd ".as_slice(), mail.as_bytes()].concat();
+    let utf16: Vec<u8> = [0xff_u8, 0xfe]
+        .into_iter()
+        .chain(format!("mail {mail}\r\n").encode_utf16().flat_map(|u| u.to_le_bytes()))
+        .collect();
+    let repo = staged_repo(&f, &[("a.dat", &nul), ("b.dat", &bad), ("c.txt", &utf16)]);
+    let scan = lords_core::privacy::scan_staged(&repo, &Rules::public()).unwrap();
+    let mut files: Vec<String> =
+        scan.hits.iter().map(|(p, h)| format!("{} {:?}", p.display(), h.class)).collect();
+    files.dedup();
+    assert_eq!(files, ["a.dat Contact", "b.dat Contact", "c.txt Contact"]);
+    assert!(!scan.binary.iter().any(|p| p.ends_with("c.txt")), "UTF-16 is text: {:?}", scan.binary);
+
+    git(&repo, &["commit", "-q", "-m", "binary"]);
+    let h = lords_core::privacy::scan_history(&repo, &Rules::public()).unwrap();
+    let places: Vec<&str> = h.hits.iter().map(|x| x.place.as_str()).collect();
+    for p in ["a.dat", "b.dat"] {
+        assert!(places.contains(&p), "{places:?}");
+    }
+}
+
+// Spec (Sol review 25 Oct, finding 13: "Staged filenames are never privacy-checked"): a staged file's path is
+// scanned with the same rules as its content.
+#[test]
+fn a_staged_file_name_is_scanned() {
+    let f = Fixture::new();
+    let name = format!("{}.txt", email("alice"));
+    let repo = staged_repo(&f, &[(&name, b"innocuous\n")]);
+    let mut r = Rules::public();
+    r.deny = vec!["kestrel".into()];
+    std::fs::create_dir_all(repo.join("Kestrel")).unwrap();
+    std::fs::write(repo.join("Kestrel/x.md"), "fine\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    let scan = lords_core::privacy::scan_staged(&repo, &r).unwrap();
+    let classes: Vec<Class> = scan.hits.iter().map(|(_, h)| h.class).collect();
+    assert_eq!(classes, [Class::Deny, Class::Contact], "{:?}", scan.hits);
 }

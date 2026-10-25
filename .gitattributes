@@ -1,3 +1,4 @@
 * text=auto eol=lf
-*.ico binary
-*.png binary
+# lords-binary: the staged privacy check allows these binary files (it refuses any binary file not marked).
+*.ico binary lords-binary
+*.png binary lords-binary

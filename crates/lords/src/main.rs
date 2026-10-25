@@ -17,10 +17,11 @@ usage:
   lords import [--store NAME] [--no-commit]
   lords retire ID --reason TEXT [--superseded-by ID] [--date YYYY-MM-DD] [--no-commit]
   lords promote ID [--strip | --split] [--no-commit]
-  lords privacy --staged [--secrets-only]
+  lords privacy --staged [--secrets-only]   staged files and their paths; a binary needs `lords-binary` in .gitattributes
+  lords privacy --message FILE [--secrets-only]   a commit message (the commit-msg hook)
   lords privacy --history [--private-stack DIR]   every commit's message and patch (the pre-push check)
   lords privacy FILE...
-  lords hooks install [--repo DIR] [--secrets-only] [--force]
+  lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit and commit-msg hooks
   lords hash PATH
   lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--json] [--apply]
   lords hooks install --post-checkout [--repo DIR]   a new worktree gets its place files (`sync --place`)
@@ -105,7 +106,7 @@ fn print_findings(findings: &[Finding], json: bool) {
     );
 }
 
-fn public_rules(public: &Path, private: Option<&Stack>) -> Rules {
+fn public_rules(public: &Path, private: Option<&Stack>) -> Result<Rules, String> {
     Rules::public().with_allow_from(public).with_private(private)
 }
 
@@ -125,7 +126,7 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
         }
     }
     let private = p.private.as_deref().map(Stack::load).transpose()?;
-    let rules = public_rules(&p.public, private.as_ref());
+    let rules = public_rules(&p.public, private.as_ref())?;
     if public_only {
         let stacks = Stacks::load(&p.public, None)?;
         let mut findings = check::check(&stacks, &rules);
@@ -335,7 +336,7 @@ fn cmd_promote(mut a: Args) -> Result<bool, String> {
     let id = a.positional().ok_or("promote needs an entry id")?;
     a.done()?;
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
-    let rules = public_rules(&p.public, stacks.private.as_ref());
+    let rules = public_rules(&p.public, stacks.private.as_ref())?;
     let r = ops::promote(&stacks, &id, mode, &rules, commit)?;
     println!("promoted {id} to {}", r.to.display());
     if r.stripped > 0 {
@@ -354,6 +355,7 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
     let staged = a.flag("--staged");
     let history = a.flag("--history");
     let secrets_only = a.flag("--secrets-only");
+    let message = a.value("--message")?;
     let public_stack = a.value("--public-stack")?.map(PathBuf::from);
     let private_stack = a.value("--private-stack")?.map(PathBuf::from);
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
@@ -367,8 +369,9 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
         if public_stack.is_some() {
             cfg.public = public_stack;
         }
-        let private = cfg.private.as_deref().and_then(|p| Stack::load(p).ok());
-        let mut rules = Rules::public().with_private(private.as_ref());
+        // A configured private stack that doesn't load fails the check: its deny and fleet lists would be skipped.
+        let private = cfg.private.as_deref().map(Stack::load).transpose()?;
+        let mut rules = Rules::public().with_private(private.as_ref())?;
         if let Some(top) = git::toplevel(&cwd) {
             rules = rules.with_allow_from(&top.join("stack"));
         }
@@ -403,23 +406,38 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
         privacy::scan_staged(&top, &rules)?
     } else {
         let mut scan = privacy::Scan::default();
-        while let Some(f) = a.positional() {
-            let text = std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}"))?;
-            scan.files_scanned += 1;
-            scan.hits
-                .extend(privacy::scan(&text, &rules).into_iter().map(|h| (PathBuf::from(&f), h)));
-        }
+        let files: Vec<String> = std::iter::from_fn(|| a.positional()).collect();
         a.done()?;
+        for f in &files {
+            let bytes = std::fs::read(f).map_err(|e| format!("{f}: {e}"))?;
+            scan.add(PathBuf::from(f), &bytes, &rules);
+        }
+        // Named files have no .gitattributes to mark them: one that isn't text is refused.
+        scan.unmarked = scan.binary.clone();
+        // A commit message has no NUL bytes, and its lossy reading keeps every readable part: never refused.
+        if let Some(m) = &message {
+            let bytes = std::fs::read(m).map_err(|e| format!("{m}: {e}"))?;
+            scan.add(PathBuf::from(m), &bytes, &rules);
+        }
         scan
     };
     for (p, h) in &scan.hits {
         eprintln!("{}", check::privacy_finding(p, h));
     }
-    if !scan.hits.is_empty() {
+    for p in &scan.unmarked {
         eprintln!(
-            "lords privacy: {} finding(s) in {} file(s) scanned; nothing committed",
+            "lords privacy: {} is not text, so only its readable bytes were scanned; if it is meant to be binary, \
+             mark it `{}` in .gitattributes",
+            p.display(),
+            privacy::BINARY_ATTR
+        );
+    }
+    if !scan.hits.is_empty() || !scan.unmarked.is_empty() {
+        eprintln!(
+            "lords privacy: {} finding(s) and {} unmarked binary file(s) in {} file(s) scanned; nothing committed",
             scan.hits.len(),
-            scan.files_scanned
+            scan.unmarked.len(),
+            scan.files_scanned + scan.binary.len()
         );
         return Ok(false);
     }
@@ -472,13 +490,15 @@ fn cmd_hooks(mut a: Args) -> Result<bool, String> {
     }
     a.done()?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let r = hooks::install(&repo, &exe, secrets_only, force)?;
-    println!("installed {}", r.hook.display());
-    if let Some(b) = r.backup {
-        println!("the old hook is at {}", b.display());
+    let installed = hooks::install(&repo, &exe, secrets_only, force)?;
+    for r in &installed {
+        println!("installed {}", r.hook.display());
+        if let Some(b) = &r.backup {
+            println!("the old hook is at {}", b.display());
+        }
     }
-    if let Some(g) = r.global_hooks_path {
-        println!("note: global core.hooksPath = {g}; its dispatcher must run .git/hooks/pre-commit for this to take effect");
+    if let Some(g) = installed.first().and_then(|r| r.global_hooks_path.as_ref()) {
+        println!("note: global core.hooksPath = {g}; its dispatcher must run .git/hooks/pre-commit and commit-msg for this to take effect");
     }
     Ok(true)
 }

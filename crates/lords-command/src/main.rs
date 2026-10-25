@@ -248,8 +248,13 @@ impl App {
         let (public, private) = (p.public.clone(), p.private.clone());
         self.checking = Some(Task::start(ctx, move || {
             let Ok(stacks) = Stacks::load(&public, private.as_deref()) else { return Vec::new() };
-            let rules =
-                Rules::public().with_allow_from(&public).with_private(stacks.private.as_ref());
+            let rules = match Rules::public()
+                .with_allow_from(&public)
+                .with_private(stacks.private.as_ref())
+            {
+                Ok(rules) => rules,
+                Err(e) => return vec![lords_core::Finding::error("privacy-scope", e)],
+            };
             let mut found = check::check(&stacks, &rules);
             found.extend(sync::drift_findings(&stacks));
             found
