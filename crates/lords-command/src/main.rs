@@ -42,6 +42,7 @@ struct Fields {
     title: String,
     audience: Vec<Audience>,
     topics: Vec<String>,
+    roles: Vec<String>,
     body: String,
 }
 
@@ -96,6 +97,7 @@ fn fields(e: &Entry) -> Fields {
         title: e.meta.title.clone(),
         audience: e.meta.audience.clone(),
         topics: e.meta.topics.clone(),
+        roles: e.meta.roles.clone(),
         body: e.body.clone(),
     }
 }
@@ -129,6 +131,9 @@ fn source_url(o: &Origin) -> Option<String> {
 fn hover_of(e: &Entry) -> String {
     let mut h =
         format!("{}\n{}\n{} · {} · {}", e.id(), e.meta.title, e.stack, e.scope, e.meta.kind.name());
+    if !e.meta.roles.is_empty() {
+        h.push_str(&format!("\nfor: {}", e.meta.roles.join(", ")));
+    }
     match &e.meta.origin {
         Origin::Own => h.push_str("\nown"),
         Origin::Adapted(s) => h.push_str(&format!(
@@ -434,6 +439,13 @@ impl App {
             }
             t
         };
+        let roles: Vec<String> = {
+            let mut r = stacks.public.manifest.roles.clone();
+            if e.stack == Visibility::Private {
+                r.extend(stacks.private.iter().flat_map(|p| p.manifest.roles.clone()));
+            }
+            r
+        };
         let others: Vec<String> = stacks
             .entries()
             .filter(|x| x.active() && x.id() != e.id())
@@ -523,6 +535,25 @@ impl App {
                 }
             });
             ui.end_row();
+            ui.label(mono("roles", dim(TEXT)));
+            ui.horizontal_wrapped(|ui| {
+                if roles.is_empty() {
+                    ui.label(mono("—", dim(TEXT)))
+                        .on_hover_text("the stack.toml declares no roles");
+                } else if draft.now.roles.is_empty() {
+                    ui.label(mono("∀", BLUE)).on_hover_text("every role");
+                }
+                for r in &roles {
+                    let mut on = draft.now.roles.contains(r);
+                    if ui::toggle(ui, &mut on, r, AMBER, "only for this role").clicked() {
+                        draft.now.roles.retain(|x| x != r);
+                        if on {
+                            draft.now.roles.push(r.clone());
+                        }
+                    }
+                }
+            });
+            ui.end_row();
             let named: Vec<(&str, &String)> = e
                 .meta
                 .overrides
@@ -567,6 +598,7 @@ impl App {
                     audience: (d.now.audience != d.loaded.audience)
                         .then(|| d.now.audience.iter().map(|a| audience_name(*a)).collect()),
                     topics: (d.now.topics != d.loaded.topics).then(|| d.now.topics.clone()),
+                    roles: (d.now.roles != d.loaded.roles).then(|| d.now.roles.clone()),
                     body: (d.now.body != d.loaded.body).then(|| d.now.body.clone()),
                 };
                 act = Some(Act::Save(e.id().to_string(), edit));

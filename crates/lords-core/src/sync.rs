@@ -150,18 +150,34 @@ fn context(
     audience: Vec<Audience>,
     layers: Layers,
 ) -> Context {
-    Context { audience, layers, public_only: false, skip_stores: native_stores(stacks, adapter) }
+    Context {
+        audience,
+        layers,
+        public_only: false,
+        skip_stores: native_stores(stacks, adapter),
+        roles: None,
+    }
+}
+
+/// A target's role, if it names one.
+fn roles_of(t: &Target) -> Option<Vec<String>> {
+    (!t.roles.is_empty()).then(|| t.roles.clone())
+}
+
+/// Past this share of an adapter's size limit, sync notes it and `check` warns, before the harness cuts text.
+pub const SIZE_WARN_PERCENT: usize = 75;
+
+fn over_size(adapter: &dyn Adapter, bytes: usize) -> Option<usize> {
+    adapter.byte_limit().filter(|limit| bytes * 100 > limit * SIZE_WARN_PERCENT)
 }
 
 fn size_note(item: &mut Item, adapter: &dyn Adapter, text: &str) {
-    if let Some(limit) = adapter.byte_limit() {
-        if text.len() > limit / 2 {
-            item.notes.push(format!(
-                "{} bytes: {} reads at most {limit} bytes of instruction files in total, repo files included",
-                text.len(),
-                adapter.id()
-            ));
-        }
+    if let Some(limit) = over_size(adapter, text.len()) {
+        item.notes.push(format!(
+            "{} bytes: {} reads at most {limit} bytes of instruction files in total, repo files included",
+            text.len(),
+            adapter.id()
+        ));
     }
 }
 
@@ -169,7 +185,8 @@ fn size_note(item: &mut Item, adapter: &dyn Adapter, text: &str) {
 /// file includes, so several profiles read one copy.
 fn instructions_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec<Item> {
     let path = expand_home(&t.path);
-    let ctx = context(stacks, adapter, audience_of(&t.audience, adapter), Layers::Global);
+    let mut ctx = context(stacks, adapter, audience_of(&t.audience, adapter), Layers::Global);
+    ctx.roles = roles_of(t);
     let composed = compose::compose(stacks, &ctx);
     let replace = t.own_text.as_deref() == Some("replace");
     let current = read(&path).unwrap_or_default();
@@ -544,6 +561,7 @@ fn repo_items(stacks: &Stacks, name: &str, repo: &stack::Repo, plan: &mut Plan) 
             },
             public_only: true,
             skip_stores: Vec::new(),
+            roles: None,
         };
         let composed = compose::compose(stacks, &ctx);
         let proposed = compose::place_block(&current, &composed.text, false);
@@ -745,6 +763,14 @@ pub fn drift_findings(stacks: &Stacks) -> Vec<crate::Finding> {
                     .at(&i.path, None)
                 })
                 .collect();
+            for i in plan.items.iter() {
+                for n in i.notes.iter().filter(|n| n.contains(" reads at most ")) {
+                    out.push(
+                        Finding::warning("size", format!("{}: {n}", i.target)).at(&i.path, None),
+                    );
+                }
+            }
+            out.extend(repo_size_findings(stacks));
             out.extend(plan.notes.iter().map(|n| Finding::info("sync-note", n.clone())));
             out
         }
@@ -781,4 +807,34 @@ pub fn backup_dir() -> Result<PathBuf, String> {
     let home = crate::config::home().ok_or("no home dir")?;
     let stamp = format!("{}-{}", crate::ops::today(), std::process::id());
     Ok(home.join(".lords-command").join("backups").join(stamp))
+}
+
+/// What one session in a repo reads together (the user-level text, the repo's own, and the tracked-instructions
+/// preamble of its first checkout), against each adapter's limit.
+fn repo_size_findings(stacks: &Stacks) -> Vec<crate::Finding> {
+    let Some(private) = &stacks.private else { return Vec::new() };
+    let mut out = Vec::new();
+    for (name, repo) in &private.manifest.repos {
+        let first = repo.checkouts.first().map(|c| expand_home(c));
+        for adapter in adapters::ALL.iter().copied() {
+            if !repo.adapters.is_empty() && !repo.adapters.iter().any(|a| a == adapter.id()) {
+                continue;
+            }
+            let global = adapter.render(&user_composed(stacks, adapter)).len();
+            let own = adapter.render(&repo_composed(stacks, name, adapter)).len();
+            let pre =
+                first.as_deref().and_then(|c| adapter.repo_preamble(c)).map_or(0, |p| p.len());
+            let total = global + own + pre;
+            if let Some(limit) = over_size(adapter, total) {
+                out.push(crate::Finding::warning(
+                    "size",
+                    format!(
+                        "repo {name}: {} reads {total} bytes there ({global} user level, {own} repo, {pre} tracked); its limit is {limit}",
+                        adapter.id()
+                    ),
+                ));
+            }
+        }
+    }
+    out
 }

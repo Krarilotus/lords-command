@@ -14,6 +14,34 @@ const HEADER: &str =
 
 const MEMORY_INTRO: &str = "Notes agents wrote down earlier. Read a note's file when its topic comes up; notes are not rules.";
 
+/// The line that stands for notes meant for one role, when the reader's role is unknown: how many per role, and
+/// the dirs they are in.
+fn role_pointer(notes: &[&Entry]) -> Option<String> {
+    if notes.is_empty() {
+        return None;
+    }
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut dirs: Vec<String> = Vec::new();
+    for e in notes {
+        for r in &e.meta.roles {
+            *counts.entry(r.as_str()).or_default() += 1;
+        }
+        let dir =
+            e.body_file.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+        let dir = if cfg!(windows) { dir.replace('/', "\\") } else { dir };
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    let counts: Vec<String> = counts.iter().map(|(r, n)| format!("{r}: {n}")).collect();
+    let dirs: Vec<String> = dirs.iter().map(|d| format!("`{d}`")).collect();
+    Some(format!(
+        "- More notes are for one role only ({}); in that role, find them in {} (each file's `roles` says whose).",
+        counts.join(", "),
+        dirs.join(", ")
+    ))
+}
+
 /// One memory index line: name, its one-line hook, and the file to read.
 pub fn index_line(e: &Entry) -> String {
     let name =
@@ -55,6 +83,10 @@ pub struct Context {
     pub public_only: bool,
     /// Memory stores the target's harness already loads by itself: left out of the memory index.
     pub skip_stores: Vec<String>,
+    /// The role whoever reads the file has (`None`: unknown). A known role gets only entries for it (or for
+    /// every role); with an unknown one, role-specific entries are labelled, and role-specific notes are left out
+    /// of the memory index for a pointer to them.
+    pub roles: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -101,7 +133,20 @@ fn reaches(e: &Entry, audience: &[Audience]) -> bool {
 }
 
 /// The label for an entry meant for only some of a target's audiences (Sol and Astra share one file).
-fn only_for(e: &Entry, audience: &[Audience]) -> Option<String> {
+/// The label for an entry meant for only some of a file's readers: the agents (Sol and Astra share one file)
+/// and, where the file's role is unknown, the roles.
+fn only_for(e: &Entry, ctx: &Context) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(agents) = only_agents(e, &ctx.audience) {
+        parts.push(agents);
+    }
+    if ctx.roles.is_none() && !e.meta.roles.is_empty() {
+        parts.push(e.meta.roles.join(", "));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+fn only_agents(e: &Entry, audience: &[Audience]) -> Option<String> {
     if e.meta.audience.contains(&Audience::All)
         || audience.iter().all(|a| e.meta.audience.contains(a))
     {
@@ -128,7 +173,16 @@ pub fn applicable<'a>(stacks: &'a Stacks, ctx: &Context) -> Vec<&'a Entry> {
         .filter(|e| e.active())
         .filter(|e| !ctx.public_only || e.stack == Visibility::Public)
         .filter(|e| in_layers(e, &ctx.layers) && reaches(e, &ctx.audience))
+        .filter(|e| for_role(e, ctx))
         .collect()
+}
+
+/// A known role takes entries for it or for every role; an unknown one keeps them all (labelled, or pointed to).
+fn for_role(e: &Entry, ctx: &Context) -> bool {
+    match &ctx.roles {
+        None => true,
+        Some(roles) => e.meta.roles.is_empty() || e.meta.roles.iter().any(|r| roles.contains(r)),
+    }
 }
 
 pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
@@ -152,7 +206,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
 
     let mut lines: Vec<String> = Vec::new();
     let push_entry = |e: &Entry, lines: &mut Vec<String>, out: &mut Composed| {
-        if let Some(who) = only_for(e, &ctx.audience) {
+        if let Some(who) = only_for(e, ctx) {
             lines.push(format!("({who} only)"));
         }
         for (i, l) in e.body.trim_matches('\n').lines().enumerate() {
@@ -212,7 +266,11 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         })
         .collect();
     notes.sort_by(|a, b| (a.rank(), a.id()).cmp(&(b.rank(), b.id())));
-    if !notes.is_empty() {
+    // Where the reader's role is unknown, notes for one role stay out of the index; one line says where they are.
+    let (role_notes, notes): (Vec<&Entry>, Vec<&Entry>) =
+        notes.into_iter().partition(|e| ctx.roles.is_none() && !e.meta.roles.is_empty());
+    let pointer = role_pointer(&role_notes);
+    if !notes.is_empty() || pointer.is_some() {
         if !lines.is_empty() {
             lines.push(String::new());
         }
@@ -231,8 +289,11 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             });
             out.ids.push(e.id().to_string());
         }
+        if let Some(p) = pointer {
+            lines.push(p);
+        }
     }
-    if out.ids.is_empty() {
+    if out.ids.is_empty() && lines.is_empty() {
         return out;
     }
     // Two header lines precede the composed lines.

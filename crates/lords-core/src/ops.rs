@@ -483,6 +483,7 @@ pub struct Edit {
     pub title: Option<String>,
     pub audience: Option<Vec<String>>,
     pub topics: Option<Vec<String>>,
+    pub roles: Option<Vec<String>>,
     pub body: Option<String>,
 }
 
@@ -515,6 +516,15 @@ pub fn edit(
         }
     }
     let stack = stacks.stack(e.stack).expect("the entry's stack is loaded");
+    if let Some(roles) = &change.roles {
+        let declared = |r: &String| {
+            stacks.public.manifest.roles.contains(r)
+                || (e.stack == Visibility::Private && stack.manifest.roles.contains(r))
+        };
+        if let Some(r) = roles.iter().find(|r| !declared(r)) {
+            return Err(format!("role `{r}` isn't in the {} stack's roles list", e.stack));
+        }
+    }
     if let Some(topics) = &change.topics {
         let declared = |t: &String| {
             stacks.public.manifest.topics.contains(t)
@@ -533,6 +543,9 @@ pub fn edit(
     }
     if let Some(t) = &change.topics {
         keys.push(("topics", (!t.is_empty()).then(|| yaml_list(t))));
+    }
+    if let Some(r) = &change.roles {
+        keys.push(("roles", (!r.is_empty()).then(|| yaml_list(r))));
     }
     let files: Vec<PathBuf> = if e.meta_file == e.body_file {
         vec![e.meta_file.clone()]

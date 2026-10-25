@@ -13,6 +13,12 @@
       "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
       "description": "the controlled list of topics entries may tag; a public entry may use only the public stack's topics"
     },
+    "roles": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+      "description": "the controlled list of roles entries and targets may name; a public entry may use only the public stack's"
+    },
     "visibility": { "enum": ["public", "private"] },
     "projects": {
       "type": "object",
@@ -50,6 +56,7 @@
           "kind": { "enum": ["instructions", "skills", "settings"] },
           "path": { "type": "string", "description": "~ expands to the home dir" },
           "audience": { "type": "array", "items": { "enum": ["opus", "sol", "astra"] } },
+          "roles": { "type": "array", "items": { "type": "string" }, "description": "the role whoever reads this file has; absent: unknown, so only every-role entries and a pointer to the rest" },
           "own_text": { "enum": ["keep", "replace"], "default": "keep", "description": "instructions: keep the text outside the managed block, or replace the whole file with it" },
           "via": { "type": "string", "description": "instructions: the shared file that holds the composed text; this file gets only an include line" },
           "exclude": { "type": "array", "items": { "type": "string" }, "description": "settings: instruction files the harness must skip" }

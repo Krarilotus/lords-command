@@ -55,6 +55,9 @@ pub struct Target {
     pub path: String,
     #[serde(default)]
     pub audience: Vec<String>,
+    /// The role whoever reads this file has; empty: unknown.
+    #[serde(default)]
+    pub roles: Vec<String>,
     /// `replace`: the whole file becomes the managed block. Default `keep`.
     #[serde(default)]
     pub own_text: Option<String>,
@@ -95,6 +98,9 @@ pub struct Manifest {
     /// The controlled list of topics (design: Entry metadata).
     #[serde(default)]
     pub topics: Vec<String>,
+    /// The controlled list of roles (design: Entry metadata).
+    #[serde(default)]
+    pub roles: Vec<String>,
     #[serde(default)]
     pub projects: BTreeMap<String, Project>,
     #[serde(default)]

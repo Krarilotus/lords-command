@@ -248,3 +248,25 @@ fn edit_changes_named_fields_and_refuses_what_would_break() {
     ));
     assert_eq!(f.read("priv/global/rules/e.md"), before, "a broken edit is put back");
 }
+
+// Spec (orchestrator, 25 Oct: roles come from the stack's roles list): an edit sets roles from that list and
+// refuses an undeclared one.
+#[test]
+fn edit_sets_declared_roles_only() {
+    let f = Fixture::new();
+    f.write(
+        "priv/stack.toml",
+        "name = \"priv\"\nvisibility = \"private\"\nroles = [\"orchestrator\"]\n",
+    );
+    f.write("priv/global/memory/n.md", &entry("memory.n", "global", "private", "", "Note.\n"));
+    let set = |roles: &[&str]| {
+        let change = lords_core::ops::Edit {
+            roles: Some(roles.iter().map(|r| r.to_string()).collect()),
+            ..Default::default()
+        };
+        lords_core::ops::edit(&f.stacks(), "memory.n", &change, false)
+    };
+    set(&["orchestrator"]).unwrap();
+    assert_eq!(f.stacks().find("memory.n").unwrap().meta.roles, ["orchestrator"]);
+    assert!(set(&["admiral"]).is_err());
+}

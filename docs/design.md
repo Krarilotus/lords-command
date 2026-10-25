@@ -91,7 +91,8 @@ it replaces.
 | `id` | `<kind>.<slug>` | unique across both stacks; never changes meaning and is never reused (retire instead); a memory's comes from its file name |
 | `kind` | intent, rule, role, fact, status, template, skill, memory | `fact` is new: host, machine and repo facts, neither rules nor memories |
 | `title` | text | one line, for lists and the GUI |
-| `audience` | list of opus, sol, astra, all | |
+| `audience` | list of opus, sol, astra, all | the agents (families' models) it is for |
+| `roles` | roles from the `roles` list in `stack.toml` (e.g. orchestrator, coder, reviewer) | absent: every role. A target that knows its reader's role (`roles` on the target) gets only entries for that role or every role; where the role is unknown, role-specific entries are labelled, and role-specific notes leave the memory index for one pointer line |
 | `scope` | global, `project:<p>`, `repo:<r>`, `path:<r>:<sub>` | must match the directory |
 | `status` | active, retired | retired needs `retired.date` and `retired.reason`, and `superseded_by` when there is a successor |
 | `visibility` | public, private | must match the stack |
@@ -209,8 +210,12 @@ never writes memory back.
   its copy in the stack.
   - Harnesses read a note's file when its topic comes up. Codex was checked to do this; it doesn't expand `@path`
     imports, so an index is the form every harness can use (load-order.md).
-  - A store that a harness already loads by itself is marked `native = ["<adapter>"]` and left out of that adapter's
-    index, so it isn't read twice.
+  - A store that a harness already loads by itself may be marked `native = ["<adapter>"]` and left out of that
+    adapter's index, so it isn't read twice. Usually it isn't: the index reaches sessions the harness's own memory
+    doesn't.
+  - Notes for one role (`roles`, e.g. orchestrator) are left out wherever the reader's role is unknown (a user-level
+    file, a repo's files); one line says how many there are per role and where. A target that names its role lists
+    them.
 - **`sync --apply` imports first** (one commit), then writes, so the index points at the notes as they are. A dry run
   says how many notes an import would bring.
 - **A note binds nobody.** The index is introduced as notes, not rules. Making a note binding is a promotion: it
@@ -229,6 +234,8 @@ never writes memory back.
 | adapted or inherited entry without repo, commit, path and licence; inherited skill differs from its recorded source hash | error |
 | privacy findings (public stack: all classes; private stack: secret) | error |
 | deployed target drifted from a fresh composition | warning |
+| an adapter's composed text past 75 % of its size limit (a user-level file; a repo's files plus the user level) | warning |
+| an entry naming a topic or role its stack doesn't list | error |
 | near-duplicate text across entries (shingled similarity over normalised sentences) | candidate |
 | same topic, conflicting numbers or keywords, no relation named | candidate |
 | active entry links a retired one | warning |

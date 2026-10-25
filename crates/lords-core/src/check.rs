@@ -152,6 +152,22 @@ fn declared(stacks: &Stacks, out: &mut Vec<Finding>) {
                 || (e.stack == Visibility::Private
                     && stacks.private.as_ref().is_some_and(|p| p.manifest.topics.contains(t)))
         };
+        // Roles likewise.
+        let role_known = |r: &String| {
+            stacks.public.manifest.roles.contains(r)
+                || (e.stack == Visibility::Private
+                    && stacks.private.as_ref().is_some_and(|p| p.manifest.roles.contains(r)))
+        };
+        for r in e.meta.roles.iter().filter(|r| !role_known(r)) {
+            out.push(
+                Finding::error(
+                    "role-undeclared",
+                    format!("role `{r}` is not in the {} stack's roles list", e.stack),
+                )
+                .at(&e.meta_file, None)
+                .entry(e.id()),
+            );
+        }
         for t in e.meta.topics.iter().filter(|t| !known(t)) {
             out.push(
                 Finding::error(

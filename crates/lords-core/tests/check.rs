@@ -345,3 +345,29 @@ fn topics_come_from_a_controlled_list() {
     );
     assert!(has(&f.check(), "topic-undeclared", "rule.a"));
 }
+
+// Spec (orchestrator, 25 Oct: "roles from the private stack's roles list"): an entry names only declared roles;
+// a public entry only the public stack's.
+#[test]
+fn roles_come_from_a_controlled_list() {
+    let f = Fixture::new();
+    f.write(
+        "priv/stack.toml",
+        "name = \"priv\"\nvisibility = \"private\"\nroles = [\"orchestrator\"]\n",
+    );
+    f.write(
+        "priv/global/rules/a.md",
+        &entry("rule.a", "global", "private", "roles: [orchestrator]\n", "x\n"),
+    );
+    assert_eq!(errors(&f.check()), Vec::<&str>::new());
+    f.write(
+        "pub/global/rules/b.md",
+        &entry("rule.b", "global", "public", "roles: [orchestrator]\n", "y\n"),
+    );
+    assert!(has(&f.check(), "role-undeclared", "rule.b"), "declared only privately");
+    f.write(
+        "priv/global/rules/a.md",
+        &entry("rule.a", "global", "private", "roles: [admiral]\n", "x\n"),
+    );
+    assert!(has(&f.check(), "role-undeclared", "rule.a"));
+}

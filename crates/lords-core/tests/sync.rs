@@ -8,7 +8,13 @@ use lords_core::sync::{apply, plan, Action, Options};
 use std::fs;
 
 fn global(audience: Vec<Audience>) -> Context {
-    Context { audience, layers: Layers::Global, public_only: false, skip_stores: vec![] }
+    Context {
+        audience,
+        layers: Layers::Global,
+        public_only: false,
+        skip_stores: vec![],
+        roles: None,
+    }
 }
 
 // Spec (Layers): composition takes the applicable entries, drops what an applicable entry overrides, orders by
@@ -113,6 +119,7 @@ fn repo_layers_take_their_project_and_repo() {
             layers: layers(false),
             public_only: false,
             skip_stores: vec![],
+            roles: None,
         },
     );
     assert_eq!(c.ids, ["rule.p", "fact.r", "fact.s"]);
@@ -123,6 +130,7 @@ fn repo_layers_take_their_project_and_repo() {
             layers: layers(true),
             public_only: true,
             skip_stores: vec![],
+            roles: None,
         },
     );
     assert_eq!(c.ids, ["rule.g", "rule.p", "fact.r"]);
@@ -384,8 +392,11 @@ fn every_adapter_gets_a_memory_index_except_for_its_native_store() {
             sub: None,
             global: false,
         };
-        compose(&f.stacks(), &Context { audience, layers, public_only: false, skip_stores: vec![] })
-            .text
+        compose(
+            &f.stacks(),
+            &Context { audience, layers, public_only: false, skip_stores: vec![], roles: None },
+        )
+        .text
     };
     assert!(repo(vec![Audience::Opus]).contains("- bench-layout: benches by purpose"));
     assert!(
@@ -523,4 +534,88 @@ fn worktree_roots_limit_the_worktrees_and_tracked_instructions_still_load() {
     assert!(claude.contains("-->\n@AGENTS.md\n\n# Facts\n\nHosts through the fleet."), "{claude}");
     let codex = by("AGENTS.override.md");
     assert!(codex.contains("-->\nTracked text.\n\n# Facts\n\nHosts through the fleet."), "{codex}");
+}
+
+fn role_ctx(roles: Option<Vec<&str>>) -> Context {
+    Context {
+        audience: vec![Audience::Sol, Audience::Astra],
+        layers: Layers::Global,
+        public_only: false,
+        skip_stores: vec![],
+        roles: roles.map(|r| r.into_iter().map(String::from).collect()),
+    }
+}
+
+// Spec (orchestrator, 25 Oct: "Index lines are filtered by role as well as family. Where a target can't know the
+// role … it shows only all-role notes, plus a one-line pointer to where role-specific ones are"): with the role
+// unknown, a note for one role is left out of the index for a pointer line, and a binding entry for one role is
+// labelled; a known role gets only what is for it (or for every role).
+#[test]
+fn notes_and_entries_follow_the_readers_role() {
+    let f = Fixture::new();
+    let note = |id: &str, roles: &str| entry(id, "global", "private", roles, "Note.\n");
+    f.write("priv/global/memory/all.md", &note("memory.all", ""));
+    f.write("priv/global/memory/orch.md", &note("memory.orch", "roles: [orchestrator]\n"));
+    f.write(
+        "priv/global/rules/merge.md",
+        &entry(
+            "rule.merge",
+            "global",
+            "private",
+            "roles: [orchestrator]\n",
+            "Merge after review.\n",
+        ),
+    );
+    let s = f.stacks();
+
+    let unknown = compose(&s, &role_ctx(None)).text;
+    assert!(unknown.contains("- all: memory.all (`") && !unknown.contains("- orch:"), "{unknown}");
+    assert!(
+        unknown.contains(
+            "- More notes are for one role only (orchestrator: 1); in that role, find them in `"
+        ),
+        "{unknown}"
+    );
+    assert!(unknown.contains("(orchestrator only)\nMerge after review."), "{unknown}");
+
+    let coder = compose(&s, &role_ctx(Some(vec!["coder"]))).text;
+    assert!(
+        !coder.contains("orch")
+            && !coder.contains("Merge after review")
+            && !coder.contains("More notes"),
+        "{coder}"
+    );
+
+    let orchestrator = compose(&s, &role_ctx(Some(vec!["orchestrator"]))).text;
+    assert!(
+        orchestrator.contains("- orch: memory.orch (`")
+            && orchestrator.contains("\nMerge after review."),
+        "{orchestrator}"
+    );
+    assert!(
+        !orchestrator.contains("(orchestrator only)") && !orchestrator.contains("More notes"),
+        "{orchestrator}"
+    );
+}
+
+// Spec (orchestrator, 25 Oct: "check warns when an adapter's composed output passes 75 % of its size limit (Codex
+// 32 KiB)"): past 75 % there is a `size` warning naming the target; below it, none.
+#[test]
+fn check_warns_before_an_adapter_cuts_text() {
+    let warned = |bytes: usize| {
+        let f = Fixture::new();
+        f.write(
+            "pub/global/rules/big.md",
+            &entry("rule.big", "global", "public", "", &format!("{}\n", "x".repeat(bytes))),
+        );
+        with_targets(
+            &f,
+            &target("codex", "codex", "instructions", &f.path("home/.codex/AGENTS.md"), ""),
+        );
+        lords_core::sync::drift_findings(&f.stacks())
+            .iter()
+            .any(|x| x.code == "size" && x.message.contains("codex"))
+    };
+    assert!(warned(25_000), "25 000 bytes of 32 768 is past 75 %");
+    assert!(!warned(23_000), "23 000 bytes is under 75 %");
 }

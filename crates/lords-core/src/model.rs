@@ -160,6 +160,9 @@ pub struct Meta {
     pub kind: Kind,
     pub title: String,
     pub audience: Vec<Audience>,
+    /// The roles it is for (stack.toml `roles`); empty: every role.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
     pub scope: String,
     pub status: Status,
     #[serde(default, skip_serializing_if = "Option::is_none")]
