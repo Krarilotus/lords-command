@@ -13,5 +13,5 @@ origin:
   path: skills/test-driven-development/SKILL.md
   licence: MIT
   copyright: Copyright (c) 2025 Addy Osmani
-  changes: "Reframed from TDD (398 lines) to tests of specified behaviour: a spec line per test, a required red check, a tautology list; drops the pyramid, browser testing and stack discovery."
+  changes: "Reframed from TDD (398 lines) to tests of specified behaviour: a spec line per test, a required red check, a tautology list; drops the pyramid, browser testing and stack discovery. The red check's default is a test committed before its fix (owner, 25 Oct: mutation runs are expensive and slow); mutation after the fact only as a stated fallback."
 topics: [testing]
