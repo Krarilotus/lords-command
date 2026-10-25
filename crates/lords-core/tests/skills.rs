@@ -109,6 +109,14 @@ fn an_old_user_level_copy_of_a_development_skill_is_retired() {
     let dir = f.path("home/skills");
     f.write("home/skills/spec-tests/SKILL.md", "an old copy\n");
     f.write("home/skills/frontend-design/SKILL.md", "not ours\n");
+    // An inherited, third-party skill in the stack: the user's own copy of it stays.
+    f.write("pub/global/skills/vendor/SKILL.md", "---\nname: vendor\n---\nx\n");
+    let hash = lords_core::check::path_hash(&f.path("pub/global/skills/vendor")).unwrap();
+    f.write(
+        "pub/global/skills/vendor/lords.yaml",
+        &format!("id: skill.vendor\nkind: skill\ntitle: vendor\naudience: [all]\nroles: [coder]\nscope: global\nstatus: active\nvisibility: public\norigin:\n  type: inherited\n  repo: someone/skills\n  commit: 0123abc\n  path: skills/vendor\n  licence: MIT\n  sha256: {hash}\n"),
+    );
+    f.write("home/skills/vendor/SKILL.md", "the user's own install\n");
     f.write(
         "priv/stack.toml",
         &format!("name = \"priv\"\nvisibility = \"private\"\nroles = [\"coder\"]\n[[targets]]\nname = \"skills\"\nadapter = \"codex\"\nkind = \"skills\"\npath = '{}'\n", dir.display()),
@@ -118,6 +126,7 @@ fn an_old_user_level_copy_of_a_development_skill_is_retired() {
         |name: &str| p.items.iter().find(|i| i.path == dir.join(name)).map(|i| i.action.clone());
     assert_eq!(action("spec-tests"), Some(Action::RemoveDir));
     assert_eq!(action("frontend-design"), None);
+    assert_eq!(action("vendor"), None, "an inherited skill's user copy stays");
     apply(&p, &f.path("backups")).unwrap();
     assert!(!dir.join("spec-tests").exists() && dir.join("frontend-design/SKILL.md").exists());
     let backed: Vec<_> = fs::read_dir(f.path("backups")).unwrap().flatten().collect();

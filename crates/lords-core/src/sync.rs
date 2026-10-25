@@ -29,7 +29,8 @@ pub enum Action {
     ReplaceDir,
     /// A link into a stack for a skill that no longer applies.
     Unlink,
-    /// A plain copy of a stack skill where that skill no longer installs (an older install): backed up, removed.
+    /// A plain copy of a skill the stack made (own or adapted) where it no longer installs (an older install):
+    /// backed up, removed. Copies of inherited, third-party skills are the user's own and stay.
     RemoveDir,
     /// Shown, never written (a tracked file: it changes by a commit, not by sync).
     Report,
@@ -358,7 +359,10 @@ fn skills_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec<Item>
             child.is_dir()
                 && stacks.entries().any(|e| {
                     e.meta.kind == Kind::Skill
-                        && !matches!(e.meta.origin, crate::model::Origin::InRepo { .. })
+                        && matches!(
+                            e.meta.origin,
+                            crate::model::Origin::Own | crate::model::Origin::Adapted(_)
+                        )
                         && e.id().trim_start_matches("skill.") == name
                 })
         };
