@@ -138,3 +138,17 @@ pub fn errors(findings: &[Finding]) -> Vec<&'static str> {
 pub fn has(findings: &[Finding], code: &str, entry: &str) -> bool {
     findings.iter().any(|f| f.code == code && f.entry.as_deref() == Some(entry))
 }
+
+/// Writes a ledger record by hand, as someone editing the ledger would: the path `root` + `parts`, of `kind`,
+/// holding what is there now, in `scope`. A forged record; sync must accept it only where the grammar does.
+pub fn forge(home: &Path, root: &Path, parts: &[&str], kind: &str, scope: &str) {
+    let path = parts.iter().fold(root.to_path_buf(), |p, part| p.join(part));
+    let sha = if kind == "dir" {
+        lords_core::fsguard::tree_sha(&lords_core::fsguard::read_tree(&path).unwrap())
+    } else {
+        lords_core::fsguard::sha(&fs::read(&path).unwrap())
+    };
+    let mut ledger = lords_core::ledger::Ledger::load(home).unwrap();
+    ledger.record(&path, kind, &sha, scope);
+    ledger.save(home).unwrap();
+}

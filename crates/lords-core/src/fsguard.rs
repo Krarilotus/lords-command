@@ -253,6 +253,13 @@ pub fn append_line(path: &Path, line: &str) -> Result<(), String> {
 
 /// Puts a file at `path`, where nothing may be: written beside it, then linked in (which fails if something
 /// appeared meanwhile), so `path` is absent or whole.
+///
+/// Spec (design-simplification-r6, rule A: "fsguard's mutating calls take no `&Path`"): a plain path doesn't
+/// compile, only a place built from a verified root.
+///
+/// ```compile_fail
+/// lords_core::fsguard::put_file(std::path::Path::new("anywhere"), b"bytes").unwrap();
+/// ```
 pub fn put_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     put_file_as(path, bytes, None)
 }

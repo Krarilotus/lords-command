@@ -509,3 +509,30 @@ fn r5_03_no_ffi_outside_the_doors() {
     assert!(missed.is_empty(), "not caught: {missed:?}");
     assert_eq!(forbidden("crates/lords-core/src/fsguard.rs", cases[0].1), Vec::<String>::new());
 }
+
+// Spec (Sol review r6, R6-03: "The required commit check never executes the text lint"; rule E: the runner runs
+// both layers): the commit check runs this lint test, not only clippy.
+#[test]
+fn r6_03_the_commit_check_runs_the_text_lint() {
+    let check =
+        fs::read_to_string(workspace().join("tools").join("commit-check.sh")).unwrap_or_default();
+    assert!(check.contains("--test fsguard_lint"), "{check}");
+}
+
+// Spec (R6-04: "Raw identifiers let a Clippy escape pass even when both lint layers run"; rule E: `r#` is
+// normalised before matching): the reviewer's raw spellings are each caught in an ordinary source.
+#[test]
+fn r6_04_raw_identifiers_are_normalised() {
+    let cases = [
+        ("a raw allow", "#[allow(clippy::r#disallowed_methods)]\nfn f() {}"),
+        ("a raw std, renamed", "use r#std as s;"),
+        ("a raw path", "let _ = std::r#fs::r#remove_file(p);"),
+        ("a raw module ban", "r#std::r#process::r#Command::new(\"powershell\");"),
+    ];
+    let missed: Vec<&str> = cases
+        .iter()
+        .filter(|(_, code)| forbidden("crates/lords-core/src/sync.rs", code).is_empty())
+        .map(|(w, _)| *w)
+        .collect();
+    assert!(missed.is_empty(), "not caught: {missed:?}");
+}

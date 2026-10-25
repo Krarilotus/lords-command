@@ -543,3 +543,61 @@ fn a_missing_lords_never_fails_the_checkout() {
     assert!(!wt.join("CLAUDE.local.md").exists());
     assert!(fs::read_to_string(&log).unwrap().contains("lords not found at /nowhere/lords.exe"));
 }
+
+/// A nonce as `lords check` makes them: 32 hex digits.
+const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+fn hook_run(env: &Env, repo: &Path, hook: &str, probe: &str, args: &[&str]) -> Output {
+    let mut c = env.cmd("git", repo);
+    c.args(["hook", "run", "--ignore-missing", hook]);
+    if !args.is_empty() {
+        c.arg("--").args(args);
+    }
+    c.env("LORDS_HOOK_PROBE", probe).output().unwrap()
+}
+
+// Spec (design review, point 1: "The hook prints the token and exits early only when `LORDS_HOOK_PROBE` equals a
+// nonce whose file exists. Anything else → the normal check, unchanged. The test: a stale or invented value with no
+// file doesn't switch the check off"): with an invented nonce and no file, the pre-commit hook still refuses a
+// staged leak.
+#[test]
+fn an_invented_probe_value_doesnt_switch_the_check_off() {
+    let env = Env::new();
+    let repo = env.repo();
+    assert!(env.lords(&repo, &["hooks", "install"]).status.success());
+    fs::write(repo.join("notes.md"), format!("logs in C:\\{}\\alice\\logs\n", "Users")).unwrap();
+    env.git(&repo, &["add", "notes.md"]);
+    for probe in [NONCE, "", "../../etc", "yes"] {
+        let o = hook_run(&env, &repo, "pre-commit", probe, &[]);
+        assert!(!o.status.success() && text(&o).contains("path"), "{probe:?}: {}", text(&o));
+        assert!(!text(&o).contains("lords-hook-probe"), "{probe:?}: {}", text(&o));
+    }
+}
+
+// Spec (design, rule D: "A hook prints `lords-hook-probe:<nonce>:<hook>` and exits 0 only when `LORDS_HOOK_PROBE`
+// is a nonce and `<home>/state/probe-<nonce>` exists"): with the nonce's file there, both hooks answer the probe
+// and check nothing.
+#[test]
+fn a_probe_with_its_nonce_file_is_answered() {
+    let env = Env::new();
+    let repo = env.repo();
+    assert!(env.lords(&repo, &["hooks", "install"]).status.success());
+    let state = env.dir.path().join("home").join(".lords-command").join("state");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(state.join(format!("probe-{NONCE}")), "").unwrap();
+    let msg = env.dir.path().join("probe-message");
+    fs::write(&msg, "a probe\n").unwrap();
+    let pre = hook_run(&env, &repo, "pre-commit", NONCE, &[]);
+    assert!(
+        pre.status.success()
+            && text(&pre).contains(&format!("lords-hook-probe:{NONCE}:pre-commit")),
+        "{}",
+        text(&pre)
+    );
+    let m = hook_run(&env, &repo, "commit-msg", NONCE, &[msg.to_str().unwrap()]);
+    assert!(
+        m.status.success() && text(&m).contains(&format!("lords-hook-probe:{NONCE}:commit-msg")),
+        "{}",
+        text(&m)
+    );
+}
