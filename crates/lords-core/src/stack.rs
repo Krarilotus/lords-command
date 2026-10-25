@@ -443,6 +443,8 @@ impl Stack {
                         visibility: self.visibility(),
                         basis: Vec::new(),
                         evidence: Vec::new(),
+                        temporary: None,
+                        state: None,
                         origin: crate::model::Origin::InRepo {
                             repo: name.clone(),
                             path,

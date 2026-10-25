@@ -32,6 +32,8 @@ pub enum Action {
     /// A plain copy of a skill the stack made (own or adapted) where it no longer installs (an older install):
     /// backed up, removed. Copies of inherited, third-party skills are the user's own and stay.
     RemoveDir,
+    /// A temporary entry that has ended: `--apply` retires it in its stack (with a commit) before writing.
+    RetireEntry,
     /// Shown, never written (a tracked file: it changes by a commit, not by sync).
     Report,
     /// Can't proceed; the reason is in the notes.
@@ -781,6 +783,18 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
             Err(e) => plan.notes.push(format!("memory stores: {e}")),
         }
     }
+    // Ended temporary entries: never composed; listed here, retired by import_and_apply.
+    for (e, why) in crate::temporary::expired(stacks, &crate::ops::today()) {
+        let mut item = Item::new(
+            &format!("{} (temporary entry)", e.id()),
+            e.meta_file.clone(),
+            Action::RetireEntry,
+        );
+        item.notes.push(format!(
+            "expired: {why}; --apply retires it (one commit) and no file composes it"
+        ));
+        plan.items.push(item);
+    }
     if opts.repo.is_none() {
         for t in &private.manifest.targets {
             let adapter = adapters::get(&t.adapter).ok_or_else(|| {
@@ -918,7 +932,8 @@ pub fn apply(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
                 fs::rename(&item.path, &backup)
                     .map_err(|e| format!("{}: {e}", item.path.display()))?;
             }
-            Action::InSync | Action::Report | Action::Conflict => continue,
+            // Retired by import_and_apply before this runs; nothing to write here.
+            Action::InSync | Action::Report | Action::Conflict | Action::RetireEntry => continue,
         }
         done.push(format!("{:?} {}", item.action, item.path.display()));
     }
@@ -1007,6 +1022,14 @@ pub fn import_and_apply(
                 }
             }
         }
+    }
+    // Ended temporary entries leave the stacks' context for good: retired, with a commit each.
+    let stacks = Stacks::load(public, private)?;
+    for (id, commit) in crate::ops::retire_expired(&stacks, &crate::ops::today(), true)? {
+        done.push(format!(
+            "retired expired {id}{}",
+            commit.map(|c| format!(": commit {c}")).unwrap_or_default()
+        ));
     }
     let stacks = Stacks::load(public, private)?;
     done.extend(apply(&plan(&stacks, opts)?, backup_dir)?);

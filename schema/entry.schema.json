@@ -69,6 +69,28 @@
         "additionalProperties": false
       }
     },
+    "temporary": {
+      "type": "object",
+      "description": "a temporary entry: it ends on `until` (a date) or `when` a status entry reaches a state, and is reviewed by `review_by` (renew it by moving that date, or it ends); an ended entry is never composed and is retired by sync",
+      "required": ["review_by", "reason"],
+      "anyOf": [{ "required": ["until"] }, { "required": ["when"] }],
+      "properties": {
+        "until": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+        "when": {
+          "type": "object",
+          "required": ["status", "state"],
+          "properties": {
+            "status": { "type": "string", "pattern": "^status\\." },
+            "state": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        },
+        "review_by": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+        "reason": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "state": { "type": "string", "minLength": 1, "description": "status entries only: the current state, which a temporary entry's `when` can watch" },
     "origin": {
       "oneOf": [
         {
@@ -116,6 +138,7 @@
   "allOf": [
     { "if": { "properties": { "status": { "const": "retired" } } }, "then": { "required": ["retired"] } },
     { "if": { "properties": { "kind": { "const": "skill" } } }, "then": { "properties": { "id": { "pattern": "^skill\\." } } } },
+    { "if": { "not": { "properties": { "kind": { "const": "status" } } } }, "then": { "not": { "required": ["state"] } } },
     { "if": { "properties": { "origin": { "properties": { "type": { "const": "inherited" } } } } }, "then": { "properties": { "origin": { "required": ["sha256"] } } } }
   ],
   "additionalProperties": false

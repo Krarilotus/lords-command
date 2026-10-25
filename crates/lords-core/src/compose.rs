@@ -234,12 +234,15 @@ fn only_agents(e: &Entry, audience: &[Audience]) -> Option<String> {
 }
 
 pub fn applicable<'a>(stacks: &'a Stacks, ctx: &Context) -> Vec<&'a Entry> {
+    let today = crate::ops::today();
     stacks
         .entries()
         .filter(|e| e.active())
         .filter(|e| !ctx.public_only || e.stack == Visibility::Public)
         .filter(|e| in_layers(e, &ctx.layers) && reaches(e, &ctx.audience))
         .filter(|e| for_role(e, ctx))
+        // An ended temporary entry is never composed (it is retired at the next sync).
+        .filter(|e| crate::temporary::ended(e, stacks, &today).is_none())
         .collect()
 }
 
@@ -281,6 +284,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
     let mut lines: Vec<String> = Vec::new();
     let push_entry = |e: &Entry, lines: &mut Vec<String>, out: &mut Composed| {
         let who = only_for(e, ctx, &development);
+        let temp = crate::temporary::label(e, stacks);
         // In a file every role reads under a byte limit, an entry for only some roles is a reference; the role
         // files of the roles it binds carry its text.
         let partial_role = ctx.roles.is_none()
@@ -288,7 +292,8 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             && !development.iter().all(|r| e.meta.roles.contains(r));
         if ctx.by_reference && partial_role {
             let who = who.unwrap_or_else(|| e.meta.roles.join(", "));
-            lines.push(format!("- ({who} only) {} (`{}`)", e.meta.title, shown_path(e)));
+            let temp = temp.map(|t| format!("; {t}")).unwrap_or_default();
+            lines.push(format!("- ({who} only{temp}) {} (`{}`)", e.meta.title, shown_path(e)));
             out.sources.push(Source {
                 line: lines.len(),
                 id: e.id().to_string(),
@@ -299,8 +304,11 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             out.ids.push(e.id().to_string());
             return;
         }
-        if let Some(who) = who {
-            lines.push(format!("({who} only)"));
+        match (who, temp) {
+            (Some(who), Some(t)) => lines.push(format!("({who} only; {t})")),
+            (Some(who), None) => lines.push(format!("({who} only)")),
+            (None, Some(t)) => lines.push(format!("({t})")),
+            (None, None) => {}
         }
         for (i, l) in e.body.trim_matches('\n').lines().enumerate() {
             lines.push(l.trim_end_matches('\r').to_string());
@@ -347,7 +355,10 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
                     .collect();
                 ext.sort_by_key(|x| x.id().to_string());
                 for x in std::iter::once(e).chain(ext) {
-                    lines.push(format!("- {} (`{}`)", x.meta.title, shown_path(x)));
+                    let temp = crate::temporary::label(x, stacks)
+                        .map(|t| format!(" ({t})"))
+                        .unwrap_or_default();
+                    lines.push(format!("- {}{temp} (`{}`)", x.meta.title, shown_path(x)));
                     out.sources.push(Source {
                         line: lines.len(),
                         id: x.id().to_string(),

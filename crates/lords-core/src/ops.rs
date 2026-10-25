@@ -109,6 +109,38 @@ pub fn retire(stacks: &Stacks, r: &Retire) -> Result<Retired, String> {
     Ok(Retired { file: e.meta_file.clone(), commit })
 }
 
+/// Retires every temporary entry that has ended by `today`, reason "expired: <why>", one commit each: it stays in
+/// history, never in an agent's context. Returns the ids with their commits.
+pub fn retire_expired(
+    stacks: &Stacks,
+    today: &str,
+    commit: bool,
+) -> Result<Vec<(String, Option<String>)>, String> {
+    let ended: Vec<(String, String)> = crate::temporary::expired(stacks, today)
+        .into_iter()
+        .map(|(e, why)| (e.id().to_string(), why))
+        .collect();
+    let mut done = Vec::new();
+    for (id, why) in ended {
+        // Reload: each retirement changes a file the next one's stack load reads.
+        let s =
+            Stacks::load(&stacks.public.root, stacks.private.as_ref().map(|p| p.root.as_path()))?;
+        let reason = format!("expired: {why}");
+        let r = retire(
+            &s,
+            &Retire {
+                id: &id,
+                reason: &reason,
+                superseded_by: None,
+                date: today.to_string(),
+                commit,
+            },
+        )?;
+        done.push((id, r.commit));
+    }
+    Ok(done)
+}
+
 // ---------------------------------------------------------------- import
 
 /// The keys Lords Command adds to a memory file, which an import keeps when the agent's copy changes: every entry

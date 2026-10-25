@@ -164,6 +164,27 @@ impl Origin {
     }
 }
 
+/// The status an end condition watches: when entry `status` has `state`, the temporary entry has ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndsWhen {
+    pub status: String,
+    pub state: String,
+}
+
+/// A temporary entry's end (owner, 25 Oct: temporary rules must not "poison the context … forever"): a date or a
+/// status condition, and a review date by which it is renewed or it ends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Temporary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<EndsWhen>,
+    pub review_by: String,
+    pub reason: String,
+}
+
 /// A case behind an entry: what happened, when, and where it is recorded. Kept beside the rule, never in the
 /// composed text (the rule stays a short principle).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +217,11 @@ pub struct Meta {
     pub basis: Vec<Basis>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<Evidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporary: Option<Temporary>,
+    /// A status entry's current state, which a temporary entry's `when` can watch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
     pub origin: Origin,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub topics: Vec<String>,

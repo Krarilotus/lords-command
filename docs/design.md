@@ -100,6 +100,8 @@ it replaces.
 | `basis` | list of {quote, date, by} | the owner's words behind the entry, where there are any |
 | `evidence` | list of {summary, date, links} | the cases behind the entry (incidents, measurements); kept beside it, never composed, so the rule stays a short principle; links are checked |
 | `origin` | own; adapted or inherited with repo, commit, path, licence (+ `changes` for adapted); imported with the store and file; in-repo with repo, path and hash | inherited means verbatim; in-repo: a skill tracked in a repo (`skills = [...]` on the repo), indexed where it is, never linked, copied or moved, and listed in that repo's files |
+| `temporary` | {until: date \| when: {status, state}, review_by, reason} | a temporary entry: it ends on `until`, when the status entry it names reaches `state`, or when `review_by` passes unrenewed (renew by moving that date). An ended entry is never composed; `check` warns (`temporary-expired`, fails `--strict`); `sync --apply` retires it with a commit. Composed text labels a live one with its end |
+| `state` | text | status entries only: the current state a `when` condition watches |
 | `topics` | tags from the `topics` list in `stack.toml` | a controlled list (a public entry uses only the public stack's); drive conflict and duplicate detection |
 | `overrides`, `extends` | entry ids | see Layers |
 | `order` | integer | optional, for ordering within a section |

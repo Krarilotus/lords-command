@@ -119,6 +119,7 @@ pub fn check(stacks: &Stacks, public_rules: &Rules) -> Vec<Finding> {
     provenance(stacks, &mut out);
     overlap::check(stacks, &mut out);
     skill_clashes(stacks, &mut out);
+    temporaries(stacks, &crate::ops::today(), &mut out);
     privacy_of_entries(stacks, public_rules, &mut out);
     for n in &public_rules.notes {
         out.push(Finding::info("privacy-scope", n.clone()));
@@ -353,6 +354,37 @@ fn provenance(stacks: &Stacks, out: &mut Vec<Finding>) {
     }
 }
 
+/// Temporary entries: each `when` watches a real status entry, and one that has ended is reported (sync retires
+/// it). The warning fails under `--strict` like any finding the owner must act on.
+pub fn temporaries(stacks: &Stacks, today: &str, out: &mut Vec<Finding>) {
+    for e in stacks.entries().filter(|e| e.active()) {
+        let Some(t) = &e.meta.temporary else { continue };
+        if let Some(w) = &t.when {
+            match stacks.find(&w.status) {
+                Some(s) if s.meta.kind == crate::model::Kind::Status => {}
+                _ => out.push(
+                    Finding::error(
+                        "dangling",
+                        format!("temporary.when watches `{}`, which is no status entry", w.status),
+                    )
+                    .at(&e.meta_file, None)
+                    .entry(e.id()),
+                ),
+            }
+        }
+        if let Some(why) = crate::temporary::ended(e, stacks, today) {
+            out.push(
+                Finding::warning(
+                    "temporary-expired",
+                    format!("ended ({why}); it is no longer composed, and sync --apply retires it"),
+                )
+                .at(&e.meta_file, None)
+                .entry(e.id()),
+            );
+        }
+    }
+}
+
 /// A development skill that sync would link into a repo where the repo already tracks a skill of that name.
 fn skill_clashes(stacks: &Stacks, out: &mut Vec<Finding>) {
     for t in stacks.entries().filter(|e| matches!(e.meta.origin, Origin::InRepo { .. })) {
@@ -415,7 +447,8 @@ pub fn public_tree(repo: &Path, rules: &Rules) -> Result<(Scan, Vec<Finding>), S
 }
 
 pub fn has_errors(findings: &[Finding], strict: bool) -> bool {
-    findings
-        .iter()
-        .any(|f| f.severity == Severity::Error || (strict && f.severity == Severity::Candidate))
+    findings.iter().any(|f| {
+        f.severity == Severity::Error
+            || (strict && (f.severity == Severity::Candidate || f.code == "temporary-expired"))
+    })
 }
