@@ -250,6 +250,8 @@ fn evidence_stays_beside_the_rule() {
         skip_stores: vec![],
         roles: None,
         by_reference: false,
+        role_dir: None,
+        relative_to: None,
     };
     let text = lords_core::compose::compose(&s, &ctx).text;
     assert!(text.contains("One writer per file.") && !text.contains("Two lanes"), "{text}");
@@ -286,8 +288,15 @@ fn repo_skills_are_indexed_in_place() {
         o => panic!("origin {o:?}"),
     }
     let p = plan(&s, &Options::default()).unwrap();
-    assert!(proposed(&p, &checkout.join("AGENTS.override.md"))
-        .contains("# Skills here\n\n- review: review a lane's diff (`"));
+    let sep = std::path::MAIN_SEPARATOR_STR;
+    let place = proposed(&p, &checkout.join("AGENTS.override.md"));
+    let here = checkout.join("v2/.claude/skills").display().to_string().replace('/', sep);
+    assert!(
+        place.contains(&format!(
+            "# Skills here\n\nIn `{here}`, as `<name>{sep}SKILL.md`:\n- review: review a lane's diff\n"
+        )),
+        "{place}"
+    );
     assert!(
         p.items.iter().all(|i| !i.path.starts_with(&skills_dir) || i.action != Action::Link),
         "never linked"

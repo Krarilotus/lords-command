@@ -15,6 +15,8 @@ fn global(audience: Vec<Audience>) -> Context {
         skip_stores: vec![],
         roles: None,
         by_reference: false,
+        role_dir: None,
+        relative_to: None,
     }
 }
 
@@ -122,6 +124,8 @@ fn repo_layers_take_their_project_and_repo() {
             skip_stores: vec![],
             roles: None,
             by_reference: false,
+            role_dir: None,
+            relative_to: None,
         },
     );
     assert_eq!(c.ids, ["rule.p", "fact.r", "fact.s"]);
@@ -134,6 +138,8 @@ fn repo_layers_take_their_project_and_repo() {
             skip_stores: vec![],
             roles: None,
             by_reference: false,
+            role_dir: None,
+            relative_to: None,
         },
     );
     assert_eq!(c.ids, ["rule.g", "rule.p", "fact.r"]);
@@ -403,15 +409,18 @@ fn the_memory_index_goes_to_places_never_to_the_user_level() {
                 skip_stores: skip,
                 roles: None,
                 by_reference: false,
+                role_dir: None,
+                relative_to: None,
             },
         )
         .text
     };
     let codex = place(vec![Audience::Sol, Audience::Astra], vec![]);
     let prompts = f.path("priv/global/memory/agent/prompts.md");
+    // The dir is named once; a note whose file isn't `<name>.md` names its file.
     let line = format!(
-        "- prompts-in-chat: paste prompts as code blocks (`{}`)",
-        prompts.display().to_string().replace('/', std::path::MAIN_SEPARATOR_STR)
+        "In `{}`:\n- prompts-in-chat: paste prompts as code blocks (`prompts.md`)",
+        prompts.parent().unwrap().display().to_string().replace('/', std::path::MAIN_SEPARATOR_STR)
     );
     assert!(codex.contains(&format!("# Memory\n\nNotes agents wrote down earlier. Read a note's file when its topic comes up; notes are not rules.\n\n{line}\n")), "{codex}");
     assert!(!codex.contains("Body that stays in the file"), "an index, not the note's text");
@@ -571,6 +580,8 @@ fn role_ctx(roles: Option<Vec<&str>>) -> Context {
         skip_stores: vec![],
         roles: roles.map(|r| r.into_iter().map(String::from).collect()),
         by_reference: false,
+        role_dir: None,
+        relative_to: None,
     }
 }
 
@@ -597,7 +608,7 @@ fn notes_and_entries_follow_the_readers_role() {
     let s = f.stacks();
 
     let unknown = compose(&s, &role_ctx(None)).text;
-    assert!(unknown.contains("- all: memory.all (`") && !unknown.contains("- orch:"), "{unknown}");
+    assert!(unknown.contains("- all: memory.all\n") && !unknown.contains("- orch:"), "{unknown}");
     assert!(
         unknown.contains(
             "- More notes are for one role only (orchestrator: 1); in that role, find them in `"
@@ -616,7 +627,7 @@ fn notes_and_entries_follow_the_readers_role() {
 
     let orchestrator = compose(&s, &role_ctx(Some(vec!["orchestrator"]))).text;
     assert!(
-        orchestrator.contains("- orch: memory.orch (`")
+        orchestrator.contains("- orch: memory.orch\n")
             && orchestrator.contains("\nMerge after review."),
         "{orchestrator}"
     );

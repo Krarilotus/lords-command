@@ -176,9 +176,16 @@ assumes a worktree per agent.
   nothing is applied.
 
 **By reference in shared place files.** Every role reads a place's agent files whole, and Codex stops at 32 KiB
-(silent truncation; the limit is never raised). So owner intent, and any entry for only some roles, appear there as
-index lines (title and file, read on demand); rules for every development role stay inline. The role files carry the
-full text. Index hooks are cut at a word, at 100 characters.
+(silent truncation; the limit is never raised). So owner intent appears there as index lines (title and file, read
+on demand); rules for every development role stay inline. Rules, facts, status and notes for only some roles are
+one line naming the checkout's role files and how many each carries. The role files carry the full text. Index hooks
+are cut at a word, at 100 characters.
+
+**Index lines name each dir once.** An index (intent, skills, memory) groups its lines by dir: one line names the
+dir, absolute (`In <dir>, as <name>.md:`), and each line under it gives its file only when the name doesn't. Paths
+are absolute until a marker run shows an adapter's agents resolve paths relative to the checkout; then one switch
+per adapter (`relative_paths`) turns them relative. `lords sizes` measures every file sync writes, by section, as
+written; a test against the real stacks (where a machine has them) keeps every place under the warning line.
 
 **Role files.** Every checkout and workspace also gets `.lords/role-<role>.md` for each declared role (excluded from
 git): everything that role follows there, standing alone (global, project, the place, notes), so a brief can point at

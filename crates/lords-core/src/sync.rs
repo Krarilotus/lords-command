@@ -162,6 +162,8 @@ fn context(
         skip_stores: native_stores(stacks, adapter),
         roles: None,
         by_reference: false,
+        role_dir: None,
+        relative_to: None,
     }
 }
 
@@ -525,6 +527,8 @@ pub fn role_composed(stacks: &Stacks, layers: Layers, role: &str) -> Composed {
         skip_stores: Vec::new(),
         roles: Some(vec![role.to_string()]),
         by_reference: false,
+        role_dir: None,
+        relative_to: None,
     };
     compose::compose(stacks, &ctx)
 }
@@ -587,9 +591,6 @@ fn place_items(stacks: &Stacks, place: &Place, plan: &mut Plan) {
     };
     for adapter in chosen {
         let file = adapter.repo_file();
-        let ctx = place_context(stacks, adapter, place.layers(false));
-        let composed = compose::compose(stacks, &ctx);
-        let text = adapter.render(&composed);
         for p in &place.paths {
             let target = format!("{} ({file})", place.label);
             let path = p.join(file);
@@ -607,11 +608,7 @@ fn place_items(stacks: &Stacks, place: &Place, plan: &mut Plan) {
                 continue;
             }
             let current = read(&path).unwrap_or_default();
-            // The dir's own instructions still load: the adapter says how (an include, or the text inline).
-            let text = match adapter.repo_preamble(p) {
-                Some(pre) if !text.is_empty() => compose::with_preamble(&text, &pre),
-                _ => text.clone(),
-            };
+            let (text, composed) = place_text(stacks, place.layers(false), adapter, p);
             let proposed = compose::place_block(&current, &text, false);
             let mut item = file_item(&target, &path, proposed, &composed);
             size_note(&mut item, adapter, &text);
@@ -628,6 +625,8 @@ fn place_items(stacks: &Stacks, place: &Place, plan: &mut Plan) {
         skip_stores: Vec::new(),
         roles: None,
         by_reference: false,
+        role_dir: None,
+        relative_to: None,
     };
     let skills: Vec<&Entry> = compose::applicable(stacks, &skill_ctx)
         .into_iter()
@@ -709,6 +708,8 @@ fn place_items(stacks: &Stacks, place: &Place, plan: &mut Plan) {
             skip_stores: Vec::new(),
             roles: None,
             by_reference: false,
+            role_dir: None,
+            relative_to: None,
         };
         let composed = compose::compose(stacks, &ctx);
         let proposed = compose::place_block(&current, &composed.text, false);
@@ -945,17 +946,60 @@ pub fn user_composed(stacks: &Stacks, adapter: &dyn Adapter) -> Composed {
     compose::compose(stacks, &context(stacks, adapter, adapter.audience(), Layers::Global))
 }
 
-/// What an adapter's untracked file in a repo holds, before the tracked-instructions preamble.
+/// What an adapter's untracked file in a repo holds, before the tracked-instructions preamble, as written in
+/// the place's first checkout (or dir).
 pub fn repo_composed(stacks: &Stacks, place: &str, adapter: &dyn Adapter) -> Composed {
-    compose::compose(stacks, &place_context(stacks, adapter, place_layers(stacks, place, false)))
+    let ctx = place_context(
+        stacks,
+        adapter,
+        place_layers(stacks, place, false),
+        first_path(stacks, place).as_deref(),
+    );
+    compose::compose(stacks, &ctx)
+}
+
+/// A place's first checkout (a repo) or its dir (a workspace).
+pub fn first_path(stacks: &Stacks, place: &str) -> Option<PathBuf> {
+    let private = stacks.private.as_ref()?;
+    match private.manifest.repos.get(place) {
+        Some(repo) => repo.checkouts.first().map(|c| expand_home(c)),
+        None => private.manifest.workspaces.get(place).map(|w| expand_home(&w.path)),
+    }
 }
 
 /// A place's agent files: read whole, under a byte limit for some harnesses, so intent goes by reference there
-/// (orchestrator T1, 25 Oct); the role files carry its text.
-fn place_context(stacks: &Stacks, adapter: &dyn Adapter, layers: Layers) -> Context {
+/// (orchestrator T1, 25 Oct); the role files in `checkout` carry the text.
+fn place_context(
+    stacks: &Stacks,
+    adapter: &dyn Adapter,
+    layers: Layers,
+    checkout: Option<&Path>,
+) -> Context {
     let mut ctx = context(stacks, adapter, adapter.audience(), layers);
     ctx.by_reference = true;
+    ctx.role_dir = checkout.map(|c| c.join(ROLE_DIR));
+    if adapter.relative_paths() {
+        ctx.relative_to = checkout.map(Path::to_path_buf);
+    }
     ctx
+}
+
+/// The text an adapter's file in `checkout` holds, as sync writes it: the composition, after the checkout's
+/// tracked instructions where the adapter carries them (an include, or the text inline).
+pub fn place_text(
+    stacks: &Stacks,
+    layers: Layers,
+    adapter: &dyn Adapter,
+    checkout: &Path,
+) -> (String, Composed) {
+    let composed =
+        compose::compose(stacks, &place_context(stacks, adapter, layers, Some(checkout)));
+    let text = adapter.render(&composed);
+    let text = match adapter.repo_preamble(checkout) {
+        Some(pre) if !text.is_empty() => compose::with_preamble(&text, &pre),
+        _ => text,
+    };
+    (text, composed)
 }
 
 /// A repo's or a workspace's layers, by name.
@@ -1093,32 +1137,128 @@ pub fn verbatim_findings(stacks: &Stacks) -> Vec<crate::Finding> {
     out
 }
 
-/// What one session in a repo reads together (the user-level text, the repo's own, and the tracked-instructions
-/// preamble of its first checkout), against each adapter's limit.
-fn repo_size_findings(stacks: &Stacks) -> Vec<crate::Finding> {
+/// One file sync writes, measured as written (absolute paths, the first checkout's tracked text).
+#[derive(Clone, Debug, Serialize)]
+pub struct Size {
+    /// "user level", "repo <name>" or "workspace <name>".
+    pub place: String,
+    /// The adapter's file, or a role file.
+    pub file: String,
+    pub bytes: usize,
+    /// What a session there reads in total: this file plus the adapter's user-level file (0 for user-level
+    /// files and role files, which are read on their own).
+    pub reads: usize,
+    /// The adapter's limit on what it reads, if any.
+    pub limit: Option<usize>,
+    /// Bytes by part: "tracked AGENTS.md", "header" (markers and the lines before the first heading), then each
+    /// heading.
+    pub sections: Vec<(String, usize)>,
+}
+
+impl Size {
+    /// Past the warning line (`SIZE_WARN_PERCENT` of the limit).
+    pub fn over_line(&self) -> bool {
+        self.limit.is_some_and(|l| self.reads * 100 > l * SIZE_WARN_PERCENT)
+    }
+}
+
+/// `text`'s bytes by part; `composed`: the part the stacks composed (the rest is the tracked preamble).
+fn sections(text: &str, composed: &str) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    let pre = text.len().saturating_sub(composed.len());
+    if pre > 0 {
+        out.push(("tracked AGENTS.md".to_string(), pre));
+    }
+    let mut name = "header".to_string();
+    let mut n = 0;
+    for line in composed.split_inclusive('\n') {
+        if let Some(h) = line.strip_prefix("# ") {
+            out.push((std::mem::replace(&mut name, h.trim().to_string()), n));
+            n = 0;
+        }
+        n += line.len();
+    }
+    out.push((name, n));
+    out
+}
+
+/// Every file sync writes for agents, measured: each adapter's user-level file, each place's file per adapter,
+/// and each place's role files.
+pub fn sizes(stacks: &Stacks) -> Vec<Size> {
     let Some(private) = &stacks.private else { return Vec::new() };
     let mut out = Vec::new();
+    let mut user = std::collections::BTreeMap::new();
+    for adapter in adapters::ALL.iter().copied() {
+        let text = adapter.render(&user_composed(stacks, adapter));
+        user.insert(adapter.id(), text.len());
+        out.push(Size {
+            place: "user level".into(),
+            file: adapter.id().to_string(),
+            bytes: text.len(),
+            reads: text.len(),
+            limit: adapter.byte_limit(),
+            sections: sections(&text, &text),
+        });
+    }
+    let mut places: Vec<(String, String, &[String])> = Vec::new();
     for (name, repo) in &private.manifest.repos {
-        let first = repo.checkouts.first().map(|c| expand_home(c));
+        places.push((format!("repo {name}"), name.clone(), &repo.adapters));
+    }
+    for (name, w) in &private.manifest.workspaces {
+        places.push((format!("workspace {name}"), name.clone(), &w.adapters));
+    }
+    for (label, name, ids) in places {
+        let Some(dir) = first_path(stacks, &name) else { continue };
         for adapter in adapters::ALL.iter().copied() {
-            if !repo.adapters.is_empty() && !repo.adapters.iter().any(|a| a == adapter.id()) {
+            if !ids.is_empty() && !ids.iter().any(|a| a == adapter.id()) {
                 continue;
             }
-            let global = adapter.render(&user_composed(stacks, adapter)).len();
-            let own = adapter.render(&repo_composed(stacks, name, adapter)).len();
-            let pre =
-                first.as_deref().and_then(|c| adapter.repo_preamble(c)).map_or(0, |p| p.len());
-            let total = global + own + pre;
-            if let Some(limit) = over_size(adapter, total) {
-                out.push(crate::Finding::warning(
-                    "size",
-                    format!(
-                        "repo {name}: {} reads {total} bytes there ({global} user level, {own} repo, {pre} tracked); its limit is {limit}",
-                        adapter.id()
-                    ),
-                ));
-            }
+            let (text, composed) =
+                place_text(stacks, place_layers(stacks, &name, false), adapter, &dir);
+            let rendered = adapter.render(&composed);
+            out.push(Size {
+                place: label.clone(),
+                file: adapter.repo_file().to_string(),
+                bytes: text.len(),
+                reads: text.len() + user[adapter.id()],
+                limit: adapter.byte_limit(),
+                sections: sections(&text, &rendered),
+            });
+        }
+        for role in declared_roles(stacks) {
+            let text = role_composed(stacks, place_layers(stacks, &name, true), &role).text;
+            out.push(Size {
+                place: label.clone(),
+                file: format!("{ROLE_DIR}/{}", role_file(&role)),
+                bytes: text.len(),
+                reads: 0,
+                limit: None,
+                sections: sections(&text, &text),
+            });
         }
     }
     out
+}
+
+/// What one session in a place reads together (the user-level text, the place's own, and the tracked
+/// instructions it carries), against each adapter's limit.
+fn repo_size_findings(stacks: &Stacks) -> Vec<crate::Finding> {
+    sizes(stacks)
+        .into_iter()
+        .filter(|s| s.reads > s.bytes && s.over_line())
+        .map(|s| {
+            crate::Finding::warning(
+                "size",
+                format!(
+                    "{}: {} reads {} bytes there ({} its file, {} user level); its limit is {}",
+                    s.place,
+                    s.file,
+                    s.reads,
+                    s.bytes,
+                    s.reads - s.bytes,
+                    s.limit.unwrap_or(0)
+                ),
+            )
+        })
+        .collect()
 }

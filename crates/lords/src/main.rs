@@ -24,6 +24,7 @@ usage:
   lords hash PATH
   lords sync [--user | --repo NAME] [--json] [--apply]
   lords compose [--repo NAME [--role ROLE]] [--adapter ID] [--json]   what a harness reads there, with sources
+  lords sizes [--json]   every file sync writes, by section; fails past the warning line
 
 stacks: --public-stack DIR, --private-stack DIR, else config.txt (beside the exe, or ~/.lords-command/),
 else the public stack is <this git repo>/stack.
@@ -81,7 +82,9 @@ fn paths(args: &mut Args) -> Result<Paths, String> {
     let public =
         public.ok_or("no public stack: pass --public-stack or set `public` in config.txt")?;
     let private = args.value("--private-stack")?.map(PathBuf::from).or(cfg.private);
-    Ok(Paths { public, private })
+    // Absolute, as sync writes them: every path an agent file shows is then the one a session can open.
+    let abs = |p: PathBuf| std::path::absolute(&p).unwrap_or(p);
+    Ok(Paths { public: abs(public), private: private.map(abs) })
 }
 
 fn print_findings(findings: &[Finding], json: bool) {
@@ -444,6 +447,15 @@ fn cmd_compose(mut a: Args) -> Result<bool, String> {
         (Some(place), Some(role)) => {
             sync::role_composed(&stacks, sync::place_layers(&stacks, place, true), role)
         }
+        (Some(place), None) if !json => {
+            let dir = sync::first_path(&stacks, place)
+                .ok_or_else(|| format!("no checkout or dir declared for `{place}`"))?;
+            let layers = sync::place_layers(&stacks, place, false);
+            let (text, _) = sync::place_text(&stacks, layers, adapter, &dir);
+            print!("{text}");
+            eprintln!("{} bytes", text.len());
+            return Ok(true);
+        }
         (Some(place), None) => sync::repo_composed(&stacks, place, adapter),
         (None, None) => sync::user_composed(&stacks, adapter),
         (None, Some(_)) => return Err("--role needs --repo (role files live in a place)".into()),
@@ -456,6 +468,35 @@ fn cmd_compose(mut a: Args) -> Result<bool, String> {
         eprintln!("{} bytes", adapter.render(&composed).len());
     }
     Ok(true)
+}
+
+/// Every file sync writes for agents, measured as written: bytes by section, and what a session reads in total
+/// against the adapter's limit.
+fn cmd_sizes(mut a: Args) -> Result<bool, String> {
+    let json = a.flag("--json");
+    let p = paths(&mut a)?;
+    a.done()?;
+    let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    let sizes = sync::sizes(&stacks);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&sizes).unwrap_or_default());
+        return Ok(true);
+    }
+    let mut over = false;
+    for s in &sizes {
+        let reads = match s.limit {
+            Some(l) if s.reads > s.bytes => {
+                let mark = if s.over_line() { "  OVER the warning line" } else { "" };
+                over |= s.over_line();
+                format!(", a session reads {} of {l} ({}%){mark}", s.reads, s.reads * 100 / l)
+            }
+            _ => String::new(),
+        };
+        println!("{} {}: {} bytes{reads}", s.place, s.file, s.bytes);
+        let parts: Vec<String> = s.sections.iter().map(|(n, b)| format!("{n} {b}")).collect();
+        println!("  {}", parts.join(", "));
+    }
+    Ok(!over)
 }
 
 fn cmd_hash(mut a: Args) -> Result<bool, String> {
@@ -483,6 +524,7 @@ fn main() -> ExitCode {
         "hash" => cmd_hash(a),
         "sync" => cmd_sync(a),
         "compose" => cmd_compose(a),
+        "sizes" => cmd_sizes(a),
         other => Err(format!("unknown command `{other}`\n\n{USAGE}")),
     };
     match result {

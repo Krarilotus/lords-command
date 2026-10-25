@@ -5,7 +5,7 @@ use crate::model::{Audience, Entry, Kind, Scope, Visibility};
 use crate::stack::Stacks;
 use serde::Serialize;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const BEGIN: &str = "<!-- lords-command:begin -->";
 pub const END: &str = "<!-- lords-command:end -->";
@@ -16,7 +16,7 @@ const MEMORY_INTRO: &str = "Notes agents wrote down earlier. Read a note's file 
 
 /// The line that stands for notes meant for one role, when the reader's role is unknown: how many per role, and
 /// the dirs they are in.
-fn role_pointer(notes: &[&Entry]) -> Option<String> {
+fn role_pointer(notes: &[&Entry], ctx: &Context) -> Option<String> {
     if notes.is_empty() {
         return None;
     }
@@ -26,9 +26,7 @@ fn role_pointer(notes: &[&Entry]) -> Option<String> {
         for r in &e.meta.roles {
             *counts.entry(r.as_str()).or_default() += 1;
         }
-        let dir =
-            e.body_file.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
-        let dir = if cfg!(windows) { dir.replace('/', "\\") } else { dir };
+        let dir = e.body_file.parent().map(|d| shown(d, ctx)).unwrap_or_default();
         if !dirs.contains(&dir) {
             dirs.push(dir);
         }
@@ -59,9 +57,11 @@ fn short_hook(hook: &str) -> String {
     format!("{}…", at_word.trim_end_matches([',', ';', ':', ' ', '-', '—']))
 }
 
-/// An entry's file as an index line shows it (the platform's separators).
-fn shown_path(e: &Entry) -> String {
-    let path = e.body_file.to_string_lossy().into_owned();
+/// A path as composed text shows it: the platform's separators, and relative to `relative_to` when the context
+/// sets it (the one switch to relative paths, once a harness is shown to resolve them; docs/load-order.md).
+fn shown(p: &Path, ctx: &Context) -> String {
+    let rel = ctx.relative_to.as_deref().and_then(|base| relative(p, base));
+    let path = rel.as_deref().unwrap_or(p).to_string_lossy().into_owned();
     if cfg!(windows) {
         path.replace('/', "\\")
     } else {
@@ -69,8 +69,132 @@ fn shown_path(e: &Entry) -> String {
     }
 }
 
-/// One memory index line: name, its one-line hook, and the file to read.
-pub fn index_line(e: &Entry) -> String {
+/// `p` from `base` (`..` up to their common dir), or `None` when they share no root (another drive).
+fn relative(p: &Path, base: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let key = |c: Component| {
+        let s = c.as_os_str().to_string_lossy().into_owned();
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    };
+    let (a, b): (Vec<Component>, Vec<Component>) =
+        (p.components().collect(), base.components().collect());
+    let common = a.iter().zip(&b).take_while(|(x, y)| key(**x) == key(**y)).count();
+    if common == 0 {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for _ in common..b.len() {
+        out.push("..");
+    }
+    for c in &a[common..] {
+        out.push(c.as_os_str());
+    }
+    Some(if out.as_os_str().is_empty() { PathBuf::from(".") } else { out })
+}
+
+/// Where an index line's file is: the dir its group names once, and the file's path within it. A skill's file is
+/// `<name>/SKILL.md` in its skills dir; any other entry's is its file name in its own dir.
+fn index_place(e: &Entry) -> (PathBuf, PathBuf) {
+    let file = &e.body_file;
+    let up = if e.meta.kind == Kind::Skill { 2 } else { 1 };
+    let mut dir = file.as_path();
+    for _ in 0..up {
+        dir = dir.parent().unwrap_or(dir);
+    }
+    (dir.to_path_buf(), file.strip_prefix(dir).unwrap_or(file).to_path_buf())
+}
+
+/// An index entry's display name, when its file follows from it (a note's `<name>.md`, a skill's
+/// `<name>/SKILL.md`).
+fn named_file(e: &Entry, name: &str) -> PathBuf {
+    match e.meta.kind {
+        Kind::Skill => Path::new(name).join("SKILL.md"),
+        _ => PathBuf::from(format!("{name}.md")),
+    }
+}
+
+/// Index lines grouped by dir: each dir is named once ("In `<dir>`:"), each line ends with its file within it, or
+/// with nothing when its name gives the file (the group line says how). `items`: the entry and the line's text.
+fn push_index(
+    items: &[(&Entry, String, Option<String>)],
+    ctx: &Context,
+    lines: &mut Vec<String>,
+    out: &mut Composed,
+) {
+    let mut current: Option<PathBuf> = None;
+    for (i, (e, text, name)) in items.iter().enumerate() {
+        let (dir, file) = index_place(e);
+        if current.as_ref() != Some(&dir) {
+            let named = |x: &(&Entry, String, Option<String>)| {
+                x.2.as_deref()
+                    .is_some_and(|n| index_place(x.0) == (dir.clone(), named_file(x.0, n)))
+            };
+            let rest = &items[i..];
+            let group = rest.iter().take_while(|x| index_place(x.0).0 == dir);
+            let how = if group.clone().any(named) {
+                let pattern = match e.meta.kind {
+                    Kind::Skill => shown(&Path::new("<name>").join("SKILL.md"), ctx),
+                    _ => "<name>.md".to_string(),
+                };
+                format!(", as `{pattern}`")
+            } else {
+                String::new()
+            };
+            lines.push(format!("In `{}`{how}:", shown(&dir, ctx)));
+            current = Some(dir.clone());
+        }
+        let follows = name.as_deref().is_some_and(|n| named_file(e, n) == file);
+        if follows {
+            lines.push(format!("- {text}"));
+        } else {
+            lines.push(format!("- {text} (`{}`)", shown(&file, ctx)));
+        }
+        out.sources.push(Source {
+            line: lines.len(),
+            id: e.id().to_string(),
+            stack: e.stack,
+            file: e.body_file.clone(),
+            file_line: 1,
+        });
+        out.ids.push(e.id().to_string());
+    }
+}
+
+/// Memory or skill index entries, each with its line's text and the name its file may follow from.
+fn index_items<'e>(entries: &[&'e Entry]) -> Vec<(&'e Entry, String, Option<String>)> {
+    entries
+        .iter()
+        .map(|e| {
+            let (name, text) = index_item(e);
+            (*e, text, Some(name))
+        })
+        .collect()
+}
+
+/// The line that stands for everything for only some roles in a place's file: each role's file carries it in
+/// full; how many entries and notes each has.
+fn role_files_line(pointed: &[&Entry], dir: &Path, ctx: &Context) -> String {
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for e in pointed {
+        for r in &e.meta.roles {
+            *counts.entry(r.as_str()).or_default() += 1;
+        }
+    }
+    let files: Vec<String> =
+        counts.iter().map(|(r, n)| format!("`{}` ({n})", crate::sync::role_file(r))).collect();
+    format!(
+        "More rules, facts, status and notes bind only some roles; each role's file in `{}` has them in full: {}.",
+        shown(dir, ctx),
+        files.join(", ")
+    )
+}
+
+/// A memory or skill index entry: its name and the line's text (name and one-line hook).
+fn index_item(e: &Entry) -> (String, String) {
     // A skill's own SKILL.md frontmatter names and describes it, as the harness shows it.
     let own = |key: &str| -> Option<String> {
         let yaml = crate::frontmatter::split(&e.body).yaml?;
@@ -90,12 +214,12 @@ pub fn index_line(e: &Entry) -> String {
     let described =
         e.meta.description.clone().or_else(|| skill.then(|| own("description")).flatten());
     let hook = short_hook(described.as_deref().unwrap_or(&e.meta.title));
-    let path = shown_path(e);
-    if hook.trim().is_empty() || hook == name {
-        format!("- {name} (`{path}`)")
+    let text = if hook.trim().is_empty() || hook == name {
+        name.clone()
     } else {
-        format!("- {name}: {hook} (`{path}`)")
-    }
+        format!("{name}: {hook}")
+    };
+    (name, text)
 }
 
 /// Kinds composed into instruction text, in section order.
@@ -143,6 +267,11 @@ pub struct Context {
     /// intent, and entries for only some roles, as index lines (title and file, read on demand) instead of their
     /// text. Role files and user-level files carry the text.
     pub by_reference: bool,
+    /// With `by_reference`, the dir of this place's role files: entries and notes for only some roles are then
+    /// left out for one line that points there (each role file carries them in full).
+    pub role_dir: Option<PathBuf>,
+    /// Paths shown relative to this dir instead of absolute (see `shown`).
+    pub relative_to: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -267,6 +396,20 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
     let overridden: BTreeSet<&str> =
         all.iter().flat_map(|e| e.meta.overrides.iter().map(String::as_str)).collect();
     let live: Vec<&Entry> = all.into_iter().filter(|e| !overridden.contains(e.id())).collect();
+    // For only some of the development roles, where the reader's role is unknown.
+    let partial_role = |e: &Entry| {
+        ctx.roles.is_none()
+            && !e.meta.roles.is_empty()
+            && !development.iter().all(|r| e.meta.roles.contains(r))
+    };
+    // Where role files exist, their entries and notes stay there: one line points to them (orchestrator, 25 Oct:
+    // cut "index lines that the role files already carry in full").
+    let (pointed, live): (Vec<&Entry>, Vec<&Entry>) = match &ctx.role_dir {
+        Some(_) if ctx.by_reference => live
+            .into_iter()
+            .partition(|e| partial_role(e) && !matches!(e.meta.kind, Kind::Intent | Kind::Skill)),
+        _ => (Vec::new(), live),
+    };
     let mut out = Composed {
         overridden: overridden.iter().map(|s| s.to_string()).collect(),
         skills: live
@@ -282,18 +425,19 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
     }
 
     let mut lines: Vec<String> = Vec::new();
+    if let (Some(dir), false) = (&ctx.role_dir, pointed.is_empty()) {
+        lines.push(role_files_line(&pointed, dir, ctx));
+    }
     let push_entry = |e: &Entry, lines: &mut Vec<String>, out: &mut Composed| {
         let who = only_for(e, ctx, &development);
         let temp = crate::temporary::label(e, stacks);
         // In a file every role reads under a byte limit, an entry for only some roles is a reference; the role
         // files of the roles it binds carry its text.
-        let partial_role = ctx.roles.is_none()
-            && !e.meta.roles.is_empty()
-            && !development.iter().all(|r| e.meta.roles.contains(r));
-        if ctx.by_reference && partial_role {
+        if ctx.by_reference && partial_role(e) {
             let who = who.unwrap_or_else(|| e.meta.roles.join(", "));
             let temp = temp.map(|t| format!("; {t}")).unwrap_or_default();
-            lines.push(format!("- ({who} only{temp}) {} (`{}`)", e.meta.title, shown_path(e)));
+            let path = shown(&e.body_file, ctx);
+            lines.push(format!("- ({who} only{temp}) {} (`{path}`)", e.meta.title));
             out.sources.push(Source {
                 line: lines.len(),
                 id: e.id().to_string(),
@@ -347,6 +491,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             lines.push(String::new());
             lines.push(INTENT_INTRO.into());
             lines.push(String::new());
+            let mut items = Vec::new();
             for e in section {
                 let mut ext: Vec<&Entry> = live
                     .iter()
@@ -358,17 +503,10 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
                     let temp = crate::temporary::label(x, stacks)
                         .map(|t| format!(" ({t})"))
                         .unwrap_or_default();
-                    lines.push(format!("- {}{temp} (`{}`)", x.meta.title, shown_path(x)));
-                    out.sources.push(Source {
-                        line: lines.len(),
-                        id: x.id().to_string(),
-                        stack: x.stack,
-                        file: x.body_file.clone(),
-                        file_line: 1,
-                    });
-                    out.ids.push(x.id().to_string());
+                    items.push((x, format!("{}{temp}", x.meta.title), None));
                 }
             }
+            push_index(&items, ctx, &mut lines, &mut out);
             continue;
         }
         for e in section {
@@ -399,17 +537,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         }
         lines.push("# Skills here".into());
         lines.push(String::new());
-        for e in here {
-            lines.push(index_line(e));
-            out.sources.push(Source {
-                line: lines.len(),
-                id: e.id().to_string(),
-                stack: e.stack,
-                file: e.body_file.clone(),
-                file_line: 1,
-            });
-            out.ids.push(e.id().to_string());
-        }
+        push_index(&index_items(&here), ctx, &mut lines, &mut out);
     }
     // Memory: an index, not text. Each harness reads the notes on demand (docs/load-order.md); a note binds
     // nobody until it is promoted to an intent, rule or fact.
@@ -426,7 +554,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
     // Where the reader's role is unknown, notes for one role stay out of the index; one line says where they are.
     let (role_notes, notes): (Vec<&Entry>, Vec<&Entry>) =
         notes.into_iter().partition(|e| ctx.roles.is_none() && !e.meta.roles.is_empty());
-    let pointer = role_pointer(&role_notes);
+    let pointer = role_pointer(&role_notes, ctx);
     if !notes.is_empty() || pointer.is_some() {
         if !lines.is_empty() {
             lines.push(String::new());
@@ -435,17 +563,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         lines.push(String::new());
         lines.push(MEMORY_INTRO.into());
         lines.push(String::new());
-        for e in notes {
-            lines.push(index_line(e));
-            out.sources.push(Source {
-                line: lines.len(),
-                id: e.id().to_string(),
-                stack: e.stack,
-                file: e.body_file.clone(),
-                file_line: 1,
-            });
-            out.ids.push(e.id().to_string());
-        }
+        push_index(&index_items(&notes), ctx, &mut lines, &mut out);
         if let Some(p) = pointer {
             lines.push(p);
         }

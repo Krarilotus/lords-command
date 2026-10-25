@@ -171,9 +171,11 @@ fn sync_apply_imports_new_memory_before_writing_the_index() {
     let o = env.lords(d, &[&args[..], &["--apply"]].concat());
     assert!(o.status.success(), "{}", text(&o));
     let agents = fs::read_to_string(work.join("AGENTS.override.md")).unwrap();
-    assert!(agents.contains("- note: the hook line (`"), "{agents}");
+    assert!(agents.contains("- note: the hook line\n"), "{agents}");
     assert!(
-        agents.contains("global") && agents.contains("note.md`)"),
+        agents.lines().any(|l| l.starts_with("In `")
+            && l.contains("global")
+            && l.ends_with("as `<name>.md`:")),
         "points at the imported copy: {agents}"
     );
     let log =

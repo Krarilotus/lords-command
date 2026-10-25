@@ -55,7 +55,11 @@ fn development_skills_install_per_checkout() {
         .proposed
         .clone()
         .unwrap();
-    assert!(codex.contains("# Skills here\n\n- spec-tests: the spec-tests skill (`"), "{codex}");
+    assert!(
+        codex.contains("# Skills here\n\nIn `")
+            && codex.contains(":\n- spec-tests: the spec-tests skill\n"),
+        "{codex}"
+    );
 
     apply(&p, &f.path("backups")).unwrap();
     assert!(

@@ -51,6 +51,10 @@ Claude loads (`file_path`, `memory_type`, `load_reason`), so these don't rest on
 - **`claudeMdExcludes` keeps an ancestor file out:** with `~/.claude/CLAUDE.md` excluded (settings
   `claudeMdExcludes`, any settings layer), it didn't load, and the repo's `AGENTS.md` did. So an excluded file doesn't
   hide `AGENTS.md`.
+- **A grouped index is followed** (25 Oct, Sonnet, `-p` with only `Read` allowed): a `CLAUDE.md` with one line
+  naming a notes dir outside the workspace (`In \`<dir>\`, as \`<name>.md\`:`) and `- name: hook` lines under it;
+  asked a question only one note answers, it read `<dir>\<name>.md` and answered. Without the index (control), it
+  answered "unknown".
 - **Claude's auto-memory dir** is one per git repository, shared by its worktrees (the docs: "derived from the git
   repository").
 
@@ -74,6 +78,8 @@ Live runs:
 - **A memory index line** (`- name: hook (\`<path>\`)`) in `AGENTS.md`, pointing at a file outside the workspace:
   asked a question only that file answers, Codex read it and answered, under the read-only sandbox. Without the line
   (control), it answered "unknown".
+- **A grouped index** (one line naming the dir, `In \`<dir>\`, as \`<name>.md\`:`, then `- name: hook` lines): not yet
+  run with Codex (the marker run waits for Codex time).
 - **An `@<path>` line is not expanded:** told not to read files, Codex didn't know a word that existed only in the
   imported file. So memory reaches Codex as an index, not an import.
 

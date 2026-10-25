@@ -23,6 +23,8 @@ fn user_level(f: &Fixture) -> String {
         skip_stores: vec![],
         roles: None,
         by_reference: false,
+        role_dir: None,
+        relative_to: None,
     };
     compose(&f.stacks(), &ctx).text
 }

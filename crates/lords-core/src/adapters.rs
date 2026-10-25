@@ -45,6 +45,11 @@ pub trait Adapter: Sync {
     fn shadowing_file(&self, _user_file: &Path) -> Option<PathBuf> {
         None
     }
+    /// Whether a place's file may show paths relative to its checkout: only once a marker run has shown the
+    /// harness's agents resolve them there (docs/load-order.md). Until then every path is absolute.
+    fn relative_paths(&self) -> bool {
+        false
+    }
 }
 
 /// Claude Code: user file `CLAUDE.md` in the profile dir; `CLAUDE.local.md` per checkout, which also keeps a
