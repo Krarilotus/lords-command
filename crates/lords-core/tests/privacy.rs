@@ -31,6 +31,8 @@ fn each_class_matches_its_shape() {
             vec![],
         ),
         ("~/.claude/CLAUDE.md and ~/.codex/AGENTS.md".to_string(), vec![]),
+        // An `\n` escape before an include line in source, not an address.
+        (format!("\"-->{}n{}AGENTS.md\"", char::from(92), '@'), vec![]),
         ("token = \"anunbrokenwordwithoutdigits\"".to_string(), vec![]),
     ];
     for (text, want) in cases {

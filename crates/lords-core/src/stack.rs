@@ -33,6 +33,9 @@ pub struct Repo {
     pub checkouts: Vec<String>,
     #[serde(default = "yes")]
     pub worktrees: bool,
+    /// Worktrees outside these dirs are skipped (and listed); empty: every worktree. Checkouts always count.
+    #[serde(default)]
+    pub worktree_roots: Vec<String>,
     /// The adapters that get this repo's files (default: every adapter).
     #[serde(default)]
     pub adapters: Vec<String>,
@@ -55,6 +58,13 @@ pub struct Target {
     /// `replace`: the whole file becomes the managed block. Default `keep`.
     #[serde(default)]
     pub own_text: Option<String>,
+    /// instructions: write the composed text to this shared file and only an include line here (adapters that
+    /// expand includes).
+    #[serde(default)]
+    pub via: Option<String>,
+    /// settings: instruction files the harness must skip (its settings' exclude list).
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

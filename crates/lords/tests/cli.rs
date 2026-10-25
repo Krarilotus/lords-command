@@ -179,3 +179,34 @@ fn sync_apply_imports_new_memory_before_writing_the_index() {
         String::from_utf8_lossy(&env.git(&private, &["log", "--format=%s"]).stdout).into_owned();
     assert!(log.starts_with("Import memory from agent: 1 new, 0 changed"), "{log}");
 }
+
+// Spec (load-order.md; orchestrator D1, 25 Oct: unmanaged repos are a known gap, "list it in check's info
+// output"): with a second Claude profile, `check` says that `~/.claude/CLAUDE.md` hides repos' AGENTS.md, until a
+// settings target in that profile excludes it.
+#[test]
+fn check_lists_the_hidden_agents_md_gap_until_excluded() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let home = d.join("home");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::write(home.join(".claude/CLAUDE.md"), "old global text\n").unwrap();
+    let (public, private) = (d.join("pub"), d.join("priv"));
+    fs::create_dir_all(&public).unwrap();
+    fs::create_dir_all(&private).unwrap();
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    let base = "name = \"priv\"\nvisibility = \"private\"\n[[targets]]\nname = \"balanced\"\nadapter = \"claude\"\nkind = \"instructions\"\npath = \"~/.claude-balanced/CLAUDE.md\"\n";
+    fs::write(private.join("stack.toml"), base).unwrap();
+    let args = [
+        "check",
+        "--public-stack",
+        public.to_str().unwrap(),
+        "--private-stack",
+        private.to_str().unwrap(),
+    ];
+    let out = text(&env.lords(d, &args));
+    assert!(out.contains("hides AGENTS.md in repos sync doesn't manage"), "{out}");
+    let excluded = format!("{base}[[targets]]\nname = \"balanced settings\"\nadapter = \"claude\"\nkind = \"settings\"\npath = \"~/.claude-balanced/settings.json\"\nexclude = [\"~/.claude/CLAUDE.md\"]\n");
+    fs::write(private.join("stack.toml"), excluded).unwrap();
+    let out = text(&env.lords(d, &args));
+    assert!(!out.contains("hides AGENTS.md"), "{out}");
+}

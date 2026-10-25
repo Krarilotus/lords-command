@@ -165,22 +165,122 @@ fn size_note(item: &mut Item, adapter: &dyn Adapter, text: &str) {
     }
 }
 
-fn instructions_item(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Item {
+/// An instructions target: the composed text in its file, or (with `via`) in one shared file that the target's
+/// file includes, so several profiles read one copy.
+fn instructions_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec<Item> {
     let path = expand_home(&t.path);
     let ctx = context(stacks, adapter, audience_of(&t.audience, adapter), Layers::Global);
     let composed = compose::compose(stacks, &ctx);
     let replace = t.own_text.as_deref() == Some("replace");
     let current = read(&path).unwrap_or_default();
     let text = adapter.render(&composed);
-    let proposed = compose::place_block(&current, &text, replace);
+    let mut items = Vec::new();
+    let block = match &t.via {
+        None => text.clone(),
+        Some(via) => {
+            let shared = expand_home(via);
+            let Some(line) = adapter.import_line(&shared) else {
+                let mut item = Item::new(&t.name, path, Action::Conflict);
+                item.notes.push(format!(
+                    "adapter {} doesn't expand includes, so `via` can't work",
+                    adapter.id()
+                ));
+                return vec![item];
+            };
+            let mut s =
+                file_item(&format!("shared text ({})", t.name), &shared, text.clone(), &composed);
+            size_note(&mut s, adapter, &text);
+            items.push(s);
+            if composed.text.is_empty() {
+                String::new()
+            } else {
+                compose::block(&line)
+            }
+        }
+    };
+    let proposed = compose::place_block(&current, &block, replace);
     let mut item = file_item(&t.name, &path, proposed, &composed);
-    size_note(&mut item, adapter, &text);
+    if t.via.is_none() {
+        size_note(&mut item, adapter, &text);
+    }
     if replace && !current.is_empty() && compose::current_block(&current).is_none() {
         item.notes.push(
             "own_text = replace: the text now in the file is replaced (it is backed up)".into(),
         );
     }
-    item
+    items.push(item);
+    items
+}
+
+fn norm(p: &Path) -> String {
+    strip_verbatim(p)
+}
+
+/// A settings target: the adapter's exclude list in a JSON settings file holds every path in `exclude`. Only
+/// that one key changes; the rest of the file keeps its keys and order.
+fn settings_item(t: &Target, adapter: &dyn Adapter) -> Item {
+    let path = expand_home(&t.path);
+    let Some(key) = adapter.excludes_key() else {
+        let mut item = Item::new(&t.name, path, Action::Conflict);
+        item.notes.push(format!("adapter {} has no exclude setting", adapter.id()));
+        return item;
+    };
+    let current = read(&path);
+    let mut value: serde_json::Value = match current.as_deref().map(serde_json::from_str) {
+        None => serde_json::json!({}),
+        Some(Ok(v @ serde_json::Value::Object(_))) => v,
+        Some(_) => {
+            let mut item = Item::new(&t.name, path, Action::Conflict);
+            item.notes.push("not a JSON object; left alone".into());
+            return item;
+        }
+    };
+    let list =
+        value.as_object_mut().expect("an object").entry(key).or_insert(serde_json::json!([]));
+    let Some(list) = list.as_array_mut() else {
+        let mut item = Item::new(&t.name, path, Action::Conflict);
+        item.notes.push(format!("`{key}` isn't a list; left alone"));
+        return item;
+    };
+    let mut added = false;
+    for e in &t.exclude {
+        let want = adapters::slashes(&expand_home(e));
+        if !list.iter().any(|v| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case(&want))) {
+            list.push(serde_json::Value::String(want));
+            added = true;
+        }
+    }
+    let proposed = match (&current, added) {
+        (Some(c), false) => c.clone(),
+        _ => serde_json::to_string_pretty(&value).expect("JSON serialises") + "\n",
+    };
+    file_item(&t.name, &path, proposed, &Composed::default())
+}
+
+/// A user file whose harness also loads another file that hides repos' own instructions, unless a settings
+/// target in the same profile dir excludes it (load-order.md).
+fn shadow_notes(private: &Stack, plan: &mut Plan) {
+    for t in private.manifest.targets.iter().filter(|t| t.kind == "instructions") {
+        let Some(adapter) = adapters::get(&t.adapter) else { continue };
+        let path = expand_home(&t.path);
+        let Some(shadow) = adapter.shadowing_file(&path) else { continue };
+        if !shadow.exists() {
+            continue;
+        }
+        let covered = private.manifest.targets.iter().any(|s| {
+            s.kind == "settings"
+                && s.adapter == t.adapter
+                && expand_home(&s.path).parent() == path.parent()
+                && s.exclude.iter().any(|e| norm(&expand_home(e)) == norm(&shadow))
+        });
+        if !covered {
+            plan.notes.push(format!(
+                "{}: {} also loads as an ancestor file under home and hides AGENTS.md in repos sync doesn't manage; a settings target in this profile with exclude = [it] fixes that",
+                t.name,
+                shadow.display()
+            ));
+        }
+    }
 }
 
 /// The dir a link points at, if `path` is a link (a junction on Windows).
@@ -290,28 +390,38 @@ fn skills_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec<Item>
     items
 }
 
-/// Every checkout and (if asked) worktree of a repo.
-fn checkouts(repo: &stack::Repo) -> Vec<PathBuf> {
+/// Every checkout and (if asked) worktree of a repo, and the worktrees skipped for lying outside
+/// `worktree_roots`.
+fn checkouts(repo: &stack::Repo) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let roots: Vec<String> = repo.worktree_roots.iter().map(|r| norm(&expand_home(r))).collect();
+    let inside = |p: &Path| {
+        let p = norm(p);
+        roots.iter().any(|r| p == *r || p.starts_with(&format!("{}/", r.trim_end_matches('/'))))
+    };
     let mut out: Vec<PathBuf> = Vec::new();
+    let mut skipped: Vec<PathBuf> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     for c in &repo.checkouts {
         let c = expand_home(c);
+        seen.push(norm(&c));
         out.push(c.clone());
-        if repo.worktrees {
-            if let Ok(list) = git::run(&c, &["worktree", "list", "--porcelain"]) {
-                out.extend(
-                    list.lines().filter_map(|l| l.strip_prefix("worktree ")).map(PathBuf::from),
-                );
+        if !repo.worktrees {
+            continue;
+        }
+        let Ok(list) = git::run(&c, &["worktree", "list", "--porcelain"]) else { continue };
+        for w in list.lines().filter_map(|l| l.strip_prefix("worktree ")).map(PathBuf::from) {
+            if seen.contains(&norm(&w)) {
+                continue;
+            }
+            seen.push(norm(&w));
+            if roots.is_empty() || inside(&w) {
+                out.push(w);
+            } else {
+                skipped.push(w);
             }
         }
     }
-    let mut seen: Vec<String> = Vec::new();
-    out.retain(|p| {
-        let k = strip_verbatim(p);
-        let new = !seen.contains(&k);
-        seen.push(k);
-        new
-    });
-    out
+    (out, skipped)
 }
 
 fn repo_items(stacks: &Stacks, name: &str, repo: &stack::Repo, plan: &mut Plan) {
@@ -329,10 +439,18 @@ fn repo_items(stacks: &Stacks, name: &str, repo: &stack::Repo, plan: &mut Plan) 
             )),
         }
     }
-    let paths = checkouts(repo);
+    let (paths, skipped) = checkouts(repo);
     if paths.is_empty() {
         plan.notes.push(format!("repo {name}: no checkouts declared"));
         return;
+    }
+    if !skipped.is_empty() {
+        let list: Vec<String> = skipped.iter().map(|p| p.display().to_string()).collect();
+        plan.notes.push(format!(
+            "repo {name}: {} worktree(s) outside worktree_roots skipped: {}",
+            skipped.len(),
+            list.join(", ")
+        ));
     }
     let path_entries = stacks
         .entries()
@@ -369,6 +487,11 @@ fn repo_items(stacks: &Stacks, name: &str, repo: &stack::Repo, plan: &mut Plan) 
                 continue;
             }
             let current = read(&path).unwrap_or_default();
+            // The checkout's tracked instructions still load: the adapter says how (an include, or inline).
+            let text = match adapter.repo_preamble(p) {
+                Some(pre) if !text.is_empty() => compose::with_preamble(&text, &pre),
+                _ => text.clone(),
+            };
             let proposed = compose::place_block(&current, &text, false);
             let mut item = file_item(&target, &path, proposed, &composed);
             size_note(&mut item, adapter, &text);
@@ -465,11 +588,26 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
                 )
             })?;
             match t.kind.as_str() {
-                "instructions" => plan.items.push(instructions_item(stacks, t, adapter)),
+                "instructions" => plan.items.extend(instructions_items(stacks, t, adapter)),
                 "skills" => plan.items.extend(skills_items(stacks, t, adapter)),
+                "settings" => plan.items.push(settings_item(t, adapter)),
                 k => return Err(format!("target {}: unknown kind {k}", t.name)),
             }
         }
+        // Profiles sharing one `via` file plan it once; different texts for one file can't both be written.
+        let mut kept: Vec<Item> = Vec::new();
+        for item in std::mem::take(&mut plan.items) {
+            match kept.iter_mut().find(|k| norm(&k.path) == norm(&item.path)) {
+                Some(k) if k.proposed == item.proposed => {}
+                Some(k) => {
+                    k.action = Action::Conflict;
+                    k.notes.push(format!("{} wants different text in the same file", item.target));
+                }
+                None => kept.push(item),
+            }
+        }
+        plan.items = kept;
+        shadow_notes(private, &mut plan);
     }
     if !opts.user_only {
         for (name, repo) in &private.manifest.repos {

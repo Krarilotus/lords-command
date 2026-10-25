@@ -154,12 +154,14 @@ Each target names an **adapter** (below). Which file each harness actually loads
 
 **A repo** (`lords sync --repo <name>`) gets its project, repo and path layers in untracked files: the global
 layers already come from the user-level files.
-- Every checkout and worktree gets the file each adapter's harness reads after the tracked ones: `CLAUDE.local.md` (Claude) and
+- Every checkout gets files, and so does every worktree under the repo's `worktree_roots` (the others are skipped
+  and listed). Each gets the file its adapter's harness reads after the tracked ones: `CLAUDE.local.md` (Claude) and
   `AGENTS.override.md` (Codex).
 - Both names go into the repo's shared `.git/info/exclude`, so worktrees stay clean.
-- For Claude, a `CLAUDE.local.md` also stops the tracked `AGENTS.md` from loading; for Codex, the override replaces
-  it. So agents with a stack read the stack's repo text, whichever branch's `AGENTS.md` a worktree has. A tracked file
-  of either name is a conflict, and nothing is applied.
+- The checkout's tracked `AGENTS.md` still loads beside the stack's text, as each adapter allows: Claude's file
+  starts with `@AGENTS.md` (a `CLAUDE.local.md` alone would hide it), and Codex's override carries its text inline
+  (the override replaces it, and Codex doesn't expand includes). A tracked file of either name is a conflict, and
+  nothing is applied.
 
 **A repo's tracked `AGENTS.md`** is never written: it changes by a commit on the repo's own branches. Sync reports
 what the public layers (public global, project and repo) would make of it, so the maintainer can commit that.
@@ -177,10 +179,11 @@ shows it; `sync --json` prints it. The agent files carry only the text, plus one
 **Audience.** Sol and Astra both read `~/.codex`, so a user-level Codex file can't tell them apart. An entry for
 only one of them is labelled ("(Sol only)") where it stands. Opus is reached through the Claude adapter.
 
-**Open: two Claude profiles.** With `CLAUDE_CONFIG_DIR` pointing at a second profile, `~/.claude/CLAUDE.md` still
-loads as an ancestor project file wherever the working dir is under home. If both profile files carry the global
-text, sessions under home read it twice, and the non-empty ancestor file keeps hiding repos' `AGENTS.md`. Which
-profile file holds the text is the owner's choice per machine (private `stack.toml`).
+**Several profiles of one harness.** Targets may share one composed file: `via = "<file>"` makes the target's own
+file hold only an include line (adapters whose harness expands includes). A `settings` target writes the adapter's
+exclude list (Claude: `claudeMdExcludes`). For two Claude profiles: both `CLAUDE.md` files include the shared
+file, and the second profile excludes `~/.claude/CLAUDE.md`, which would otherwise load again as an ancestor and
+hide repos' `AGENTS.md`. Without that exclude, the plan (and `check`, as info) says so.
 
 ## Adapters
 

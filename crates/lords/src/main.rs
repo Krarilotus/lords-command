@@ -149,18 +149,23 @@ fn drift(stacks: &Stacks) -> Vec<Finding> {
     }
     let opts = sync::Options { repo: None, user_only: true };
     match sync::plan(stacks, &opts) {
-        Ok(plan) => plan
-            .items
-            .iter()
-            .filter(|i| i.changes())
-            .map(|i| {
-                Finding::warning(
-                    "drift",
-                    format!("{}: {:?} (`lords sync` shows the diff)", i.target, i.action),
-                )
-                .at(&i.path, None)
-            })
-            .collect(),
+        Ok(plan) => {
+            let mut out: Vec<Finding> = plan
+                .items
+                .iter()
+                .filter(|i| i.changes())
+                .map(|i| {
+                    Finding::warning(
+                        "drift",
+                        format!("{}: {:?} (`lords sync` shows the diff)", i.target, i.action),
+                    )
+                    .at(&i.path, None)
+                })
+                .collect();
+            // Known gaps the plan sees (e.g. a profile that hides repos' AGENTS.md) are shown, never hidden.
+            out.extend(plan.notes.iter().map(|n| Finding::info("sync-note", n.clone())));
+            out
+        }
         Err(e) => vec![Finding::warning("drift", format!("no sync plan: {e}"))],
     }
 }

@@ -173,6 +173,10 @@ pub fn scan(text: &str, rules: &Rules) -> Vec<Hit> {
                 if p.group == 1 && p.class == Class::Secret && !looks_random(m.as_str()) {
                     continue;
                 }
+                // A backslash escape before `@` (an `\n@AGENTS.md` include line in source) is not an address.
+                if p.class == Class::Contact && line[..m.start()].ends_with(char::from(92)) {
+                    continue;
+                }
                 hits.push(Hit {
                     class: p.class,
                     line: n,

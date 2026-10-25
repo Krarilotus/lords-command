@@ -39,7 +39,20 @@ the model listed the instruction files in its context and the markers it saw:
 | under home | `AGENTS.md`, `CLAUDE.local.md` containing `@AGENTS.md` | the above plus `AGENTS.md` (through the import) |
 | outside home | `AGENTS.md` | profile `CLAUDE.md`, `AGENTS.md` |
 | outside home, empty `.claude/CLAUDE.md` one level up | `AGENTS.md` | profile `CLAUDE.md`, `AGENTS.md` (an empty file doesn't count) |
-| outside home, `.claude/CLAUDE.md` one level up importing the profile file | `AGENTS.md` | profile `CLAUDE.md` and the importing file; not `AGENTS.md`. The imported text was reported once, not twice (the model's own count; treat it as likely, not proven) |
+| outside home, `.claude/CLAUDE.md` one level up importing the profile file | `AGENTS.md` | profile `CLAUDE.md` and the importing file; not `AGENTS.md` |
+
+**Mechanical checks** (25 Oct). An `InstructionsLoaded` hook passed with `--settings` logs every instruction file
+Claude loads (`file_path`, `memory_type`, `load_reason`), so these don't rest on the model's own report:
+- **One shared file, imported by both the profile's `CLAUDE.md` and an ancestor `.claude/CLAUDE.md`, loads once.**
+  In 3 runs out of 3, the hook logged it once (`load_reason: include`), and the model quoted its unique marker line
+  once.
+- **Under a second profile, `~/.claude/CLAUDE.md` loads with `memory_type: Project`.** Under the default profile it
+  loads once, as `User`, and the repo's `AGENTS.md` loads too.
+- **`claudeMdExcludes` keeps an ancestor file out:** with `~/.claude/CLAUDE.md` excluded (settings
+  `claudeMdExcludes`, any settings layer), it didn't load, and the repo's `AGENTS.md` did. So an excluded file doesn't
+  hide `AGENTS.md`.
+- **Claude's auto-memory dir** is one per git repository, shared by its worktrees (the docs: "derived from the git
+  repository").
 
 ## Codex
 
@@ -72,11 +85,11 @@ The adapters (`crates/lords-core/src/adapters.rs`) encode these facts.
 |---|---|---|
 | user level (claude) | the profile's `CLAUDE.md` (each profile in use) | the user file |
 | user level (codex) | `$CODEX_HOME/AGENTS.md` | the global file |
-| a repo (claude) | untracked `CLAUDE.local.md` in every checkout and worktree | loads after the tracked files and stops a stale tracked `AGENTS.md` from loading; the stack's repo layers replace it |
-| a repo (codex) | untracked `AGENTS.override.md` in every checkout and worktree | replaces the tracked `AGENTS.md` in that dir |
+| a repo (claude) | untracked `CLAUDE.local.md` in every checkout and worktree under `worktree_roots`: `@AGENTS.md` first, then the repo's layers | a `CLAUDE.local.md` alone would stop the tracked `AGENTS.md` from loading; the include keeps it |
+| a repo (codex) | untracked `AGENTS.override.md`: the tracked `AGENTS.md` text inline, then the repo's layers | the override replaces the tracked file, and Codex doesn't expand includes |
 | a repo's tracked `AGENTS.md` | nothing: reported only | it changes by a commit on the repo's own branches, which sync never makes |
 
 Every one of these files also carries the memory index for its layers (see the design's Memory section). Both
 untracked files go into the repo's shared `.git/info/exclude`, so the worktrees stay clean. With two Claude
-profiles in use, `~/.claude/CLAUDE.md` also loads under the other profile. The private stack decides which profile
-file carries the global text (see the design's open question).
+profiles in use, both profile files include one shared composed file (`via`), and the second profile's settings
+exclude `~/.claude/CLAUDE.md` (a `settings` target), so nothing loads twice and repos' `AGENTS.md` stays visible.

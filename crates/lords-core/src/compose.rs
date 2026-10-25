@@ -248,6 +248,20 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
     out
 }
 
+/// A managed block holding `body` (e.g. one include line).
+pub fn block(body: &str) -> String {
+    format!("{BEGIN}\n{HEADER}\n{}\n{END}\n", body.trim_end())
+}
+
+/// A composed block with `pre` first, right after the header (a repo file's tracked-instructions line).
+pub fn with_preamble(text: &str, pre: &str) -> String {
+    let head = format!("{BEGIN}\n{HEADER}\n");
+    match text.strip_prefix(&head) {
+        Some(rest) => format!("{head}{}\n\n{rest}", pre.trim_end()),
+        None => format!("{}\n\n{text}", pre.trim_end()),
+    }
+}
+
 /// Puts a block into a file's text: between existing markers, else appended. `replace` drops the text outside.
 pub fn place_block(current: &str, block: &str, replace: bool) -> String {
     if replace {

@@ -403,3 +403,126 @@ fn a_target_with_an_unknown_adapter_is_refused() {
     let err = plan(&f.stacks(), &Options::default()).unwrap_err();
     assert!(err.contains("unknown adapter `cursor`") && err.contains("claude, codex"), "{err}");
 }
+
+// Spec (orchestrator D1, 25 Oct: "the composed global text in one file, with both CLAUDE.md files a one-line
+// @import of it"): targets with the same `via` share one composed file, planned once; each target's own file
+// holds only the include line; an adapter that doesn't expand includes can't use `via`.
+#[test]
+fn profiles_share_one_composed_file_through_via() {
+    let f = Fixture::new();
+    f.write("pub/global/rules/a.md", &entry("rule.a", "global", "public", "", "Rule A.\n"));
+    let shared = f.path("home/.lords-command/out/claude-global.md");
+    let via = format!("via = '{}'\n", shared.display());
+    let (one, two) = (f.path("home/.claude/CLAUDE.md"), f.path("home/.claude-balanced/CLAUDE.md"));
+    with_targets(
+        &f,
+        &[
+            target("default", "claude", "instructions", &one, &via),
+            target("balanced", "claude", "instructions", &two, &via),
+        ]
+        .concat(),
+    );
+    let opts = Options { user_only: true, ..Options::default() };
+    let p = plan(&f.stacks(), &opts).unwrap();
+    assert_eq!(
+        p.items.iter().filter(|i| i.path == shared).count(),
+        1,
+        "the shared file is planned once"
+    );
+    apply(&p, &f.path("backups")).unwrap();
+    assert!(fs::read_to_string(&shared).unwrap().contains("Rule A."));
+    let include =
+        format!("@{}", shared.display().to_string().replace(std::path::MAIN_SEPARATOR, "/"));
+    for file in [&one, &two] {
+        let text = fs::read_to_string(file).unwrap();
+        assert!(text.contains(&format!("\n{include}\n")) && !text.contains("Rule A."), "{text}");
+    }
+    assert!(plan(&f.stacks(), &opts).unwrap().items.iter().all(|i| i.action == Action::InSync));
+
+    with_targets(
+        &f,
+        &target("codex", "codex", "instructions", &f.path("home/.codex/AGENTS.md"), &via),
+    );
+    assert_eq!(plan(&f.stacks(), &opts).unwrap().items[0].action, Action::Conflict);
+}
+
+// Spec (load-order.md: `claudeMdExcludes` keeps an ancestor file from loading and from hiding AGENTS.md): a
+// settings target adds its paths to the adapter's exclude list and changes nothing else in the file; already
+// listed, it is in sync.
+#[test]
+fn a_settings_target_adds_the_exclude_and_keeps_the_rest() {
+    let f = Fixture::new();
+    let settings = f.write(
+        "home/.claude-balanced/settings.json",
+        "{\n  \"model\": \"x\",\n  \"hooks\": {},\n  \"zeta\": 1\n}\n",
+    );
+    let excluded = f.path("home/.claude/CLAUDE.md");
+    let extra = format!("exclude = ['{}']\n", excluded.display());
+    with_targets(&f, &target("balanced settings", "claude", "settings", &settings, &extra));
+    let opts = Options { user_only: true, ..Options::default() };
+    let p = plan(&f.stacks(), &opts).unwrap();
+    assert_eq!(p.items[0].action, Action::Update);
+    apply(&p, &f.path("backups")).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+    let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["model", "hooks", "zeta", "claudeMdExcludes"], "other keys keep their order");
+    assert_eq!(
+        v["claudeMdExcludes"],
+        serde_json::json!([excluded.display().to_string().replace(std::path::MAIN_SEPARATOR, "/")])
+    );
+    assert_eq!(plan(&f.stacks(), &opts).unwrap().items[0].action, Action::InSync);
+    // Already listed, in the owner's own formatting: nothing is rewritten.
+    let path = excluded.display().to_string().replace(std::path::MAIN_SEPARATOR, "/");
+    let compact = format!("{{\"claudeMdExcludes\":[\"{path}\"],\"model\":\"x\"}}")
+        + "
+";
+    fs::write(&settings, &compact).unwrap();
+    assert_eq!(plan(&f.stacks(), &opts).unwrap().items[0].action, Action::InSync);
+}
+
+// Spec (orchestrator D2, 25 Oct: "worktree_roots … skip and list" the rest; D1: "every managed repo gets
+// CLAUDE.local.md containing @AGENTS.md plus the project and repo layers"): only worktrees under a root get
+// files, the others are listed; where the checkout has an AGENTS.md, the Claude file includes it and the Codex
+// override carries its text (Codex doesn't expand includes).
+#[test]
+fn worktree_roots_limit_the_worktrees_and_tracked_instructions_still_load() {
+    let f = Fixture::new();
+    f.write(
+        "priv/repo/beta-core/facts/h.md",
+        &entry("fact.h", "repo:beta-core", "private", "", "Hosts through the fleet.\n"),
+    );
+    let main = f.path("checkout");
+    f.write("checkout/AGENTS.md", "Tracked text.\n");
+    f.git_init("checkout");
+    git(&main, &["worktree", "add", "-q", "../wt-root/a", "-b", "a"]);
+    git(&main, &["worktree", "add", "-q", "../gate-temp", "-b", "g"]);
+    let manifest = format!(
+        "name = \"priv\"\nvisibility = \"private\"\n[projects.beta]\n[repos.beta-core]\nproject = \"beta\"\ncheckouts = ['{}']\nworktree_roots = ['{}']\n",
+        main.display(),
+        f.path("wt-root").display()
+    );
+    f.write("priv/stack.toml", &manifest);
+    let p =
+        plan(&f.stacks(), &Options { repo: Some("beta-core".into()), user_only: false }).unwrap();
+    let written: Vec<String> = p
+        .items
+        .iter()
+        .filter(|i| i.action == Action::Create && i.target.contains("CLAUDE.local.md"))
+        .map(|i| i.path.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(written, ["checkout", "a"]);
+    assert!(
+        p.notes.iter().any(|n| n.contains("1 worktree(s) outside worktree_roots skipped")
+            && n.contains("gate-temp")),
+        "{:?}",
+        p.notes
+    );
+    let by = |file: &str| {
+        p.items.iter().find(|i| i.path == main.join(file)).unwrap().proposed.clone().unwrap()
+    };
+    let claude = by("CLAUDE.local.md");
+    assert!(claude.contains("-->\n@AGENTS.md\n\n# Facts\n\nHosts through the fleet."), "{claude}");
+    let codex = by("AGENTS.override.md");
+    assert!(codex.contains("-->\nTracked text.\n\n# Facts\n\nHosts through the fleet."), "{codex}");
+}
