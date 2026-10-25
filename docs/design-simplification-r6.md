@@ -24,9 +24,14 @@ edits. Reads keep taking `&Path`.
 - An `OwnerFile` comes only from a target's configured path, a settings target, or a checkout root's
   `info/exclude`.
 - So every writer has to name its root. Import, promote, retire and edit join validated parts under
-  `Root::stack` (R6-01: a scope's project name becomes `Part::skill`, and `../..` can't be one). Set-aside takes a
-  human's path only once `Root::containing(path)` splits it into a root and parts. Restore re-derives every manifest
-  line from the current config.
+  `Root::stack` (R6-01: a scope's project name becomes `Part::skill`, and `../..` can't be one).
+- **Set-aside** takes a human's path only through `Roots::containing(path)`. That returns one of the plan's
+  already-verified roots, the one that contains the path, and the parts below it. It never builds a root from the
+  path itself, which would make every path "contained"; a path in no verified root is refused.
+- **Restore** re-derives every manifest line under the current config: an owner edit must be one of the
+  `OwnerFile`s the config yields now, and a set-aside path must lie in one of today's verified roots. If any line
+  doesn't re-derive, restore refuses before changing anything and lists each such line with its path and where its
+  bytes are in the backup, for recovery by hand. It never guesses.
 - The ledger stores scope plus parts, and computes the path from them, so a record is valid exactly when its root
   still verifies. That is ledger format 2. This PC's format-1 ledger holds only the 2 hook records of this
   afternoon: it is deleted and the hooks reinstalled, as a dry-run-first step.
@@ -54,11 +59,13 @@ recall on open or data access), reparse, integrity, and whatever Windows adds la
   refuse on its cloud bits, which is the right default.
 - Tool-owned paths stay out of contract: the tool owns them whole, and their hash covers bytes only.
 
-**D. Privacy reachability by behaviour.** The installed privacy hooks start with a probe: when `LORDS_HOOK_PROBE`
-is set, they print `lords-hook-probe:<token>:<hook>` and exit 0, before the commit check or any scan.
-- `lords check` runs `git hook run --ignore-missing pre-commit`, and `commit-msg` with a temp message file in the
-  tool home that it deletes afterwards, with a fresh token. Verified means the token came back for that hook.
-  Anything else, a git error included, is "not verified".
+**D. Privacy reachability by behaviour.** The installed privacy hooks start with a probe that can't become a
+bypass. A hook prints `lords-hook-probe:<nonce>:<hook>` and exits 0 only when `LORDS_HOOK_PROBE` is a nonce (32
+hex digits) and `<home>/state/probe-<nonce>` exists. Any other value, set or exported anywhere, runs the normal
+check unchanged.
+- `lords check` creates that file right before it runs `git hook run --ignore-missing pre-commit` (and
+  `commit-msg`, with a temp message file in the tool home), and deletes both right after. Verified means the nonce
+  came back for that hook. Anything else, a git error included, is "not verified".
 - That works for any dispatcher, the attribution guard or another, and reads no file to guess (R6-07, R6-08).
 - Git 2.42 here has `git hook run`; an older git errors, which reads as not verified.
 - What stays outside: `--no-verify`, a hooks path set after the check, and commits made elsewhere (guarantee 7's
@@ -155,6 +162,9 @@ Out of contract and stated, as before: tests, build scripts and dependencies (ou
   6. The staged mode, last, as a flag on the existing plan.
 - **Tests:**
   - Every R6 probe becomes a red-first spec test, with the reviewer's reproductions as the base.
+  - The three points of the design review (25 Oct) get one each: an invented or stale probe value, with no nonce
+    file, doesn't switch the check off; set-aside refuses a path in no verified root; restore refuses, changing
+    nothing, a line that doesn't re-derive.
   - A's acceptance is compile-time: a test crate that tries to call fsguard's mutating API with a `&Path` must not
     build (a `compile_fail` doctest in fsguard.rs, no new dependency).
 - **After it:** the ledger reset and hook reinstall on this PC, dry run first.
