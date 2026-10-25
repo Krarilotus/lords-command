@@ -211,8 +211,11 @@ one line naming the checkout's role files and how many each carries. The role fi
 are cut at a word, at 100 characters.
 
 **A place's default role.** A session nobody briefed (a thread the owner starts) doesn't know its role. A place's
-`default_role` (stack.toml) is that role: its entries and notes go inline in the place's files, labelled; the
-role-files line stays for briefed agents of the other roles.
+`default_role` (stack.toml) is that role. How a place's file carries it is the adapter's (orchestrator, 25 Oct,
+option 1): Claude's file has its entries and notes inline, labelled; Codex's, which stops at its byte limit, has
+them by reference like every other role's, and its role-files line names the default role's file first ("the
+default role here"). The role-files line stays for briefed agents of the other roles. `lords sizes` and the size
+guard name the place, the adapter, its file and each section's bytes.
 
 **New worktrees.** `lords hooks install --post-checkout` writes the repo's own `.git/hooks/post-checkout` (the
 common dir, so every worktree runs it). On a new worktree (old HEAD all zeros) it runs `lords sync --repo X --place

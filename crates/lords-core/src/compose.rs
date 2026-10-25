@@ -31,7 +31,8 @@ fn role_pointer(notes: &[&Entry], ctx: &Context) -> Option<String> {
             dirs.push(dir);
         }
     }
-    let counts: Vec<String> = counts.iter().map(|(r, n)| format!("{r}: {n}")).collect();
+    let counts: Vec<String> =
+        default_first(counts, ctx).iter().map(|(r, n)| format!("{r}: {n}")).collect();
     let dirs: Vec<String> = dirs.iter().map(|d| format!("`{d}`")).collect();
     Some(format!(
         "- More notes are for one role only ({}); in that role, find them in {} (each file's `roles` says whose).",
@@ -184,8 +185,17 @@ fn role_files_line(pointed: &[&Entry], dir: &Path, ctx: &Context) -> String {
             *counts.entry(r.as_str()).or_default() += 1;
         }
     }
-    let files: Vec<String> =
-        counts.iter().map(|(r, n)| format!("`{}` ({n})", crate::sync::role_file(r))).collect();
+    let files: Vec<String> = default_first(counts, ctx)
+        .iter()
+        .map(|(r, n)| {
+            let here = if ctx.default_role.as_deref() == Some(*r) {
+                ", the default role here"
+            } else {
+                ""
+            };
+            format!("`{}` ({n}{here})", crate::sync::role_file(r))
+        })
+        .collect();
     format!(
         "More rules, facts, status and notes bind only some roles; each role's file in `{}` has them in full: {}.",
         shown(dir, ctx),
@@ -272,9 +282,29 @@ pub struct Context {
     pub role_dir: Option<PathBuf>,
     /// Paths shown relative to this dir instead of absolute (see `shown`).
     pub relative_to: Option<PathBuf>,
-    /// With `role_dir`, the role a reader without a brief has (the place's `default_role`): its entries and notes
-    /// stay inline, labelled, instead of behind the role-files line.
+    /// With `role_dir`, the role a reader without a brief has (the place's `default_role`): with
+    /// `default_role_inline` its entries and notes stay inline, labelled; without, they go behind the role-files
+    /// line like the others', and that line (and the notes line) names this role first.
     pub default_role: Option<String>,
+    /// Whether the adapter's file carries the default role inline (`Adapter::default_role_inline`).
+    pub default_role_inline: bool,
+}
+
+impl Context {
+    /// The default role, where its entries and notes stay inline.
+    fn inline_role(&self) -> Option<&String> {
+        self.default_role.as_ref().filter(|_| self.default_role_inline && self.role_dir.is_some())
+    }
+}
+
+/// Roles and their counts, the default role first, then by name.
+fn default_first<'a>(
+    counts: std::collections::BTreeMap<&'a str, usize>,
+    ctx: &Context,
+) -> Vec<(&'a str, usize)> {
+    let mut v: Vec<(&str, usize)> = counts.into_iter().collect();
+    v.sort_by_key(|(r, _)| ctx.default_role.as_deref() != Some(*r));
+    v
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -415,7 +445,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         Some(_) if ctx.by_reference => live.into_iter().partition(|e| {
             partial_role(e)
                 && !matches!(e.meta.kind, Kind::Intent | Kind::Skill)
-                && !ctx.default_role.as_ref().is_some_and(|d| e.meta.roles.contains(d))
+                && !ctx.inline_role().is_some_and(|d| e.meta.roles.contains(d))
         }),
         _ => (Vec::new(), live),
     };
@@ -442,8 +472,8 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         let temp = crate::temporary::label(e, stacks);
         // In a file every role reads under a byte limit, an entry for only some roles is a reference; the role
         // files of the roles it binds carry its text.
-        let inline_here = ctx.role_dir.is_some()
-            && ctx.default_role.as_ref().is_some_and(|d| e.meta.roles.contains(d));
+        let inline_here =
+            ctx.role_dir.is_some() && ctx.inline_role().is_some_and(|d| e.meta.roles.contains(d));
         if ctx.by_reference && partial_role(e) && !inline_here {
             let who = who.unwrap_or_else(|| e.meta.roles.join(", "));
             let temp = temp.map(|t| format!("; {t}")).unwrap_or_default();
@@ -565,8 +595,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
     // Where the reader's role is unknown, notes for one role stay out of the index; one line says where they are.
     // The place's default role is no unknown one: its notes stay in the index.
     let default_note = |e: &Entry| {
-        ctx.role_dir.is_some()
-            && ctx.default_role.as_ref().is_some_and(|d| e.meta.roles.contains(d))
+        ctx.role_dir.is_some() && ctx.inline_role().is_some_and(|d| e.meta.roles.contains(d))
     };
     let (role_notes, notes): (Vec<&Entry>, Vec<&Entry>) = notes
         .into_iter()

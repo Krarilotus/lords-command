@@ -46,15 +46,6 @@ fn every_place_on_this_machine_stays_under_the_size_line() {
             "{place} is measured with a limited adapter"
         );
     }
-    let over: Vec<String> = all
-        .iter()
-        .filter(|s| s.over_line())
-        .map(|s| {
-            format!(
-                "{} {}: {} of {:?}, by part {:?}",
-                s.place, s.file, s.reads, s.limit, s.sections
-            )
-        })
-        .collect();
+    let over: Vec<String> = all.iter().filter(|s| s.over_line()).map(|s| s.describe()).collect();
     assert!(over.is_empty(), "past {SIZE_WARN_PERCENT}% of the limit: {over:#?}");
 }

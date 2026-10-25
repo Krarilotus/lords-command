@@ -201,6 +201,7 @@ fn relative_paths_are_one_switch() {
             role_dir: Some(checkout.join(".lords")),
             relative_to: relative.then(|| checkout.clone()),
             default_role: None,
+            default_role_inline: false,
         };
         lords_core::compose::compose(&f.stacks(), &ctx).text
     };

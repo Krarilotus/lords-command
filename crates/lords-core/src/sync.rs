@@ -861,6 +861,7 @@ fn context(
         role_dir: None,
         relative_to: None,
         default_role: None,
+        default_role_inline: false,
     }
 }
 
@@ -1345,6 +1346,7 @@ pub fn role_composed(stacks: &Stacks, layers: Layers, role: &str) -> Composed {
         role_dir: None,
         relative_to: None,
         default_role: None,
+        default_role_inline: false,
     };
     compose::compose(stacks, &ctx)
 }
@@ -1580,6 +1582,7 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
             role_dir: None,
             relative_to: None,
             default_role: None,
+            default_role_inline: false,
         };
         let composed = compose::compose(pl.stacks, &ctx);
         let label = format!("{} (tracked AGENTS.md)", place.label);
@@ -2486,6 +2489,7 @@ fn place_skills(stacks: &Stacks, layers: Layers) -> Vec<&Entry> {
         role_dir: None,
         relative_to: None,
         default_role: None,
+        default_role_inline: false,
     };
     compose::applicable(stacks, &ctx)
         .into_iter()
@@ -2556,6 +2560,7 @@ fn place_context(
     ctx.by_reference = true;
     ctx.role_dir = checkout.map(|c| c.join(ROLE_DIR));
     ctx.default_role = default_role;
+    ctx.default_role_inline = adapter.default_role_inline();
     if adapter.relative_paths() {
         ctx.relative_to = checkout.map(Path::to_path_buf);
     }
@@ -2781,6 +2786,9 @@ pub fn shadow_findings(stacks: &Stacks) -> Vec<crate::Finding> {
 pub struct Size {
     /// "user level", "repo <name>" or "workspace <name>".
     pub place: String,
+    /// The adapter whose agents read it (its id); empty for what every adapter's agents read (role files, skill
+    /// copies).
+    pub adapter: String,
     /// The adapter's file, or a role file.
     pub file: String,
     pub bytes: usize,
@@ -2800,6 +2808,27 @@ impl Size {
     /// Past the warning line (`SIZE_WARN_PERCENT` of the limit).
     pub fn over_line(&self) -> bool {
         self.limit.is_some_and(|l| self.reads * 100 > l * SIZE_WARN_PERCENT)
+    }
+
+    /// One line for a reader who has to make it smaller: the place, the adapter and its file, what a session
+    /// there reads against the limit, and each section's bytes (orchestrator, 25 Oct).
+    pub fn describe(&self) -> String {
+        let who = if self.adapter.is_empty() {
+            "every adapter".to_string()
+        } else {
+            self.adapter.clone()
+        };
+        let against = match self.limit {
+            Some(l) => format!("{} of {l} bytes ({} %)", self.reads, self.reads * 100 / l),
+            None => format!("{} bytes", self.bytes),
+        };
+        let parts: Vec<String> = self.sections.iter().map(|(s, n)| format!("{s} {n}")).collect();
+        format!(
+            "{}, {who} ({}): {against}; by section: {}",
+            self.place,
+            self.file,
+            parts.join(", ")
+        )
     }
 }
 
@@ -2834,6 +2863,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
         user.insert(adapter.id(), text.len());
         out.push(Size {
             place: "user level".into(),
+            adapter: adapter.id().to_string(),
             file: adapter.id().to_string(),
             bytes: text.len(),
             reads: text.len(),
@@ -2859,6 +2889,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
             let rendered = adapter.render(&composed);
             out.push(Size {
                 place: label.clone(),
+                adapter: adapter.id().to_string(),
                 file: adapter.repo_file().to_string(),
                 bytes: text.len(),
                 reads: text.len() + user[adapter.id()],
@@ -2889,6 +2920,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
             parts.push((format!("in all {paths}"), each * paths));
             out.push(Size {
                 place: label.clone(),
+                adapter: String::new(),
                 file: "skill copies".into(),
                 bytes: each,
                 reads: 0,
@@ -2901,6 +2933,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
             let text = role_composed(stacks, place_layers(stacks, &name, true), &role).text;
             out.push(Size {
                 place: label.clone(),
+                adapter: String::new(),
                 file: format!("{ROLE_DIR}/{}", role_file(&role)),
                 bytes: text.len(),
                 reads: 0,

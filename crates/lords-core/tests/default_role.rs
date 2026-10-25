@@ -44,7 +44,8 @@ fn repo(f: &Fixture, default_role: &str) -> std::path::PathBuf {
 }
 
 // Spec (option 1, Codex): Codex's file, which stops at its byte limit, carries the default role's entries by
-// reference like every other role's; its role-files line and its notes line name the default role first.
+// reference like every other role's, its notes too; the role-files line, which counts both, names the default
+// role's file first.
 #[test]
 fn codex_reads_the_default_role_by_reference_and_first() {
     let f = Fixture::new();
@@ -53,13 +54,10 @@ fn codex_reads_the_default_role_by_reference_and_first() {
     let p = plan(&f.stacks(), &f.opts()).unwrap();
     let codex = proposed(&p, &checkout.join("AGENTS.override.md"));
     assert!(!codex.contains("Merge in order."), "not inline for Codex: {codex}");
+    assert!(!codex.contains("- on: memory.on"), "its notes not indexed inline: {codex}");
     let line = codex.lines().find(|l| l.contains("has them in full:")).unwrap_or_default();
-    let (o, c) = (line.find("role-orchestrator.md"), line.find("role-coder.md"));
+    let (o, c) = (line.find("role-orchestrator.md` (2"), line.find("role-coder.md` (2"));
     assert!(o.is_some() && c.is_some() && o < c, "the default role's file first: {line}");
-    let notes =
-        codex.lines().find(|l| l.contains("More notes are for one role only")).unwrap_or_default();
-    let (o, c) = (notes.find("orchestrator"), notes.find("coder"));
-    assert!(o.is_some() && c.is_some() && o < c, "the default role's notes first: {notes}");
 }
 
 // Spec (option 1, Claude): Claude's file keeps the default role's entries inline, labelled, and its notes indexed.

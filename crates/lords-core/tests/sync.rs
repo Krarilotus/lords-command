@@ -21,6 +21,7 @@ fn global(audience: Vec<Audience>) -> Context {
         role_dir: None,
         relative_to: None,
         default_role: None,
+        default_role_inline: false,
     }
 }
 
@@ -131,6 +132,7 @@ fn repo_layers_take_their_project_and_repo() {
             role_dir: None,
             relative_to: None,
             default_role: None,
+            default_role_inline: false,
         },
     );
     assert_eq!(c.ids, ["rule.p", "fact.r", "fact.s"]);
@@ -146,6 +148,7 @@ fn repo_layers_take_their_project_and_repo() {
             role_dir: None,
             relative_to: None,
             default_role: None,
+            default_role_inline: false,
         },
     );
     assert_eq!(c.ids, ["rule.g", "rule.p", "fact.r"]);
@@ -424,6 +427,7 @@ fn the_memory_index_goes_to_places_never_to_the_user_level() {
                 role_dir: None,
                 relative_to: None,
                 default_role: None,
+                default_role_inline: false,
             },
         )
         .text
@@ -595,6 +599,7 @@ fn role_ctx(roles: Option<Vec<&str>>) -> Context {
         role_dir: None,
         relative_to: None,
         default_role: None,
+        default_role_inline: false,
     }
 }
 

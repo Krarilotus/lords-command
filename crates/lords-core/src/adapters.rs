@@ -51,6 +51,12 @@ pub trait Adapter: Sync {
     fn relative_paths(&self) -> bool {
         false
     }
+    /// Whether a place's file carries the place's default role's entries and notes inline (orchestrator, 25 Oct,
+    /// option 1). Where it doesn't, they go by reference like every other role's, and the role-files line names
+    /// the default role's file first.
+    fn default_role_inline(&self) -> bool {
+        true
+    }
 }
 
 /// Claude Code: user file `CLAUDE.md` in the profile dir; `CLAUDE.local.md` per checkout, which also keeps a
@@ -115,6 +121,11 @@ impl Adapter for Codex {
 
     fn byte_limit(&self) -> Option<usize> {
         Some(32 * 1024)
+    }
+
+    /// Codex stops at its byte limit, so the default role's text stays in its role file, named first.
+    fn default_role_inline(&self) -> bool {
+        false
     }
 
     /// The override replaces the tracked `AGENTS.md` and Codex doesn't expand includes, so the tracked text is

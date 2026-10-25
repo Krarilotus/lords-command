@@ -29,6 +29,7 @@ fn user_level(f: &Fixture) -> String {
         role_dir: None,
         relative_to: None,
         default_role: None,
+        default_role_inline: false,
     };
     compose(&f.stacks(), &ctx).text
 }
