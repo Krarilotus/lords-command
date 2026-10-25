@@ -256,6 +256,58 @@ exclude list (Claude: `claudeMdExcludes`). For two Claude profiles: both `CLAUDE
 file, and the second profile excludes `~/.claude/CLAUDE.md`, which would otherwise load again as an ancestor and
 hide repos' `AGENTS.md`. Without that exclude, the plan (and `check`, as info) says so.
 
+## Ownership boundary
+
+*Proposed 25 Oct after the second Sol review; once built, it replaces the Sync paragraphs on skills, on what apply
+may touch, and on backups.* Two review rounds found the same class again and again: the tool *inferred* what was
+its own (a dir by its name or contents, a record inside a copy, a link by where it points) and *edited in place*
+on a filesystem the owner also uses. Each patch closed one case and opened its neighbour. So sync stops inferring.
+
+**Three kinds of path.**
+1. **Tool-owned paths**, the only ones sync creates, replaces or removes: each skill copy dir, each place's `.lords/`
+   dir, `CLAUDE.local.md`, `AGENTS.override.md`, and the files under `~/.lords-command/out/`. Each is whole: sync never
+   edits one, it builds the new version beside it and swaps it in.
+2. **Owner files**, which sync edits minimally and nowhere else: the managed block in the user-level instruction files
+   (`~/.claude/CLAUDE.md`, a profile's `CLAUDE.md`, `~/.codex/AGENTS.md`), the one settings key (`claudeMdExcludes`),
+   and sync's two lines in a repo's `.git/info/exclude`. Only these need backups and restore.
+3. **Everything else**, which sync only reads, and never through a link.
+
+**The ledger** (`~/.lords-command/state/ledger.toml`) is the only proof of ownership. It lists every tool-owned path
+sync created: its normalized path (case-folded on Windows), what it is, and the SHA-256 of what sync put there (a
+dir's hash covers every file in it). A path that isn't in the ledger is not the tool's, whatever its name or
+contents: where sync wants to write and finds one, that's a conflict. Nothing in a copy says it's the tool's; there is
+no record to parse or forge, and no directory listing decides what goes. What goes is what the ledger holds and the
+stack no longer wants.
+
+**Replacing a tool-owned path.** Sync builds the new version beside it, under a name unique to the run, created with
+`create_new`; it hashes what it built, not the source. It checks the old version still matches its ledger hash,
+moves it aside, renames the new one in, records the new hash, then deletes the old one. Rollback is regenerating
+(sync from an earlier stack commit) or `lords uninstall`, which removes every ledger path that still matches; never a
+restore into a dir the owner may have touched.
+
+**Removing** happens only to a ledger path whose hash still matches, through one delete that follows nothing: it
+refuses a reparse point (junction, symlink) on the path or anywhere below it, and deletes file by file, bottom up. A
+path that changed is left and reported.
+
+**Every filesystem step goes through one choke point** that refuses a reparse point anywhere from the drive root
+down to the path (ancestors included) before it reads, writes, moves or deletes there.
+
+**Owner-file edits** read the file, compute the new bytes, then move the file aside into the run's backup and compare
+what was moved with what was planned. A mismatch means an edit since planning: the file goes back and that item
+fails, so nothing an owner wrote is lost, even during the apply. Otherwise the new file is renamed in. Backups are
+numbered files with a manifest naming each original path and the hash sync wrote. `restore` puts a file back only
+while it still holds exactly what sync wrote; anything else is left and reported.
+
+**Stack edits** (import, retirement) touch only files git already tracks and holds unmodified, plus new files; they
+run under the same lock, after the plan is known to apply.
+
+**The changeover, once and with a human:** the 3a place files, the old `~/.codex/skills` copies and any other path
+from before the ledger are listed by `lords adopt --list`. Adopting a file records it only if it is byte for byte what
+sync would write now. Removing an old copy moves it into the backup only on the owner's confirmation.
+
+**Out of git without editing git.** A tool-owned dir (a skill copy, `.lords/`) holds a `.gitignore` of `*`, so it
+ignores itself. Only the two root files need lines in `.git/info/exclude`.
+
 ## Adapters
 
 The stack format belongs to no harness: entries are Markdown with neutral metadata, layers are directories, and
