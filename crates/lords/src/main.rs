@@ -18,6 +18,7 @@ usage:
   lords retire ID --reason TEXT [--superseded-by ID] [--date YYYY-MM-DD] [--no-commit]
   lords promote ID [--strip | --split] [--no-commit]
   lords privacy --staged [--secrets-only]
+  lords privacy --history [--private-stack DIR]   every commit's message and patch (the pre-push check)
   lords privacy FILE...
   lords hooks install [--repo DIR] [--secrets-only] [--force]
   lords hash PATH
@@ -326,12 +327,21 @@ fn cmd_promote(mut a: Args) -> Result<bool, String> {
 
 fn cmd_privacy(mut a: Args) -> Result<bool, String> {
     let staged = a.flag("--staged");
+    let history = a.flag("--history");
     let secrets_only = a.flag("--secrets-only");
+    let public_stack = a.value("--public-stack")?.map(PathBuf::from);
+    let private_stack = a.value("--private-stack")?.map(PathBuf::from);
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let rules = if secrets_only {
         Rules::secrets_only()
     } else {
-        let cfg = Config::discover();
+        let mut cfg = Config::discover();
+        if private_stack.is_some() {
+            cfg.private = private_stack;
+        }
+        if public_stack.is_some() {
+            cfg.public = public_stack;
+        }
         let private = cfg.private.as_deref().and_then(|p| Stack::load(p).ok());
         let mut rules = Rules::public().with_private(private.as_ref());
         if let Some(top) = git::toplevel(&cwd) {
@@ -344,6 +354,23 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
     };
     for n in &rules.notes {
         eprintln!("lords privacy: {n}");
+    }
+    if history {
+        a.done()?;
+        let top = git::toplevel(&cwd).ok_or("not in a git repo")?;
+        let h = privacy::scan_history(&top, &rules)?;
+        for x in &h.hits {
+            println!(
+                "{} {}:{} {}: `{}`",
+                x.commit,
+                x.place,
+                x.hit.line,
+                x.hit.class.name(),
+                x.hit.text
+            );
+        }
+        println!("history: {} commits scanned, {} finding(s)", h.commits, h.hits.len());
+        return Ok(h.hits.is_empty());
     }
     let scan = if staged {
         a.done()?;

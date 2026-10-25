@@ -88,3 +88,35 @@ fn a_missing_private_stack_is_reported() {
     let r = Rules::public().with_private(None);
     assert_eq!(r.notes.len(), 1);
 }
+
+// Spec (orchestrator, 25 Oct: "Show me the before/after privacy output over all commits (`git log -p` through the
+// privacy scanner), not only the tree"): a private detail a later commit removed is still found, in the commit
+// that added it, and so is one in a commit message; a clean history gives none.
+#[test]
+fn the_history_scan_finds_what_the_tree_no_longer_shows() {
+    let f = Fixture::new();
+    let repo = f.path("repo");
+    f.write("repo/a.md", &format!("mail {}\n", email("alice")));
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "first"]);
+    f.write("repo/a.md", "nothing here\n");
+    git(&repo, &["commit", "-q", "-am", "Ask Kestrel about it"]);
+    let mut rules = Rules::public();
+    rules.deny = vec!["kestrel".into()];
+    let tree = lords_core::privacy::scan_tree(&repo, &rules).unwrap();
+    assert!(tree.hits.is_empty(), "the tree is clean");
+    let h = lords_core::privacy::scan_history(&repo, &rules).unwrap();
+    assert_eq!(h.commits, 2);
+    let places: Vec<(&str, Class)> =
+        h.hits.iter().map(|x| (x.place.as_str(), x.hit.class)).collect();
+    assert!(places.contains(&("a.md", Class::Contact)), "{places:?}");
+    assert!(places.contains(&("message", Class::Deny)), "{places:?}");
+
+    let clean = f.path("clean");
+    f.write("clean/a.md", "fine\n");
+    git(&clean, &["init", "-q"]);
+    git(&clean, &["add", "-A"]);
+    git(&clean, &["commit", "-q", "-m", "fine"]);
+    assert!(lords_core::privacy::scan_history(&clean, &rules).unwrap().hits.is_empty());
+}

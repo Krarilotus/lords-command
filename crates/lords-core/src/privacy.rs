@@ -297,3 +297,48 @@ pub fn scan_staged(repo: &Path, rules: &Rules) -> Result<Scan, String> {
     }
     Ok(scan)
 }
+
+/// One finding in a repo's history: the commit, where in it (`message`, or the file the patch line belongs to),
+/// and the span.
+#[derive(Clone, Debug, Serialize)]
+pub struct HistoryHit {
+    pub commit: String,
+    pub place: String,
+    pub hit: Hit,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct HistoryScan {
+    pub commits: usize,
+    pub hits: Vec<HistoryHit>,
+}
+
+/// Every commit reachable from any ref, as `git log -p` shows it: its message and its whole patch (file names
+/// included). What a later commit removed is still in the history, so a clean tree proves nothing about it.
+pub fn scan_history(repo: &Path, rules: &Rules) -> Result<HistoryScan, String> {
+    let out = git::run(
+        repo,
+        &["log", "--all", "-p", "--no-color", "--no-ext-diff", "--format=%x1e%H%n%B%x1f"],
+    )?;
+    let mut scan = HistoryScan::default();
+    for record in out.split('\u{1e}').filter(|r| !r.trim().is_empty()) {
+        let (head, patch) = record.split_once('\u{1f}').unwrap_or((record, ""));
+        let (commit, message) = head.split_once('\n').unwrap_or((head, ""));
+        let commit: String = commit.trim().chars().take(12).collect();
+        scan.commits += 1;
+        for h in self::scan(message, rules) {
+            scan.hits.push(HistoryHit { commit: commit.clone(), place: "message".into(), hit: h });
+        }
+        let lines: Vec<&str> = patch.lines().collect();
+        for h in self::scan(patch, rules) {
+            let file = lines[..h.line.min(lines.len())]
+                .iter()
+                .rev()
+                .find_map(|l| l.strip_prefix("diff --git a/").and_then(|r| r.split(" b/").next()))
+                .unwrap_or("patch")
+                .to_string();
+            scan.hits.push(HistoryHit { commit: commit.clone(), place: file, hit: h });
+        }
+    }
+    Ok(scan)
+}
