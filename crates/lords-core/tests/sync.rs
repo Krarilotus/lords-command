@@ -474,9 +474,7 @@ fn a_settings_target_adds_the_exclude_and_keeps_the_rest() {
     assert_eq!(plan(&f.stacks(), &opts).unwrap().items[0].action, Action::InSync);
     // Already listed, in the owner's own formatting: nothing is rewritten.
     let path = excluded.display().to_string().replace(std::path::MAIN_SEPARATOR, "/");
-    let compact = format!("{{\"claudeMdExcludes\":[\"{path}\"],\"model\":\"x\"}}")
-        + "
-";
+    let compact = format!("{{\"claudeMdExcludes\":[\"{path}\"],\"model\":\"x\"}}\n");
     fs::write(&settings, &compact).unwrap();
     assert_eq!(plan(&f.stacks(), &opts).unwrap().items[0].action, Action::InSync);
 }
