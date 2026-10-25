@@ -1,5 +1,9 @@
 //! Lords Command's window: browse the stacks' entries, see what `check` finds, edit and retire, see what each
 //! harness reads in each place and where every line comes from, and sync behind a confirmation.
+//!
+//! Renderer-agnostic by rule (owner, 25 Oct: the egui code stays, its renderer moves from OpenGL to a CPU
+//! rasteriser): draw only through egui's painter and widgets. No glow or GPU calls, no paint callbacks, no custom
+//! shaders or textures; the renderer is picked in Cargo.toml alone.
 #![windows_subsystem = "windows"]
 
 mod ui;
