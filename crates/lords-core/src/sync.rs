@@ -90,6 +90,9 @@ pub struct Options {
     pub repo: Option<String>,
     /// Only user-level targets.
     pub user_only: bool,
+    /// Only this adapter's files (its targets, and its file and skill links in each place); role files, which
+    /// every adapter's agents read, are always planned. `None`: every adapter.
+    pub adapter: Option<String>,
 }
 
 fn audience_of(names: &[String], adapter: &dyn Adapter) -> Vec<Audience> {
@@ -542,7 +545,7 @@ fn place_adapters(place: &Place) -> Vec<&'static dyn Adapter> {
     }
 }
 
-fn place_items(stacks: &Stacks, place: &Place, plan: &mut Plan) {
+fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Plan) {
     let mut chosen: Vec<&dyn Adapter> = Vec::new();
     if place.adapters.is_empty() {
         chosen.extend(adapters::ALL.iter().copied());
@@ -557,6 +560,7 @@ fn place_items(stacks: &Stacks, place: &Place, plan: &mut Plan) {
             )),
         }
     }
+    chosen.retain(|a| only.is_none_or(|o| o == a.id()));
     let path_entries = stacks
         .entries()
         .filter(|e| {
@@ -635,8 +639,11 @@ fn place_items(stacks: &Stacks, place: &Place, plan: &mut Plan) {
                 && !matches!(e.meta.origin, crate::model::Origin::InRepo { .. })
         })
         .collect();
-    let skill_dirs: Vec<&str> =
-        place_adapters(place).iter().filter_map(|a| a.repo_skills_dir()).collect();
+    let skill_dirs: Vec<&str> = place_adapters(place)
+        .iter()
+        .filter(|a| only.is_none_or(|o| o == a.id()))
+        .filter_map(|a| a.repo_skills_dir())
+        .collect();
     for dir in skill_dirs {
         for p in place.paths.iter().filter(|p| p.is_dir()) {
             for e in &skills {
@@ -725,7 +732,13 @@ fn place_items(stacks: &Stacks, place: &Place, plan: &mut Plan) {
     }
 }
 
-fn repo_items(stacks: &Stacks, name: &str, repo: &stack::Repo, plan: &mut Plan) {
+fn repo_items(
+    stacks: &Stacks,
+    name: &str,
+    repo: &stack::Repo,
+    only: Option<&str>,
+    plan: &mut Plan,
+) {
     let (paths, skipped) = checkouts(repo);
     if paths.is_empty() {
         plan.notes.push(format!("repo {name}: no checkouts declared"));
@@ -747,10 +760,16 @@ fn repo_items(stacks: &Stacks, name: &str, repo: &stack::Repo, plan: &mut Plan) 
         adapters: &repo.adapters,
         paths,
     };
-    place_items(stacks, &place, plan);
+    place_items(stacks, &place, only, plan);
 }
 
-fn workspace_items(stacks: &Stacks, name: &str, w: &stack::Workspace, plan: &mut Plan) {
+fn workspace_items(
+    stacks: &Stacks,
+    name: &str,
+    w: &stack::Workspace,
+    only: Option<&str>,
+    plan: &mut Plan,
+) {
     let place = Place {
         label: format!("workspace {name}"),
         name: name.to_string(),
@@ -759,7 +778,7 @@ fn workspace_items(stacks: &Stacks, name: &str, w: &stack::Workspace, plan: &mut
         adapters: &w.adapters,
         paths: vec![expand_home(&w.path)],
     };
-    place_items(stacks, &place, plan);
+    place_items(stacks, &place, only, plan);
 }
 
 pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
@@ -798,6 +817,9 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
     }
     if opts.repo.is_none() {
         for t in &private.manifest.targets {
+            if opts.adapter.as_deref().is_some_and(|a| a != t.adapter) {
+                continue;
+            }
             let adapter = adapters::get(&t.adapter).ok_or_else(|| {
                 format!(
                     "target {}: unknown adapter `{}` (known: {})",
@@ -833,13 +855,13 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
             if opts.repo.as_deref().is_some_and(|r| r != name) {
                 continue;
             }
-            repo_items(stacks, name, repo, &mut plan);
+            repo_items(stacks, name, repo, opts.adapter.as_deref(), &mut plan);
         }
         for (name, w) in &private.manifest.workspaces {
             if opts.repo.as_deref().is_some_and(|r| r != name) {
                 continue;
             }
-            workspace_items(stacks, name, w, &mut plan);
+            workspace_items(stacks, name, w, opts.adapter.as_deref(), &mut plan);
         }
         if let Some(r) = &opts.repo {
             if !private.manifest.repos.contains_key(r)
@@ -1018,7 +1040,7 @@ pub fn drift_findings(stacks: &Stacks) -> Vec<crate::Finding> {
     if stacks.private.is_none() {
         return Vec::new();
     }
-    match plan(stacks, &Options { repo: None, user_only: true }) {
+    match plan(stacks, &Options { user_only: true, ..Options::default() }) {
         Ok(plan) => {
             let mut out: Vec<Finding> = plan
                 .items

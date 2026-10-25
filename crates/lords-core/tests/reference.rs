@@ -21,6 +21,27 @@ fn proposed(p: &lords_core::sync::Plan, path: &Path) -> String {
     p.items.iter().find(|i| i.path == path).and_then(|i| i.proposed.clone()).unwrap_or_default()
 }
 
+// Spec (orchestrator, 25 Oct: Claude's files now, Codex's "only after the grouped-form marker run passes"): a plan
+// for one adapter holds that adapter's place file and none of the other's; the role files, which agents of every
+// adapter read, are planned either way.
+#[test]
+fn a_plan_for_one_adapter_leaves_the_others_files_alone() {
+    let f = Fixture::new();
+    f.write(
+        "priv/project/beta/rules/all.md",
+        &entry("rule.all", "project:beta", "private", "", "Gate before merge.\n"),
+    );
+    let checkout = f.path("checkout");
+    f.write("checkout/README.md", "a repo\n");
+    f.git_init("checkout");
+    manifest(&f, &checkout);
+    let opts = Options { adapter: Some("claude".into()), ..Options::default() };
+    let p = plan(&f.stacks(), &opts).unwrap();
+    let has = |path: &Path| p.items.iter().any(|i| i.path == path);
+    assert!(has(&checkout.join("CLAUDE.local.md")) && !has(&checkout.join("AGENTS.override.md")));
+    assert!(has(&checkout.join(".lords/role-coder.md")), "role files are planned");
+}
+
 // Spec (above; orchestrator, 25 Oct, the efficiency pass: cut "index lines that the role files already carry in
 // full" and "long paths where a stable id plus one lookup line would do"): in the files every agent in a checkout
 // reads, owner intent is an index line (its title and file) under a heading that says it binds, its dir named

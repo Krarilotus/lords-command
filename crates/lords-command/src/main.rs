@@ -813,6 +813,7 @@ impl App {
         let opts = sync::Options {
             repo: (!self.plan_repo.is_empty()).then(|| self.plan_repo.clone()),
             user_only: self.plan_repo.is_empty(),
+            adapter: None,
         };
         let (pu, pr) = (paths.public.clone(), paths.private.clone());
         self.planning = Some(Task::start(ctx, move || {
@@ -873,6 +874,7 @@ impl App {
                         let opts = sync::Options {
                             repo: (!self.plan_repo.is_empty()).then(|| self.plan_repo.clone()),
                             user_only: self.plan_repo.is_empty(),
+                            adapter: None,
                         };
                         let (pu, pr) = (public.clone(), private.clone());
                         self.applying = Some(Task::start(ctx, move || {

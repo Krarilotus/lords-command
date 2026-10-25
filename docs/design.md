@@ -183,13 +183,14 @@ are cut at a word, at 100 characters.
 
 **Index lines name each dir once.** An index (intent, skills, memory) groups its lines by dir: one line names the
 dir, absolute (`In <dir>, as <name>.md:`), and each line under it gives its file only when the name doesn't. Paths
-are absolute until a marker run shows an adapter's agents resolve paths relative to the checkout; then one switch
-per adapter (`relative_paths`) turns them relative. `lords sizes` measures every file sync writes, by section, as
+stay absolute: relative paths were dropped (orchestrator, 25 Oct), since with each dir named once they saved about
+1 % of the largest place. The switch per adapter (`relative_paths`) stays off for every adapter. `lords sizes` measures every file sync writes, by section, as
 written; a test against the real stacks (where a machine has them) keeps every place under the warning line.
 
 **Role files.** Every checkout and workspace also gets `.lords/role-<role>.md` for each declared role (excluded from
 git): everything that role follows there, standing alone (global, project, the place, notes), so a brief can point at
-the file and carry only the task. The role `product` gets no development rule.
+the file and carry only the task. The role `product` gets no development rule and no notes (a note for every role is
+a development note).
 
 **Nothing of a tracked `AGENTS.md` is dropped.** Codex's override carries it verbatim, then the stack's layers;
 Claude's local file includes it with `@AGENTS.md`. `check` verifies both in every checkout and workspace: every

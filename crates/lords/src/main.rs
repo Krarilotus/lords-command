@@ -22,7 +22,7 @@ usage:
   lords privacy FILE...
   lords hooks install [--repo DIR] [--secrets-only] [--force]
   lords hash PATH
-  lords sync [--user | --repo NAME] [--json] [--apply]
+  lords sync [--user | --repo NAME] [--adapter ID] [--json] [--apply]
   lords compose [--repo NAME [--role ROLE]] [--adapter ID] [--json]   what a harness reads there, with sources
   lords sizes [--json]   every file sync writes, by section; fails past the warning line
 
@@ -165,10 +165,17 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     let json = a.flag("--json");
     let user_only = a.flag("--user");
     let repo = a.value("--repo")?;
+    let adapter = a.value("--adapter")?;
     let p = paths(&mut a)?;
     a.done()?;
+    if let Some(id) = adapter.as_deref().filter(|id| lords_core::adapters::get(id).is_none()) {
+        return Err(format!(
+            "unknown adapter `{id}` (known: {})",
+            lords_core::adapters::ids().join(", ")
+        ));
+    }
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
-    let opts = sync::Options { repo, user_only };
+    let opts = sync::Options { repo, user_only, adapter };
     let plan = sync::plan(&stacks, &opts)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_default());

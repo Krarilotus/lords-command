@@ -283,7 +283,7 @@ fn repo_targets_write_untracked_files_in_every_worktree() {
         main.display()
     );
     f.write("priv/stack.toml", &manifest);
-    let opts = Options { repo: Some("beta-core".into()), user_only: false };
+    let opts = Options { repo: Some("beta-core".into()), user_only: false, adapter: None };
     let p = plan(&f.stacks(), &opts).unwrap();
     let creates: Vec<String> = p
         .items
@@ -542,8 +542,11 @@ fn worktree_roots_limit_the_worktrees_and_tracked_instructions_still_load() {
         f.path("wt-root").display()
     );
     f.write("priv/stack.toml", &manifest);
-    let p =
-        plan(&f.stacks(), &Options { repo: Some("beta-core".into()), user_only: false }).unwrap();
+    let p = plan(
+        &f.stacks(),
+        &Options { repo: Some("beta-core".into()), user_only: false, adapter: None },
+    )
+    .unwrap();
     let written: Vec<String> = p
         .items
         .iter()
@@ -635,6 +638,25 @@ fn notes_and_entries_follow_the_readers_role() {
         !orchestrator.contains("(orchestrator only)") && !orchestrator.contains("More notes"),
         "{orchestrator}"
     );
+}
+
+// Spec (orchestrator, 25 Oct: "Notes without roles count as development, so role-product.md gets no notes
+// index"): the product role's file has no notes at all, while a rule for every role still reaches it.
+#[test]
+fn product_runs_get_no_notes() {
+    let f = Fixture::new();
+    f.write("priv/global/memory/all.md", &entry("memory.all", "global", "private", "", "Note.\n"));
+    f.write(
+        "priv/repo/alpha-core/rules/every.md",
+        &entry("rule.every", "repo:alpha-core", "private", "", "Every run follows this.\n"),
+    );
+    let product = compose(&f.stacks(), &role_ctx(Some(vec!["product"]))).text;
+    assert!(
+        product.contains("Every run follows this.") && !product.contains("# Memory"),
+        "{product}"
+    );
+    let coder = compose(&f.stacks(), &role_ctx(Some(vec!["coder"]))).text;
+    assert!(coder.contains("- all: memory.all\n"), "{coder}");
 }
 
 // Spec (orchestrator, 25 Oct: "check warns when an adapter's composed output passes 75 % of its size limit (Codex

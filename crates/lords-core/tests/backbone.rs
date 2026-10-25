@@ -97,7 +97,11 @@ fn a_workspace_gets_its_layer_without_git() {
         ),
     );
     assert_eq!(errors(&f.check()), Vec::<&str>::new(), "{:#?}", f.check());
-    let p = plan(&f.stacks(), &Options { repo: Some("harness".into()), user_only: false }).unwrap();
+    let p = plan(
+        &f.stacks(),
+        &Options { repo: Some("harness".into()), user_only: false, adapter: None },
+    )
+    .unwrap();
     let claude = proposed(&p, &dir.join("CLAUDE.local.md"));
     assert!(
         claude.contains("Notes go under notes/.") && !claude.contains("Repo only."),

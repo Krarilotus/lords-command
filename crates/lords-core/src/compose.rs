@@ -379,7 +379,11 @@ pub fn applicable<'a>(stacks: &'a Stacks, ctx: &Context) -> Vec<&'a Entry> {
 fn for_role(e: &Entry, ctx: &Context) -> bool {
     match &ctx.roles {
         None => true,
-        Some(roles) => e.meta.roles.is_empty() || e.meta.roles.iter().any(|r| roles.contains(r)),
+        // A note for every role is a development note: product runs get none (orchestrator, 25 Oct).
+        Some(roles) if e.meta.roles.is_empty() => {
+            e.meta.kind != Kind::Memory || roles.iter().any(|r| r != PRODUCT_ROLE)
+        }
+        Some(roles) => e.meta.roles.iter().any(|r| roles.contains(r)),
     }
 }
 
