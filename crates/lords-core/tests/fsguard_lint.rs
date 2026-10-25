@@ -1,9 +1,15 @@
 //! The filesystem guard is the only door (orchestrator, 25 Oct: "The choke point is the only filesystem API in the
 //! apply path. Add a test or lint that fails if std::fs remove, rename or write calls appear outside it"). This
 //! reads every Rust source of the CLI, the GUI and the library and fails on a call that changes the filesystem
-//! anywhere but `fsguard.rs`. The boundary it enforces is stated in fsguard.rs's header (Sol review r3, R3-08):
-//! std's functions that change the filesystem, in any spelling (qualified, imported, renamed, spaced or split over
-//! lines), file handles opened for writing or changed, and child processes outside the two places allowed them.
+//! anywhere but `fsguard.rs`. The boundary it enforces is stated in fsguard.rs's header (Sol review r3, R3-08; r4,
+//! R4-06): outside the two doors, no runtime source reaches `std::fs`, `std::os` or `std::process` by any spelling
+//! (a path through them, a grouped or renamed `use`, a renamed `std`); and, so a name that reaches them some other
+//! way is still caught, no call that changes a file and no child process. fsguard.rs may reach `std::fs` and
+//! `std::os`, process.rs `std::process`, each nothing else of the three.
+//!
+//! A module ban here rather than clippy's `disallowed-types`/`disallowed-methods`: this repo's hooks don't run
+//! clippy, `cargo test` does run this; and a ban of the whole module needs no list of its functions, which is what
+//! let `DirBuilder` through.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,21 +47,53 @@ const CHANGES: [&str; 11] = [
     "mklink",
 ];
 
-/// The child processes a file may start (fsguard.rs's header): `git` in git.rs, the file manager in the GUI.
-fn programs_allowed(file: &str) -> &'static [&'static str] {
+/// Which door a source is, by its path.
+#[derive(Clone, Copy, PartialEq)]
+enum Door {
+    Fs,
+    Process,
+    None,
+}
+
+fn door(file: &str) -> Door {
     let file = file.replace('\\', "/");
-    if file.ends_with("lords-core/src/git.rs") || file == "git.rs" {
-        &["\"git\""]
-    } else if file.ends_with("lords-command/src/main.rs") {
-        &["\"explorer\"", "\"xdg-open\""]
+    if file.ends_with("lords-core/src/fsguard.rs") {
+        Door::Fs
+    } else if file.ends_with("lords-core/src/process.rs") {
+        Door::Process
     } else {
-        &[]
+        Door::None
     }
 }
 
-/// The code of a Rust source with its comments removed (string and char literals kept whole), so neither a
-/// comment hides code nor a `//` inside a string ends the line early.
-fn code_of(text: &str) -> String {
+/// The std modules a door may reach.
+fn modules_allowed(d: Door) -> &'static [&'static str] {
+    match d {
+        Door::Fs => &["fs", "os"],
+        Door::Process => &["process"],
+        Door::None => &[],
+    }
+}
+
+/// The child processes a source may start: `git` and the file manager, both in process.rs.
+fn programs_allowed(d: Door) -> &'static [&'static str] {
+    match d {
+        Door::Process => &["\"git\"", "\"explorer\"", "\"xdg-open\""],
+        _ => &[],
+    }
+}
+
+/// The code of a Rust source with its comments removed, so neither a comment hides code nor a `//` inside a string
+/// ends the line early; string literals kept whole, or (`keep_strings` false) emptied, so a string that names a
+/// module is not taken for a path to it.
+fn code_of(text: &str, keep_strings: bool) -> String {
+    let literal = |out: &mut String, s: &[char]| {
+        if keep_strings {
+            out.extend(s);
+        } else {
+            out.push_str("\"\"");
+        }
+    };
     let c: Vec<char> = text.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -106,7 +144,7 @@ fn code_of(text: &str) -> String {
                     i += 1;
                 }
                 i = (i + 1 + hashes).min(c.len());
-                out.extend(&c[start..i]);
+                literal(&mut out, &c[start..i]);
             }
             ('"', _) => {
                 let start = i;
@@ -115,7 +153,7 @@ fn code_of(text: &str) -> String {
                     i += if c[i] == '\\' { 2 } else { 1 };
                 }
                 i = (i + 1).min(c.len());
-                out.extend(&c[start..i]);
+                literal(&mut out, &c[start..i]);
             }
             ('\'', _) => {
                 // A char literal ('x', '\n', '\u{..}'), not a lifetime.
@@ -141,45 +179,67 @@ fn idents(s: &str) -> Vec<&str> {
     s.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|t| !t.is_empty()).collect()
 }
 
-/// What in one source file (named `file`) changes the filesystem or starts a process it may not: one line each.
+/// What in one source file (named `file`) reaches a module, changes a file or starts a process it may not: one line
+/// each.
 fn forbidden(file: &str, text: &str) -> Vec<String> {
-    let code: String = code_of(text).chars().filter(|c| !c.is_whitespace()).collect();
+    let d = door(file);
+    let allowed = modules_allowed(d);
+    let squeeze = |s: String| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    // Strings emptied for the module ban (a string naming a module reaches nothing), kept for the program names.
+    let code = squeeze(code_of(text, false));
+    let with_strings = squeeze(code_of(text, true));
     let mut found = Vec::new();
     let ident = |c: char| c.is_alphanumeric() || c == '_';
-    for name in FS_CHANGES {
-        let path = format!("fs::{name}");
-        // Called or passed as a value: anything but a longer name (`fs::write_all`) after it.
+    // A path through a module it may not reach, however spaced or split (`std :: fs`, `::std::fs`).
+    for m in ["fs", "os", "process"].into_iter().filter(|m| !allowed.contains(m)) {
+        let path = format!("std::{m}");
         if code.match_indices(&path).any(|(at, _)| {
             !code[at + path.len()..].starts_with(ident) && !code[..at].ends_with(ident)
         }) {
             found.push(format!("{file}: {path}"));
         }
     }
-    for what in CHANGES {
-        if code.contains(what) {
-            found.push(format!("{file}: {what}"));
-        }
-    }
-    // An import of the module under another name, or of a changing function (then callable unqualified).
-    for chunk in code_of(text).split(';') {
+    // `use` of std: no renamed std, no group or renamed import that reaches one of the three.
+    for chunk in code_of(text, false).split(';') {
         let words = idents(chunk);
+        if words.windows(3).any(|w| w == ["extern", "crate", "std"]) {
+            found.push(format!("{file}: std named as an extern crate ({})", words.join(" ")));
+        }
         let Some(at) = words.iter().position(|w| *w == "use") else { continue };
         let words = &words[at..];
-        if !words.contains(&"fs") {
+        if words.get(1) != Some(&"std") {
             continue;
         }
         let stmt = words.join(" ");
-        if words.windows(2).any(|w| (w[0] == "fs" || w[0] == "self") && w[1] == "as") {
-            found.push(format!("{file}: the fs module imported under another name ({stmt})"));
+        if words.get(2) == Some(&"as") || words.windows(2).any(|w| w == ["self", "as"]) {
+            found.push(format!("{file}: std or a std module imported under another name ({stmt})"));
         }
-        for name in FS_CHANGES.iter().filter(|n| words.contains(n)) {
-            found.push(format!("{file}: fs::{name} imported ({stmt})"));
+        for m in
+            ["fs", "os", "process"].iter().filter(|m| !allowed.contains(m) && words.contains(m))
+        {
+            found.push(format!("{file}: std::{m} imported ({stmt})"));
         }
     }
-    let allowed = programs_allowed(file);
-    for (at, _) in code.match_indices("Command::new(") {
-        let arg = &code[at + "Command::new(".len()..];
-        if !allowed.iter().any(|p| arg.starts_with(&format!("{p})"))) {
+    if d != Door::Fs {
+        for name in FS_CHANGES {
+            let path = format!("fs::{name}");
+            // Called or passed as a value: anything but a longer name (`fs::write_all`) after it.
+            if code.match_indices(&path).any(|(at, _)| {
+                !code[at + path.len()..].starts_with(ident) && !code[..at].ends_with(ident)
+            }) {
+                found.push(format!("{file}: {path}"));
+            }
+        }
+        for what in CHANGES {
+            if code.contains(what) {
+                found.push(format!("{file}: {what}"));
+            }
+        }
+    }
+    let programs = programs_allowed(d);
+    for (at, _) in with_strings.match_indices("Command::new(") {
+        let arg = &with_strings[at + "Command::new(".len()..];
+        if !programs.iter().any(|p| arg.starts_with(&format!("{p})"))) {
             found.push(format!("{file}: a child process ({})", &arg[..arg.len().min(30)]));
         }
     }
@@ -197,7 +257,7 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-// Spec (above): outside fsguard.rs, no source of the crates' `src` dirs calls anything that changes the filesystem.
+// Spec (above): no source of the crates' `src` dirs reaches std's filesystem or processes but through its door.
 #[test]
 fn only_fsguard_changes_the_filesystem() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -206,11 +266,13 @@ fn only_fsguard_changes_the_filesystem() {
         sources(&root.join(krate).join("src"), &mut files);
     }
     assert!(files.len() > 10, "the sources were found: {files:?}");
+    let doors: Vec<Door> = files.iter().map(|f| door(&f.display().to_string())).collect();
+    assert!(doors.contains(&Door::Fs) && doors.contains(&Door::Process), "both doors were found");
     let mut found = Vec::new();
-    for f in files.iter().filter(|f| f.file_name().is_some_and(|n| n != "fsguard.rs")) {
+    for f in &files {
         found.extend(forbidden(&f.display().to_string(), &fs::read_to_string(f).unwrap()));
     }
-    assert!(found.is_empty(), "filesystem changes outside fsguard.rs:\n{}", found.join("\n"));
+    assert!(found.is_empty(), "past the doors:\n{}", found.join("\n"));
 }
 
 // Spec (Sol review r3, R3-08: "The filesystem lint does not enforce its stated boundary"; property: the lint catches

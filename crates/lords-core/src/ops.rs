@@ -8,7 +8,6 @@ use crate::git;
 use crate::model::{Entry, Kind, Origin, Scope, Visibility};
 use crate::privacy::{self, Hit, Rules};
 use crate::stack::{self, Stack, Stacks, DEFAULTS, SIDECAR};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Today's date (UTC) as YYYY-MM-DD.
@@ -94,7 +93,7 @@ fn stack_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// Writes keys into an entry's metadata file: frontmatter for Markdown, the whole file for a sidecar.
 fn set_meta_keys(meta_file: &Path, keys: &[(&str, Option<String>)]) -> Result<(), String> {
     let text =
-        fs::read_to_string(meta_file).map_err(|e| format!("{}: {e}", meta_file.display()))?;
+        fsguard::read_string(meta_file).map_err(|e| format!("{}: {e}", meta_file.display()))?;
     let new = if stack::file_name(meta_file) == SIDECAR {
         frontmatter::set_keys(&text, keys)
     } else {
@@ -139,7 +138,7 @@ pub fn retire(stacks: &Stacks, r: &Retire) -> Result<Retired, String> {
             return Err(format!("a public entry can't name the private `{s}` as its successor"));
         }
     }
-    let before = fs::read(&e.meta_file).map_err(|e| e.to_string())?;
+    let before = fsguard::read_bytes(&e.meta_file).map_err(|e| e.to_string())?;
     let keys = [
         ("status", Some("retired".to_string())),
         ("superseded_by", r.superseded_by.map(str::to_string)),
@@ -320,9 +319,9 @@ fn import_stores(
                 continue;
             }
             seen.push(name.clone());
-            let incoming = fs::read_to_string(&f).map_err(|e| format!("{}: {e}", f.display()))?;
+            let incoming = fsguard::read_string(&f).map_err(|e| format!("{}: {e}", f.display()))?;
             let target = dest.join(&name);
-            match fs::read_to_string(&target) {
+            match fsguard::read_string(&target) {
                 Err(_) => {
                     if write {
                         git_keeps(&target)?;
@@ -453,7 +452,7 @@ pub fn promote(
     }
     let mut hits: Vec<(PathBuf, Hit)> = Vec::new();
     for f in &e.files {
-        let text = fs::read_to_string(f).unwrap_or_default();
+        let text = fsguard::read_string(f).unwrap_or_default();
         hits.extend(privacy::scan(&text, rules).into_iter().map(|h| (f.clone(), h)));
     }
     if !hits.is_empty() {
@@ -481,7 +480,7 @@ pub fn promote(
     let mut files: Vec<(PathBuf, String)> = Vec::new();
     let mut private_part = None;
     for f in &e.files {
-        let text = fs::read_to_string(f).unwrap_or_default();
+        let text = fsguard::read_string(f).unwrap_or_default();
         let mine: Vec<Hit> = hits.iter().filter(|(p, _)| p == f).map(|(_, h)| h.clone()).collect();
         let text = match mode {
             Promote::Split if !mine.is_empty() => {
@@ -526,6 +525,30 @@ pub fn promote(
     }
     if let Some((name, _)) = &private_part {
         git_keeps(&e.meta_file.with_file_name(name))?;
+    }
+    // A skill's dir goes whole, so it may hold only what git gives back and the promotion carries over: files it
+    // copies, and no dir without a file below it, which git doesn't record (Sol review r4, R4-07).
+    if is_skill {
+        let tree = fsguard::read_tree(&src_path)?;
+        let carried: Vec<String> = files
+            .iter()
+            .map(|(f, _)| rel(&src_path, f).to_string_lossy().replace('\\', "/"))
+            .collect();
+        for r in tree.keys() {
+            let refused = if fsguard::is_dir_entry(r) {
+                !tree.keys().any(|k| !fsguard::is_dir_entry(k) && k.starts_with(r.as_str()))
+            } else {
+                !carried.contains(r)
+            };
+            if refused {
+                return Err(format!(
+                    "{}: {} is {}; git couldn't give it back once the promotion deletes the skill's private dir. Remove it or add a file, and promote again",
+                    e.id(),
+                    src_path.join(r).display(),
+                    if fsguard::is_dir_entry(r) { "an empty dir" } else { "a file the promotion doesn't carry" }
+                ));
+            }
+        }
     }
     // Write: public copy, then the private part, then remove the private original.
     for (f, text) in &files {
@@ -674,7 +697,8 @@ pub fn edit(
     for f in &files {
         git_keeps(f)?;
     }
-    let before: Vec<Vec<u8>> = files.iter().map(|f| fs::read(f).unwrap_or_default()).collect();
+    let before: Vec<Vec<u8>> =
+        files.iter().map(|f| fsguard::read_bytes(f).unwrap_or_default()).collect();
     let restore = || {
         for (f, b) in files.iter().zip(&before) {
             let _ = fsguard::replace_own_file(f, b);
@@ -684,7 +708,7 @@ pub fn edit(
         set_meta_keys(&e.meta_file, &keys)?;
     }
     if let Some(body) = &change.body {
-        let text = fs::read_to_string(&e.body_file).map_err(|err| err.to_string())?;
+        let text = fsguard::read_string(&e.body_file).map_err(|err| err.to_string())?;
         let new = if e.body_file == e.meta_file {
             let parts = frontmatter::split(&text);
             let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };

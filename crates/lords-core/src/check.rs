@@ -1,13 +1,13 @@
 //! `check` (design: Check): every test over both stacks. Candidates are for the owner, never resolved here.
 
 use crate::finding::{Finding, Severity};
+use crate::fsguard;
 use crate::model::{Entry, Origin, Scope, Visibility};
 use crate::overlap;
 use crate::privacy::{self, Rules, Scan};
 use crate::stack::{Stacks, SIDECAR};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 
 /// Whether two scopes can ever apply in the same composition.
@@ -63,7 +63,7 @@ pub fn dir_hash(dir: &Path) -> String {
             continue;
         }
         let rel = f.strip_prefix(dir).unwrap_or(&f).to_string_lossy().replace('\\', "/");
-        let bytes = fs::read(&f).unwrap_or_default();
+        let bytes = fsguard::read_bytes(&f).unwrap_or_default();
         h.update(rel.as_bytes());
         h.update([0]);
         h.update(normalise_eol(&bytes));
@@ -77,7 +77,7 @@ pub fn path_hash(path: &Path) -> Result<String, String> {
     if path.is_dir() {
         return Ok(dir_hash(path));
     }
-    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text = fsguard::read_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let body = crate::frontmatter::split(&text).body;
     Ok(hex(Sha256::digest(normalise_eol(body.as_bytes()))))
 }
@@ -436,7 +436,7 @@ fn privacy_of_entries(stacks: &Stacks, public_rules: &Rules, out: &mut Vec<Findi
         let rules = if stack.visibility() == Visibility::Public { public_rules } else { &secrets };
         for e in &stack.entries {
             for f in &e.files {
-                let Ok(text) = fs::read_to_string(f) else { continue };
+                let Ok(text) = fsguard::read_string(f) else { continue };
                 for h in privacy::scan(&text, rules) {
                     out.push(privacy_finding(f, &h).entry(e.id()));
                 }

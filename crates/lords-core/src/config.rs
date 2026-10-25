@@ -1,8 +1,8 @@
 //! `config.txt`: `key = value` lines, `#` comments (overseer's format). Read from beside the exe, else from
 //! `~/.lords-command/config.txt`.
 
+use crate::fsguard;
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Default)]
@@ -39,7 +39,7 @@ impl Config {
     /// The config in `path`, None if there is none. One that is there but can't be read or decoded is an error:
     /// read as none, it would silently drop the private stack and with it the deny and fleet checks.
     pub fn read(path: &Path) -> Result<Option<Config>, String> {
-        let text = match fs::read_to_string(path) {
+        let text = match fsguard::read_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("{} can't be read: {e}", path.display())),

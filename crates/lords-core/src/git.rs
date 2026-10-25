@@ -1,15 +1,9 @@
-//! git through its CLI, so the user's config and hooks apply.
+//! git through its CLI, so the user's config and hooks apply; the process starts in process.rs.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 pub fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    let out = crate::process::git(dir, args)?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
@@ -23,12 +17,7 @@ pub fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 pub fn bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    let out = crate::process::git(dir, args)?;
     if out.status.success() {
         Ok(out.stdout)
     } else {

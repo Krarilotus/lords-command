@@ -5,6 +5,7 @@
 //! The facts each adapter encodes are checked in docs/load-order.md.
 
 use crate::compose::Composed;
+use crate::fsguard;
 use crate::model::Audience;
 use std::path::{Path, PathBuf};
 
@@ -119,7 +120,7 @@ impl Adapter for Codex {
     /// The override replaces the tracked `AGENTS.md` and Codex doesn't expand includes, so the tracked text is
     /// carried inline (and re-planned when a checkout's `AGENTS.md` changes).
     fn repo_preamble(&self, checkout: &Path) -> Option<String> {
-        let text = std::fs::read_to_string(checkout.join("AGENTS.md")).ok()?;
+        let text = fsguard::read_string(checkout.join("AGENTS.md")).ok()?;
         let text = text.trim_end().to_string();
         (!text.is_empty()).then_some(text)
     }

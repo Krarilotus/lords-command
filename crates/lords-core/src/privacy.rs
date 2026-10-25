@@ -1,12 +1,12 @@
 //! The privacy check (design: Privacy). Finds spans that must not reach a public repo.
 
 use crate::config::expand_home;
+use crate::fsguard;
 use crate::git;
 use crate::stack::Stack;
 use regex::Regex;
 use serde::Serialize;
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -73,7 +73,7 @@ impl Rules {
 
     /// Adds the allow-list of a stack (`privacy/allow.txt`), if it has one.
     pub fn with_allow_from(mut self, stack_root: &Path) -> Rules {
-        if let Ok(text) = fs::read_to_string(stack_root.join("privacy").join("allow.txt")) {
+        if let Ok(text) = fsguard::read_string(stack_root.join("privacy").join("allow.txt")) {
             self.allow.extend(list_lines(&text).map(str::to_string));
         }
         self
@@ -88,7 +88,7 @@ impl Rules {
         };
         self = self.with_allow_from(&private.root);
         let deny = private.root.join("privacy").join("deny.txt");
-        match fs::read_to_string(&deny) {
+        match fsguard::read_string(&deny) {
             Ok(text) => self.deny.extend(list_lines(&text).map(fold_term)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 self.notes.push("the private stack has no privacy/deny.txt".into())
@@ -110,7 +110,7 @@ fn list_lines(text: &str) -> impl Iterator<Item = &str> {
 
 /// Host names from a fleet config: the `[host.*]` and `[machine.*]` keys and each link's `target`.
 pub fn fleet_hosts(path: &Path) -> Result<Vec<String>, String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text = fsguard::read_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let value: toml::Table =
         toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut out = BTreeSet::new();
@@ -310,11 +310,9 @@ pub struct Scan {
 /// The attribute that allows a staged binary file (`*.png lords-binary` in .gitattributes).
 pub const BINARY_ATTR: &str = "lords-binary";
 
-/// A file's bytes as text to scan, and whether they are text. UTF-8 without NUL bytes and UTF-16 with a byte order
-/// mark are text. Anything else is not text, and is scanned as every reading it has: its lossy UTF-8 reading, its
-/// printable ASCII runs with NUL bytes dropped, and its UTF-16 readings, little- and big-endian, from its first byte
-/// and from its second. No count of NUL bytes decides whether a UTF-16 reading is scanned: text in a script without
-/// Latin letters has none (Sol review r3, R3-07).
+/// A file's bytes as the text it is, and whether they are text: UTF-8 without NUL bytes, or UTF-16 with a byte
+/// order mark. Anything else is not text, and reads as its lossy UTF-8 reading and printable ASCII runs. This
+/// reading is the one a hit's line refers to; `Scan::add` scans every other reading too (`readings`).
 pub fn decode(bytes: &[u8]) -> (String, bool) {
     match bytes {
         [0xff, 0xfe, rest @ ..] => return (utf16(rest, false), true),
@@ -324,14 +322,22 @@ pub fn decode(bytes: &[u8]) -> (String, bool) {
     if let Some(text) = utf8(bytes) {
         return (text.to_string(), true);
     }
-    let mut text = byte_text(bytes);
+    (byte_text(bytes), false)
+}
+
+/// Every reading of a file's bytes that the privacy check scans, whatever they look like (Sol review r3, R3-07;
+/// r4, R4-02): UTF-8 (lossy, with its printable ASCII runs) and UTF-16 little- and big-endian, from the first byte
+/// and from the second. No reading is chosen over another: bytes that are valid UTF-8 can be UTF-16 text too
+/// (`中中中中` in UTF-16LE is `-N-N-N-N`), and text in a script without Latin letters has no NUL bytes. What this
+/// doesn't read is listed in the design (Privacy, "Not covered").
+pub fn readings(bytes: &[u8]) -> Vec<String> {
+    let mut all = vec![byte_text(bytes)];
     for from in [bytes, bytes.get(1..).unwrap_or_default()] {
         for be in [false, true] {
-            text.push('\n');
-            text.push_str(&utf16(from, be));
+            all.push(utf16(from, be));
         }
     }
-    (text, false)
+    all
 }
 
 fn utf16(bytes: &[u8], be: bool) -> String {
@@ -379,15 +385,12 @@ impl Scan {
     pub fn add(&mut self, path: PathBuf, bytes: &[u8], rules: &Rules) {
         let (text, is_text) = decode(bytes);
         let mut hits = scan(&text, rules);
-        if utf8(bytes).is_none() {
-            // A UTF-16 byte order mark can also be a binary file's first bytes: its byte runs are scanned too.
-            if is_text {
-                hits.extend(scan(&byte_text(bytes), rules));
-            }
-            // The readings overlap: one hit per text.
-            let mut seen = BTreeSet::new();
-            hits.retain(|h| seen.insert((h.class, h.text.clone())));
+        for reading in readings(bytes) {
+            hits.extend(scan(&reading, rules));
         }
+        // The readings overlap: one hit per text, the one in the file's own reading first.
+        let mut seen = BTreeSet::new();
+        hits.retain(|h| seen.insert((h.class, h.text.clone())));
         if is_text {
             self.files_scanned += 1;
         } else {
@@ -422,7 +425,8 @@ pub fn tree_files(repo: &Path) -> Result<Vec<PathBuf>, String> {
 pub fn scan_tree(repo: &Path, rules: &Rules) -> Result<Scan, String> {
     let mut scan = Scan::default();
     for rel in tree_files(repo)? {
-        let bytes = fs::read(repo.join(&rel)).map_err(|e| format!("{}: {e}", rel.display()))?;
+        let bytes =
+            fsguard::read_bytes(repo.join(&rel)).map_err(|e| format!("{}: {e}", rel.display()))?;
         scan.add_name(&rel, rules);
         scan.add(rel, &bytes, rules);
     }

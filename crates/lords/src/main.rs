@@ -5,9 +5,9 @@ use lords_core::config::Config;
 use lords_core::model::Visibility;
 use lords_core::ops::{self, Promote, Retire};
 use lords_core::privacy::{self, Rules};
+use lords_core::process::ExitCode;
 use lords_core::{git, hooks, sync, Finding, Severity, Stack, Stacks};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 
 const USAGE: &str = "\
 lords: one home for how you work with agents
@@ -513,7 +513,7 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
         let files: Vec<String> = std::iter::from_fn(|| a.positional()).collect();
         a.done()?;
         for f in &files {
-            let bytes = std::fs::read(f).map_err(|e| format!("{f}: {e}"))?;
+            let bytes = lords_core::fsguard::read_bytes(f).map_err(|e| format!("{f}: {e}"))?;
             scan.add(PathBuf::from(f), &bytes, &rules);
         }
         // Named files have no .gitattributes to mark them: one that isn't text is refused.
@@ -523,7 +523,7 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
     // The message is scanned with the staged or named files too. A commit message has no NUL bytes, and its lossy
     // reading keeps every readable part: never refused.
     if let Some(m) = &message {
-        let bytes = std::fs::read(m).map_err(|e| format!("{m}: {e}"))?;
+        let bytes = lords_core::fsguard::read_bytes(m).map_err(|e| format!("{m}: {e}"))?;
         scan.add(PathBuf::from(m), &bytes, &rules);
     }
     for (p, h) in &scan.hits {

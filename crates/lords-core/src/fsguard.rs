@@ -3,12 +3,13 @@
 //! move or delete here ever lands somewhere other than the path it names. Nothing here overwrites: a new file or dir
 //! appears only where nothing was, and replacing means moving the old one aside first. Deletes follow nothing.
 //!
-//! The boundary, exactly (Sol review r3, R3-08), which tests/fsguard_lint.rs enforces: in the run-time sources of
-//! the library, the CLI and the GUI (`src/` of each crate), nothing but this file calls std's filesystem functions
-//! that create, write, rename, copy, link, truncate, remove or change a file's metadata, in any spelling; and child
-//! processes start only in git.rs (`git`, whose writing commands change only the stack repo an operation names)
-//! and in the GUI's "open in the file manager" (which writes nothing itself). Build scripts (Cargo's `OUT_DIR`) and
-//! tests (their own temp dirs) are outside it.
+//! The boundary, exactly (Sol review r3, R3-08; r4, R4-06), which tests/fsguard_lint.rs enforces: in the run-time
+//! sources of the library, the CLI and the GUI (`src/` of each crate), only this file reaches `std::fs` (and the
+//! platform `std::os` extensions), and only process.rs reaches `std::process`, by any spelling: no path through
+//! them, no grouped or renamed `use` of them, no renamed `std`. Every other source reads and writes through here:
+//! the checked calls for anything sync decides on, and the plain reads below (which follow links, as std does) for
+//! the stacks, configs and files only shown or scanned. Build scripts (Cargo's `OUT_DIR`) and tests (their own temp
+//! dirs) are outside it.
 //!
 //! Each check here and the action after it are separate steps by path, not one step on an open handle: a process
 //! that swaps a checked dir for a junction in between could redirect the action. The design (Ownership boundary,
@@ -46,20 +47,58 @@ fn is_link(m: &fs::Metadata) -> bool {
     m.file_type().is_symlink()
 }
 
-/// Refuses `path` when it, or any dir above it up to the drive root, is a reparse point.
+/// Refuses `path` when it, or any dir above it up to the drive root, is a reparse point, or when what it is can't be
+/// told: only "not found" means a part isn't there yet; any other error refuses (orchestrator, 25 Oct: the check
+/// failed open on a metadata error).
 pub fn check(path: &Path) -> Result<(), String> {
     for p in path.ancestors() {
         if p.as_os_str().is_empty() {
             continue;
         }
-        if fs::symlink_metadata(p).is_ok_and(|m| is_link(&m)) {
-            return Err(format!(
-                "{} is a link (junction or symlink); sync goes nowhere through one",
-                p.display()
-            ));
+        match fs::symlink_metadata(p) {
+            Ok(m) if is_link(&m) => {
+                return Err(format!(
+                    "{} is a link (junction or symlink); sync goes nowhere through one",
+                    p.display()
+                ))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "{}: {e}; sync can't tell whether it is a link, so it goes nowhere through it",
+                    p.display()
+                ))
+            }
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- plain reads
+//
+// For the stacks, configs and files sync only shows or scans: like std's, they follow links. Nothing sync decides
+// to write, move or delete is read through these.
+
+/// A file's bytes (std's `fs::read`).
+pub fn read_bytes(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
+    fs::read(path)
+}
+
+/// A file's text (std's `fs::read_to_string`).
+pub fn read_string(path: impl AsRef<Path>) -> std::io::Result<String> {
+    fs::read_to_string(path)
+}
+
+/// The paths in a dir, unsorted; none when it can't be read.
+pub fn list_dir(dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect()
+}
+
+/// What is at a path, not following a link there: `Some(true)` a link, `Some(false)` anything else, `None` when
+/// it can't be read.
+pub fn is_link_at(path: &Path) -> Option<bool> {
+    fs::symlink_metadata(path).ok().map(|m| is_link(&m))
 }
 
 /// What is at a path (checked first).
@@ -147,7 +186,7 @@ fn beside(path: &Path, what: &str) -> Result<PathBuf, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    Ok(dir.join(format!(".{name}.lords-{what}-{}-{nanos}-{n}", std::process::id())))
+    Ok(dir.join(format!(".{name}.lords-{what}-{}-{nanos}-{n}", crate::process::id())))
 }
 
 pub fn create_dir_all(dir: &Path) -> Result<(), String> {
@@ -194,16 +233,17 @@ pub fn put_file_as(path: &Path, bytes: &[u8], like: Option<&Attrs>) -> Result<()
     }
     let staged = beside(path, "new")?;
     create_file(&staged, bytes)?;
-    let linked = fs::hard_link(&staged, path).or_else(|e| match e.kind() {
-        // A volume without hardlinks: written in place, where nothing may be (never a rename, which on Windows
-        // replaces a file that appeared meanwhile: R3-05). Not whole until written; nothing is overwritten.
-        std::io::ErrorKind::Unsupported | std::io::ErrorKind::Other => {
-            create_file(path, bytes).map_err(std::io::Error::other)
-        }
-        _ => Err(e),
-    });
+    // Linking in is the only way a file appears at a sync path: on a volume without hard links sync refuses, never
+    // writes in place (Sol review r4, R4-04: that left a partial file where the old one had to go back).
+    let linked = fs::hard_link(&staged, path);
     let _ = fs::remove_file(&staged);
-    linked.map_err(|e| format!("{}: {e}", path.display()))?;
+    linked.map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => format!("{}: {e}", path.display()),
+        _ => format!(
+            "{}: {e}; sync puts a file in place only as a hard link, so it writes only on volumes that have them",
+            path.display()
+        ),
+    })?;
     if let Some(a) = like {
         if let Err(e) = set_attrs(path, a) {
             fs::remove_file(path).map_err(|d| format!("{e}; and {}: {d}", path.display()))?;
@@ -217,6 +257,18 @@ pub fn put_file_as(path: &Path, bytes: &[u8], like: Option<&Attrs>) -> Result<()
 /// not-indexed; elsewhere its mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Attrs(u32);
+
+impl Attrs {
+    /// As a backup manifest stores them (Sol review r4, R4-03): `attrs:<hex>`.
+    pub fn text(&self) -> String {
+        format!("attrs:{:x}", self.0)
+    }
+
+    /// From the manifest's form; `None` for anything else.
+    pub fn parse(text: &str) -> Option<Attrs> {
+        u32::from_str_radix(text.strip_prefix("attrs:")?, 16).ok().map(Attrs)
+    }
+}
 
 /// The attributes of the file at `path`.
 pub fn attrs(path: &Path) -> Result<Attrs, String> {

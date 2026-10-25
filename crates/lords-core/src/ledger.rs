@@ -10,6 +10,10 @@ use std::path::{Component, Path, PathBuf};
 const HEADER: &str =
     "# Lords Command: every path sync created and still owns. Sync rewrites this file; don't edit it by hand.";
 
+/// The ledger's format, written as `format = N` (Sol review r4, R4-05). A build reads only its own; there is no
+/// migration (no ledger existed before this one, 25 Oct). Raise it whenever a key, a hash or a field changes meaning.
+pub const FORMAT: u32 = 1;
+
 /// One tool-owned path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Owned {
@@ -111,7 +115,44 @@ impl Ledger {
     /// records of one key are an error.
     pub fn load(home: &Path) -> Result<Ledger, String> {
         let path = file(home);
+        // A save cut short leaves the old ledger beside, under the name `fsguard::move_aside` gave it: never read
+        // as no ledger (orchestrator, 25 Oct).
+        let dir = path.parent().expect("the ledger has a dir");
+        let mut aside: Vec<PathBuf> = fsguard::list_dir(dir)
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(".ledger.toml.lords-old-"))
+            })
+            .collect();
+        aside.sort();
+        if let Some(old) = aside.first() {
+            return Err(match fsguard::kind(&path)? {
+                fsguard::Kind::Missing => format!(
+                    "the last save of the ledger was cut short: the ledger is at {}. Rename it to {} and sync again (unless a sync is saving it right now: then plan again)",
+                    old.display(),
+                    path.display()
+                ),
+                _ => format!(
+                    "the last save of the ledger was cut short after the new one was in place: {} is current and {} the one before. Delete {} once you have checked, and sync again (unless a sync is saving it right now: then plan again)",
+                    path.display(),
+                    old.display(),
+                    old.display()
+                ),
+            });
+        }
         let Some(text) = fsguard::read_text(&path)? else { return Ok(Ledger::default()) };
+        // The format first: a ledger another build wrote, or none, is never read as this one (R4-05).
+        let table: toml::Table =
+            toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let format = table.get("format").and_then(toml::Value::as_integer);
+        if format != Some(FORMAT.into()) {
+            return Err(format!(
+                "{}: ledger format {}, this build reads {FORMAT}; sync does nothing with it",
+                path.display(),
+                format.map_or("none".into(), |f| f.to_string())
+            ));
+        }
         let read: Ledger = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut ledger = Ledger::default();
         for o in read.owned.into_values() {
@@ -139,7 +180,7 @@ impl Ledger {
         let path = file(home);
         fsguard::create_dir_all(path.parent().expect("the ledger has a dir"))?;
         let body = toml::to_string(self).map_err(|e| e.to_string())?;
-        fsguard::replace_own_file(&path, format!("{HEADER}\n{body}").as_bytes())
+        fsguard::replace_own_file(&path, format!("{HEADER}\nformat = {FORMAT}\n{body}").as_bytes())
     }
 
     /// The record of `path`. A record spelt otherwise (a case-only rename, say) counts only while both spellings

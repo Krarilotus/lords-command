@@ -112,10 +112,7 @@ fn audience_name(a: Audience) -> String {
 
 /// Opens a source in the browser (or a path in Explorer).
 fn open(target: &str) {
-    #[cfg(windows)]
-    let _ = std::process::Command::new("explorer").arg(target).spawn();
-    #[cfg(not(windows))]
-    let _ = std::process::Command::new("xdg-open").arg(target).spawn();
+    lords_core::process::open_in_file_manager(target);
 }
 
 fn source_url(o: &Origin) -> Option<String> {
@@ -1174,7 +1171,7 @@ fn style(ctx: &egui::Context) {
     // egui's fonts lack some glyphs (✦ ♟ ⚒ ◷); Windows' symbol font, if present, fills in.
     let symbols = std::env::var_os("WINDIR")
         .map(|dir| Path::new(&dir).join("Fonts").join("seguisym.ttf"))
-        .and_then(|path| std::fs::read(path).ok());
+        .and_then(|path| lords_core::fsguard::read_bytes(path).ok());
     if let Some(bytes) = symbols {
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert("symbols".into(), egui::FontData::from_owned(bytes).into());

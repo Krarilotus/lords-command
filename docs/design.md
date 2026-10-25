@@ -131,11 +131,20 @@ A **finding** is a matched span: file, line, pattern class and the matched text.
   (installed by `lords hooks install`), never through `core.hooksPath`, so a global hooks path that dispatches to
   the repo's own hooks (such as an attribution guard) keeps working.
 - **What it reads:** each staged file's content and its path, and the commit message. Deny and fleet terms match in
-  any case (Unicode lower case, NFKD), a phrase across line breaks too. UTF-16 with a byte order mark is read as
-  text; other non-text files are scanned in every reading their bytes have (lossy UTF-8, ASCII runs, and UTF-16 both
-  ways from either of the first two bytes, whatever their count of NUL bytes: Sol review r3, R3-07), and the staged
-  check refuses them unless `.gitattributes` marks them `lords-binary` (e.g. `*.png binary lords-binary`). A marked
-  file is still scanned.
+  any case (Unicode lower case, NFKD), a phrase across line breaks too.
+- **Encodings covered.** Every file, text or not, marked `lords-binary` or not, is scanned in each of these readings,
+  and none is chosen over another (Sol review r3, R3-07; r4, R4-02: bytes that are valid UTF-8 can also be UTF-16
+  text, and text without Latin letters has no NUL bytes):
+  - UTF-8 (lossy), with its printable ASCII runs (NUL bytes dropped);
+  - UTF-16 little-endian and big-endian, each from the file's first byte and from its second;
+  - UTF-16 after a byte order mark, which also makes the file text.
+- **Not covered**, each on purpose and stated so nobody relies on it: UTF-32; legacy code pages (Latin-1,
+  Windows-1252, Shift JIS and the like) beyond the ASCII they share; compressed content (zip, gzip, PNG chunks, office
+  files); encoded payloads (base64, hex, URL or HTML escapes); text inside images. A file that isn't UTF-8 or UTF-16
+  with a byte order mark is not text: the staged check refuses it unless `.gitattributes` marks it `lords-binary`
+  (e.g. `*.png binary lords-binary`), and marking it only lets it through, scanned as above. The history scan reads
+  `git log -p --text`, which recovers ASCII and ASCII-range UTF-16 but not other UTF-16; it looks back, while the
+  staged check above is the gate.
 - **Without a private stack** (CI, a stranger's clone), the deny and fleet classes are skipped. The check says so.
   A private stack that is configured but doesn't load, or a deny-list or fleet config that can't be read, fails it.
 - `privacy/allow.txt` lists accepted false positives as exact strings.
@@ -258,7 +267,8 @@ on a filesystem the owner also uses. Each patch closed one case and opened its n
 2. **Owner files**, which sync edits minimally and nowhere else: the managed block in the user-level instruction files
    (`~/.claude/CLAUDE.md`, a profile's `CLAUDE.md`, `~/.codex/AGENTS.md`), the one settings key (`claudeMdExcludes`),
    and sync's two lines in a repo's `.git/info/exclude`. Only these need backups and restore.
-3. **Everything else**, which sync only reads, and never through a link.
+3. **Everything else**, which sync only reads. What it decides to change it reads through the choke point, never
+   through a link; the stacks, configs and files it only shows or scans it reads as std does.
 
 **The ledger** (`~/.lords-command/state/ledger.toml`) is the only proof of ownership. It lists every tool-owned path
 sync created: its normalized path, what it is, its scope (the target, place or hooks dir it belongs to), and the
@@ -271,12 +281,23 @@ no directory listing decides what goes. What goes is what the ledger holds and t
   UTF-16 unit to one), never by Unicode's full case mapping, which merges names NTFS keeps apart (`İ.txt` and
   `i̇.txt`). A record spelt otherwise than the path asked about counts only while both exist and are one file by
   volume and file id. `\\?\UNC\host\share` and `\\host\share` are one key.
-- **Checked when read** (R3-03). Loading refuses a record that isn't well formed (kind, hash, scope, a hook's name
-  and dir) and two records of one path. Planning then refuses the whole plan when a record lies anywhere but in a
-  place its scope names, in the shape sync writes there: one dir per skill in a skills target, the shared file of a
-  `via` target, a place's adapter files, `.lords/` and one dir per skill in its adapters' skills dirs. A record whose
-  path is gone only loses its record. A record of a target or place the stack no longer declares is never acted on
-  (no plan covers it) and is noted; it is checked again if that target comes back.
+- **One grammar of places** (R4-01). A scope names roots and the slots sync writes in them, and both sync and the
+  ledger check get every path from it, so they can't drift apart: a `target:<name>` skills target is its dir, with
+  one dir per skill; a `target:<name>` instructions target with `via` is its shared file; `repo:<name>` and
+  `workspace:<name>` are the place's real checkouts and worktrees (never the dirs worktrees are kept in) or its
+  workspace dir, with `.lords/`; `…/<adapter>` adds that adapter's file and one dir per skill in its skills dir, for
+  an adapter the place writes for.
+- **Checked when read** (R3-03, R4-01). Loading refuses a record that isn't well formed (kind, hash, scope, a hook's
+  name and dir) and two records of one path. Planning then refuses the whole plan when a record's path, kind and
+  scope aren't exactly a slot of that scope. A record whose path is gone only loses its record. A record of a target
+  or place the stack no longer declares is never acted on (no plan covers it) and is noted; it is checked again if
+  that target comes back. Replacing or removing a path also checks that what is there is the kind its record says.
+- **Its format** (R4-05). The ledger states `format = N`; a build reads only its own, and any other or none is
+  refused ("ledger format N, this build reads M"). There is no migration: no ledger existed anywhere before format
+  1 (checked 25 Oct on all five machines).
+- **A save cut short** leaves the old ledger beside it as `.ledger.toml.lords-old-*`. While one is there, loading
+  refuses and names the recovery: rename it back when `ledger.toml` is missing; otherwise the new one is in place,
+  and the old one goes once checked.
 - **One writer.** Apply, adopt, set-aside, restore and hook installation (R3-09) take the apply lock before they
   read the ledger.
 
@@ -291,14 +312,20 @@ refuses a reparse point (junction, symlink) on the path or anywhere below it, an
 path that changed is left and reported.
 
 **Every filesystem step goes through one choke point** that refuses a reparse point anywhere from the drive root
-down to the path (ancestors included) before it reads, writes, moves or deletes there. What exactly may change files
-outside it is stated in `fsguard.rs` and enforced by `tests/fsguard_lint.rs` (R3-08).
+down to the path (ancestors included) before it reads, writes, moves or deletes there, and refuses a path whose
+metadata it can't read for any reason but "not found". A file appears at a sync path only as a hard link to a file
+written whole beside it; on a volume without hard links sync refuses (R4-04). Only `fsguard.rs` reaches `std::fs`,
+and only `process.rs` reaches `std::process`: stated in `fsguard.rs`, enforced by `tests/fsguard_lint.rs` (R3-08,
+R4-06).
 
-**Operating assumption** (R3-05). The choke point checks a path, then acts on it by name: the check and the action
-are two steps, not one on an open handle. A process that swapped a checked dir for a junction between them could
-redirect the action. Lords Command runs on the owner's own PC, under the apply lock, and no concurrent agent renames
-its dirs; within that, the gap is accepted. Apply also checks after each action that its path still lies inside the
-target the plan placed it in, with no link on the way; if not, it stops there and says where. *v2 hardening:*
+**Operating assumption** (R3-05). The promise that sync never acts through a link or outside a target holds under
+this assumption: one operator, and nothing else renames or relinks the place paths during an apply. The choke point
+checks a path, then acts on it by name: the check and the action are two steps, not one on an open handle. A
+process that swapped a checked dir for a junction between them could redirect the action. Lords Command runs on the
+owner's own PC, under the apply lock, and no concurrent agent renames its dirs; within that, the gap is accepted.
+Apply also checks after each action that its path still lies inside the target the plan placed it in, with no link
+on the way; if not, it stops there and says where. That check finds a link still there; it can't prove that no
+link came and went during the action. *v2 hardening:*
 handle-relative operations (open the target's root once, without following links, and create, rename and delete
 relative to that handle: `NtCreateFile` with a root directory on Windows, `openat`/`renameat`/`unlinkat` elsewhere),
 so no swapped path can redirect an action at all.
@@ -308,13 +335,15 @@ before anything moves; a backup that fails changes nothing (R3-02). Then the fil
 compared again. A mismatch means an edit since planning: the file goes back and that item fails, so nothing an owner
 wrote is lost, even during the apply. Otherwise the new file goes in with the old one's attributes (read-only,
 hidden and the rest, R3-06). Any error after the move puts the old file back. Backups are numbered files with a
-manifest naming each original path and the hash sync wrote. `restore` puts a file back only while it still holds
-exactly what sync wrote; anything else is left and reported.
+manifest naming each original path, the hash sync wrote and the file's attributes. `restore` puts a file back, with
+its attributes (R4-03), only while it still holds exactly what sync wrote; anything else is left and reported.
 
 **Stack edits** (import, retirement, promotion, edit) touch only files git already tracks and holds unmodified, plus
 new files, whether they commit or not (R3-10): git is the stack's backup, so an edit cut short, or made with
-`--no-commit`, is undone from git. Outside git, a stack edit only writes new files. Under `sync --apply` they run
-under the same lock, after the plan is known to apply.
+`--no-commit`, is undone from git. Outside git, a stack edit only writes new files. Promoting a skill deletes its
+private dir, so it refuses while that dir holds anything git can't give back or the promotion doesn't carry: an
+empty dir, or a file outside the entry (R4-07). Under `sync --apply` stack edits run under the same lock, after the
+plan is known to apply.
 
 **The changeover, once and with a human:** the 3a place files, the old `~/.codex/skills` copies and any other path
 from before the ledger are listed by `lords adopt --list`. Adopting a file records it only if it is byte for byte what

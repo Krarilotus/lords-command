@@ -2,12 +2,12 @@
 
 use crate::finding::Finding;
 use crate::frontmatter;
+use crate::fsguard;
 use crate::model::{Entry, Kind, Meta, Scope, Visibility};
 use crate::schema;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const MANIFEST: &str = "stack.toml";
@@ -153,7 +153,7 @@ impl Stack {
     /// Loads a stack. Fails only when `stack.toml` is missing or invalid; entry problems are collected.
     pub fn load(root: &Path) -> Result<Stack, String> {
         let manifest_path = root.join(MANIFEST);
-        let text = fs::read_to_string(&manifest_path)
+        let text = fsguard::read_string(&manifest_path)
             .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
         let value: Value =
             toml::from_str(&text).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
@@ -256,7 +256,7 @@ impl Stack {
         scope: &Scope,
         defaults: Option<&Map<String, Value>>,
     ) {
-        let text = match fs::read_to_string(file) {
+        let text = match fsguard::read_string(file) {
             Ok(t) => t,
             Err(e) => {
                 self.problems.push(Finding::error("read", e.to_string()).at(file, None));
@@ -314,7 +314,7 @@ impl Stack {
             }
         };
         let skill_file = dir.join(SKILL_FILE);
-        let body = match fs::read_to_string(&skill_file) {
+        let body = match fsguard::read_string(&skill_file) {
             Ok(t) => t,
             Err(_) => {
                 self.problems
@@ -423,7 +423,7 @@ impl Stack {
                     .filter(|d| d.join(SKILL_FILE).is_file())
                 {
                     let file = dir.join(SKILL_FILE);
-                    let body = fs::read_to_string(&file).unwrap_or_default();
+                    let body = fsguard::read_string(&file).unwrap_or_default();
                     let front = frontmatter::split(&body)
                         .yaml
                         .map(parse_yaml)
@@ -565,7 +565,7 @@ fn parse_yaml(text: &str) -> Result<Map<String, Value>, String> {
 }
 
 fn read_yaml_file(path: &Path) -> Result<Option<Map<String, Value>>, String> {
-    match fs::read_to_string(path) {
+    match fsguard::read_string(path) {
         Ok(t) => parse_yaml(&t).map(Some).map_err(|e| format!("{}: {e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("{}: {e}", path.display())),
@@ -593,8 +593,7 @@ fn layer_dirs(root: &Path) -> Vec<(PathBuf, Scope)> {
 }
 
 pub fn sorted_children(dir: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> =
-        fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    let mut v: Vec<PathBuf> = fsguard::list_dir(dir);
     v.sort();
     v
 }
@@ -604,10 +603,9 @@ pub fn sorted_children(dir: &Path) -> Vec<PathBuf> {
 pub fn all_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for c in sorted_children(dir) {
-        match fs::symlink_metadata(&c) {
-            Ok(m) if m.file_type().is_symlink() => {}
-            Ok(m) if m.is_dir() => out.extend(all_files(&c)),
-            Ok(m) if m.is_file() => out.push(c),
+        match fsguard::is_link_at(&c) {
+            Some(false) if c.is_dir() => out.extend(all_files(&c)),
+            Some(false) if c.is_file() => out.push(c),
             _ => {}
         }
     }
@@ -616,10 +614,10 @@ pub fn all_files(dir: &Path) -> Vec<PathBuf> {
 
 /// Whether `dir` holds a link anywhere below it (not following links).
 pub fn has_links(dir: &Path) -> bool {
-    sorted_children(dir).iter().any(|c| match fs::symlink_metadata(c) {
-        Ok(m) if m.file_type().is_symlink() => true,
-        Ok(m) if m.is_dir() => has_links(c),
-        _ => false,
+    sorted_children(dir).iter().any(|c| match fsguard::is_link_at(c) {
+        Some(true) => true,
+        Some(false) => c.is_dir() && has_links(c),
+        None => false,
     })
 }
 
