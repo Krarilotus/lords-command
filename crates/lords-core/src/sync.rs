@@ -93,6 +93,19 @@ pub struct Item {
     /// `via` file too), a repo or a workspace. Never read back from a label.
     #[serde(skip)]
     pub(crate) units: Vec<Unit>,
+    /// Why an item is a conflict, by type (r7 fix check, FC-01): only `ModifiedCopy` leaves the view complete.
+    #[serde(skip)]
+    pub(crate) conflict: ConflictKind,
+}
+
+/// The kind of a conflict, set where it is made: anything but a copy the owner changed may hide what is wanted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ConflictKind {
+    /// A tool-owned copy sync planned in full that no longer matches its ledger record.
+    ModifiedCopy,
+    /// Every other conflict: a place that is missing or can't be read, a path that isn't the tool's, a config clash.
+    #[default]
+    Other,
 }
 
 /// Where an item acts, as fsguard's changes take it.
@@ -173,6 +186,7 @@ impl Item {
             notes: Vec::new(),
             sources: Vec::new(),
             units: Vec::new(),
+            conflict: ConflictKind::Other,
         }
     }
 
@@ -269,6 +283,13 @@ fn read_or_finding(path: &Path, out: &mut Vec<crate::Finding>) -> Option<String>
 fn conflict(target: &str, path: &Path, note: impl Into<String>) -> Item {
     let mut item = Item::new(target, path.to_path_buf(), Action::Conflict);
     item.notes.push(note.into());
+    item
+}
+
+/// A tool-owned copy the owner changed since sync wrote it: the one conflict that hides nothing wanted (FC-01).
+fn modified_copy(target: &str, path: &Path, note: &str) -> Item {
+    let mut item = conflict(target, path, note);
+    item.conflict = ConflictKind::ModifiedCopy;
     item
 }
 
@@ -651,7 +672,7 @@ impl Planner<'_> {
                         item.action = if have == want { Action::InSync } else { Action::Update };
                     }
                     Some(_) => {
-                        return conflict(
+                        return modified_copy(
                             target,
                             path,
                             "changed since sync wrote it: move the change into the stack, or delete the file and sync again",
@@ -702,7 +723,7 @@ impl Planner<'_> {
                         item.action = if have == want { Action::InSync } else { Action::Refresh };
                     }
                     Some(_) => {
-                        return conflict(
+                        return modified_copy(
                             target,
                             path,
                             "changed since sync wrote it (a file edited, added or removed): move the change into the stack, or delete the dir and sync again",
@@ -1731,8 +1752,18 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
                 Some(k) => {
                     if k.proposed != item.proposed {
                         k.action = Action::Conflict;
+                        k.conflict = ConflictKind::Other;
                         k.notes
                             .push(format!("{} wants different text in the same file", item.target));
+                    } else if item.action == Action::Conflict {
+                        // The same file planned twice keeps the graver conflict of the two (FC-01).
+                        if k.action != Action::Conflict {
+                            k.action = Action::Conflict;
+                            k.notes.extend(item.notes.clone());
+                        }
+                        if item.conflict == ConflictKind::Other {
+                            k.conflict = ConflictKind::Other;
+                        }
                     }
                     k.units.extend(item.units);
                 }
@@ -1774,15 +1805,15 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         }
     }
     // Removal only from a complete view (design-simplification-r6, rule B; Sol review r7, R7-04/R7-05): a problem of
-    // any level in the stacks, or any conflict but one at a path the plan wants (whose want it saw: a copy the owner
-    // changed, say), means something wanted may not have been seen (a declared checkout or workspace that isn't
-    // there, a target file that can't be read), so nothing is removed or forgotten; installs go on.
+    // any level in the stacks, or any conflict but a copy the owner changed (by its kind, r7 fix check FC-01), means
+    // something wanted may not have been seen (a declared checkout or workspace that isn't there, a target file that
+    // can't be read), so nothing is removed or forgotten; installs go on.
     let problems = stacks.all().map(|s| s.problems.len()).sum::<usize>();
     let conflicts = pl
         .plan
         .items
         .iter()
-        .filter(|i| i.action == Action::Conflict && !pl.wanted.contains(&ledger::key(&i.path)))
+        .filter(|i| i.action == Action::Conflict && i.conflict != ConflictKind::ModifiedCopy)
         .count();
     let complete = (problems == 0 && conflicts == 0).then_some(Complete(()));
     let why = format!(
@@ -2181,6 +2212,37 @@ enum Undo {
     Aside { to: Contained, from: Contained },
 }
 
+/// One manifest line, parsed whole (r7 fix check, FC-02): each kind's every field, as `Run` writes it. A path is
+/// absolute, a backup name a `Part`, a hash 64 hex digits, attributes `attrs:<hex>`; anything else is no record.
+enum Record<'a> {
+    Edit { path: &'a Path, name: Part, written: &'a str, attrs: fsguard::Attrs },
+    Created { path: &'a Path, written: &'a str },
+    Aside { path: &'a Path, name: Part },
+}
+
+impl<'a> Record<'a> {
+    fn parse(line: &'a str) -> Option<Record<'a>> {
+        let path = |p: &'a str| Some(Path::new(p)).filter(|p| p.is_absolute());
+        let hash = |h: &'a str| {
+            Some(h).filter(|h| {
+                h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
+        };
+        let fields: Vec<&'a str> = line.split('\t').collect();
+        Some(match fields.as_slice() {
+            ["edit", p, name, written, attrs] => Record::Edit {
+                path: path(p)?,
+                name: Part::new(name).ok()?,
+                written: hash(written)?,
+                attrs: fsguard::Attrs::parse(attrs)?,
+            },
+            ["created", p, written] => Record::Created { path: path(p)?, written: hash(written)? },
+            ["aside", p, name] => Record::Aside { path: path(p)?, name: Part::new(name).ok()? },
+            _ => return None,
+        })
+    }
+}
+
 /// Undoes one apply's owner-file edits from its backup dir, last first: a file gets its old bytes back, and a file
 /// apply created goes, each only while it still holds exactly what sync wrote (Sol review r2, R2-03). A path moved
 /// there by `set-aside` comes back where nothing is. Every line must re-derive under `plan`, the current config
@@ -2206,14 +2268,17 @@ pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
     let mut undo = Vec::new();
     let mut refused = Vec::new();
     for line in manifest.lines().rev() {
-        let f: Vec<&str> = line.split('\t').collect();
-        let path = PathBuf::from(f.get(1).copied().unwrap_or(""));
         let kept = |name: &str| format!("{}", backup_dir.join(name).display());
-        match f.as_slice() {
-            ["edit", _, name, written, attrs] => {
-                let parsed = (Part::new(name), fsguard::Attrs::parse(attrs));
-                match (owner(&path), parsed) {
-                    (Some(o), (Ok(_), Some(attrs))) => {
+        // A record that doesn't parse completely refuses the whole restore, never is skipped (R7-07, FC-02).
+        let Some(record) = Record::parse(line) else {
+            refused.push(format!("a manifest line that doesn't parse: {line:?}"));
+            continue;
+        };
+        match record {
+            Record::Edit { path, name, written, attrs } => {
+                let (path, name, written) = (path.to_path_buf(), name.as_str(), written);
+                match owner(&path) {
+                    Some(o) => {
                         // The file as it is now must be one sync may replace, as apply checks it (Sol review r7,
                         // R7-06): one with an attribute it can't set back is refused here, before any change.
                         let now = match fsguard::kind(&path)? {
@@ -2237,37 +2302,35 @@ pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
                             )),
                         }
                     }
-                    (None, _) => refused.push(format!(
+                    None => refused.push(format!(
                         "{}: no file the config names now; its old bytes are in {}",
                         path.display(),
                         kept(name)
                     )),
-                    (Some(_), _) => refused.push(format!("a manifest line that doesn't parse: {line:?}")),
                 }
             }
-            ["created", _, written] => match owner(&path) {
-                Some(o) => {
-                    undo.push((path.clone(), Undo::Created { owner: o, written: written.to_string() }))
-                }
+            Record::Created { path, written } => match owner(path) {
+                Some(o) => undo.push((
+                    path.to_path_buf(),
+                    Undo::Created { owner: o, written: written.to_string() },
+                )),
                 None => refused.push(format!(
                     "{}: no file the config names now (apply created it; the backup {} holds no bytes of it)",
                     path.display(),
                     backup_dir.display()
                 )),
             },
-            ["aside", _, name] => {
-                let from = Part::new(name).map(|n| bdir.child(n));
-                match (containing(&plan.roots, &path), from) {
-                    (Some(to), Ok(from)) => undo.push((path.clone(), Undo::Aside { to, from })),
-                    _ => refused.push(format!(
-                        "{}: in no root this config verifies; it is in {}",
-                        path.display(),
-                        kept(name)
-                    )),
-                }
-            }
-            // A line that doesn't parse refuses the whole restore, never is skipped (Sol review r7, R7-07).
-            _ => refused.push(format!("a manifest line that doesn't parse: {line:?}")),
+            Record::Aside { path, name } => match containing(&plan.roots, path) {
+                Some(to) => undo.push((
+                    path.to_path_buf(),
+                    Undo::Aside { to, from: bdir.child(name) },
+                )),
+                None => refused.push(format!(
+                    "{}: in no root this config verifies; it is in {}",
+                    path.display(),
+                    kept(name.as_str())
+                )),
+            },
         }
     }
     if !refused.is_empty() {

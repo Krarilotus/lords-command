@@ -238,3 +238,107 @@ fn a_part_refuses_device_names_and_windows_reserved_characters() {
         assert!(fsguard::Part::new(ok).is_ok(), "{ok} is an ordinary name");
     }
 }
+
+// ---- The r7 fix check (Harness/notes/2026-10-25-sol-fixcheck-lords-r7.md)
+
+// Spec (FC-01, orchestrator: "the `Complete` exception by type, not by path membership"): a missing workspace
+// holds removal even where another target wants a file at the very path its conflict names.
+#[test]
+fn another_targets_want_does_not_hide_a_missing_workspace() {
+    let f = Fixture::new();
+    skill(&f);
+    skills_target(&f, "");
+    sync::apply(&sync::plan(&f.stacks(), &f.opts()).unwrap()).unwrap();
+    skills_target(
+        &f,
+        &format!(
+            "[[targets]]\nname = 'shared'\nadapter = 'claude'\nkind = 'instructions'\npath = '{}'\nvia = '{}'\n[workspaces.missing]\npath = '{}'\nadapters = ['claude']\n",
+            f.path("profile/CLAUDE.md").display(),
+            f.path("absent/CLAUDE.local.md").display(),
+            f.path("absent").display()
+        ),
+    );
+    let p = sync::plan(&f.stacks(), &f.opts()).unwrap();
+    assert!(p.complete.is_none(), "a missing place: no complete view");
+    let r = sync::plan(&f.stacks(), &sync::Options { uninstall: true, ..f.opts() })
+        .and_then(|p| sync::apply(&p));
+    assert!(r.is_err(), "refused: {r:?}");
+    assert!(f.path("out/demo/SKILL.md").is_file(), "nothing removed");
+}
+
+// Spec (FC-01): the one exempt conflict is a copy the owner changed: uninstall leaves it and forgets its record.
+#[test]
+fn uninstall_keeps_an_owner_modified_copy() {
+    let f = Fixture::new();
+    skill(&f);
+    skills_target(&f, "");
+    sync::apply(&sync::plan(&f.stacks(), &f.opts()).unwrap()).unwrap();
+    f.write("out/demo/SKILL.md", "OWNER CHANGE\n");
+    let p = sync::plan(&f.stacks(), &sync::Options { uninstall: true, ..f.opts() }).unwrap();
+    assert!(p.complete.is_some() && p.items.iter().any(|i| i.action == sync::Action::Forget));
+    sync::apply(&p).unwrap();
+    assert_eq!(f.read("out/demo/SKILL.md"), "OWNER CHANGE\n");
+    assert!(lords_core::ledger::Ledger::load(&f.home()).unwrap().owned.is_empty());
+}
+
+// Spec (FC-02, orchestrator: "a record that doesn't parse completely refuses the whole restore"): every hash field
+// is 64 hex digits and every required field is there; any other record refuses before any change.
+#[test]
+fn an_incomplete_manifest_record_refuses_the_restore() {
+    let hash = "a".repeat(64);
+    let bad = [
+        "created\tOWNER\t".to_string(),
+        "created\tOWNER\tnot-a-hash".to_string(),
+        "created\t\t".to_string() + &hash,
+        format!("edit\tOWNER\t0001\t{}\tattrs:20", "a".repeat(63)),
+        "edit\tOWNER\t0001\t\tattrs:20".to_string(),
+        format!("edit\tOWNER\t\t{hash}\tattrs:20"),
+        format!("edit\tOWNER\t0001\t{hash}\t"),
+        "aside\tOWNER\t".to_string(),
+    ];
+    for bad in bad {
+        let f = Fixture::new();
+        rule(&f);
+        instructions(&f, "user");
+        f.write("out/owner.md", "OWNER\n");
+        let b = sync::apply(&sync::plan(&f.stacks(), &f.opts()).unwrap()).unwrap().backups.unwrap();
+        let applied = f.read("out/owner.md");
+        let line = bad.replace("OWNER", &f.path("out/owner.md").display().to_string());
+        let mut manifest =
+            fs::OpenOptions::new().append(true).open(b.join("manifest.tsv")).unwrap();
+        // Without a final newline, as an interrupted write leaves it.
+        write!(manifest, "{line}").unwrap();
+        drop(manifest);
+        let r = sync::restore(&sync::plan(&f.stacks(), &f.opts()).unwrap(), &b);
+        assert!(r.is_err(), "{bad:?} refused: {r:?}");
+        assert_eq!(f.read("out/owner.md"), applied, "{bad:?}: unchanged");
+    }
+}
+
+// Spec (FC-03, orchestrator: "the staged privacy scan reads only blobs … refuse mode 160000 (gitlink) with a clear
+// message"): a staged gitlink stops the scan, even when its commit is in the repo.
+#[test]
+fn a_staged_gitlink_is_refused() {
+    let f = Fixture::new();
+    f.write("repo/README", "clean\n");
+    f.git_init("repo");
+    let head = git(&f.path("repo"), &["rev-parse", "HEAD"]);
+    let entry = format!("160000,{},sub", head.trim());
+    git(&f.path("repo"), &["update-index", "--add", "--cacheinfo", &entry]);
+    let r = privacy::scan_staged(&f.path("repo"), &privacy::Rules::public());
+    assert!(r.as_ref().is_err_and(|e| e.contains("gitlink")), "{r:?}");
+}
+
+// Spec (FC-03): what is scanned is each staged blob's bytes, a link's target text included, and a file in its
+// first commit (no HEAD yet) too.
+#[test]
+fn the_staged_scan_reads_blobs_before_the_first_commit() {
+    let f = Fixture::new();
+    f.write("repo/README", "clean\n");
+    git(&f.path("repo"), &["init", "-q"]);
+    f.write("repo/notes.md", &email("someone"));
+    git(&f.path("repo"), &["add", "notes.md"]);
+    let scan = privacy::scan_staged(&f.path("repo"), &privacy::Rules::public()).unwrap();
+    assert_eq!(scan.files_scanned, 1);
+    assert!(!scan.hits.is_empty());
+}

@@ -142,7 +142,8 @@ A **finding** is a matched span: file, line, pattern class and the matched text.
   privacy check. Lords Command's runs `cargo fmt --check` and clippy with `-D warnings`, which carries the filesystem
   and process boundary (below).
 - **What it reads:** the content and path of every staged entry that isn't a deletion (a type or mode change too,
-  R7-01), and the commit message. Deny and fleet terms match in
+  R7-01), read as the blob the index names (`git cat-file blob`); a staged gitlink (submodule) or an entry whose
+  blob can't be read refuses the commit (FC-03). And the commit message. Deny and fleet terms match in
   any case (Unicode lower case, NFKD), a phrase across line breaks too.
 - **Encodings covered.** Every file, text or not, marked `lords-binary` or not, is scanned in each of these readings,
   and none is chosen over another (Sol review r3, R3-07; r4, R4-02: bytes that are valid UTF-8 can also be UTF-16
@@ -354,8 +355,9 @@ and no decision calls one.
 
 **Removal only from a complete view** (design-simplification-r6, rule B). A plan removes or forgets a path only with
 a `Complete` witness, which planning makes only when the stacks loaded with no problem of any level, warnings
-included, and the plan has no conflict but one at a path it wants (R7-04, R7-05): a declared checkout or workspace
-that isn't there, or a target file that can't be read, hides what is wanted. Apply refuses a removal without it, and
+included, and the plan has no conflict but a copy the owner changed (R7-04, R7-05), by the conflict's kind, set
+where it is made (FC-01): a declared checkout or workspace that isn't there, or a target file that can't be read,
+hides what is wanted. Apply refuses a removal without it, and
 `uninstall` refuses outright. With any load problem a skill that couldn't be read would look unwanted, so sync then
 installs and updates and removes nothing (R6-05), and says why. That is also what closes the swallowed-error class:
 an error elsewhere can only make sync write less, never delete.
@@ -383,8 +385,9 @@ old file back. Backups are numbered files with a
 manifest naming each original path, the hash sync wrote and the file's attributes. `restore` puts a file back, with
 its attributes (R4-03), only while it still holds exactly what sync wrote; anything else is left and reported. It
 checks the file's attributes as they are now by the same allowlist as apply, and a manifest line that doesn't
-parse, like one that doesn't re-derive under the current config, refuses the whole restore before any change; no
-line is skipped (R7-06, R7-07).
+parse completely (every field of its kind: an absolute path, a backup name, a 64-hex-digit hash, the attributes),
+like one that doesn't re-derive under the current config, refuses the whole restore before any change; no line is
+skipped (R7-06, R7-07, FC-02).
 
 **Stack edits** (import, retirement, promotion, edit) touch only files git already tracks and holds unmodified, plus
 new files, whether they commit or not (R3-10): git is the stack's backup, so an edit cut short, or made with

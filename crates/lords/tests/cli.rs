@@ -132,6 +132,25 @@ fn the_hook_refuses_a_type_change_with_a_private_detail() {
     assert_eq!(text(&env.git(&repo, &["rev-parse", "HEAD"])), head, "nothing committed");
 }
 
+// Spec (r7 fix check, FC-03: "refuse mode 160000 (gitlink) with a clear message"): the installed hooks refuse a
+// staged gitlink whose commit is in the repo, and nothing is committed.
+#[test]
+fn the_hook_refuses_a_staged_gitlink() {
+    let env = Env::new();
+    let repo = env.repo();
+    let o = env.lords(&repo, &["hooks", "install"]);
+    assert!(o.status.success(), "{}", text(&o));
+    fs::write(repo.join("README"), "clean\n").unwrap();
+    env.git(&repo, &["add", "README"]);
+    assert!(env.git(&repo, &["commit", "-q", "-m", "clean"]).status.success());
+    let head = text(&env.git(&repo, &["rev-parse", "HEAD"]));
+    let entry = format!("160000,{},sub", head.trim());
+    assert!(env.git(&repo, &["update-index", "--add", "--cacheinfo", &entry]).status.success());
+    let o = env.git(&repo, &["commit", "-q", "-m", "a gitlink"]);
+    assert!(!o.status.success() && text(&o).contains("gitlink"), "refused: {}", text(&o));
+    assert_eq!(text(&env.git(&repo, &["rev-parse", "HEAD"])), head, "nothing committed");
+}
+
 // Spec (Sol review 25 Oct, finding 14: "The installed hook cannot prevent private commit messages"): `hooks
 // install` also writes a commit-msg hook, so a clean commit with a private message is refused; `privacy --message`
 // checks a message file.

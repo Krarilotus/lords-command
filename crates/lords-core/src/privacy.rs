@@ -443,14 +443,36 @@ pub fn scan_tree(repo: &Path, rules: &Rules) -> Result<Scan, String> {
 }
 
 /// The staged version of every staged entry that isn't a deletion (added, copied, modified, renamed, a type or mode
-/// change, Sol review r7, R7-01), and its path: what the commit would contain. One whose staged version can't be
-/// read is an error, never left out. Binary files the staged .gitattributes doesn't mark `lords-binary` are listed
-/// in `unmarked`.
+/// change, Sol review r7, R7-01), and its path: what the commit would contain. Each is read as the blob the index
+/// names, by its mode and object id (`git cat-file blob`, never a rendering of another object; r7 fix check,
+/// FC-03): a gitlink (mode 160000) or any entry whose blob can't be read is an error, never left out. Binary files
+/// the staged .gitattributes doesn't mark `lords-binary` are listed in `unmarked`.
 pub fn scan_staged(repo: &Path, rules: &Rules) -> Result<Scan, String> {
-    let names = git::run(repo, &["diff", "--cached", "--name-only", "--diff-filter=d", "-z"])?;
+    // Raw records, NUL-separated: `:<old mode> <new mode> <old id> <new id> <status>`, then the path.
+    let raw = git::run(
+        repo,
+        &["diff", "--cached", "--raw", "--no-abbrev", "--no-renames", "--diff-filter=d", "-z"],
+    )?;
+    let mut fields = raw.split('\0');
     let mut scan = Scan::default();
-    for rel in names.split('\0').filter(|s| !s.is_empty()) {
-        let bytes = git::bytes(repo, &["show", &format!(":{rel}")])?;
+    while let Some(head) = fields.next().filter(|s| !s.is_empty()) {
+        let rel = fields.next().filter(|s| !s.is_empty()).ok_or_else(|| {
+            format!("git diff --raw: a record without its path ({head:?}); nothing was scanned")
+        })?;
+        let parts: Vec<&str> = head.trim_start_matches(':').split(' ').collect();
+        let [_, mode, _, id, _] = parts.as_slice() else {
+            return Err(format!("git diff --raw: a record that doesn't parse ({head:?})"));
+        };
+        if *mode == "160000" {
+            return Err(format!(
+                "{rel}: a staged gitlink (submodule, mode 160000); the privacy check reads only file contents, so it refuses the commit. Commit the submodule's own repo, or unstage it"
+            ));
+        }
+        if !matches!(*mode, "100644" | "100755" | "120000") {
+            return Err(format!("{rel}: staged with mode {mode}, not a file; refused"));
+        }
+        let bytes = git::bytes(repo, &["cat-file", "blob", id])
+            .map_err(|e| format!("{rel}: its staged blob can't be read ({e}); refused"))?;
         scan.add_name(Path::new(rel), rules);
         scan.add(PathBuf::from(rel), &bytes, rules);
     }
