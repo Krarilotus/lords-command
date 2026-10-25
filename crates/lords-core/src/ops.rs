@@ -111,25 +111,23 @@ pub fn retire(stacks: &Stacks, r: &Retire) -> Result<Retired, String> {
 
 // ---------------------------------------------------------------- import
 
-/// The keys Lords Command adds to a memory file; an import keeps them when the agent's copy changes.
-const LORDS_KEYS: [&str; 16] = [
-    "id",
-    "kind",
-    "title",
-    "audience",
-    "scope",
-    "status",
-    "superseded_by",
-    "retired",
-    "visibility",
-    "basis",
-    "origin",
-    "topics",
-    "overrides",
-    "extends",
-    "order",
-    "links",
-];
+/// The keys Lords Command adds to a memory file, which an import keeps when the agent's copy changes: every entry
+/// property in the published schema except the agent's own (`name`, `description`, `metadata`). Read from the
+/// schema, so a new field is never dropped by a forgotten list.
+fn lords_keys() -> &'static [String] {
+    static KEYS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        let schema: serde_json::Value =
+            serde_json::from_str(crate::schema::ENTRY_SCHEMA).expect("the bundled schema is JSON");
+        schema["properties"]
+            .as_object()
+            .expect("the schema lists properties")
+            .keys()
+            .filter(|k| !matches!(k.as_str(), "name" | "description" | "metadata"))
+            .cloned()
+            .collect()
+    })
+}
 
 #[derive(Debug, Default)]
 pub struct Imported {
@@ -142,12 +140,31 @@ pub struct Imported {
     pub commit: Option<String>,
 }
 
+/// Whether the stack's copy still holds exactly what the agent wrote: the same body, and the same frontmatter once
+/// the keys Lords Command added are taken out. Those keys (and where they sit) are not the agent's change.
+fn same_source(incoming: &str, existing: &str) -> bool {
+    let (a, b) = (frontmatter::split(incoming), frontmatter::split(existing));
+    let lines =
+        |y: &str| y.lines().map(|l| l.trim_end_matches('\r').to_string()).collect::<Vec<_>>();
+    let agent_yaml = |yaml: &str| {
+        let none: Vec<(&str, Option<String>)> =
+            lords_keys().iter().map(|k| (k.as_str(), None)).collect();
+        lines(&frontmatter::set_keys(yaml, &none))
+            .into_iter()
+            .filter(|l| !l.trim().is_empty())
+            .collect::<Vec<_>>()
+    };
+    let theirs: Vec<String> =
+        lines(a.yaml.unwrap_or("")).into_iter().filter(|l| !l.trim().is_empty()).collect();
+    a.body == b.body && theirs == agent_yaml(b.yaml.unwrap_or(""))
+}
+
 /// The agent's new text, with the Lords Command keys of the stack's copy carried over.
 fn carry_keys(incoming: &str, existing: &str) -> String {
     let Some(old_yaml) = frontmatter::split(existing).yaml else { return incoming.to_string() };
-    let keys: Vec<(&str, Option<String>)> = LORDS_KEYS
+    let keys: Vec<(&str, Option<String>)> = lords_keys()
         .iter()
-        .filter_map(|k| frontmatter::get_key(old_yaml, k).map(|v| (*k, Some(v))))
+        .filter_map(|k| frontmatter::get_key(old_yaml, k).map(|v| (k.as_str(), Some(v))))
         .collect();
     if keys.is_empty() {
         incoming.to_string()
@@ -227,7 +244,7 @@ fn import_stores(
                 }
                 Ok(existing) => {
                     let merged = carry_keys(&incoming, &existing);
-                    if merged == existing {
+                    if same_source(&incoming, &existing) {
                         rep.unchanged += 1;
                     } else {
                         if write {

@@ -81,11 +81,10 @@ pub fn get_key(yaml: &str, key: &str) -> Option<String> {
     if !inline.is_empty() {
         return Some(inline.to_string());
     }
-    let block: Vec<&str> = lines
-        .take_while(|l| l.starts_with([' ', '\t', '-']))
-        .map(|l| l.strip_prefix("  ").unwrap_or(l))
-        .collect();
-    Some(block.join("\n"))
+    let block: Vec<&str> = lines.take_while(|l| l.starts_with([' ', '\t', '-'])).collect();
+    // Remove only the indent every line shares, so nested lines keep theirs (a list item's next keys).
+    let indent = block.iter().map(|l| l.len() - l.trim_start_matches(' ').len()).min().unwrap_or(0);
+    Some(block.iter().map(|l| l.get(indent..).unwrap_or(l)).collect::<Vec<_>>().join("\n"))
 }
 
 /// Rewrites a whole file with changed frontmatter keys; adds frontmatter if it had none.

@@ -130,12 +130,33 @@ fn import_keeps_a_retirement_when_the_agent_edits_the_file() {
     import(&Stack::load(&f.priv_root()).unwrap(), None, true).unwrap();
     let stacks = lords_core::Stacks::load(&f.pub_root(), Some(&f.priv_root())).unwrap();
     retire(&stacks, &retire_args("memory.agent.a", "now a rule", None)).unwrap();
+    // Every key the stack adds is kept, the newer fields too (roles, evidence).
+    let copy = f.path("priv/global/memory/agent/a.md");
+    let text = std::fs::read_to_string(&copy).unwrap();
+    std::fs::write(
+        &copy,
+        text.replacen(
+            "---\n",
+            "---\nroles: [orchestrator]\nevidence:\n- summary: why\n  date: 2026-10-25\n",
+            1,
+        ),
+    )
+    .unwrap();
+    let unchanged =
+        &lords_core::ops::import_preview(&Stack::load(&f.priv_root()).unwrap(), None).unwrap()[0];
+    assert!(
+        unchanged.changed.is_empty(),
+        "the stack's own keys aren't a change: {:?}",
+        unchanged.changed
+    );
     std::fs::write(src.join("a.md"), "---\nname: a\n---\nA, edited\n").unwrap();
     import(&Stack::load(&f.priv_root()).unwrap(), None, true).unwrap();
     let s = f.stacks();
     let a = s.find("memory.agent.a").unwrap();
     assert!(!a.active());
     assert_eq!(a.body, "A, edited\n");
+    assert_eq!(a.meta.roles, ["orchestrator"]);
+    assert_eq!(a.meta.evidence[0].summary, "why");
 }
 
 fn promote_fixture(body: &str) -> Fixture {
