@@ -8,6 +8,34 @@ Two stacks, one layout: this public repo (the tool plus a generic stack anyone c
 stack (intent with private details, memories, host facts, per-project and per-repo rules). Entries are layered
 global → project → repo → path; a narrower entry changes a broader one only by naming its id.
 
-Status: design (milestone 1). See [docs/design.md](docs/design.md) and [schema/](schema/).
+Status: CLI core (milestone 2). Design: [docs/design.md](docs/design.md). Schemas: [schema/](schema/).
+
+## > use
+
+```text
+lords check [--public] [--strict] [--json]   every check over both stacks; --public: this repo's whole tree
+lords import [--store NAME]                  agents' memory dirs into the private stack, committed
+lords retire ID --reason TEXT [--superseded-by ID]
+lords promote ID [--strip | --split]         private → public, only once nothing private is left
+lords hooks install [--secrets-only]         the privacy check as this repo's pre-commit hook
+lords privacy --staged | FILE...
+lords hash PATH                              the sha256 an inherited entry records
+```
+
+The stacks come from `--public-stack` / `--private-stack`, else `config.txt` beside the exe or in
+`~/.lords-command/`:
+
+```text
+public = ~/lords-command/stack
+private = ~/lords-command-private
+```
+
+## > hack
+
+```powershell
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
 
 [MIT](LICENSE)

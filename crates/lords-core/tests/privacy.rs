@@ -31,7 +31,7 @@ fn each_class_matches_its_shape() {
             vec![],
         ),
         ("~/.claude/CLAUDE.md and ~/.codex/AGENTS.md".to_string(), vec![]),
-        ("token = \"a long word without digits\"".to_string(), vec![]),
+        ("token = \"anunbrokenwordwithoutdigits\"".to_string(), vec![]),
     ];
     for (text, want) in cases {
         assert_eq!(classes(&text, &r), want, "{text}");

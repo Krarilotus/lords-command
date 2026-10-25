@@ -94,6 +94,12 @@ fn a_public_entry_naming_a_private_one_is_an_error() {
         &entry("rule.q", "global", "public", "links: [rule.p]\n", "y\n"),
     );
     assert_eq!(errors(&f.check()), ["public-to-private"]);
+    f.write(
+        "pub/global/rules/q.md",
+        &entry("rule.q", "global", "public", "extends: [rule.p]\n", "y\n"),
+    );
+    let found = f.check();
+    assert!(errors(&found).contains(&"public-to-private"), "{found:#?}");
 }
 
 // Spec (Entry metadata, origin): adapted or inherited needs repo, commit, path and licence.
