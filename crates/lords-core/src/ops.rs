@@ -3,6 +3,7 @@
 
 use crate::config::expand_home;
 use crate::frontmatter::{self, quote};
+use crate::fsguard;
 use crate::git;
 use crate::model::{Entry, Kind, Origin, Scope, Visibility};
 use crate::privacy::{self, Hit, Rules};
@@ -38,6 +39,49 @@ fn rel<'a>(root: &Path, p: &'a Path) -> &'a Path {
     p.strip_prefix(root).unwrap_or(p)
 }
 
+/// Whether git keeps every byte that changing `path` replaces (design: Ownership boundary; Sol review r2, R2-05: a
+/// clean status alone proves nothing for an ignored file). Outside git there is nothing to check. An operation that
+/// commits checks each file it will change once, before its first write.
+fn git_keeps(path: &Path) -> Result<(), String> {
+    let dir = path.parent().ok_or_else(|| format!("{}: no parent dir", path.display()))?;
+    let Some(top) = dir.exists().then(|| git::toplevel(dir)).flatten() else { return Ok(()) };
+    let name = rel(&top, path).to_string_lossy().replace('\\', "/");
+    match fsguard::kind(path)? {
+        fsguard::Kind::File => {
+            if git::run(&top, &["ls-files", "--error-unmatch", "--", &name]).is_err() {
+                return Err(format!(
+                    "{}: git doesn't track it, so it couldn't give back what this replaces; commit it first",
+                    path.display()
+                ));
+            }
+            if git::run(&top, &["diff", "--quiet", "HEAD", "--", &name]).is_err() {
+                return Err(format!(
+                    "{}: has uncommitted changes; commit them first",
+                    path.display()
+                ));
+            }
+        }
+        fsguard::Kind::Missing => {
+            if git::run(&top, &["check-ignore", "-q", "--", &name]).is_ok() {
+                return Err(format!(
+                    "{}: git ignores it, so it couldn't be committed",
+                    path.display()
+                ));
+            }
+        }
+        fsguard::Kind::Dir => return Err(format!("{} is a dir", path.display())),
+    }
+    Ok(())
+}
+
+/// Writes a stack file through `fsguard` (an operation that commits has checked it with `git_keeps` first).
+fn stack_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        fsguard::create_dir_all(dir)?;
+    }
+    fsguard::replace_own_file(path, bytes)
+}
+
 /// Writes keys into an entry's metadata file: frontmatter for Markdown, the whole file for a sidecar.
 fn set_meta_keys(meta_file: &Path, keys: &[(&str, Option<String>)]) -> Result<(), String> {
     let text =
@@ -47,7 +91,7 @@ fn set_meta_keys(meta_file: &Path, keys: &[(&str, Option<String>)]) -> Result<()
     } else {
         frontmatter::rewrite(&text, keys)
     };
-    fs::write(meta_file, new).map_err(|e| format!("{}: {e}", meta_file.display()))
+    stack_write(meta_file, new.as_bytes())
 }
 
 // ---------------------------------------------------------------- retire
@@ -92,13 +136,16 @@ pub fn retire(stacks: &Stacks, r: &Retire) -> Result<Retired, String> {
         ("superseded_by", r.superseded_by.map(str::to_string)),
         ("retired", Some(format!("date: {}\nreason: {}", r.date, quote(r.reason)))),
     ];
+    if r.commit {
+        git_keeps(&e.meta_file)?;
+    }
     set_meta_keys(&e.meta_file, &keys)?;
     // The stack must still load the entry, now retired; otherwise put the file back.
     let root = stacks.stack(e.stack).expect("the entry's stack is loaded").root.clone();
     let ok =
         Stack::load(&root).ok().and_then(|s| s.find(r.id).map(|x| !x.active())).unwrap_or(false);
     if !ok {
-        fs::write(&e.meta_file, before).map_err(|e| e.to_string())?;
+        fsguard::replace_own_file(&e.meta_file, &before)?;
         return Err(format!("retiring `{}` would leave invalid metadata; nothing changed", r.id));
     }
     let commit = if r.commit && is_repo(&root) {
@@ -245,7 +292,7 @@ fn import_stores(
         }
         let dest = private.layer_dir(&scope).join("memory").join(&s.name);
         if write {
-            fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+            fsguard::create_dir_all(&dest)?;
         }
         let defaults = dest.join(DEFAULTS);
         if write && !defaults.exists() {
@@ -255,7 +302,10 @@ fn import_stores(
                 "# Metadata every memory file in this store shares (lords import).\nkind: memory\nscope: {}\naudience: [{audience}]\nstatus: active\nvisibility: private\norigin:\n  type: imported\n  store: {}\n",
                 s.scope, s.name
             );
-            fs::write(&defaults, text).map_err(|e| e.to_string())?;
+            if commit {
+                git_keeps(&defaults)?;
+            }
+            stack_write(&defaults, text.as_bytes())?;
         }
         let mut rep = Imported { store: s.name.clone(), ..Imported::default() };
         let mut seen = Vec::new();
@@ -270,7 +320,10 @@ fn import_stores(
             match fs::read_to_string(&target) {
                 Err(_) => {
                     if write {
-                        fs::write(&target, &incoming).map_err(|e| e.to_string())?;
+                        if commit {
+                            git_keeps(&target)?;
+                        }
+                        stack_write(&target, incoming.as_bytes())?;
                     }
                     rep.added.push(name);
                 }
@@ -280,7 +333,10 @@ fn import_stores(
                         rep.unchanged += 1;
                     } else {
                         if write {
-                            fs::write(&target, merged).map_err(|e| e.to_string())?;
+                            if commit {
+                                git_keeps(&target)?;
+                            }
+                            stack_write(&target, merged.as_bytes())?;
                         }
                         rep.changed.push(name);
                     }
@@ -461,22 +517,31 @@ pub fn promote(
         }
     }
 
+    // Before any write of a promotion that commits, git must keep every byte it changes in either stack.
+    if commit {
+        for (f, _) in &files {
+            git_keeps(f)?;
+            git_keeps(&public.root.join(rel(&private.root, f)))?;
+        }
+        if let Some((name, _)) = &private_part {
+            git_keeps(&e.meta_file.with_file_name(name))?;
+        }
+    }
     // Write: public copy, then the private part, then remove the private original.
     for (f, text) in &files {
         let to = public.root.join(rel(&private.root, f));
-        fs::create_dir_all(to.parent().expect("a file has a parent")).map_err(|e| e.to_string())?;
-        fs::write(&to, text).map_err(|e| e.to_string())?;
+        stack_write(&to, text.as_bytes())?;
     }
     let mut part_path = None;
     if let Some((name, text)) = private_part {
         let p = e.meta_file.with_file_name(name);
-        fs::write(&p, text).map_err(|e| e.to_string())?;
+        stack_write(&p, text.as_bytes())?;
         part_path = Some(p);
     }
     if is_skill {
-        fs::remove_dir_all(&src_path).map_err(|e| e.to_string())?;
+        fsguard::delete_tree(&src_path)?;
     } else {
-        fs::remove_file(&src_path).map_err(|e| e.to_string())?;
+        fsguard::delete_file(&src_path)?;
     }
     let mut commits = Vec::new();
     if commit {
@@ -606,10 +671,15 @@ pub fn edit(
     } else {
         vec![e.meta_file.clone(), e.body_file.clone()]
     };
+    if commit {
+        for f in &files {
+            git_keeps(f)?;
+        }
+    }
     let before: Vec<Vec<u8>> = files.iter().map(|f| fs::read(f).unwrap_or_default()).collect();
     let restore = || {
         for (f, b) in files.iter().zip(&before) {
-            let _ = fs::write(f, b);
+            let _ = fsguard::replace_own_file(f, b);
         }
     };
     if !keys.is_empty() {
@@ -624,7 +694,7 @@ pub fn edit(
         } else {
             body.clone()
         };
-        fs::write(&e.body_file, new).map_err(|err| err.to_string())?;
+        stack_write(&e.body_file, new.as_bytes())?;
     }
     // The entry must still load, with no new problem in its files; otherwise put them back.
     let reloaded = Stack::load(&stack.root);

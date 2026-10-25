@@ -1,10 +1,11 @@
 //! What `apply` may never do to a file or link (Sol review, 25 Oct, against the apply contract: owner text and
-//! bytes survive, every replaced thing has a backup, nothing outside the configured path changes, ownership is
-//! proven before a removal, ended entries leave every output). One test per finding; each failed before its fix.
+//! bytes survive, every replaced owner byte has a backup, nothing outside the configured path changes, ownership is
+//! proven before a removal, ended entries leave every output). One test per round-1 finding; each failed before its
+//! fix. Since the ownership boundary (design), a few state the stricter rule that replaced the first fix.
 
 mod common;
 use common::*;
-use lords_core::sync::{apply, plan, Action, Options, Plan};
+use lords_core::sync::{apply, plan, Action, Plan};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,7 +35,7 @@ fn instructions(name: &str, path: &Path, extra: &str) -> String {
 }
 
 fn plan_all(f: &Fixture) -> Plan {
-    plan(&f.stacks(), &Options::default()).unwrap()
+    plan(&f.stacks(), &f.opts()).unwrap()
 }
 
 fn item<'p>(p: &'p Plan, path: &Path) -> &'p lords_core::sync::Item {
@@ -101,8 +102,8 @@ fn skills_target(dir: &Path) -> String {
     )
 }
 
-// Spec (finding 1: "Distinct targets overwrite each other's backups"): two targets whose paths differ only in a
-// separator both keep their replaced text in the run's backups, and each run gets its own backup dir.
+// Spec (finding 1: "Distinct targets overwrite each other's backups"): two owner files whose paths differ only in
+// a separator both keep their replaced text in the run's backups, and each run gets its own backup dir.
 #[test]
 fn backups_do_not_collide() {
     let f = Fixture::new();
@@ -116,13 +117,12 @@ fn backups_do_not_collide() {
             instructions("two", &b, "own_text = \"replace\"\n")
         ),
     );
-    let run = f.path("backups/run");
-    apply(&plan_all(&f), &run).unwrap();
-    let kept = texts(&run).join("\n");
+    let one = apply(&plan_all(&f)).unwrap().backups.unwrap();
+    let kept = texts(&one).join("\n");
     assert!(kept.contains("FIRST") && kept.contains("SECOND"), "{kept}");
-    let (one, two) =
-        (lords_core::sync::backup_dir().unwrap(), lords_core::sync::backup_dir().unwrap());
-    assert_ne!(one, two, "two applies in one process get two backup dirs");
+    fs::write(&a, "THIRD\n").unwrap();
+    let two = apply(&plan_all(&f)).unwrap().backups.unwrap();
+    assert_ne!(one, two, "two applies get two backup dirs");
 }
 
 // Spec (finding 2: "Invalid or unreadable targets are treated as absent and overwritten without backup"): a
@@ -147,7 +147,7 @@ fn invalid_utf8_is_not_a_missing_file() {
     let p = plan_all(&f);
     assert_eq!(item(&p, &settings).action, Action::Conflict);
     assert_eq!(item(&p, &doc).action, Action::Conflict);
-    assert!(apply(&p, &f.path("backups/run")).is_err());
+    assert!(apply(&p).is_err());
     assert_eq!(fs::read(&settings).unwrap(), [0xFF, 0x7B, 0x7D]);
 }
 
@@ -161,14 +161,15 @@ fn apply_does_not_lose_post_plan_edits() {
     targets(&f, &instructions("t", &t, ""));
     let p = plan_all(&f);
     fs::write(&t, "OWNER EDIT AFTER PLAN").unwrap();
-    assert!(apply(&p, &f.path("backups/run")).is_err(), "a stale plan is refused");
+    assert!(apply(&p).is_err(), "a stale plan is refused");
     assert_eq!(fs::read_to_string(&t).unwrap(), "OWNER EDIT AFTER PLAN");
 }
 
-// Spec (finding 4: "A shared `via` file discards all owner text outside any managed block"): the shared file
-// keeps its owner's text, as every other target does.
+// Spec (finding 4: "A shared `via` file discards all owner text outside any managed block"; since the ownership
+// boundary the shared file is the tool's, under its own dir): one there that sync didn't write is a conflict, and
+// its owner's text stays.
 #[test]
-fn via_file_keeps_owner_text() {
+fn a_shared_file_sync_did_not_write_is_left_alone() {
     let f = Fixture::new();
     rule(&f);
     let shared = f.write("shared.md", "OWNER PREFIX\r\n");
@@ -182,11 +183,9 @@ fn via_file_keeps_owner_text() {
         ),
     );
     let p = plan_all(&f);
-    let proposed = item(&p, &shared).proposed.clone().unwrap();
-    assert!(
-        proposed.starts_with("OWNER PREFIX\r\n") && proposed.contains("Rule text."),
-        "{proposed}"
-    );
+    assert_eq!(item(&p, &shared).action, Action::Conflict, "{:?}", item(&p, &shared).notes);
+    assert!(apply(&p).is_err());
+    assert_eq!(f.read("shared.md"), "OWNER PREFIX\r\n");
 }
 
 // Spec (finding 5: "Writes escape through existing junctions"): a target whose dir is a link to somewhere else is
@@ -201,7 +200,7 @@ fn parent_junction_does_not_redirect_writes() {
     targets(&f, &instructions("t", &t, ""));
     let p = plan_all(&f);
     assert_eq!(item(&p, &t).action, Action::Conflict, "{:?}", item(&p, &t).notes);
-    let _ = apply(&p, &f.path("backups/run"));
+    let _ = apply(&p);
     assert!(!f.path("outside/AGENTS.md").exists());
 }
 
@@ -215,7 +214,7 @@ fn hardlink_does_not_change_unconfigured_file() {
     let t = f.path("target.md");
     fs::hard_link(&outside, &t).unwrap();
     targets(&f, &instructions("t", &t, "own_text = \"replace\"\n"));
-    apply(&plan_all(&f), &f.path("backups/run")).unwrap();
+    apply(&plan_all(&f)).unwrap();
     assert!(fs::read_to_string(&t).unwrap().contains("Rule text."));
     assert_eq!(fs::read_to_string(&outside).unwrap(), "OWNER");
 }
@@ -238,12 +237,7 @@ fn conflict_does_not_first_retire_stack() {
             settings.display()
         ),
     );
-    let r = lords_core::sync::import_and_apply(
-        &f.pub_root(),
-        Some(&f.priv_root()),
-        &Options::default(),
-        &f.path("backups/run"),
-    );
+    let r = lords_core::sync::import_and_apply(&f.pub_root(), Some(&f.priv_root()), &f.opts());
     assert!(r.is_err());
     assert_eq!(fs::read_to_string(&gone).unwrap(), before, "the stack is untouched");
 }
@@ -259,26 +253,27 @@ fn a_partial_block_is_a_conflict() {
     assert_eq!(item(&plan_all(&f), &t).action, Action::Conflict);
 }
 
-// Spec (finding 8: "Removed or repointed junctions have no rollback backup"): unlinking records the link and where
-// it pointed in the run's backups, so it can be put back.
+// Spec (finding 8: "Removed or repointed junctions have no rollback backup"; since the ownership boundary: a link
+// is never the tool's): a link into the stack for a skill that ended stays as it is, and a wanted skill whose place
+// is a link is a conflict.
 #[test]
-fn removed_junction_has_a_backup() {
+fn a_link_is_never_removed_or_written_through() {
     let f = Fixture::new();
-    let src = skill(&f, "old", &expired());
+    let old = skill(&f, "old", &expired());
+    let demo = skill(&f, "demo", "");
     let dir = f.path("home/skills");
-    dir_link(&dir.join("old"), &src);
+    dir_link(&dir.join("old"), &old);
+    dir_link(&dir.join("demo"), &demo);
     targets(&f, &skills_target(&dir));
     let p = plan_all(&f);
-    assert_eq!(item(&p, &dir.join("old")).action, Action::Unlink);
-    let run = f.path("backups/run");
-    apply(&p, &run).unwrap();
-    let want = src.to_string_lossy().replace('\\', "/").to_lowercase();
-    let kept = texts(&run).join("\n").replace('\\', "/").to_lowercase();
-    assert!(kept.contains(&want), "the link's target is recorded: {kept}");
+    assert_eq!(item(&p, &dir.join("demo")).action, Action::Conflict);
+    assert!(p.items.iter().all(|i| i.path != dir.join("old")), "{:#?}", p.items);
+    let _ = apply(&p);
+    assert!(fs::read_link(dir.join("old")).is_ok() && old.join("SKILL.md").is_file());
 }
 
 // Spec (finding 9: "A path-prefix collision makes a foreign junction tool-owned"): a link into a sibling dir whose
-// name merely starts with the stack's is not ours: no Unlink.
+// name merely starts with the stack's is not the tool's: nothing touches it.
 #[test]
 fn sibling_of_stack_is_not_owned() {
     let f = Fixture::new();
@@ -287,16 +282,11 @@ fn sibling_of_stack_is_not_owned() {
     dir_link(&dir.join("foreign"), &f.path("pub-other/x"));
     targets(&f, &skills_target(&dir));
     let p = plan_all(&f);
-    assert!(
-        p.items.iter().all(|i| i.path != dir.join("foreign")
-            || !matches!(i.action, Action::Unlink | Action::ReplaceLink)),
-        "{:#?}",
-        p.items
-    );
+    assert!(p.items.iter().all(|i| i.path != dir.join("foreign")), "{:#?}", p.items);
 }
 
 // Spec (finding 10: "An unrelated real directory is removed based only on its basename"): a real dir that merely
-// shares a stack skill's name, with files the skill doesn't have, stays.
+// shares a stack skill's name stays.
 #[test]
 fn unrelated_directory_with_retired_skill_name() {
     let f = Fixture::new();
@@ -305,7 +295,9 @@ fn unrelated_directory_with_retired_skill_name() {
     f.write("home/skills/demo/OWNER.txt", "mine\n");
     targets(&f, &skills_target(&dir));
     let p = plan_all(&f);
-    assert!(p.items.iter().all(|i| i.action != Action::RemoveDir), "{:#?}", p.items);
+    assert!(p.items.iter().all(|i| i.action != Action::Remove), "{:#?}", p.items);
+    let _ = apply(&p);
+    assert!(f.path("home/skills/demo/OWNER.txt").is_file());
 }
 
 // Spec (finding 11: "Literal inline marker strings delete owner prose"): markers count only as whole lines; a
@@ -322,7 +314,7 @@ fn inline_markers_are_owner_bytes() {
 }
 
 // Spec (finding 18: "Planning a real skill directory follows its foreign sub-junctions"): planning never reads
-// through a link inside an installed copy.
+// through a link inside a dir where a copy goes; it is a conflict.
 #[test]
 fn owner_skill_subjunction_is_not_traversed() {
     let f = Fixture::new();
@@ -333,20 +325,19 @@ fn owner_skill_subjunction_is_not_traversed() {
     dir_link(&dir.join("demo/foreign"), &f.path("outside"));
     targets(&f, &skills_target(&dir));
     let p = plan_all(&f);
-    let notes = format!("{:?}", p.items.iter().map(|i| &i.notes).collect::<Vec<_>>());
-    assert!(!notes.contains("secret-owner"), "{notes}");
+    assert_eq!(item(&p, &dir.join("demo")).action, Action::Conflict);
+    let notes = format!("{:?}", p.items.iter().map(|i| (&i.notes, &i.diff)).collect::<Vec<_>>());
+    assert!(!notes.contains("secret"), "{notes}");
 }
 
-// Spec (finding 19: "Expired repo skills remain installed and loadable"): a checkout's link to a stack skill that no
-// longer applies is unlinked.
+// Spec (finding 19: "Expired repo skills remain installed and loadable"): a checkout's copy of a stack skill that
+// no longer applies is removed.
 #[test]
-fn expired_repo_skill_link_is_removed() {
+fn expired_repo_skill_copy_is_removed() {
     let f = Fixture::new();
-    let src = skill(&f, "demo", &format!("roles: [coder]\n{}", expired()));
     let checkout = f.path("checkout");
     f.write("checkout/README.md", "a repo\n");
     f.git_init("checkout");
-    dir_link(&checkout.join(".claude/skills/demo"), &src);
     f.write(
         "priv/stack.toml",
         &format!(
@@ -354,8 +345,15 @@ fn expired_repo_skill_link_is_removed() {
             checkout.display()
         ),
     );
+    skill(&f, "demo", "roles: [coder]\n");
+    apply(&plan_all(&f)).unwrap();
+    let installed = checkout.join(".claude/skills/demo");
+    assert!(installed.join("SKILL.md").is_file());
+    skill(&f, "demo", &format!("roles: [coder]\n{}", expired()));
     let p = plan_all(&f);
-    assert_eq!(item(&p, &checkout.join(".claude/skills/demo")).action, Action::Unlink);
+    assert_eq!(item(&p, &installed).action, Action::Remove);
+    apply(&p).unwrap();
+    assert!(!installed.exists());
 }
 
 // Spec (P2 finding 20: "Settings edits reformat unrelated keys and values"): adding the exclude key keeps the rest of
@@ -385,8 +383,10 @@ fn settings_preserve_formatting() {
     assert_eq!(v["model"], "x");
 }
 
-// Spec (P2 finding 21: "Git excludes are broad patterns rather than exact generated paths"): the files sync writes
-// are ignored by their exact paths; a file of the same name deeper down, or another file in `.lords`, is not.
+// Spec (P2 finding 21: "Git excludes are broad patterns rather than exact generated paths"; since the ownership
+// boundary the tool's dirs ignore themselves): the two root files are ignored by their exact paths, a file of the
+// same name deeper down is not; a file someone adds in `.lords/` makes that dir a conflict, never silently the
+// tool's.
 #[test]
 fn excludes_are_exact() {
     let f = Fixture::new();
@@ -405,9 +405,8 @@ fn excludes_are_exact() {
             checkout.display()
         ),
     );
-    apply(&plan_all(&f), &f.path("backups/run")).unwrap();
+    apply(&plan_all(&f)).unwrap();
     f.write("checkout/nested/AGENTS.override.md", "mine\n");
-    f.write("checkout/.lords/owner.txt", "mine\n");
     let ignored = |rel: &str| {
         Command::new("git")
             .arg("-C")
@@ -418,7 +417,10 @@ fn excludes_are_exact() {
             .success()
     };
     assert!(ignored("AGENTS.override.md") && ignored(".lords/role-coder.md"));
-    assert!(!ignored("nested/AGENTS.override.md") && !ignored(".lords/owner.txt"));
+    assert!(!ignored("nested/AGENTS.override.md"));
+    assert_eq!(git(&checkout, &["status", "--porcelain"]), "?? nested/\n");
+    f.write("checkout/.lords/owner.txt", "mine\n");
+    assert_eq!(item(&plan_all(&f), &checkout.join(".lords")).action, Action::Conflict);
 }
 
 // Spec (P2 finding 22: "Re-sync keeps updating when carried tracked instructions contain markers"): a tracked
@@ -440,7 +442,7 @@ fn tracked_marker_text_does_not_grow_each_sync() {
             checkout.display()
         ),
     );
-    apply(&plan_all(&f), &f.path("backups/one")).unwrap();
+    apply(&plan_all(&f)).unwrap();
     assert_eq!(item(&plan_all(&f), &checkout.join("AGENTS.override.md")).action, Action::InSync);
 }
 
@@ -483,37 +485,30 @@ fn until_date_is_an_end_boundary() {
     assert!(lords_core::temporary::ended(e, &s, "2026-10-24").is_none());
 }
 
-// Spec (finding 8, "the backup cannot restore its original link target"; the orchestrator, 25 Oct: backups and
-// rollback for every apply): `restore` undoes an apply from its backup dir: a replaced file gets its bytes back, a
-// created file goes, a removed link comes back pointing where it did, and a file edited since apply is kept.
+// Spec (finding 8's rollback, for what apply changes in owner files; design: Ownership boundary): `restore` puts a
+// replaced owner file's bytes back and removes an owner file apply created, each only while it holds what sync
+// wrote; a file edited since apply is kept.
 #[test]
-fn restore_undoes_an_apply() {
+fn restore_undoes_an_apply_of_owner_files() {
     let f = Fixture::new();
     rule(&f);
-    let src = skill(&f, "old", &expired());
-    let dir = f.path("home/skills");
-    dir_link(&dir.join("old"), &src);
-    let (kept, new, edited) =
-        (f.write("out/kept.md", "OWNER\n"), f.path("out/new.md"), f.path("out/edited.md"));
+    let kept = f.write("out/kept.md", "OWNER\n");
+    let new = f.path("out/new.md");
+    let edited = f.write("out/edited.md", "EARLIER\n");
     targets(
         &f,
         &format!(
-            "{}{}{}{}",
+            "{}{}{}",
             instructions("kept", &kept, "own_text = \"replace\"\n"),
             instructions("new", &new, ""),
-            instructions("edited", &edited, ""),
-            skills_target(&dir)
+            instructions("edited", &edited, "")
         ),
     );
-    let run = f.path("backups/run");
-    apply(&plan_all(&f), &run).unwrap();
-    assert!(!dir.join("old").exists() && new.exists());
+    let run = apply(&plan_all(&f)).unwrap().backups.unwrap();
+    assert!(new.exists());
     fs::write(&edited, "EDITED AFTER APPLY").unwrap();
-
-    let steps = lords_core::sync::restore(&run).unwrap();
-    assert_eq!(fs::read_to_string(&kept).unwrap(), "OWNER\n");
+    let steps = lords_core::sync::restore(&f.home(), &run).unwrap();
+    assert_eq!(fs::read_to_string(&kept).unwrap(), "OWNER\n", "{steps:?}");
     assert!(!new.exists(), "{steps:?}");
     assert_eq!(fs::read_to_string(&edited).unwrap(), "EDITED AFTER APPLY", "{steps:?}");
-    assert!(lords_core::sync::link_points_at(&dir.join("old"), &src), "{steps:?}");
-    assert!(src.join("SKILL.md").is_file(), "the stack's skill is untouched");
 }

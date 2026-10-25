@@ -134,7 +134,7 @@ pub struct PlanItemView {
     pub path: PathBuf,
     pub action: Action,
     pub changes: bool,
-    pub copy_from: Option<PathBuf>,
+    pub class: crate::sync::Class,
     pub diff: String,
     pub notes: Vec<String>,
 }
@@ -160,7 +160,7 @@ pub fn plan(p: &Plan) -> PlanView {
                 path: i.path.clone(),
                 action: i.action.clone(),
                 changes: i.changes(),
-                copy_from: i.copy_from.clone(),
+                class: i.class,
                 diff: i.diff.clone(),
                 notes: i.notes.clone(),
             })

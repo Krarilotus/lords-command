@@ -177,14 +177,13 @@ fn instruction_targets_keep_owner_text_and_report_drift() {
         .concat(),
     );
     let s = f.stacks();
-    let p = plan(&s, &Options { user_only: true, ..Options::default() }).unwrap();
+    let p = plan(&s, &Options { user_only: true, ..f.opts() }).unwrap();
     let actions: Vec<&Action> = p.items.iter().map(|i| &i.action).collect();
     assert_eq!(actions, [&Action::Update, &Action::Update, &Action::Create]);
     assert_eq!(f.read("home/keep/CLAUDE.md"), "My own line.\n", "planning only reads");
     assert!(p.items[0].diff.contains("+Rule A."));
 
-    let backups = f.path("backups");
-    apply(&p, &backups).unwrap();
+    let backups = apply(&p).unwrap().backups.unwrap();
     let k = f.read("home/keep/CLAUDE.md");
     assert!(
         k.starts_with("My own line.\n\n<!-- lords-command:begin -->")
@@ -192,18 +191,18 @@ fn instruction_targets_keep_owner_text_and_report_drift() {
             && k.ends_with(&format!("{END}\n"))
     );
     assert!(f.read("home/replace/AGENTS.md").starts_with(BEGIN));
-    // The replaced files are kept under `files/` in the run's backup dir (beside its manifest).
+    // The replaced files are kept as numbered files in the run's backup dir, beside its manifest.
     fn files(dir: &std::path::Path, out: &mut Vec<String>) {
         for e in fs::read_dir(dir).into_iter().flatten().flatten() {
             if e.path().is_dir() {
                 files(&e.path(), out);
-            } else {
+            } else if e.file_name() != "manifest.tsv" {
                 out.push(fs::read_to_string(e.path()).unwrap());
             }
         }
     }
     let mut saved = Vec::new();
-    files(&backups.join("files"), &mut saved);
+    files(&backups, &mut saved);
     assert_eq!(
         saved.len(),
         2,
@@ -211,10 +210,10 @@ fn instruction_targets_keep_owner_text_and_report_drift() {
     );
     assert!(saved.contains(&"Old global text.\n".to_string()));
 
-    let p = plan(&f.stacks(), &Options { user_only: true, ..Options::default() }).unwrap();
+    let p = plan(&f.stacks(), &Options { user_only: true, ..f.opts() }).unwrap();
     assert!(p.items.iter().all(|i| i.action == Action::InSync));
     fs::write(&kept, k.replace("Rule A.", "Rule A, edited by hand.")).unwrap();
-    let p = plan(&f.stacks(), &Options { user_only: true, ..Options::default() }).unwrap();
+    let p = plan(&f.stacks(), &Options { user_only: true, ..f.opts() }).unwrap();
     assert_eq!(p.items[0].action, Action::Update);
     assert!(p.items[0].diff.contains("-Rule A, edited by hand.\n+Rule A."));
 }
@@ -228,11 +227,11 @@ fn skill(f: &Fixture, name: &str, text: &str) {
 }
 
 // Spec (Sync, skills; orchestrator, 25 Oct: "managed copies for Claude (deletable with the worktree without
-// harming the source)"): a skill is installed as a copy with a manifest, never a link; a real dir in its place is
-// backed up and replaced; dirs not from a stack are left alone; sync's copy of a skill that no longer applies is
-// moved to the backup, and the stack keeps the skill.
+// harming the source)"; design: Ownership boundary): a skill is installed as a copy recorded in the ledger, never a
+// link; a real dir in its place that isn't the tool's is a conflict, never replaced; other dirs are left alone; the
+// tool's copy of a skill that no longer applies is removed, and the stack keeps the skill.
 #[test]
-fn skills_are_links_into_the_stack() {
+fn skills_install_as_copies_the_ledger_owns() {
     let f = Fixture::new();
     skill(&f, "spec-tests", "---\nname: spec-tests\n---\nNew text.\n");
     skill(&f, "old", "---\nname: old\n---\nx\n");
@@ -240,24 +239,23 @@ fn skills_are_links_into_the_stack() {
     f.write("home/skills/mine/SKILL.md", "mine\n");
     let dir = f.path("home/skills");
     with_targets(&f, &target("skills", "codex", "skills", &dir, ""));
-    let opts = Options { user_only: true, ..Options::default() };
+    let opts = Options { user_only: true, ..f.opts() };
     let p = plan(&f.stacks(), &opts).unwrap();
     let by = |name: &str| p.items.iter().find(|i| i.path.ends_with(name)).unwrap();
     assert_eq!(by("old").action, Action::Install);
-    assert_eq!(by("spec-tests").action, Action::ReplaceDir);
-    assert!(by("spec-tests").diff.contains("-Old text.\n+New text."));
-    assert!(p.items.iter().any(|i| i.notes.iter().any(|n| n.contains("left alone: mine"))));
+    assert_eq!(by("spec-tests").action, Action::Conflict, "not the tool's: never replaced");
+    assert!(p.items.iter().all(|i| !i.path.ends_with("mine")));
+    assert!(apply(&p).is_err());
 
-    apply(&p, &f.path("backups")).unwrap();
+    std::fs::remove_dir_all(dir.join("spec-tests")).unwrap();
+    let p = plan(&f.stacks(), &opts).unwrap();
+    apply(&p).unwrap();
     assert_eq!(
         f.read("home/skills/spec-tests/SKILL.md"),
-        "---\nname: spec-tests\n---\nNew text.\n",
-        "the copy"
+        "---\nname: spec-tests\n---\nNew text.\n"
     );
     assert!(fs::read_link(dir.join("spec-tests")).is_err(), "a copy, not a link");
     assert_eq!(f.read("home/skills/mine/SKILL.md"), "mine\n");
-    let manifest = f.read("backups/manifest.tsv");
-    assert_eq!(manifest.lines().filter(|l| l.starts_with("dir\t")).count(), 1, "{manifest}");
     assert!(plan(&f.stacks(), &opts).unwrap().items.iter().all(|i| i.action == Action::InSync));
 
     let side = f.read("pub/global/skills/old/lords.yaml");
@@ -269,8 +267,8 @@ fn skills_are_links_into_the_stack() {
         ),
     );
     let p = plan(&f.stacks(), &opts).unwrap();
-    assert_eq!(p.items.iter().find(|i| i.path.ends_with("old")).unwrap().action, Action::Uninstall);
-    apply(&p, &f.path("backups2")).unwrap();
+    assert_eq!(p.items.iter().find(|i| i.path.ends_with("old")).unwrap().action, Action::Remove);
+    apply(&p).unwrap();
     assert!(!dir.join("old").exists());
     assert!(f.path("pub/global/skills/old/SKILL.md").exists(), "the stack keeps the skill");
 }
@@ -294,8 +292,7 @@ fn repo_targets_write_untracked_files_in_every_worktree() {
         main.display()
     );
     f.write("priv/stack.toml", &manifest);
-    let opts =
-        Options { repo: Some("beta-core".into()), user_only: false, adapter: None, place: None };
+    let opts = Options { repo: Some("beta-core".into()), ..f.opts() };
     let p = plan(&f.stacks(), &opts).unwrap();
     let creates: Vec<String> = p
         .items
@@ -325,7 +322,7 @@ fn repo_targets_write_untracked_files_in_every_worktree() {
         "no public entries apply, so the tracked file is as the stack would have it"
     );
 
-    apply(&p, &f.path("backups")).unwrap();
+    apply(&p).unwrap();
     assert!(f.read("wt/AGENTS.override.md").contains("Hosts through the fleet."));
     assert_eq!(f.read("checkout/AGENTS.md"), "Tracked text.\n");
     let exclude = f.read("checkout/.git/info/exclude");
@@ -347,14 +344,14 @@ fn repo_targets_write_untracked_files_in_every_worktree() {
     let tracked = p.items.iter().find(|i| i.target.contains("tracked AGENTS.md")).unwrap();
     assert_eq!(tracked.action, Action::Report);
     assert!(tracked.diff.contains("+Public repo rule."));
-    apply(&p, &f.path("backups2")).unwrap();
+    apply(&p).unwrap();
     assert_eq!(f.read("checkout/AGENTS.md"), "Tracked text.\n");
 
     f.write("wt/CLAUDE.local.md", "tracked by someone\n");
     git(&f.path("wt"), &["add", "-f", "CLAUDE.local.md"]);
     let p = plan(&f.stacks(), &opts).unwrap();
     assert!(p.items.iter().any(|i| i.action == Action::Conflict));
-    assert!(apply(&p, &f.path("backups3")).is_err());
+    assert!(apply(&p).is_err());
 }
 
 fn memory_store(f: &Fixture, dir: &str, scope: &str, store: &str, audience: &str) {
@@ -392,7 +389,7 @@ fn the_memory_index_goes_to_places_never_to_the_user_level() {
     );
     f.write("priv/stack.toml", &manifest);
     fs::create_dir_all(&home).unwrap();
-    let p = plan(&f.stacks(), &Options { user_only: true, ..Options::default() }).unwrap();
+    let p = plan(&f.stacks(), &Options { user_only: true, ..f.opts() }).unwrap();
     for i in &p.items {
         let text = i.proposed.clone().unwrap_or_default();
         assert!(
@@ -454,7 +451,7 @@ fn the_memory_index_goes_to_places_never_to_the_user_level() {
 fn a_target_with_an_unknown_adapter_is_refused() {
     let f = Fixture::new();
     with_targets(&f, &target("x", "cursor", "instructions", &f.path("x.md"), ""));
-    let err = plan(&f.stacks(), &Options::default()).unwrap_err();
+    let err = plan(&f.stacks(), &f.opts()).unwrap_err();
     assert!(err.contains("unknown adapter `cursor`") && err.contains("claude, codex"), "{err}");
 }
 
@@ -476,14 +473,14 @@ fn profiles_share_one_composed_file_through_via() {
         ]
         .concat(),
     );
-    let opts = Options { user_only: true, ..Options::default() };
+    let opts = Options { user_only: true, ..f.opts() };
     let p = plan(&f.stacks(), &opts).unwrap();
     assert_eq!(
         p.items.iter().filter(|i| i.path == shared).count(),
         1,
         "the shared file is planned once"
     );
-    apply(&p, &f.path("backups")).unwrap();
+    apply(&p).unwrap();
     assert!(fs::read_to_string(&shared).unwrap().contains("Rule A."));
     let include =
         format!("@{}", shared.display().to_string().replace(std::path::MAIN_SEPARATOR, "/"));
@@ -513,10 +510,10 @@ fn a_settings_target_adds_the_exclude_and_keeps_the_rest() {
     let excluded = f.path("home/.claude/CLAUDE.md");
     let extra = format!("exclude = ['{}']\n", excluded.display());
     with_targets(&f, &target("balanced settings", "claude", "settings", &settings, &extra));
-    let opts = Options { user_only: true, ..Options::default() };
+    let opts = Options { user_only: true, ..f.opts() };
     let p = plan(&f.stacks(), &opts).unwrap();
     assert_eq!(p.items[0].action, Action::Update);
-    apply(&p, &f.path("backups")).unwrap();
+    apply(&p).unwrap();
     let v: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
     let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
@@ -555,11 +552,7 @@ fn worktree_roots_limit_the_worktrees_and_tracked_instructions_still_load() {
         f.path("wt-root").display()
     );
     f.write("priv/stack.toml", &manifest);
-    let p = plan(
-        &f.stacks(),
-        &Options { repo: Some("beta-core".into()), user_only: false, adapter: None, place: None },
-    )
-    .unwrap();
+    let p = plan(&f.stacks(), &Options { repo: Some("beta-core".into()), ..f.opts() }).unwrap();
     let written: Vec<String> = p
         .items
         .iter()
@@ -687,7 +680,7 @@ fn check_warns_before_an_adapter_cuts_text() {
             &f,
             &target("codex", "codex", "instructions", &f.path("home/.codex/AGENTS.md"), ""),
         );
-        lords_core::sync::drift_findings(&f.stacks())
+        lords_core::sync::drift_findings(&f.stacks(), &f.home())
             .iter()
             .any(|x| x.code == "size" && x.message.contains("codex"))
     };

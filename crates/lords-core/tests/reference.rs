@@ -42,7 +42,7 @@ fn a_places_default_role_reads_its_entries_inline() {
     manifest(&f, &checkout);
     let toml = std::fs::read_to_string(f.path("priv/stack.toml")).unwrap();
     f.write("priv/stack.toml", &format!("{toml}default_role = \"coder\"\n"));
-    let p = plan(&f.stacks(), &Options::default()).unwrap();
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
     let place = proposed(&p, &checkout.join("CLAUDE.local.md"));
     assert!(place.contains("(coder only)\nCoders test first."), "{place}");
     assert!(place.contains("- cn: memory.cn"), "the default role's notes are indexed: {place}");
@@ -99,11 +99,11 @@ fn a_plan_for_one_adapter_leaves_the_others_files_alone() {
     f.write("checkout/README.md", "a repo\n");
     f.git_init("checkout");
     manifest(&f, &checkout);
-    let opts = Options { adapter: Some("claude".into()), ..Options::default() };
+    let opts = Options { adapter: Some("claude".into()), ..f.opts() };
     let p = plan(&f.stacks(), &opts).unwrap();
     let has = |path: &Path| p.items.iter().any(|i| i.path == path);
     assert!(has(&checkout.join("CLAUDE.local.md")) && !has(&checkout.join("AGENTS.override.md")));
-    assert!(has(&checkout.join(".lords/role-coder.md")), "role files are planned");
+    assert!(has(&checkout.join(".lords")), "role files are planned");
 }
 
 // Spec (above; orchestrator, 25 Oct, the efficiency pass: cut "index lines that the role files already carry in
@@ -139,7 +139,7 @@ fn intent_and_partial_role_rules_go_by_reference_in_place_files() {
     f.write("checkout/README.md", "a repo\n");
     f.git_init("checkout");
     manifest(&f, &checkout);
-    let p = plan(&f.stacks(), &lords_core::sync::Options::default()).unwrap();
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
 
     let place = proposed(&p, &checkout.join("AGENTS.override.md"));
     let native =
@@ -161,12 +161,12 @@ fn intent_and_partial_role_rules_go_by_reference_in_place_files() {
         "{place}"
     );
 
-    let orch = proposed(&p, &checkout.join(".lords/role-orchestrator.md"));
+    let orch = planned_in(&p, &checkout.join(".lords"), "role-orchestrator.md");
     assert!(
         orch.contains("Exceed, not parity.") && orch.contains("Merge lanes one at a time."),
         "{orch}"
     );
-    let coder = proposed(&p, &checkout.join(".lords/role-coder.md"));
+    let coder = planned_in(&p, &checkout.join(".lords"), "role-coder.md");
     assert!(coder.contains("Exceed, not parity.") && !coder.contains("Merge lanes"), "{coder}");
 }
 
@@ -233,10 +233,8 @@ fn index_hooks_are_cut_at_a_word() {
     f.write("checkout/README.md", "a repo\n");
     f.git_init("checkout");
     manifest(&f, &checkout);
-    let place = proposed(
-        &plan(&f.stacks(), &Options::default()).unwrap(),
-        &checkout.join("AGENTS.override.md"),
-    );
+    let place =
+        proposed(&plan(&f.stacks(), &f.opts()).unwrap(), &checkout.join("AGENTS.override.md"));
     let line = place.lines().find(|l| l.starts_with("- n: ")).expect("an index line");
     let hook = line.trim_start_matches("- n: ").split(" (`").next().unwrap();
     assert!(hook.ends_with("word…") && hook.chars().count() <= 101, "{hook}");

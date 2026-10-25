@@ -256,7 +256,7 @@ impl App {
                 Err(e) => return vec![lords_core::Finding::error("privacy-scope", e)],
             };
             let mut found = check::check(&stacks, &rules);
-            found.extend(sync::drift_findings(&stacks));
+            found.extend(sync::drift_findings(&stacks, &sync::default_home().unwrap_or_default()));
             found
         }));
         // Keep the draft only if its entry still has the text it was opened with.
@@ -820,6 +820,8 @@ impl App {
             user_only: self.plan_repo.is_empty(),
             adapter: None,
             place: None,
+            home: sync::default_home().unwrap_or_default(),
+            uninstall: false,
         };
         let (pu, pr) = (paths.public.clone(), paths.private.clone());
         self.planning = Some(Task::start(ctx, move || {
@@ -871,7 +873,7 @@ impl App {
                 let hover = if conflicts {
                     "resolve the conflicts first"
                 } else if self.confirm_apply {
-                    "click again: import memory, back up every target, write"
+                    "click again: import memory, back up the owner files it edits, write"
                 } else {
                     "write this plan (asks once more)"
                 };
@@ -882,12 +884,16 @@ impl App {
                             user_only: self.plan_repo.is_empty(),
                             adapter: None,
                             place: None,
+                            home: sync::default_home().unwrap_or_default(),
+                            uninstall: false,
                         };
                         let (pu, pr) = (public.clone(), private.clone());
                         self.applying = Some(Task::start(ctx, move || {
-                            let backups = sync::backup_dir()?;
-                            let mut done = sync::import_and_apply(&pu, pr.as_deref(), &opts, &backups)?;
-                            done.push(format!("backups: {}", backups.display()));
+                            let applied = sync::import_and_apply(&pu, pr.as_deref(), &opts)?;
+                            let mut done = applied.done;
+                            if let Some(b) = applied.backups {
+                                done.push(format!("backups of the owner files changed: {}", b.display()));
+                            }
                             Ok(done)
                         }));
                         self.confirm_apply = false;
@@ -925,15 +931,12 @@ impl App {
                         Action::Create => ("+", GREEN, "create"),
                         Action::Update => ("~", AMBER, "update"),
                         Action::InSync => ("=", dim(TEXT), "in sync"),
-                        Action::Install => ("↓", GREEN, "install a copy of the skill"),
+                        Action::Install => ("↓", GREEN, "install the tool's dir"),
                         Action::Refresh => {
-                            ("↻", AMBER, "back up the old copy, install the new one")
+                            ("↻", AMBER, "replace the tool's dir with its new version")
                         }
-                        Action::ReplaceDir => ("⇆", AMBER, "back up the dir, then install a copy"),
-                        Action::ReplaceLink => ("⇆", AMBER, "remove the old link, install a copy"),
-                        Action::Uninstall => ("⌫", AMBER, "move sync's copy to the backup"),
-                        Action::Unlink => ("✂", AMBER, "remove an old link"),
-                        Action::RemoveDir => ("⌫", AMBER, "move an old copy to the backup"),
+                        Action::Remove => ("⌫", AMBER, "remove the tool's path (no longer wanted)"),
+                        Action::Forget => ("·", dim(TEXT), "drop a ledger record"),
                         Action::RetireEntry => {
                             ("⌛", AMBER, "an expired temporary entry: retired in its stack")
                         }
@@ -960,9 +963,11 @@ impl App {
             for n in &item.notes {
                 ui.label(mono(format!("· {n}"), AMBER));
             }
-            if let Some(from) = &item.copy_from {
-                ui.label(mono(format!("from {}", from.display()), BLUE));
-            }
+            let whose = match item.class {
+                sync::Class::Tool => "the tool's (ledger), replaced whole",
+                sync::Class::Owner => "the owner's: one managed edit, backed up",
+            };
+            ui.label(mono(whose, BLUE));
             ScrollArea::vertical().id_salt("plan-diff").auto_shrink([false, false]).show(
                 ui,
                 |ui| {

@@ -142,6 +142,8 @@ fn import_keeps_a_retirement_when_the_agent_edits_the_file() {
         ),
     )
     .unwrap();
+    // The hand edit is committed: an import that commits writes only files git keeps (Sol review r2, R2-05).
+    git(&f.priv_root(), &["commit", "-qam", "keys added by hand"]);
     let unchanged =
         &lords_core::ops::import_preview(&Stack::load(&f.priv_root()).unwrap(), None).unwrap()[0];
     assert!(

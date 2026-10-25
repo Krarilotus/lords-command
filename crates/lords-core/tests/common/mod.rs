@@ -62,6 +62,16 @@ impl Fixture {
         fs::read_to_string(self.path(rel)).unwrap()
     }
 
+    /// The tool's own dir for this fixture (its ledger, backups and lock): never the real one.
+    pub fn home(&self) -> PathBuf {
+        self.path("lords-home")
+    }
+
+    /// Sync options for this fixture: every target, its own tool home.
+    pub fn opts(&self) -> lords_core::sync::Options {
+        lords_core::sync::Options { home: self.home(), ..lords_core::sync::Options::default() }
+    }
+
     pub fn stacks(&self) -> Stacks {
         Stacks::load(&self.pub_root(), Some(&self.priv_root())).unwrap()
     }
@@ -106,6 +116,17 @@ pub fn codes(findings: &[Finding], severity: Severity) -> Vec<&'static str> {
         findings.iter().filter(|f| f.severity == severity).map(|f| f.code).collect();
     v.sort();
     v
+}
+
+/// A file's planned text inside a tool-owned dir's item (a place's `.lords/` role files).
+pub fn planned_in(p: &lords_core::sync::Plan, dir: &Path, file: &str) -> String {
+    p.items
+        .iter()
+        .find(|i| i.path == dir)
+        .and_then(|i| i.tree.as_ref())
+        .and_then(|t| t.get(file))
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_default()
 }
 
 pub fn errors(findings: &[Finding]) -> Vec<&'static str> {

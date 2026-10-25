@@ -24,7 +24,11 @@ usage:
   lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit and commit-msg hooks
   lords hash PATH
   lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--json] [--apply]
-  lords sync --restore BACKUP_DIR   undo one apply from its backups (its manifest), last change first
+  lords sync --restore BACKUP_DIR   undo one apply's owner-file edits, each only while it holds what sync wrote
+  lords uninstall [--user | --repo NAME] [--apply]   remove the tool's paths that still match its ledger
+  lords adopt [--list | PATH...]   record paths from before the ledger that hold exactly what sync writes there
+  lords set-aside PATH... [--yes]   move paths that aren't the tool's into a new backup dir
+  (sync, uninstall, adopt, set-aside: --home DIR, the tool's own dir; default ~/.lords-command)
   lords hooks install --post-checkout [--repo DIR]   a new worktree gets its place files (`sync --place`)
   lords compose [--repo NAME [--role ROLE]] [--adapter ID] [--json]   what a harness reads there, with sources
   lords sizes [--json]   every file sync writes, by section; fails past the warning line
@@ -162,13 +166,37 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
 }
 
 fn drift(stacks: &Stacks) -> Vec<Finding> {
-    sync::drift_findings(stacks)
+    match sync::default_home() {
+        Ok(home) => sync::drift_findings(stacks, &home),
+        Err(e) => vec![Finding::warning("drift", format!("no sync plan: {e}"))],
+    }
+}
+
+/// The tool's own dir: `--home DIR`, else `~/.lords-command`.
+fn tool_home(a: &mut Args) -> Result<PathBuf, String> {
+    match a.value("--home")? {
+        Some(h) => Ok(std::path::absolute(PathBuf::from(&h)).unwrap_or_else(|_| PathBuf::from(h))),
+        None => sync::default_home(),
+    }
+}
+
+fn print_applied(applied: &sync::Applied) {
+    for line in &applied.done {
+        println!("{line}");
+    }
+    if let Some(b) = &applied.backups {
+        println!(
+            "backups of the owner files changed: {} (`lords sync --restore` that dir)",
+            b.display()
+        );
+    }
 }
 
 fn cmd_sync(mut a: Args) -> Result<bool, String> {
+    let home = tool_home(&mut a)?;
     if let Some(dir) = a.value("--restore")? {
         a.done()?;
-        for line in sync::restore(Path::new(&dir))? {
+        for line in sync::restore(&home, Path::new(&dir))? {
             println!("{line}");
         }
         return Ok(true);
@@ -191,7 +219,7 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         ));
     }
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
-    let opts = sync::Options { repo, user_only, adapter, place };
+    let opts = sync::Options { repo, user_only, adapter, place, home, uninstall: false };
     let plan = sync::plan(&stacks, &opts)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_default());
@@ -200,22 +228,89 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     }
     if !apply {
         if !json {
-            println!("dry run: nothing written (`--apply` writes, after backing up every target)");
+            println!(
+                "dry run: nothing written (`--apply` writes; owner files are backed up first)"
+            );
         }
         return Ok(true);
     }
-    let backups = sync::backup_dir()?;
     // One worktree (its post-checkout hook): only its files, no import or retiring, which commit to the stack.
     if opts.place.is_some() {
-        for line in sync::apply(&plan, &backups)? {
-            println!("{line}");
-        }
+        print_applied(&sync::apply(&plan)?);
         return Ok(true);
     }
-    for line in sync::import_and_apply(&p.public, p.private.as_deref(), &opts, &backups)? {
+    print_applied(&sync::import_and_apply(&p.public, p.private.as_deref(), &opts)?);
+    Ok(true)
+}
+
+/// `lords uninstall`: removes every tool-owned path in scope that still matches its ledger record.
+fn cmd_uninstall(mut a: Args) -> Result<bool, String> {
+    let home = tool_home(&mut a)?;
+    let apply = a.flag("--apply");
+    let user_only = a.flag("--user");
+    let repo = a.value("--repo")?;
+    let p = paths(&mut a)?;
+    a.done()?;
+    let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    let opts = sync::Options { repo, user_only, home, uninstall: true, ..sync::Options::default() };
+    let plan = sync::plan(&stacks, &opts)?;
+    print_plan(&plan);
+    if apply {
+        print_applied(&sync::apply(&plan)?);
+    } else {
+        println!("dry run: nothing removed (`--apply` removes)");
+    }
+    Ok(true)
+}
+
+/// `lords adopt`: `--list` shows the paths sync would write that aren't in the ledger but already hold exactly
+/// that; naming paths records them as the tool's. A human's step, for paths from before the ledger.
+fn cmd_adopt(mut a: Args) -> Result<bool, String> {
+    let home = tool_home(&mut a)?;
+    let list = a.flag("--list");
+    let p = paths(&mut a)?;
+    let mut named = Vec::new();
+    while let Some(x) = a.positional() {
+        named.push(PathBuf::from(x));
+    }
+    a.done()?;
+    let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    let plan = sync::plan(&stacks, &sync::Options { home, ..sync::Options::default() })?;
+    if list || named.is_empty() {
+        let adoptable: Vec<&sync::Item> = plan.items.iter().filter(|i| i.adoptable).collect();
+        for i in &adoptable {
+            println!("{}", i.path.display());
+        }
+        println!("{} adoptable (`lords adopt PATH...` records them)", adoptable.len());
+        return Ok(true);
+    }
+    for line in sync::adopt(&plan, &named)? {
         println!("{line}");
     }
-    println!("backups: {}", backups.display());
+    Ok(true)
+}
+
+/// `lords set-aside PATH... --yes`: moves paths that aren't the tool's into a new backup dir (a human's step for
+/// leftovers from before the ledger).
+fn cmd_set_aside(mut a: Args) -> Result<bool, String> {
+    let home = tool_home(&mut a)?;
+    let yes = a.flag("--yes");
+    let mut named = Vec::new();
+    while let Some(x) = a.positional() {
+        named.push(PathBuf::from(x));
+    }
+    a.done()?;
+    if named.is_empty() {
+        return Err("set-aside needs the paths to move".into());
+    }
+    if !yes {
+        for p in &named {
+            println!("would set aside {}", p.display());
+        }
+        println!("nothing moved: check each path, then run again with --yes");
+        return Ok(true);
+    }
+    print_applied(&sync::set_aside(&home, &named)?);
     Ok(true)
 }
 
@@ -236,8 +331,8 @@ fn print_plan(plan: &sync::Plan) {
                     i.target,
                     i.path.display()
                 );
-                if let Some(from) = &i.copy_from {
-                    println!("   from {}", from.display());
+                if i.class == sync::Class::Tool && !i.scope.is_empty() {
+                    println!("   the tool's ({})", i.scope);
                 }
                 for n in &i.notes {
                     println!("   note: {n}");
@@ -486,7 +581,7 @@ fn cmd_hooks(mut a: Args) -> Result<bool, String> {
             public_stack: explicit_public.map(|p| std::path::absolute(&p).unwrap_or(p)),
             private_stack: explicit_private.map(|p| std::path::absolute(&p).unwrap_or(p)),
         };
-        let r = hooks::install_post_checkout(&top, &exe, &args)?;
+        let r = hooks::install_post_checkout(&top, &exe, &args, &sync::default_home()?)?;
         println!("installed {} (repo {name})", r.hook.display());
         if let Some(b) = r.backup {
             println!("the hook that was there runs first, from {}", b.display());
@@ -498,7 +593,7 @@ fn cmd_hooks(mut a: Args) -> Result<bool, String> {
     }
     a.done()?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let installed = hooks::install(&repo, &exe, secrets_only, force)?;
+    let installed = hooks::install(&repo, &exe, secrets_only, force, &sync::default_home()?)?;
     for r in &installed {
         println!("installed {}", r.hook.display());
         if let Some(b) = &r.backup {
@@ -608,6 +703,9 @@ fn main() -> ExitCode {
         "hash" => cmd_hash(a),
         "sync" => cmd_sync(a),
         "compose" => cmd_compose(a),
+        "uninstall" => cmd_uninstall(a),
+        "adopt" => cmd_adopt(a),
+        "set-aside" => cmd_set_aside(a),
         "sizes" => cmd_sizes(a),
         other => Err(format!("unknown command `{other}`\n\n{USAGE}")),
     };

@@ -65,8 +65,7 @@ fn the_plan_view_carries_each_targets_diff_and_the_counts() {
         "priv/stack.toml",
         &format!("name = \"priv\"\nvisibility = \"private\"\n[[targets]]\nname = \"codex\"\nadapter = \"codex\"\nkind = \"instructions\"\npath = '{}'\n", target.display()),
     );
-    let v =
-        view::plan(&plan(&f.stacks(), &Options { user_only: true, ..Options::default() }).unwrap());
+    let v = view::plan(&plan(&f.stacks(), &Options { user_only: true, ..f.opts() }).unwrap());
     assert_eq!((v.to_change, v.in_sync, v.conflicts), (1, 0, 0));
     assert!(v.items[0].changes && v.items[0].diff.contains("+Rule A."));
     assert!(serde_json::to_string(&v).unwrap().contains("\"action\":\"create\""));

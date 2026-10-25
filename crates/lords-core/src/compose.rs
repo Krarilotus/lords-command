@@ -658,9 +658,9 @@ pub fn place_block(current: &str, block: &str, replace: bool) -> Result<String, 
     }
     if let Some((b, e)) = block_span(current)? {
         let after = &current[e..];
+        // Removing the block keeps every byte around it, the end marker's own line ending included (Sol review
+        // r2, R2-18).
         if block.is_empty() {
-            let after =
-                after.strip_prefix("\r\n").or_else(|| after.strip_prefix('\n')).unwrap_or(after);
             return Ok(format!("{}{after}", &current[..b]));
         }
         let body = block.strip_suffix('\n').unwrap_or(block);

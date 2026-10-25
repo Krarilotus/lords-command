@@ -1,5 +1,6 @@
-//! `sync` (design: Sync): a plan of what each target would become, as diffs; `apply` carries a plan out after
-//! backing up everything it replaces. Planning only reads.
+//! `sync` (design: Sync, Ownership boundary): a plan of what each target would become, as diffs; `apply` carries a
+//! plan out. Sync changes only paths its ledger proves are the tool's (replaced whole) and the owner files it edits
+//! minimally (backed up); every filesystem change goes through `fsguard`. Planning only reads.
 //!
 //! Harness-neutral: each target names an adapter (adapters.rs), which says which agents it reaches and which
 //! untracked file it reads in a repo. Those facts are checked in docs/load-order.md.
@@ -8,40 +9,47 @@ use crate::adapters::{self, Adapter};
 use crate::compose::{self, Composed, Context, Layers, Source};
 use crate::config::expand_home;
 use crate::diff;
+use crate::fsguard::{self, Tree};
 use crate::git;
+use crate::ledger::{self, Ledger};
 use crate::model::{Audience, Entry, Kind};
 use crate::stack::{self, Stack, Stacks, Target};
 use serde::Serialize;
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Action {
+    /// A file where nothing is.
     Create,
+    /// A file changes: a tool-owned one is replaced whole, an owner file gets its one managed edit (backed up).
     Update,
     InSync,
-    /// Install a copy of the stack's skill (with its manifest, `.lords-copy`).
+    /// A tool-owned dir (a skill copy, `.lords/`) where nothing is.
     Install,
-    /// A copy sync made, unchanged since, of an older version of the skill: move it to the backup, install anew.
+    /// A tool-owned dir that still matches its ledger record, replaced whole by its new version.
     Refresh,
-    /// A real dir that isn't sync's copy where the skill goes: move it to the backup, then install.
-    ReplaceDir,
-    /// A link of ours (from an earlier version, which linked skills): remove the link itself, then install a copy.
-    ReplaceLink,
-    /// A copy sync made of a skill that no longer installs here: moved to the backup.
-    Uninstall,
-    /// A link of ours (from an earlier version) for a skill that no longer installs here: the link alone goes.
-    Unlink,
-    /// A plain copy of a skill the stack made (own or adapted), from before copies had manifests, where it no
-    /// longer installs: moved to the backup. Copies of inherited, third-party skills are the user's own and stay.
-    RemoveDir,
+    /// A tool-owned path the stack no longer wants, still matching its ledger record: deleted, following nothing.
+    Remove,
+    /// A ledger record whose path is gone already (its worktree removed, say): the record goes.
+    Forget,
     /// A temporary entry that has ended: `--apply` retires it in its stack (with a commit) before writing.
     RetireEntry,
-    /// Shown, never written (a tracked file: it changes by a commit, not by sync).
+    /// Shown, never written (a tracked file, or a path that is no longer the tool's).
     Report,
     /// Can't proceed; the reason is in the notes.
     Conflict,
+}
+
+/// Whose a path is (design: Ownership boundary).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Class {
+    /// Created by sync, recorded in the ledger, replaced whole and never edited.
+    Tool,
+    /// The owner's file: sync changes only its managed block or one key, with a backup.
+    Owner,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -49,20 +57,25 @@ pub struct Item {
     pub target: String,
     pub path: PathBuf,
     pub action: Action,
+    pub class: Class,
+    /// The ledger scope of a tool-owned path (`target:<name>`, `repo:<name>`, `repo:<name>/<adapter>`, …).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proposed: Option<String>,
-    /// For the installing actions: the stack's skill dir the copy comes from.
+    /// A tool-owned dir's contents, as it will be built.
+    #[serde(skip)]
+    pub tree: Option<std::sync::Arc<Tree>>,
+    /// The hash of what is there now (a tool-owned path: as the ledger records it).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub copy_from: Option<PathBuf>,
-    /// For `ReplaceLink` and `Unlink`: where the link points now (checked again before apply touches it, and kept
-    /// in the run's backups).
+    pub have: Option<String>,
+    /// The hash of what sync will put there.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub link_from: Option<PathBuf>,
-    /// For `Refresh` and `Uninstall`: the manifest hash of the copy there now (checked again before apply).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub copy_hash: Option<String>,
+    pub want: Option<String>,
+    /// A path that isn't in the ledger but holds byte for byte what sync would put there: `lords adopt` records it.
+    pub adoptable: bool,
     pub diff: String,
     pub notes: Vec<String>,
     #[serde(skip)]
@@ -75,11 +88,14 @@ impl Item {
             target: target.to_string(),
             path,
             action,
+            class: Class::Owner,
+            scope: String::new(),
             current: None,
             proposed: None,
-            copy_from: None,
-            link_from: None,
-            copy_hash: None,
+            tree: None,
+            have: None,
+            want: None,
+            adoptable: false,
             diff: String::new(),
             notes: Vec::new(),
             sources: Vec::new(),
@@ -95,6 +111,12 @@ impl Item {
 pub struct Plan {
     pub items: Vec<Item>,
     pub notes: Vec<String>,
+    /// The tool's own dir the plan was made for (its ledger, backups and lock).
+    #[serde(skip)]
+    pub home: PathBuf,
+    /// The ledger's revision when planned: apply refuses a plan made against another ledger.
+    #[serde(skip)]
+    pub ledger_revision: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -103,11 +125,21 @@ pub struct Options {
     pub repo: Option<String>,
     /// Only user-level targets.
     pub user_only: bool,
-    /// Only this adapter's files (its targets, and its file and skill links in each place); role files, which
+    /// Only this adapter's files (its targets, and its file and skill copies in each place); role files, which
     /// every adapter's agents read, are always planned. `None`: every adapter.
     pub adapter: Option<String>,
     /// With `repo`: only this one checkout or worktree of it (a new worktree's files, from its post-checkout hook).
     pub place: Option<PathBuf>,
+    /// The tool's own dir: its ledger, backups and lock (`default_home()` on a machine; a temp dir in tests).
+    /// Planning refuses an empty one, so nothing ever reads or writes a home it wasn't given.
+    pub home: PathBuf,
+    /// Plan the removal of every tool-owned path in scope that still matches its ledger record (`lords uninstall`).
+    pub uninstall: bool,
+}
+
+/// `~/.lords-command`, the tool's own dir on this machine.
+pub fn default_home() -> Result<PathBuf, String> {
+    Ok(crate::config::home().ok_or("no home dir")?.join(".lords-command"))
 }
 
 fn audience_of(names: &[String], adapter: &dyn Adapter) -> Vec<Audience> {
@@ -122,47 +154,10 @@ fn audience_of(names: &[String], adapter: &dyn Adapter) -> Vec<Audience> {
     }
 }
 
-/// Best-effort text of a file sync only reads (a skill's SKILL.md for a diff, a tracked file it carries).
+/// Best-effort text of a file sync only reads (a skill's SKILL.md for a diff, a tracked file it carries), read
+/// through the guard.
 fn read(path: &Path) -> Option<String> {
-    fs::read_to_string(path).ok()
-}
-
-/// A target's text: `None` when nothing is there. Anything sync can't read as UTF-8 text is an error, never taken
-/// for a missing file (Sol review, finding 2): sync then leaves it alone.
-fn read_target(path: &Path) -> Result<Option<String>, String> {
-    match fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("can't read it: {e}")),
-        Ok(m) if m.is_dir() => return Err("a dir is where a file goes".into()),
-        Ok(_) => {}
-    }
-    let bytes = fs::read(path).map_err(|e| format!("can't read it: {e}"))?;
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|_| "not UTF-8 text (UTF-16 or binary?); sync doesn't edit it".into())
-}
-
-/// Why sync may not write `path`, if it may not: the path is a link, or a link in a dir above it would send the
-/// write somewhere else (Sol review, finding 5). Sync writes only plain files at the path it was given.
-pub fn write_guard(path: &Path) -> Result<(), String> {
-    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(format!("{} is a link; sync writes only plain files", display(path)));
-    }
-    dirs_guard(path)
-}
-
-/// Why sync may not write below the dirs above `path`: one of them is a link.
-fn dirs_guard(path: &Path) -> Result<(), String> {
-    for dir in path.ancestors().skip(1) {
-        if fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
-            let to = link_target(dir).map(|t| display(&t)).unwrap_or_else(|| "elsewhere".into());
-            return Err(format!(
-                "{} is a link (to {to}), so a write below it would land there",
-                display(dir)
-            ));
-        }
-    }
-    Ok(())
+    fsguard::read_text(path).ok().flatten()
 }
 
 fn conflict(target: &str, path: &Path, note: impl Into<String>) -> Item {
@@ -171,28 +166,21 @@ fn conflict(target: &str, path: &Path, note: impl Into<String>) -> Item {
     item
 }
 
-/// The item that puts `block` into the file at `path`, keeping the owner's text around it (or replacing it).
-fn block_item(target: &str, path: &Path, block: &str, replace: bool, composed: &Composed) -> Item {
-    let current = match read_target(path) {
-        Ok(c) => c.unwrap_or_default(),
-        Err(e) => return conflict(target, path, e),
-    };
-    match compose::place_block(&current, block, replace) {
-        Ok(proposed) => file_item(target, path, proposed, composed),
-        Err(e) => conflict(target, path, e),
-    }
-}
-
 fn display(p: &Path) -> String {
     p.display().to_string()
 }
 
-/// An item that makes `path` hold `proposed` (or says it already does).
-fn file_item(target: &str, path: &Path, proposed: String, composed: &Composed) -> Item {
-    if let Err(e) = write_guard(path) {
-        return conflict(target, path, e);
+fn sources_into(item: &mut Item, composed: &Composed) {
+    item.sources = composed.sources.clone();
+    if !composed.overridden.is_empty() {
+        item.notes.push(format!("overridden here: {}", composed.overridden.join(", ")));
     }
-    let current = match read_target(path) {
+}
+
+/// The item that gives an owner file `proposed` (or says it already holds it). The owner's file: sync makes this one
+/// edit with a backup and nothing else.
+fn owner_file_item(target: &str, path: &Path, proposed: String, composed: &Composed) -> Item {
+    let current = match fsguard::read_text(path) {
         Ok(c) => c,
         Err(e) => return conflict(target, path, e),
     };
@@ -210,13 +198,236 @@ fn file_item(target: &str, path: &Path, proposed: String, composed: &Composed) -
         &display(path),
         3,
     );
-    item.sources = composed.sources.clone();
-    if !composed.overridden.is_empty() {
-        item.notes.push(format!("overridden here: {}", composed.overridden.join(", ")));
-    }
+    sources_into(&mut item, composed);
+    item.have = current.as_deref().map(|c| fsguard::sha(c.as_bytes()));
+    item.want = Some(fsguard::sha(proposed.as_bytes()));
     item.current = current;
     item.proposed = Some(proposed);
     item
+}
+
+/// The item that puts `block` into an owner file, keeping the owner's text around it (or replacing it).
+fn owner_block_item(
+    target: &str,
+    path: &Path,
+    block: &str,
+    replace: bool,
+    composed: &Composed,
+) -> Item {
+    let current = match fsguard::read_text(path) {
+        Ok(c) => c.unwrap_or_default(),
+        Err(e) => return conflict(target, path, e),
+    };
+    match compose::place_block(&current, block, replace) {
+        Ok(proposed) => owner_file_item(target, path, proposed, composed),
+        Err(e) => conflict(target, path, e),
+    }
+}
+
+/// A stack skill's files as a copy holds them: its plain files, without the sidecar, plus a `.gitignore` of `*` so
+/// the copy keeps itself out of git. A link anywhere in the skill's dir is an error: a copy would silently lack what
+/// it points at (Sol review r2, R2-23).
+pub fn skill_tree(src: &Path) -> Result<Tree, String> {
+    let mut tree = fsguard::read_tree(src)?;
+    tree.remove(stack::SIDECAR);
+    tree.insert(".gitignore".into(), b"*\n".to_vec());
+    Ok(tree)
+}
+
+/// What planning carries besides the stacks: the ledger, which tool-owned paths the plan wants, and which ledger
+/// scopes it covers (only those can lose a path the plan no longer wants).
+struct Planner<'a> {
+    stacks: &'a Stacks,
+    ledger: Ledger,
+    plan: Plan,
+    wanted: BTreeSet<String>,
+    /// A scope the plan covers, and with `--place` the one dir it's limited to.
+    covered: Vec<(String, Option<PathBuf>)>,
+    trees: BTreeMap<String, Result<std::sync::Arc<Tree>, String>>,
+}
+
+impl Planner<'_> {
+    fn cover(&mut self, scope: &str, under: Option<&Path>) {
+        self.covered.push((scope.to_string(), under.map(Path::to_path_buf)));
+    }
+
+    /// A skill's copy, read once per plan.
+    fn tree_of(&mut self, e: &Entry) -> Result<std::sync::Arc<Tree>, String> {
+        let src = e.meta_file.parent().expect("a sidecar has a dir").to_path_buf();
+        self.trees
+            .entry(e.id().to_string())
+            .or_insert_with(|| skill_tree(&src).map(std::sync::Arc::new))
+            .clone()
+    }
+
+    /// What a path that isn't in the ledger means where sync wants to write: a conflict. When it holds exactly what
+    /// sync would write, `lords adopt` records it; otherwise a human decides (`lords set-aside` moves it away).
+    fn not_ours(item: &mut Item, same: bool) {
+        item.action = Action::Conflict;
+        item.adoptable = same;
+        item.notes.push(if same {
+            "not in the ledger, though exactly what sync writes here: `lords adopt <path>` records it as the tool's".into()
+        } else {
+            "not the tool's (no ledger record): sync never claims a path by its name or contents; move its text into the stack, or `lords set-aside <path>` once you've checked it".into()
+        });
+    }
+
+    /// The item that makes the tool-owned file `path` hold `content`, replaced whole.
+    fn tool_file(
+        &mut self,
+        target: &str,
+        scope: &str,
+        path: &Path,
+        content: String,
+        composed: &Composed,
+    ) -> Item {
+        self.wanted.insert(ledger::key(path));
+        let want = fsguard::sha(content.as_bytes());
+        let mut item = Item::new(target, path.to_path_buf(), Action::Create);
+        item.class = Class::Tool;
+        item.scope = scope.to_string();
+        item.want = Some(want.clone());
+        let mut current = String::new();
+        match fsguard::kind(path) {
+            Err(e) => return conflict(target, path, e),
+            Ok(fsguard::Kind::Dir) => return conflict(target, path, "a dir where the file goes"),
+            Ok(fsguard::Kind::Missing) => {}
+            Ok(fsguard::Kind::File) => {
+                let bytes = match fsguard::read(path) {
+                    Ok(b) => b.unwrap_or_default(),
+                    Err(e) => return conflict(target, path, e),
+                };
+                let have = fsguard::sha(&bytes);
+                current = String::from_utf8_lossy(&bytes).into_owned();
+                match self.ledger.get(path) {
+                    Some(o) if o.sha == have => {
+                        item.have = Some(have.clone());
+                        item.action = if have == want { Action::InSync } else { Action::Update };
+                    }
+                    Some(_) => {
+                        return conflict(
+                            target,
+                            path,
+                            "changed since sync wrote it: move the change into the stack, or delete the file and sync again",
+                        )
+                    }
+                    None => Self::not_ours(&mut item, have == want),
+                }
+                item.current = Some(current.clone());
+            }
+        }
+        item.diff = diff::unified(&current, &content, &display(path), &display(path), 3);
+        item.proposed = Some(content);
+        sources_into(&mut item, composed);
+        item
+    }
+
+    /// The item that makes the tool-owned dir `path` hold `tree`, replaced whole.
+    fn tool_dir(
+        &mut self,
+        target: &str,
+        scope: &str,
+        path: &Path,
+        tree: std::sync::Arc<Tree>,
+    ) -> Item {
+        self.wanted.insert(ledger::key(path));
+        let want = fsguard::tree_sha(&tree);
+        let mut item = Item::new(target, path.to_path_buf(), Action::Install);
+        item.class = Class::Tool;
+        item.scope = scope.to_string();
+        item.want = Some(want.clone());
+        let mut old = Tree::new();
+        match fsguard::kind(path) {
+            Err(e) => return conflict(target, path, e),
+            Ok(fsguard::Kind::File) => return conflict(target, path, "a file where the dir goes"),
+            Ok(fsguard::Kind::Missing) => {}
+            Ok(fsguard::Kind::Dir) => {
+                old = match fsguard::read_tree(path) {
+                    Ok(t) => t,
+                    Err(e) => return conflict(target, path, e),
+                };
+                let have = fsguard::tree_sha(&old);
+                match self.ledger.get(path) {
+                    Some(o) if o.sha == have => {
+                        item.have = Some(have.clone());
+                        item.action = if have == want { Action::InSync } else { Action::Refresh };
+                    }
+                    Some(_) => {
+                        return conflict(
+                            target,
+                            path,
+                            "changed since sync wrote it (a file edited, added or removed): move the change into the stack, or delete the dir and sync again",
+                        )
+                    }
+                    None => Self::not_ours(&mut item, have == want),
+                }
+            }
+        }
+        // The diff shows what changes in each file, by name.
+        let text = |t: &Tree, r: &str| t.get(r).map(|b| String::from_utf8_lossy(b).into_owned());
+        let names: BTreeSet<&String> = old.keys().chain(tree.keys()).collect();
+        for r in names {
+            let (a, b) = (text(&old, r).unwrap_or_default(), text(&tree, r).unwrap_or_default());
+            if a != b {
+                let label = display(&path.join(r));
+                item.diff.push_str(&diff::unified(&a, &b, &label, &label, 3));
+            }
+        }
+        item.tree = Some(tree);
+        item
+    }
+
+    /// Every ledger record in a covered scope that the plan no longer wants: removed while it still matches what
+    /// sync put there, its record dropped when the path is gone or changed (the path then is no longer the tool's).
+    fn unwanted(&mut self) {
+        let records: Vec<ledger::Owned> = self.ledger.owned.values().cloned().collect();
+        for o in records {
+            let path = PathBuf::from(&o.path);
+            let key = ledger::key(&path);
+            let covered = self.covered.iter().any(|(scope, under)| {
+                *scope == o.scope
+                    && under.as_deref().is_none_or(|u| {
+                        let u = ledger::key(u);
+                        key == u || key.starts_with(&format!("{u}/"))
+                    })
+            });
+            if !covered || self.wanted.contains(&key) {
+                continue;
+            }
+            let target = format!("{} (no longer wanted)", o.scope);
+            let mut item = Item::new(&target, path.clone(), Action::Forget);
+            item.class = Class::Tool;
+            item.scope = o.scope.clone();
+            item.have = Some(o.sha.clone());
+            let now = match fsguard::kind(&path) {
+                Err(e) => {
+                    item.action = Action::Report;
+                    item.notes.push(format!("can't check it ({e}); left as it is"));
+                    self.plan.items.push(item);
+                    continue;
+                }
+                Ok(fsguard::Kind::Missing) => None,
+                Ok(fsguard::Kind::File) if o.kind == "file" => {
+                    fsguard::read(&path).ok().flatten().map(|b| fsguard::sha(&b))
+                }
+                Ok(fsguard::Kind::Dir) if o.kind == "dir" => {
+                    fsguard::read_tree(&path).ok().map(|t| fsguard::tree_sha(&t))
+                }
+                Ok(_) => Some(String::new()),
+            };
+            match now {
+                None => item.notes.push("gone already; its ledger record goes".into()),
+                Some(h) if h == o.sha => {
+                    item.action = Action::Remove;
+                    item.notes.push("sync's, unchanged, and no longer wanted here: deleted".into());
+                }
+                Some(_) => item.notes.push(
+                    "changed since sync wrote it: left as it is, and no longer the tool's (its record goes)".into(),
+                ),
+            }
+            self.plan.items.push(item);
+        }
+    }
 }
 
 /// Memory stores the adapter's harness loads by itself (stack.toml `native`).
@@ -271,32 +482,41 @@ fn size_note(item: &mut Item, adapter: &dyn Adapter, text: &str) {
     }
 }
 
-/// An instructions target: the composed text in its file, or (with `via`) in one shared file that the target's
-/// file includes, so several profiles read one copy.
-fn instructions_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec<Item> {
+/// An instructions target: the composed text in its file (an owner file: the managed block), or (with `via`) in
+/// one shared, tool-owned file under the tool's own dir that the target's file includes, so several profiles read
+/// one copy.
+fn instructions_items(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Vec<Item> {
     let path = expand_home(&t.path);
-    let mut ctx = context(stacks, adapter, audience_of(&t.audience, adapter), Layers::Global);
+    let mut ctx = context(pl.stacks, adapter, audience_of(&t.audience, adapter), Layers::Global);
     ctx.roles = roles_of(t);
-    let composed = compose::compose(stacks, &ctx);
+    let composed = compose::compose(pl.stacks, &ctx);
     let replace = t.own_text.as_deref() == Some("replace");
-    let current = read_target(&path).ok().flatten().unwrap_or_default();
+    let current = fsguard::read_text(&path).ok().flatten().unwrap_or_default();
     let text = adapter.render(&composed);
     let mut items = Vec::new();
+    let scope = format!("target:{}", t.name);
+    pl.cover(&scope, None);
     let block = match &t.via {
         None => text.clone(),
         Some(via) => {
             let shared = expand_home(via);
             let Some(line) = adapter.import_line(&shared) else {
-                let mut item = Item::new(&t.name, path, Action::Conflict);
-                item.notes.push(format!(
-                    "adapter {} doesn't expand includes, so `via` can't work",
-                    adapter.id()
-                ));
-                return vec![item];
+                return vec![conflict(
+                    &t.name,
+                    &path,
+                    format!(
+                        "adapter {} doesn't expand includes, so `via` can't work",
+                        adapter.id()
+                    ),
+                )];
             };
-            // The shared file keeps its owner's text too (Sol review, finding 4).
-            let mut s =
-                block_item(&format!("shared text ({})", t.name), &shared, &text, false, &composed);
+            let mut s = pl.tool_file(
+                &format!("shared text ({})", t.name),
+                &scope,
+                &shared,
+                text.clone(),
+                &composed,
+            );
             size_note(&mut s, adapter, &text);
             items.push(s);
             if composed.text.is_empty() {
@@ -306,7 +526,7 @@ fn instructions_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec
             }
         }
     };
-    let mut item = block_item(&t.name, &path, &block, replace, &composed);
+    let mut item = owner_block_item(&t.name, &path, &block, replace, &composed);
     if t.via.is_none() {
         size_note(&mut item, adapter, &text);
     }
@@ -439,16 +659,18 @@ fn json_set_key(text: &str, key: &str, value: &serde_json::Value) -> Result<Stri
     Ok(out)
 }
 
-/// A settings target: the adapter's exclude list in a JSON settings file holds every path in `exclude`. Only
-/// that one key changes; the rest of the file keeps its keys and order.
+/// A settings target (an owner file): the adapter's exclude list in a JSON settings file holds every path in
+/// `exclude`. Only that one key changes; the rest of the file keeps its bytes.
 fn settings_item(t: &Target, adapter: &dyn Adapter) -> Item {
     let path = expand_home(&t.path);
     let Some(key) = adapter.excludes_key() else {
-        let mut item = Item::new(&t.name, path, Action::Conflict);
-        item.notes.push(format!("adapter {} has no exclude setting", adapter.id()));
-        return item;
+        return conflict(
+            &t.name,
+            &path,
+            format!("adapter {} has no exclude setting", adapter.id()),
+        );
     };
-    let current = match read_target(&path) {
+    let current = match fsguard::read_text(&path) {
         Ok(c) => c,
         Err(e) => return conflict(&t.name, &path, e),
     };
@@ -461,14 +683,14 @@ fn settings_item(t: &Target, adapter: &dyn Adapter) -> Item {
     let list =
         value.as_object_mut().expect("an object").entry(key).or_insert(serde_json::json!([]));
     let Some(list) = list.as_array_mut() else {
-        let mut item = Item::new(&t.name, path, Action::Conflict);
-        item.notes.push(format!("`{key}` isn't a list; left alone"));
-        return item;
+        return conflict(&t.name, &path, format!("`{key}` isn't a list; left alone"));
     };
+    // One path, however its separators and case are spelt (Sol review r2, R2-20).
+    let same = |a: &str, b: &str| ledger::key(Path::new(a)) == ledger::key(Path::new(b));
     let mut added = false;
     for e in &t.exclude {
         let want = adapters::slashes(&expand_home(e));
-        if !list.iter().any(|v| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case(&want))) {
+        if !list.iter().any(|v| v.as_str().is_some_and(|s| same(s, &want))) {
             list.push(serde_json::Value::String(want));
             added = true;
         }
@@ -482,7 +704,7 @@ fn settings_item(t: &Target, adapter: &dyn Adapter) -> Item {
         },
         (None, _) => serde_json::to_string_pretty(&value).expect("JSON serialises") + "\n",
     };
-    file_item(&t.name, &path, proposed, &Composed::default())
+    owner_file_item(&t.name, &path, proposed, &Composed::default())
 }
 
 /// A user file whose harness also loads another file that hides repos' own instructions, unless a settings
@@ -511,27 +733,8 @@ fn shadow_notes(private: &Stack, plan: &mut Plan) {
     }
 }
 
-/// The dir a link points at, if `path` is a link (a junction on Windows).
-fn link_target(path: &Path) -> Option<PathBuf> {
-    fs::read_link(path).ok().map(|t| {
-        if t.is_absolute() {
-            t
-        } else {
-            path.parent().unwrap_or(Path::new(".")).join(t)
-        }
-    })
-}
-
-/// Whether `link` is a link that points at `to`.
-pub fn link_points_at(link: &Path, to: &Path) -> bool {
-    link_target(link).is_some_and(|t| same_place(&t, to))
-}
-
 fn same_place(a: &Path, b: &Path) -> bool {
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => strip_verbatim(a) == strip_verbatim(b),
-    }
+    ledger::key(a) == ledger::key(b)
 }
 
 fn strip_verbatim(p: &Path) -> String {
@@ -539,232 +742,35 @@ fn strip_verbatim(p: &Path) -> String {
     s.trim_start_matches("//?/").trim_start_matches("/??/").to_ascii_lowercase()
 }
 
-/// A path as compared for containment: resolved where it exists, else cleaned lexically (`.` and `..` folded).
-fn resolved(p: &Path) -> String {
-    if let Ok(c) = fs::canonicalize(p) {
-        return strip_verbatim(&c).trim_end_matches('/').to_string();
-    }
-    let mut clean = PathBuf::new();
-    for c in p.components() {
-        match c {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                clean.pop();
-            }
-            c => clean.push(c.as_os_str()),
-        }
-    }
-    strip_verbatim(&clean).trim_end_matches('/').to_string()
-}
-
-/// Whether `p` lies inside `root` (or is it), dir by dir: a sibling whose name merely starts with the root's is
-/// outside (Sol review, finding 9).
-fn inside(p: &Path, root: &Path) -> bool {
-    let (p, root) = (resolved(p), resolved(root));
-    p == root || p.starts_with(&format!("{root}/"))
-}
-
-fn in_a_stack(stacks: &Stacks, p: &Path) -> bool {
-    stacks.all().any(|s| inside(p, &s.root))
-}
-
-/// Whether `dir` is an installed copy of a skill the stacks made (own or adapted) called `name`: a real dir, no
-/// links in it, a SKILL.md that names it, and no file the stack's copy doesn't have. A dir that merely shares the
-/// name stays the owner's (Sol review, finding 10).
-fn copy_of_ours(stacks: &Stacks, dir: &Path, name: &str) -> bool {
-    if !fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
-        return false;
-    }
-    let named = read(&dir.join(stack::SKILL_FILE)).is_some_and(|t| {
-        crate::frontmatter::split(&t).yaml.is_some_and(|y| {
-            y.lines().any(|l| {
-                l.strip_prefix("name:")
-                    .is_some_and(|v| v.trim().trim_matches(['"', char::from(39)]) == name)
-            })
-        })
-    });
-    if !named || stack::has_links(dir) {
-        return false;
-    }
-    let files: Vec<PathBuf> = stack::all_files(dir)
-        .iter()
-        .filter_map(|f| f.strip_prefix(dir).ok().map(Path::to_path_buf))
-        .collect();
-    stacks.entries().any(|e| {
-        e.meta.kind == Kind::Skill
-            && matches!(e.meta.origin, crate::model::Origin::Own | crate::model::Origin::Adapted(_))
-            && e.id().trim_start_matches("skill.") == name
-            && e.meta_file.parent().is_some_and(|src| {
-                files.iter().all(|r| src.join(r).is_file() || r == Path::new(stack::SIDECAR))
-            })
-    })
-}
-
-fn skills_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec<Item> {
+/// A user-level skills target: a tool-owned copy of each skill that suits every run. What sync copied there before
+/// and the stack no longer wants goes by its ledger record; nothing else in the dir is looked at.
+fn skills_items(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Vec<Item> {
     let dir = expand_home(&t.path);
-    let ctx = context(stacks, adapter, audience_of(&t.audience, adapter), Layers::Global);
-    let wanted: Vec<&Entry> = compose::applicable(stacks, &ctx)
+    let ctx = context(pl.stacks, adapter, audience_of(&t.audience, adapter), Layers::Global);
+    let wanted: Vec<&Entry> = compose::applicable(pl.stacks, &ctx)
         .into_iter()
         .filter(|e| e.meta.kind == Kind::Skill)
         .filter(|e| !matches!(e.meta.origin, crate::model::Origin::InRepo { .. }))
         .collect();
+    let scope = format!("target:{}", t.name);
+    pl.cover(&scope, None);
     let mut items = Vec::new();
-    for e in &wanted {
+    for e in wanted {
         let name = e.id().trim_start_matches("skill.").to_string();
-        items.push(copy_item(stacks, &t.name, &dir.join(&name), e));
-    }
-    let (gone, unmanaged) = unwanted_skills(stacks, &t.name, &dir, &wanted);
-    items.extend(gone);
-    if !unmanaged.is_empty() {
-        let mut item = Item::new(&t.name, dir.clone(), Action::InSync);
-        item.notes.push(format!("not from a stack, left alone: {}", unmanaged.join(", ")));
-        items.push(item);
+        let dest = dir.join(&name);
+        match pl.tree_of(e) {
+            Ok(tree) => items.push(pl.tool_dir(&t.name, &scope, &dest, tree)),
+            Err(err) => items.push(conflict(&t.name, &dest, format!("skill {}: {err}", e.id()))),
+        }
     }
     items
-}
-
-/// What goes from a skills dir: everything of sync's there for a skill not in `wanted` (a copy it made and nobody
-/// changed, a link of ours from an earlier version, a pre-manifest copy of a stack skill). Also the names it leaves
-/// alone.
-fn unwanted_skills(
-    stacks: &Stacks,
-    target: &str,
-    dir: &Path,
-    wanted: &[&Entry],
-) -> (Vec<Item>, Vec<String>) {
-    let names: Vec<String> =
-        wanted.iter().map(|e| e.id().trim_start_matches("skill.").to_string()).collect();
-    let (mut items, mut left) = (Vec::new(), Vec::new());
-    for child in stack::sorted_children(dir) {
-        let name = stack::file_name(&child);
-        if names.contains(&name) || name.starts_with('.') {
-            continue;
-        }
-        if let Some(to) = link_target(&child) {
-            if in_a_stack(stacks, &to) {
-                let mut item = Item::new(target, child.clone(), Action::Unlink);
-                item.link_from = Some(to);
-                item.notes.push("a link of ours for a skill that no longer installs here".into());
-                items.push(item);
-            } else {
-                left.push(name);
-            }
-            continue;
-        }
-        if !fs::symlink_metadata(&child).is_ok_and(|m| m.is_dir()) {
-            left.push(name);
-            continue;
-        }
-        match crate::copies::state(&child) {
-            crate::copies::State::Clean(hash) => {
-                let mut item = Item::new(target, child.clone(), Action::Uninstall);
-                item.copy_hash = Some(hash);
-                item.notes.push(
-                    "sync's copy of a skill that no longer installs here; moved to the backup"
-                        .into(),
-                );
-                items.push(item);
-            }
-            crate::copies::State::Modified(what) => left.push(format!(
-                "{name} (sync's copy, changed by hand: {}; delete it yourself if it should go)",
-                what.join(", ")
-            )),
-            crate::copies::State::NotOurs if copy_of_ours(stacks, &child, &name) => {
-                let mut item = Item::new(target, child.clone(), Action::RemoveDir);
-                item.notes.push(
-                    "an older copy of a stack skill that no longer installs here; moved to the backup".into(),
-                );
-                items.push(item);
-            }
-            crate::copies::State::NotOurs => left.push(name),
-        }
-    }
-    (items, left)
-}
-
-/// The item that makes `dest` a copy of skill `e` (or says it already is one).
-fn copy_item(stacks: &Stacks, target: &str, dest: &Path, e: &Entry) -> Item {
-    let src = e.meta_file.parent().expect("a sidecar has a dir").to_path_buf();
-    let mut item = Item::new(target, dest.to_path_buf(), Action::Install);
-    item.copy_from = Some(src.clone());
-    // The install path itself may be a link of ours (from an earlier version): handled below.
-    if let Err(err) = dirs_guard(dest) {
-        return conflict(target, dest, err);
-    }
-    let want = match crate::copies::record_of(&src) {
-        Ok((_, hash)) => hash,
-        Err(err) => return conflict(target, dest, err),
-    };
-    let skill_diff = |item: &mut Item| {
-        let old = read(&dest.join(stack::SKILL_FILE)).unwrap_or_default();
-        let new = read(&src.join(stack::SKILL_FILE)).unwrap_or_default();
-        item.diff = diff::unified(
-            &old,
-            &new,
-            &display(&dest.join(stack::SKILL_FILE)),
-            &display(&src.join(stack::SKILL_FILE)),
-            3,
-        );
-    };
-    let meta = fs::symlink_metadata(dest).ok();
-    if let Some(to) = link_target(dest) {
-        if in_a_stack(stacks, &to) {
-            item.action = Action::ReplaceLink;
-            item.link_from = Some(to);
-            item.notes.push(
-                "a link from an earlier version: the link alone goes, a copy takes its place"
-                    .into(),
-            );
-        } else {
-            return conflict(target, dest, format!("a link to {} that isn't ours", to.display()));
-        }
-    } else if meta.as_ref().is_some_and(|m| m.is_dir()) {
-        match crate::copies::state(dest) {
-            crate::copies::State::Clean(hash) if hash == want => item.action = Action::InSync,
-            crate::copies::State::Clean(hash) => {
-                item.action = Action::Refresh;
-                item.copy_hash = Some(hash);
-                skill_diff(&mut item);
-            }
-            crate::copies::State::Modified(what) => {
-                return conflict(
-                    target,
-                    dest,
-                    format!(
-                        "sync's copy, changed by hand ({}); move the change into the stack's skill, or delete the copy",
-                        what.join(", ")
-                    ),
-                );
-            }
-            crate::copies::State::NotOurs => {
-                item.action = Action::ReplaceDir;
-                skill_diff(&mut item);
-                let extra: Vec<String> = stack::all_files(dest)
-                    .iter()
-                    .filter_map(|f| {
-                        f.strip_prefix(dest).ok().map(|r| r.to_string_lossy().replace('\\', "/"))
-                    })
-                    .filter(|r| !src.join(r).exists())
-                    .collect();
-                if !extra.is_empty() {
-                    item.notes.push(format!(
-                        "files only in the installed dir (kept in the backup): {}",
-                        extra.join(", ")
-                    ));
-                }
-            }
-        }
-    } else if meta.is_some() {
-        return conflict(target, dest, "a file where the skill's copy goes");
-    }
-    item
 }
 
 /// The header line above the exclude patterns sync owns in a repo's `.git/info/exclude`.
 const EXCLUDE_HEADER: &str = "# Lords Command: agent files written by sync";
 
-/// Whether an exclude line is one sync writes: the exact anchored paths it writes now, and the broader forms
-/// earlier versions wrote under the same header.
+/// Whether an exclude line is one sync writes now (its two root files) or wrote under its header in earlier
+/// versions (the broader forms and per-file paths, no longer needed: tool-owned dirs ignore themselves).
 fn ours(line: &str) -> bool {
     let l = line.trim().trim_start_matches('/');
     ["CLAUDE.local.md", "AGENTS.override.md"].contains(&l)
@@ -772,10 +778,9 @@ fn ours(line: &str) -> bool {
         || l.starts_with(".claude/skills/")
 }
 
-/// A repo's exclude file with sync's section holding exactly `files`: exact paths from the worktree's root, so a
-/// file of the same name deeper down, or the owner's own file beside them, stays visible to git (Sol review, P2
-/// finding 21). Every other line keeps its place and bytes; sync's earlier sections under its header merge into
-/// one.
+/// A repo's exclude file with sync's section holding the lines of `files` that no other line has already (Sol
+/// review r2, R2-19): exact paths from the worktree's root. Every other line keeps its place and bytes; sync's
+/// earlier sections under its header merge into one.
 fn excludes_text(current: &str, files: &[String]) -> String {
     let mut kept: Vec<&str> = Vec::new();
     let mut in_ours = false;
@@ -792,7 +797,8 @@ fn excludes_text(current: &str, files: &[String]) -> String {
         kept.push(line);
     }
     let mut out: String = kept.concat();
-    let mut want: Vec<&String> = files.iter().collect();
+    let there: BTreeSet<&str> = kept.iter().map(|l| l.trim()).collect();
+    let mut want: Vec<&String> = files.iter().filter(|f| !there.contains(f.as_str())).collect();
     want.sort();
     want.dedup();
     if !want.is_empty() {
@@ -901,16 +907,17 @@ pub fn role_composed(stacks: &Stacks, layers: Layers, role: &str) -> Composed {
     compose::compose(stacks, &ctx)
 }
 
-/// The adapters a place's files are written for (default: every adapter); unknown ids are skipped.
-fn place_adapters(place: &Place) -> Vec<&'static dyn Adapter> {
-    if place.adapters.is_empty() {
-        adapters::ALL.to_vec()
-    } else {
-        place.adapters.iter().filter_map(|id| adapters::get(id)).collect()
+/// The ledger scope of a place's paths: `repo:<name>` (or `workspace:<name>`) for what every adapter's agents read,
+/// with `/<adapter>` for one adapter's files.
+fn place_scope(place: &Place, adapter: Option<&dyn Adapter>) -> String {
+    let base = format!("{}:{}", if place.workspace { "workspace" } else { "repo" }, place.name);
+    match adapter {
+        Some(a) => format!("{base}/{}", a.id()),
+        None => base,
     }
 }
 
-fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Plan) {
+fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Option<&Path>) {
     let mut chosen: Vec<&dyn Adapter> = Vec::new();
     if place.adapters.is_empty() {
         chosen.extend(adapters::ALL.iter().copied());
@@ -918,7 +925,7 @@ fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Pl
     for id in place.adapters {
         match adapters::get(id) {
             Some(a) => chosen.push(a),
-            None => plan.notes.push(format!(
+            None => pl.plan.notes.push(format!(
                 "{}: unknown adapter `{id}` (known: {})",
                 place.label,
                 adapters::ids().join(", ")
@@ -926,7 +933,12 @@ fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Pl
         }
     }
     chosen.retain(|a| only.is_none_or(|o| o == a.id()));
-    let path_entries = stacks
+    pl.cover(&place_scope(place, None), under);
+    for a in &chosen {
+        pl.cover(&place_scope(place, Some(*a)), under);
+    }
+    let path_entries = pl
+        .stacks
         .entries()
         .filter(|e| {
             e.active()
@@ -935,11 +947,12 @@ fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Pl
         })
         .count();
     if path_entries > 0 {
-        plan.notes.push(format!(
+        pl.plan.notes.push(format!(
             "{}: {path_entries} path-scoped entries are not written yet",
             place.label
         ));
     }
+    // The two root files are the only lines sync keeps in a repo's exclude file; its dirs ignore themselves.
     let mut excludes: Vec<(PathBuf, Vec<String>)> = Vec::new();
     let mut add_exclude = |p: &Path, what: &str| {
         if place.workspace {
@@ -958,40 +971,37 @@ fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Pl
             }
         }
     };
-    for adapter in chosen {
+    for adapter in chosen.iter().copied() {
         let file = adapter.repo_file();
+        let scope = place_scope(place, Some(adapter));
         for p in &place.paths {
             let target = format!("{} ({file})", place.label);
             let path = p.join(file);
             if !p.is_dir() {
-                let mut item = Item::new(&target, path, Action::Conflict);
-                item.notes.push("checkout not found".into());
-                plan.items.push(item);
+                pl.plan.items.push(conflict(&target, &path, "checkout not found"));
                 continue;
             }
             if !place.workspace && git::run(p, &["ls-files", "--error-unmatch", file]).is_ok() {
-                let mut item = Item::new(&target, path, Action::Conflict);
-                item.notes
-                    .push(format!("{file} is tracked here; sync writes only untracked files"));
-                plan.items.push(item);
+                pl.plan.items.push(conflict(
+                    &target,
+                    &path,
+                    format!("{file} is tracked here; sync writes only untracked files"),
+                ));
                 continue;
             }
-            let (text, composed) = place_text(stacks, place.layers(false), adapter, p);
-            let mut item = block_item(&target, &path, &text, false, &composed);
+            let (text, composed) = place_text(pl.stacks, place.layers(false), adapter, p);
+            let mut item = pl.tool_file(&target, &scope, &path, text.clone(), &composed);
             size_note(&mut item, adapter, &text);
-            plan.items.push(item);
+            pl.plan.items.push(item);
             add_exclude(p, &format!("/{file}"));
         }
     }
-    // Development skills, copied into each checkout for harnesses that read a skills dir there. Each copy's exact
-    // path is excluded, never the dir, so skills the repo tracks there stay visible to git.
-    let skills = place_skills(stacks, place.layers(false));
-    let skill_dirs: Vec<&str> = place_adapters(place)
-        .iter()
-        .filter(|a| only.is_none_or(|o| o == a.id()))
-        .filter_map(|a| a.repo_skills_dir())
-        .collect();
-    for dir in skill_dirs {
+    // Development skills, copied into each checkout for harnesses that read a skills dir there.
+    let skills = place_skills(pl.stacks, place.layers(false));
+    let skill_dirs: Vec<(&dyn Adapter, &str)> =
+        chosen.iter().copied().filter_map(|a| a.repo_skills_dir().map(|d| (a, d))).collect();
+    for (adapter, dir) in skill_dirs {
+        let scope = place_scope(place, Some(adapter));
         for p in place.paths.iter().filter(|p| p.is_dir()) {
             for e in &skills {
                 let name = e.id().trim_start_matches("skill.").to_string();
@@ -1000,52 +1010,64 @@ fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Pl
                 if !place.workspace
                     && git::run(p, &["ls-files", &rel]).is_ok_and(|o| !o.trim().is_empty())
                 {
-                    plan.items.push(conflict(
+                    pl.plan.items.push(conflict(
                         &target,
                         &p.join(&rel),
                         format!("the repo tracks a skill at {rel}; rename one of them"),
                     ));
                     continue;
                 }
-                plan.items.push(copy_item(stacks, &target, &p.join(&rel), e));
-                add_exclude(p, &format!("/{rel}/"));
+                match pl.tree_of(e) {
+                    Ok(tree) => {
+                        let item = pl.tool_dir(&target, &scope, &p.join(&rel), tree);
+                        pl.plan.items.push(item);
+                    }
+                    Err(err) => pl.plan.items.push(conflict(
+                        &target,
+                        &p.join(&rel),
+                        format!("skill {}: {err}", e.id()),
+                    )),
+                }
             }
-            // What of sync's is here for a skill that no longer applies (ended, retired, another place's) goes
-            // (Sol review, finding 19); anything else in the dir is the repo's or the owner's.
-            let (gone, _) = unwanted_skills(
-                stacks,
-                &format!("{} (skills)", place.label),
-                &p.join(dir),
-                &skills,
-            );
-            plan.items.extend(gone);
         }
     }
-    // One composed file per role, at a stable untracked path, for briefs to point at (backbone requirement BB-3).
-    for role in declared_roles(stacks) {
-        let composed = role_composed(stacks, place.layers(true), &role);
-        for p in place.paths.iter().filter(|p| p.is_dir()) {
-            let path = p.join(ROLE_DIR).join(role_file(&role));
-            plan.items.push(block_item(
-                &format!("{} (role {role})", place.label),
-                &path,
-                &composed.text,
-                false,
-                &composed,
-            ));
-            add_exclude(p, &format!("/{ROLE_DIR}/{}", role_file(&role)));
+    // One composed file per role, at a stable untracked path, for briefs to point at (backbone requirement BB-3);
+    // all of them in one tool-owned dir that ignores itself.
+    let roles: Vec<(String, Composed)> = declared_roles(pl.stacks)
+        .into_iter()
+        .map(|role| {
+            let c = role_composed(pl.stacks, place.layers(true), &role);
+            (role, c)
+        })
+        .collect();
+    let mut tree = Tree::new();
+    for (role, c) in &roles {
+        if !c.text.is_empty() {
+            tree.insert(role_file(role), c.text.clone().into_bytes());
         }
+    }
+    tree.insert(".gitignore".into(), b"*\n".to_vec());
+    let tree = std::sync::Arc::new(tree);
+    let scope = place_scope(place, None);
+    for p in place.paths.iter().filter(|p| p.is_dir()) {
+        let item = pl.tool_dir(
+            &format!("{} (role files)", place.label),
+            &scope,
+            &p.join(ROLE_DIR),
+            tree.clone(),
+        );
+        pl.plan.items.push(item);
     }
     for (ex, files) in excludes {
-        let current = match read_target(&ex) {
+        let current = match fsguard::read_text(&ex) {
             Ok(c) => c.unwrap_or_default(),
             Err(e) => {
-                plan.items.push(conflict(&format!("{} (git exclude)", place.label), &ex, e));
+                pl.plan.items.push(conflict(&format!("{} (git exclude)", place.label), &ex, e));
                 continue;
             }
         };
         let proposed = excludes_text(&current, &files);
-        plan.items.push(file_item(
+        pl.plan.items.push(owner_file_item(
             &format!("{} (git exclude)", place.label),
             &ex,
             proposed,
@@ -1069,10 +1091,10 @@ fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Pl
             relative_to: None,
             default_role: None,
         };
-        let composed = compose::compose(stacks, &ctx);
+        let composed = compose::compose(pl.stacks, &ctx);
         let label = format!("{} (tracked AGENTS.md)", place.label);
         let mut item = match compose::place_block(&current, &composed.text, false) {
-            Ok(proposed) => file_item(&label, &tracked, proposed, &composed),
+            Ok(proposed) => owner_file_item(&label, &tracked, proposed, &composed),
             Err(e) => conflict(&label, &tracked, e),
         };
         item.action = match item.action {
@@ -1081,23 +1103,22 @@ fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Pl
             _ => Action::Report,
         };
         item.notes.push("tracked: changes by a commit on the repo's branch, never by sync; agents with a stack read the untracked files instead".into());
-        plan.items.push(item);
+        pl.plan.items.push(item);
     }
 }
 
 fn repo_items(
-    stacks: &Stacks,
+    pl: &mut Planner,
     name: &str,
     repo: &stack::Repo,
     only: Option<&str>,
     only_path: Option<&Path>,
-    plan: &mut Plan,
 ) {
     let (mut paths, skipped) = checkouts(repo);
     if let Some(one) = only_path {
-        paths.retain(|p| norm(p) == norm(one));
+        paths.retain(|p| same_place(p, one));
         if paths.is_empty() {
-            plan.notes.push(format!(
+            pl.plan.notes.push(format!(
                 "repo {name}: {} is none of its checkouts or worktrees under worktree_roots",
                 display(one)
             ));
@@ -1105,12 +1126,12 @@ fn repo_items(
         }
     }
     if paths.is_empty() {
-        plan.notes.push(format!("repo {name}: no checkouts declared"));
+        pl.plan.notes.push(format!("repo {name}: no checkouts declared"));
         return;
     }
     if !skipped.is_empty() {
         let list: Vec<String> = skipped.iter().map(|p| p.display().to_string()).collect();
-        plan.notes.push(format!(
+        pl.plan.notes.push(format!(
             "repo {name}: {} worktree(s) outside worktree_roots skipped: {}",
             skipped.len(),
             list.join(", ")
@@ -1120,20 +1141,14 @@ fn repo_items(
         label: format!("repo {name}"),
         name: name.to_string(),
         workspace: false,
-        project: stacks.repo_project(name),
+        project: pl.stacks.repo_project(name),
         adapters: &repo.adapters,
         paths,
     };
-    place_items(stacks, &place, only, plan);
+    place_items(pl, &place, only, only_path);
 }
 
-fn workspace_items(
-    stacks: &Stacks,
-    name: &str,
-    w: &stack::Workspace,
-    only: Option<&str>,
-    plan: &mut Plan,
-) {
+fn workspace_items(pl: &mut Planner, name: &str, w: &stack::Workspace, only: Option<&str>) {
     let place = Place {
         label: format!("workspace {name}"),
         name: name.to_string(),
@@ -1142,7 +1157,7 @@ fn workspace_items(
         adapters: &w.adapters,
         paths: vec![expand_home(&w.path)],
     };
-    place_items(stacks, &place, only, plan);
+    place_items(pl, &place, only, None);
 }
 
 pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
@@ -1150,13 +1165,28 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         .private
         .as_ref()
         .ok_or("targets are declared in the private stack.toml; no private stack loaded")?;
-    let mut plan = Plan::default();
+    if opts.home.as_os_str().is_empty() {
+        return Err("no tool home given (Options.home): sync reads its ledger there".into());
+    }
+    let ledger = Ledger::load(&opts.home)?;
+    let mut pl = Planner {
+        stacks,
+        plan: Plan {
+            home: opts.home.clone(),
+            ledger_revision: ledger.revision(),
+            ..Plan::default()
+        },
+        ledger,
+        wanted: BTreeSet::new(),
+        covered: Vec::new(),
+        trees: BTreeMap::new(),
+    };
     // The memory index points at the stack's copies: say what an import would bring first.
     if !private.manifest.memory_stores.is_empty() {
         match crate::ops::import_preview(private, None) {
             Ok(reports) => {
                 for r in reports.iter().filter(|r| !r.added.is_empty() || !r.changed.is_empty()) {
-                    plan.notes.push(format!(
+                    pl.plan.notes.push(format!(
                         "memory store {}: {} new, {} changed since the last import; --apply imports them (one commit) before writing",
                         r.store,
                         r.added.len(),
@@ -1164,7 +1194,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
                     ));
                 }
             }
-            Err(e) => plan.notes.push(format!("memory stores: {e}")),
+            Err(e) => pl.plan.notes.push(format!("memory stores: {e}")),
         }
     }
     // Ended temporary entries: never composed; listed here, retired by import_and_apply.
@@ -1177,9 +1207,10 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         item.notes.push(format!(
             "expired: {why}; --apply retires it (one commit) and no file composes it"
         ));
-        plan.items.push(item);
+        pl.plan.items.push(item);
     }
     if opts.repo.is_none() {
+        let mut items = Vec::new();
         for t in &private.manifest.targets {
             if opts.adapter.as_deref().is_some_and(|a| a != t.adapter) {
                 continue;
@@ -1193,16 +1224,16 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
                 )
             })?;
             match t.kind.as_str() {
-                "instructions" => plan.items.extend(instructions_items(stacks, t, adapter)),
-                "skills" => plan.items.extend(skills_items(stacks, t, adapter)),
-                "settings" => plan.items.push(settings_item(t, adapter)),
+                "instructions" => items.extend(instructions_items(&mut pl, t, adapter)),
+                "skills" => items.extend(skills_items(&mut pl, t, adapter)),
+                "settings" => items.push(settings_item(t, adapter)),
                 k => return Err(format!("target {}: unknown kind {k}", t.name)),
             }
         }
         // Profiles sharing one `via` file plan it once; different texts for one file can't both be written.
         let mut kept: Vec<Item> = Vec::new();
-        for item in std::mem::take(&mut plan.items) {
-            match kept.iter_mut().find(|k| norm(&k.path) == norm(&item.path)) {
+        for item in items {
+            match kept.iter_mut().find(|k| same_place(&k.path, &item.path)) {
                 Some(k) if k.proposed == item.proposed => {}
                 Some(k) => {
                     k.action = Action::Conflict;
@@ -1211,29 +1242,22 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
                 None => kept.push(item),
             }
         }
-        plan.items = kept;
-        shadow_notes(private, &mut plan);
+        pl.plan.items.extend(kept);
+        shadow_notes(private, &mut pl.plan);
     }
     if !opts.user_only {
         for (name, repo) in &private.manifest.repos {
             if opts.repo.as_deref().is_some_and(|r| r != name) {
                 continue;
             }
-            repo_items(
-                stacks,
-                name,
-                repo,
-                opts.adapter.as_deref(),
-                opts.place.as_deref(),
-                &mut plan,
-            );
+            repo_items(&mut pl, name, repo, opts.adapter.as_deref(), opts.place.as_deref());
         }
         for (name, w) in &private.manifest.workspaces {
             if opts.repo.as_deref().is_some_and(|r| r != name) {
                 continue;
             }
             if opts.place.is_none() {
-                workspace_items(stacks, name, w, opts.adapter.as_deref(), &mut plan);
+                workspace_items(&mut pl, name, w, opts.adapter.as_deref());
             }
         }
         if let Some(r) = &opts.repo {
@@ -1244,188 +1268,41 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
             }
         }
     }
-    Ok(plan)
+    // Uninstall: nothing is wanted, so every tool-owned path in scope goes (owner files keep their blocks; `restore`
+    // takes those back).
+    if opts.uninstall {
+        pl.plan.items.clear();
+        pl.wanted.clear();
+    }
+    pl.unwanted();
+    Ok(pl.plan)
 }
 
 // ---------------------------------------------------------------- apply
 
-fn make_link(link: &Path, to: &Path) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        // cmd reads a `/` inside a path as a switch, so both paths go in with backslashes only.
-        let win = |p: &Path| p.to_string_lossy().replace('/', "\\");
-        let out = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(win(link))
-            .arg(win(to))
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            return Err(format!(
-                "mklink /J {}: {}",
-                link.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        std::os::unix::fs::symlink(to, link).map_err(|e| e.to_string())
-    }
-}
-
-/// Removes a link (a junction, or a symlink) and never what it points at: a non-recursive removal of the link
-/// itself, refused when `link` is no link (Sol review, finding 8; the 25 Oct incident: a recursive delete through a
-/// junction emptied the stack's skill dirs).
-fn remove_link(link: &Path) -> Result<(), String> {
-    if !fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(format!("{} is no link; sync removes only links it owns", link.display()));
-    }
-    fs::remove_dir(link)
-        .or_else(|_| fs::remove_file(link))
-        .map_err(|e| format!("{}: {e}", link.display()))
-}
-
-/// Writes `bytes` to `path` through a new file beside it, renamed over the target: a reader sees the old file or
-/// the new one, never a part (Sol review, finding 7), and a hardlink to the old file keeps the old bytes (finding 5).
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    let dir = path.parent().ok_or_else(|| format!("{}: no parent dir", path.display()))?;
-    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.lords-{}.tmp", std::process::id()));
-    let written = (|| -> std::io::Result<()> {
-        let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()
-    })();
-    let done = written.and_then(|()| fs::rename(&tmp, path));
-    if let Err(e) = done {
-        let _ = fs::remove_file(&tmp);
-        return Err(format!("{}: {e}", path.display()));
-    }
-    Ok(())
-}
-
-/// Where a backed-up path goes inside a run's backup dir: its whole path, dir by dir (`C:\a\b` is `C/a/b`), so two
-/// different paths never share a backup (Sol review, finding 1).
-fn mirror(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            Component::Prefix(p) => {
-                let s: String = p
-                    .as_os_str()
-                    .to_string_lossy()
-                    .chars()
-                    .filter(|c| c.is_ascii_alphanumeric())
-                    .collect();
-                out.push(if s.is_empty() { "root".to_string() } else { s });
-            }
-            Component::RootDir | Component::CurDir => {}
-            Component::ParentDir => out.push("__up__"),
-            Component::Normal(n) => out.push(n),
-        }
-    }
-    out
-}
-
-/// One apply's backups: the replaced bytes, moved dirs and removed links, and a manifest (`manifest.tsv`, one line
-/// per change, written before the change) that `restore` reads back.
-struct Backups {
-    dir: PathBuf,
-    manifest: fs::File,
-}
-
-/// A manifest line's fields: tabs and line breaks in paths would break the format, so a path with one is refused.
-fn field(p: &Path) -> Result<String, String> {
-    let s = p.to_string_lossy().into_owned();
-    if s.contains(['\t', '\n', '\r']) {
-        return Err(format!("{s:?}: a tab or line break in a path; sync won't touch it"));
-    }
-    Ok(s)
-}
-
-impl Backups {
-    /// A new, empty dir: an existing one (a second apply reusing it) is refused, so no backup is overwritten.
-    fn open(dir: &Path) -> Result<Backups, String> {
-        if let Some(parent) = dir.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-        }
-        fs::create_dir(dir).map_err(|e| {
-            format!("backup dir {}: {e} (each apply needs a new one)", dir.display())
-        })?;
-        let manifest = fs::File::create(dir.join("manifest.tsv"))
-            .map_err(|e| format!("{}: {e}", dir.display()))?;
-        Ok(Backups { dir: dir.to_path_buf(), manifest })
-    }
-
-    fn record(&mut self, fields: &[String]) -> Result<(), String> {
-        use std::io::Write;
-        writeln!(self.manifest, "{}", fields.join("\t"))
-            .and_then(|()| self.manifest.sync_all())
-            .map_err(|e| format!("{}: {e}", self.dir.display()))
-    }
-
-    /// Keeps `bytes`, what `path` held, before it is replaced.
-    fn file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), String> {
-        let rel = Path::new("files").join(mirror(path));
-        write_atomic(&self.dir.join(&rel), bytes)?;
-        self.record(&["file".into(), field(path)?, field(&rel)?])
-    }
-
-    /// Where the dir at `path` moves to, recorded first.
-    fn dir_for(&mut self, path: &Path) -> Result<PathBuf, String> {
-        let rel = Path::new("dirs").join(mirror(path));
-        let to = self.dir.join(&rel);
-        if let Some(parent) = to.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-        }
-        self.record(&["dir".into(), field(path)?, field(&rel)?])?;
-        Ok(to)
-    }
-
-    /// A link about to be removed, and where it pointed.
-    fn link(&mut self, path: &Path, to: &Path) -> Result<(), String> {
-        self.record(&["link".into(), field(path)?, field(to)?])
-    }
-
-    /// A file or link apply is about to create, which a restore removes again (a file only while it still holds
-    /// what apply wrote).
-    fn created(&mut self, path: &Path, what: &str, detail: &str) -> Result<(), String> {
-        self.record(&[format!("created-{what}"), field(path)?, detail.to_string()])
-    }
-}
-
-/// One apply at a time on this machine (a user's sync and a post-checkout hook's): a lock file beside the
-/// backups, waited for up to `secs` seconds.
+/// One apply at a time on this machine (a user's sync and a post-checkout hook's): a lock file in the tool's
+/// home, waited for up to `secs` seconds.
 struct ApplyLock(PathBuf);
 
 impl ApplyLock {
-    fn take(dir: &Path, secs: u64) -> Result<ApplyLock, String> {
-        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let lock = dir.join("apply.lock");
+    fn take(home: &Path, secs: u64) -> Result<ApplyLock, String> {
+        fsguard::create_dir_all(home)?;
+        let lock = home.join("apply.lock");
         let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
         loop {
-            match fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
-                Ok(mut f) => {
-                    use std::io::Write;
-                    let _ = writeln!(f, "pid {}", std::process::id());
-                    return Ok(ApplyLock(lock));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if std::time::Instant::now() >= until {
-                        return Err(format!(
-                            "another apply holds {} ({}); if none is running, delete that file",
-                            lock.display(),
-                            fs::read_to_string(&lock).unwrap_or_default().trim()
-                        ));
-                    }
+            match fsguard::create_file(&lock, format!("pid {}\n", std::process::id()).as_bytes()) {
+                Ok(()) => return Ok(ApplyLock(lock)),
+                Err(_) if lock.exists() && std::time::Instant::now() < until => {
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
-                Err(e) => return Err(format!("{}: {e}", lock.display())),
+                Err(_) if lock.exists() => {
+                    return Err(format!(
+                        "another apply holds {} ({}); if none is running, delete that file",
+                        lock.display(),
+                        read(&lock).unwrap_or_default().trim()
+                    ))
+                }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -1433,197 +1310,327 @@ impl ApplyLock {
 
 impl Drop for ApplyLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        let _ = fsguard::delete_file(&self.0);
     }
 }
 
-fn sha(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(bytes))
+/// One apply's record of the owner files it changed: the replaced bytes as numbered files and a manifest line per
+/// change (written before the change) with the hash sync wrote, which `restore` checks.
+struct Run {
+    home: PathBuf,
+    dir: Option<PathBuf>,
+    n: usize,
 }
 
-/// Whether an item's path is still as the plan saw it; apply refuses the whole plan otherwise (Sol review, finding
-/// 3: an edit after planning is never overwritten or lost).
-fn unchanged(item: &Item) -> Result<(), String> {
-    let stale = |what: &str| {
-        Err(format!(
-            "{}: {what} since the plan; plan again (nothing was changed)",
-            item.path.display()
-        ))
+impl Run {
+    fn new(home: &Path) -> Run {
+        Run { home: home.to_path_buf(), dir: None, n: 0 }
+    }
+
+    /// The run's backup dir, made on first use: a new dir no earlier run used.
+    fn dir(&mut self) -> Result<PathBuf, String> {
+        if let Some(d) = &self.dir {
+            return Ok(d.clone());
+        }
+        let root = self.home.join("backups");
+        fsguard::create_dir_all(&root)?;
+        for n in 0.. {
+            let d = root.join(format!("{}-{}-{n}", crate::ops::today(), std::process::id()));
+            if fsguard::kind(&d)? == fsguard::Kind::Missing {
+                fsguard::create_dir_all(&d)?;
+                fsguard::create_file(&d.join("manifest.tsv"), b"")?;
+                self.dir = Some(d.clone());
+                return Ok(d);
+            }
+        }
+        unreachable!()
+    }
+
+    fn line(&mut self, fields: &[&str]) -> Result<(), String> {
+        if fields.iter().any(|f| f.contains(['\t', '\n', '\r'])) {
+            return Err(format!("{fields:?}: a tab or line break in a path; sync won't touch it"));
+        }
+        let dir = self.dir()?;
+        fsguard::append_line(&dir.join("manifest.tsv"), &fields.join("\t"))
+    }
+
+    /// Keeps `bytes`, what an owner file held, and notes the edit about to be made.
+    fn edit(&mut self, path: &Path, bytes: &[u8], written: &str) -> Result<(), String> {
+        let dir = self.dir()?;
+        self.n += 1;
+        let name = format!("{:04}", self.n);
+        fsguard::create_file(&dir.join(&name), bytes)?;
+        self.line(&["edit", &path.to_string_lossy(), &name, written])
+    }
+
+    fn created(&mut self, path: &Path, written: &str) -> Result<(), String> {
+        self.line(&["created", &path.to_string_lossy(), written])
+    }
+
+    /// Notes a path moved here by `set-aside`, under its number.
+    fn aside(&mut self, path: &Path) -> Result<PathBuf, String> {
+        let dir = self.dir()?;
+        self.n += 1;
+        let name = format!("{:04}", self.n);
+        self.line(&["aside", &path.to_string_lossy(), &name])?;
+        Ok(dir.join(name))
+    }
+}
+
+/// What an apply did: one line per change, and the backup dir, if it changed an owner file.
+#[derive(Clone, Debug, Default)]
+pub struct Applied {
+    pub done: Vec<String>,
+    pub backups: Option<PathBuf>,
+}
+
+fn stale(item: &Item, what: &str) -> String {
+    format!("{}: {what} since the plan; plan again (it was left as it is)", item.path.display())
+}
+
+/// Puts an owner file's new text in: the file moves aside, what moved is compared with what was planned (an edit
+/// made since, even mid-apply, puts it back and stops), its bytes are kept in the run, and the new file goes in.
+fn owner_update(item: &Item, run: &mut Run) -> Result<(), String> {
+    let path = &item.path;
+    let new = item.proposed.as_deref().unwrap_or("").as_bytes();
+    let want = item.want.clone().unwrap_or_default();
+    if item.action == Action::Create {
+        if fsguard::kind(path)? != fsguard::Kind::Missing {
+            return Err(stale(item, "something appeared"));
+        }
+        run.created(path, &want)?;
+        return fsguard::put_file(path, new);
+    }
+    let aside = fsguard::move_aside(path)?;
+    let moved = fsguard::read(&aside)?.unwrap_or_default();
+    if Some(moved.as_slice()) != item.current.as_deref().map(str::as_bytes) {
+        fsguard::move_back(&aside, path)?;
+        return Err(stale(item, "it changed"));
+    }
+    run.edit(path, &moved, &want)?;
+    if let Err(e) = fsguard::put_file(path, new) {
+        fsguard::move_back(&aside, path)?;
+        return Err(e);
+    }
+    fsguard::delete_file(&aside)
+}
+
+/// Replaces or removes a tool-owned path: what is there moves aside and must still match its ledger record
+/// (otherwise it goes back and apply stops); the new version goes in; the old one is deleted, following nothing.
+fn tool_change(item: &Item, ledger: &mut Ledger) -> Result<(), String> {
+    let path = &item.path;
+    let have = |p: &Path| -> Result<String, String> {
+        Ok(match fsguard::kind(p)? {
+            fsguard::Kind::Dir => fsguard::tree_sha(&fsguard::read_tree(p)?),
+            fsguard::Kind::File => fsguard::sha(&fsguard::read(p)?.unwrap_or_default()),
+            fsguard::Kind::Missing => String::new(),
+        })
     };
-    let meta = fs::symlink_metadata(&item.path).ok();
-    let is_link = meta.as_ref().is_some_and(|m| m.file_type().is_symlink());
-    match item.action {
-        Action::Create | Action::Update => {
-            write_guard(&item.path)?;
-            let now =
-                read_target(&item.path).map_err(|e| format!("{}: {e}", item.path.display()))?;
-            if now != item.current {
-                return stale("changed");
+    let recorded = ledger.get(path).map(|o| o.sha.clone());
+    let old = match item.action {
+        Action::Create | Action::Install => {
+            if fsguard::kind(path)? != fsguard::Kind::Missing {
+                return Err(stale(item, "something appeared"));
             }
+            None
         }
-        Action::Install => {
-            write_guard(&item.path)?;
-            if meta.is_some() {
-                return stale("something appeared");
+        Action::Update | Action::Refresh | Action::Remove => {
+            if recorded.is_none() || recorded != item.have {
+                return Err(stale(item, "its ledger record changed"));
             }
-        }
-        Action::ReplaceLink | Action::Unlink => {
-            let now = link_target(&item.path);
-            if !is_link || now.as_deref().map(norm) != item.link_from.as_deref().map(norm) {
-                return stale("the link changed");
+            let aside = fsguard::move_aside(path)?;
+            if Some(have(&aside)?) != recorded {
+                fsguard::move_back(&aside, path)?;
+                return Err(stale(item, "it changed"));
             }
+            Some(aside)
         }
-        Action::Refresh | Action::Uninstall => {
-            let clean = item.copy_hash.clone().map(crate::copies::State::Clean);
-            if is_link || clean.is_none() || Some(crate::copies::state(&item.path)) != clean {
-                return stale("the copy changed");
+        Action::Forget => {
+            ledger.forget(path);
+            return Ok(());
+        }
+        _ => return Ok(()),
+    };
+    let put = match (item.action.clone(), &item.tree) {
+        (Action::Remove, _) => Ok(None),
+        (_, Some(tree)) => fsguard::put_tree(path, tree).map(Some),
+        (_, None) => {
+            let bytes = item.proposed.as_deref().unwrap_or("").as_bytes();
+            fsguard::put_file(path, bytes).map(|()| Some(fsguard::sha(bytes)))
+        }
+    };
+    let put = match put {
+        Ok(p) => p,
+        Err(e) => {
+            if let Some(aside) = &old {
+                fsguard::move_back(aside, path)?;
             }
+            return Err(e);
         }
-        Action::ReplaceDir | Action::RemoveDir => {
-            if !meta.as_ref().is_some_and(|m| m.is_dir()) || is_link {
-                return stale("the dir changed");
-            }
+    };
+    match put {
+        Some(sha) => {
+            let kind = if item.tree.is_some() { "dir" } else { "file" };
+            ledger.record(path, kind, &sha, &item.scope);
         }
-        Action::InSync | Action::Report | Action::Conflict | Action::RetireEntry => {}
+        None => ledger.forget(path),
+    }
+    if let Some(aside) = old {
+        match fsguard::kind(&aside)? {
+            fsguard::Kind::Dir => fsguard::delete_tree(&aside)?,
+            _ => fsguard::delete_file(&aside)?,
+        }
     }
     Ok(())
 }
 
-/// Carries out every changing item of a plan, after checking each path is still as planned. Everything it
-/// replaces or removes is first kept in `backup_dir` (a new dir), with a manifest that `restore` undoes it from.
-/// Returns one line per change.
-pub fn apply(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
+/// Carries out a plan: every change goes through the filesystem guard; tool-owned paths change only while they
+/// match their ledger record, owner files only while they hold what was planned. Nothing to change touches
+/// nothing, not even a lock (Sol review r2, R2-21).
+pub fn apply(plan: &Plan) -> Result<Applied, String> {
     if plan.items.iter().any(|i| i.action == Action::Conflict) {
         return Err("the plan has conflicts; resolve them first (nothing was changed)".into());
     }
-    let changing: Vec<&Item> = plan.items.iter().filter(|i| i.changes()).collect();
-    let root = backup_dir.parent().unwrap_or(backup_dir);
-    let _lock = ApplyLock::take(root, 60)?;
-    for item in &changing {
-        unchanged(item)?;
+    let changing: Vec<&Item> =
+        plan.items.iter().filter(|i| i.changes() && i.action != Action::RetireEntry).collect();
+    if changing.is_empty() {
+        return Ok(Applied::default());
     }
-    let mut done = Vec::new();
-    if changing.iter().all(|i| i.action == Action::RetireEntry) {
-        return Ok(done);
+    let _lock = ApplyLock::take(&plan.home, 60)?;
+    let mut ledger = Ledger::load(&plan.home)?;
+    if ledger.revision() != plan.ledger_revision {
+        return Err(
+            "the ledger changed since the plan (another sync?); plan again (nothing was changed)"
+                .into(),
+        );
     }
-    let mut backups = Backups::open(backup_dir)?;
+    let mut run = Run::new(&plan.home);
+    let mut applied = Applied::default();
     for item in changing {
-        let path = &item.path;
-        match item.action {
-            Action::Create => {
-                let new = item.proposed.as_deref().unwrap_or("");
-                backups.created(path, "file", &sha(new.as_bytes()))?;
-                write_atomic(path, new.as_bytes())?;
-            }
-            Action::Update => {
-                backups.file(path, item.current.as_deref().unwrap_or("").as_bytes())?;
-                write_atomic(path, item.proposed.as_deref().unwrap_or("").as_bytes())?;
-            }
-            Action::Install | Action::Refresh | Action::ReplaceDir | Action::ReplaceLink => {
-                let src = item.copy_from.as_ref().expect("an install item has a source");
-                match item.action {
-                    Action::Refresh | Action::ReplaceDir => {
-                        let dest = backups.dir_for(path)?;
-                        fs::rename(path, &dest).map_err(|e| format!("{}: {e}", path.display()))?;
-                    }
-                    Action::ReplaceLink => {
-                        let old =
-                            item.link_from.as_ref().expect("a replaced link knows its target");
-                        backups.link(path, old)?;
-                        remove_link(path)?;
-                    }
-                    _ => {}
-                }
-                let (_, hash) = crate::copies::record_of(src)?;
-                backups.created(path, "copy", &hash)?;
-                crate::copies::install(src, path)?;
-            }
-            Action::Unlink => {
-                let old = item.link_from.as_ref().expect("an unlink knows the old target");
-                backups.link(path, old)?;
-                remove_link(path)?;
-            }
-            Action::Uninstall | Action::RemoveDir => {
-                let dest = backups.dir_for(path)?;
-                fs::rename(path, &dest).map_err(|e| format!("{}: {e}", path.display()))?;
-            }
-            // Retired by import_and_apply before this runs; nothing to write here.
-            Action::InSync | Action::Report | Action::Conflict | Action::RetireEntry => continue,
-        }
-        done.push(format!("{:?} {}", item.action, path.display()));
+        let result = match item.class {
+            Class::Owner => owner_update(item, &mut run),
+            Class::Tool => tool_change(item, &mut ledger).and_then(|()| ledger.save(&plan.home)),
+        };
+        applied.backups = run.dir.clone();
+        result?;
+        applied.done.push(format!("{:?} {}", item.action, item.path.display()));
     }
-    Ok(done)
+    Ok(applied)
 }
 
-/// Undoes one apply from its backup dir, last change first: created files (while they still hold what apply
-/// wrote) and links go, replaced bytes come back, moved dirs move back and removed links are made again. Anything
-/// that has changed since is left as it is and listed. Returns one line per step.
-pub fn restore(backup_dir: &Path) -> Result<Vec<String>, String> {
-    let manifest = fs::read_to_string(backup_dir.join("manifest.tsv"))
-        .map_err(|e| format!("{}: {e}", backup_dir.display()))?;
-    let root = backup_dir.parent().unwrap_or(backup_dir);
-    let _lock = ApplyLock::take(root, 60)?;
+/// Undoes one apply's owner-file edits from its backup dir, last first: a file gets its old bytes back, and a file
+/// apply created goes, each only while it still holds exactly what sync wrote (Sol review r2, R2-03). A path moved
+/// there by `set-aside` comes back where nothing is. Tool-owned paths aren't restored: sync regenerates them, or
+/// `lords uninstall` removes them. Returns one line per step.
+pub fn restore(home: &Path, backup_dir: &Path) -> Result<Vec<String>, String> {
+    let manifest = fsguard::read_text(&backup_dir.join("manifest.tsv"))?
+        .ok_or_else(|| format!("{}: no manifest", backup_dir.display()))?;
+    let _lock = ApplyLock::take(home, 60)?;
     let mut done = Vec::new();
     for line in manifest.lines().rev() {
         let f: Vec<&str> = line.split('\t').collect();
-        let (kind, path) = match f.as_slice() {
-            [k, p, ..] => (*k, PathBuf::from(p)),
-            _ => continue,
+        let path = PathBuf::from(f.get(1).copied().unwrap_or(""));
+        let holds = |sha: &str| -> Result<bool, String> {
+            Ok(fsguard::read(&path)?.is_some_and(|b| fsguard::sha(&b) == sha))
         };
-        let detail = f.get(2).copied().unwrap_or("");
-        let step = match kind {
-            "created-file" => match fs::read(&path) {
-                Ok(b) if sha(&b) == detail => {
-                    fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-                    format!("removed {}", path.display())
-                }
-                Ok(_) => format!("kept {} (changed since apply)", path.display()),
-                Err(_) => format!("{} is gone already", path.display()),
-            },
-            "created-copy" => {
-                if crate::copies::remove_clean(&path, detail)? {
-                    format!("removed the copy {}", path.display())
+        let step = match f.as_slice() {
+            ["edit", _, name, written] if holds(written)? => {
+                let old = fsguard::read(&backup_dir.join(name))?.unwrap_or_default();
+                let aside = fsguard::move_aside(&path)?;
+                if fsguard::read(&aside)?.is_some_and(|b| fsguard::sha(&b) == *written) {
+                    fsguard::put_file(&path, &old)?;
+                    fsguard::delete_file(&aside)?;
+                    format!("restored {}", path.display())
                 } else {
-                    format!("kept {} (not the copy apply made, or changed since)", path.display())
+                    fsguard::move_back(&aside, &path)?;
+                    format!("kept {} (changed while restoring)", path.display())
                 }
             }
-            "created-link" => match link_target(&path) {
-                Some(to) if norm(&to) == norm(Path::new(detail)) => {
-                    remove_link(&path)?;
-                    format!("unlinked {}", path.display())
-                }
-                _ => format!("kept {} (not the link apply made)", path.display()),
-            },
-            "file" => {
-                let bytes = fs::read(backup_dir.join(detail))
-                    .map_err(|e| format!("{}: {e}", backup_dir.join(detail).display()))?;
-                write_guard(&path)?;
-                write_atomic(&path, &bytes)?;
-                format!("restored {}", path.display())
+            ["created", _, written] if holds(written)? => {
+                let aside = fsguard::move_aside(&path)?;
+                fsguard::delete_file(&aside)?;
+                format!("removed {}", path.display())
             }
-            "dir" => {
-                if fs::symlink_metadata(&path).is_ok() {
-                    format!("kept {} (something is there now)", path.display())
-                } else {
-                    fs::rename(backup_dir.join(detail), &path)
-                        .map_err(|e| format!("{}: {e}", path.display()))?;
+            ["aside", _, name] => match fsguard::kind(&path)? {
+                fsguard::Kind::Missing => {
+                    fsguard::move_to(&backup_dir.join(name), &path)?;
                     format!("moved back {}", path.display())
                 }
+                _ => format!("kept {} (something is there now)", path.display()),
+            },
+            [kind, ..] if ["edit", "created"].contains(kind) => {
+                format!("kept {} (changed since apply)", path.display())
             }
-            "link" => {
-                if fs::symlink_metadata(&path).is_ok() {
-                    format!("kept {} (something is there now)", path.display())
-                } else {
-                    make_link(&path, Path::new(detail))?;
-                    format!("relinked {} to {detail}", path.display())
-                }
-            }
-            other => format!("unknown manifest line `{other}`, skipped"),
+            _ => format!("skipped a manifest line: {line}"),
         };
         done.push(step);
     }
     Ok(done)
+}
+
+/// Records paths as the tool's (design: Ownership boundary, the changeover): each must be in the plan as a path
+/// that isn't in the ledger but holds byte for byte what sync writes there. A human runs this for paths written
+/// before the ledger existed.
+pub fn adopt(plan: &Plan, paths: &[PathBuf]) -> Result<Vec<String>, String> {
+    let _lock = ApplyLock::take(&plan.home, 60)?;
+    let mut ledger = Ledger::load(&plan.home)?;
+    if ledger.revision() != plan.ledger_revision {
+        return Err("the ledger changed since the plan; plan again".into());
+    }
+    let mut done = Vec::new();
+    for p in paths {
+        let item =
+            plan.items.iter().find(|i| same_place(&i.path, p) && i.adoptable).ok_or_else(|| {
+                format!(
+                    "{}: not adoptable (it must hold exactly what sync writes there)",
+                    p.display()
+                )
+            })?;
+        let (kind, now) = match fsguard::kind(&item.path)? {
+            fsguard::Kind::Dir => ("dir", fsguard::tree_sha(&fsguard::read_tree(&item.path)?)),
+            fsguard::Kind::File => {
+                ("file", fsguard::sha(&fsguard::read(&item.path)?.unwrap_or_default()))
+            }
+            fsguard::Kind::Missing => return Err(format!("{}: gone", p.display())),
+        };
+        if Some(&now) != item.want.as_ref() {
+            return Err(format!("{}: changed since the plan", p.display()));
+        }
+        ledger.record(&item.path, kind, &now, &item.scope);
+        done.push(format!("adopted {}", item.path.display()));
+    }
+    ledger.save(&plan.home)?;
+    Ok(done)
+}
+
+/// Moves paths that aren't the tool's into a new backup dir, whole (a human's step for leftovers from before the
+/// ledger, design: Ownership boundary). Refused for a ledger path, for anything holding a link, and across volumes
+/// (it moves, never copies and deletes). `restore` moves them back.
+pub fn set_aside(home: &Path, paths: &[PathBuf]) -> Result<Applied, String> {
+    let _lock = ApplyLock::take(home, 60)?;
+    let ledger = Ledger::load(home)?;
+    let mut run = Run::new(home);
+    let mut applied = Applied::default();
+    for p in paths {
+        if ledger.get(p).is_some() {
+            return Err(format!(
+                "{} is the tool's (in the ledger): `lords uninstall` removes it",
+                p.display()
+            ));
+        }
+        match fsguard::kind(p)? {
+            fsguard::Kind::Missing => return Err(format!("{}: nothing there", p.display())),
+            fsguard::Kind::Dir => {
+                fsguard::read_tree(p)?;
+            }
+            fsguard::Kind::File => {}
+        }
+        let to = run.aside(p)?;
+        fsguard::move_to(p, &to)?;
+        applied.done.push(format!("set aside {} (to {})", p.display(), to.display()));
+        applied.backups = run.dir.clone();
+    }
+    Ok(applied)
 }
 
 /// The stack skills a place installs (copied into each checkout for harnesses that read a skills dir there).
@@ -1743,12 +1750,13 @@ pub fn place_layers(stacks: &Stacks, place: &str, global: bool) -> Layers {
 
 /// `check`'s view of the user-level targets: a warning for each that differs from a fresh composition, and the
 /// plan's notes (known gaps, pending imports) as info. Nothing without a private stack.
-pub fn drift_findings(stacks: &Stacks) -> Vec<crate::Finding> {
+pub fn drift_findings(stacks: &Stacks, home: &Path) -> Vec<crate::Finding> {
     use crate::Finding;
     if stacks.private.is_none() {
         return Vec::new();
     }
-    match plan(stacks, &Options { user_only: true, ..Options::default() }) {
+    match plan(stacks, &Options { user_only: true, home: home.to_path_buf(), ..Options::default() })
+    {
         Ok(plan) => {
             let mut out: Vec<Finding> = plan
                 .items
@@ -1779,24 +1787,15 @@ pub fn drift_findings(stacks: &Stacks) -> Vec<crate::Finding> {
     }
 }
 
-/// Whether `root` is inside a git checkout and nothing under it is uncommitted: then git holds every byte that
-/// an import or a retirement replaces there.
-fn clean_git(root: &Path) -> bool {
-    git::run(root, &["status", "--porcelain", "--", "."]).is_ok_and(|s| s.trim().is_empty())
-}
-
-/// `sync --apply` as one step: import every memory store (one commit each), retire ended temporary entries (one
-/// commit each), plan again from the updated stacks, then apply with backups under `backup_dir`. A plan that
-/// can't apply stops it before any stack file changes, and import and retire run only on a clean git checkout of
-/// their stack (Sol review, finding 6); otherwise they're skipped with a note (ended entries stay out of every
-/// file anyway). Returns what changed. The CLI and the GUI both call this.
+/// `sync --apply` as one step, under one lock: a plan that can't apply stops it before anything changes; then every
+/// memory store is imported (one commit each) and ended temporary entries are retired (one commit each), each
+/// writing only stack files git tracks and holds unmodified, or new ones (Sol review r2, R2-05, in ops.rs); then a
+/// fresh plan is applied. Returns what changed. The CLI and the GUI both call this.
 pub fn import_and_apply(
     public: &Path,
     private: Option<&Path>,
     opts: &Options,
-    backup_dir: &Path,
-) -> Result<Vec<String>, String> {
-    let mut done = Vec::new();
+) -> Result<Applied, String> {
     let stacks = Stacks::load(public, private)?;
     let first = plan(&stacks, opts)?;
     if let Some(c) = first.items.iter().find(|i| i.action == Action::Conflict) {
@@ -1806,64 +1805,32 @@ pub fn import_and_apply(
             c.notes.join("; ")
         ));
     }
-    if let Some(p) = &stacks.private {
-        if !p.manifest.memory_stores.is_empty() {
-            if clean_git(&p.root) {
+    let mut done = Vec::new();
+    {
+        let _lock = ApplyLock::take(&opts.home, 60)?;
+        if let Some(p) = &stacks.private {
+            if !p.manifest.memory_stores.is_empty() {
                 for r in crate::ops::import(p, None, true)? {
                     if let Some(c) = r.commit {
                         done.push(format!("imported memory from {}: commit {c}", r.store));
                     }
                 }
-            } else {
-                done.push(format!(
-                    "memory import skipped: {} has uncommitted changes or no git",
-                    p.root.display()
-                ));
             }
         }
-    }
-    // Ended temporary entries leave the stacks' context for good: retired, with a commit each.
-    let stacks = Stacks::load(public, private)?;
-    let today = crate::ops::today();
-    let ended = crate::temporary::expired(&stacks, &today);
-    let dirty: Vec<String> = stacks
-        .all()
-        .filter(|s| ended.iter().any(|(e, _)| e.stack == s.visibility()) && !clean_git(&s.root))
-        .map(|s| s.root.display().to_string())
-        .collect();
-    if dirty.is_empty() {
-        for (id, commit) in crate::ops::retire_expired(&stacks, &today, true)? {
+        // Ended temporary entries leave the stacks' context for good: retired, with a commit each.
+        let stacks = Stacks::load(public, private)?;
+        for (id, commit) in crate::ops::retire_expired(&stacks, &crate::ops::today(), true)? {
             done.push(format!(
                 "retired expired {id}{}",
                 commit.map(|c| format!(": commit {c}")).unwrap_or_default()
             ));
         }
-    } else {
-        done.push(format!(
-            "retiring {} ended entr(y/ies) skipped: {} has uncommitted changes or no git; no file composes them",
-            ended.len(),
-            dirty.join(", ")
-        ));
     }
     let stacks = Stacks::load(public, private)?;
-    done.extend(apply(&plan(&stacks, opts)?, backup_dir)?);
-    Ok(done)
-}
-
-/// Where `--apply` keeps this run's backups: `~/.lords-command/backups/<date>-<pid>-<n>`, a dir no earlier run
-/// used (Sol review, finding 1: two applies in one process never share one).
-pub fn backup_dir() -> Result<PathBuf, String> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static RUNS: AtomicUsize = AtomicUsize::new(0);
-    let home = crate::config::home().ok_or("no home dir")?;
-    let root = home.join(".lords-command").join("backups");
-    loop {
-        let n = RUNS.fetch_add(1, Ordering::SeqCst);
-        let dir = root.join(format!("{}-{}-{n}", crate::ops::today(), std::process::id()));
-        if !dir.exists() {
-            return Ok(dir);
-        }
-    }
+    let mut applied = apply(&plan(&stacks, opts)?)?;
+    done.append(&mut applied.done);
+    applied.done = done;
+    Ok(applied)
 }
 
 /// Whether every line of `tracked` appears in `file`, in order (other lines may come between).
@@ -2062,7 +2029,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
                 .iter()
                 .map(|e| {
                     let src = e.meta_file.parent().unwrap_or(Path::new("."));
-                    let n = crate::copies::copy_bytes(src).unwrap_or(0) as usize;
+                    let n = skill_tree(src).map(|t| t.values().map(Vec::len).sum()).unwrap_or(0);
                     (e.id().trim_start_matches("skill.").to_string(), n)
                 })
                 .collect();

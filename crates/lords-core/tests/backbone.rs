@@ -55,7 +55,7 @@ fn user_level_text_suits_any_run() {
     f.git_init("checkout");
     let user = f.path("home/AGENTS.md");
     repo_with(&f, &checkout, &format!("[[targets]]\nname = \"codex\"\nadapter = \"codex\"\nkind = \"instructions\"\npath = '{}'\n", user.display()));
-    let p = plan(&f.stacks(), &Options::default()).unwrap();
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
     let at_user = proposed(&p, &user);
     assert!(
         at_user.contains("Be kind.")
@@ -97,18 +97,14 @@ fn a_workspace_gets_its_layer_without_git() {
         ),
     );
     assert_eq!(errors(&f.check()), Vec::<&str>::new(), "{:#?}", f.check());
-    let p = plan(
-        &f.stacks(),
-        &Options { repo: Some("harness".into()), user_only: false, adapter: None, place: None },
-    )
-    .unwrap();
+    let p = plan(&f.stacks(), &Options { repo: Some("harness".into()), ..f.opts() }).unwrap();
     let claude = proposed(&p, &dir.join("CLAUDE.local.md"));
     assert!(
         claude.contains("Notes go under notes/.") && !claude.contains("Repo only."),
         "{claude}"
     );
     assert!(p.items.iter().all(|i| !i.target.contains("exclude")), "no git, no exclude");
-    apply(&p, &f.path("backups")).unwrap();
+    apply(&p).unwrap();
     assert!(fs::read_to_string(dir.join("AGENTS.override.md"))
         .unwrap()
         .contains("Notes go under notes/."));
@@ -129,9 +125,9 @@ fn files_that_hide_agents_md_keep_every_line_of_it() {
     f.write("checkout/AGENTS.md", "# Tracked\n\n- first\n- second\n");
     f.git_init("checkout");
     repo_with(&f, &checkout, "");
-    apply(&plan(&f.stacks(), &Options::default()).unwrap(), &f.path("backups")).unwrap();
+    apply(&plan(&f.stacks(), &f.opts()).unwrap()).unwrap();
     let verbatim = |s: &lords_core::Stacks| {
-        drift_findings(s).into_iter().filter(|x| x.code == "verbatim").count()
+        drift_findings(s, &f.home()).into_iter().filter(|x| x.code == "verbatim").count()
     };
     assert_eq!(verbatim(&f.stacks()), 0, "sync's own files keep every line");
     let over = fs::read_to_string(checkout.join("AGENTS.override.md")).unwrap();
@@ -190,8 +186,8 @@ fn one_checkout_gets_a_file_per_role() {
     );
     f.git_init("checkout");
     repo_with(&f, &checkout, "");
-    let p = plan(&f.stacks(), &Options::default()).unwrap();
-    let role = |r: &str| proposed(&p, &checkout.join(".lords").join(format!("role-{r}.md")));
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    let role = |r: &str| planned_in(&p, &checkout.join(".lords"), &format!("role-{r}.md"));
     let (orch, coder, product) = (role("orchestrator"), role("coder"), role("product"));
     assert!(
         orch.contains("Be kind.")
@@ -206,11 +202,13 @@ fn one_checkout_gets_a_file_per_role() {
             && !product.contains("Merge lanes"),
         "{product}"
     );
-    apply(&p, &f.path("backups")).unwrap();
-    assert!(fs::read_to_string(checkout.join(".git/info/exclude"))
-        .unwrap()
-        .lines()
-        .any(|l| l == "/.lords/role-coder.md"));
+    apply(&p).unwrap();
+    // The role files' dir ignores itself (design: Ownership boundary): no exclude line for it.
+    assert_eq!(
+        f.read("checkout/.lords/.gitignore"),
+        "*
+"
+    );
     assert_eq!(
         git(&checkout, &["status", "--porcelain"]),
         "",
@@ -292,7 +290,7 @@ fn repo_skills_are_indexed_in_place() {
         }
         o => panic!("origin {o:?}"),
     }
-    let p = plan(&s, &Options::default()).unwrap();
+    let p = plan(&s, &f.opts()).unwrap();
     let sep = std::path::MAIN_SEPARATOR_STR;
     let place = proposed(&p, &checkout.join("AGENTS.override.md"));
     let here = checkout.join("v2/.claude/skills").display().to_string().replace('/', sep);

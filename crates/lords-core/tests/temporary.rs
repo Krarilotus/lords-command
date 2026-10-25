@@ -181,7 +181,7 @@ fn sync_retires_an_expired_entry_and_no_file_carries_it() {
         ),
     );
     f.git_init("priv");
-    let p = lords_core::sync::plan(&f.stacks(), &lords_core::sync::Options::default()).unwrap();
+    let p = lords_core::sync::plan(&f.stacks(), &f.opts()).unwrap();
     let listed: Vec<&str> = p
         .items
         .iter()
@@ -190,13 +190,7 @@ fn sync_retires_an_expired_entry_and_no_file_carries_it() {
         .collect();
     assert_eq!(listed.len(), 2, "{listed:?}");
 
-    lords_core::sync::import_and_apply(
-        &f.pub_root(),
-        Some(&f.priv_root()),
-        &lords_core::sync::Options::default(),
-        &f.path("backups"),
-    )
-    .unwrap();
+    lords_core::sync::import_and_apply(&f.pub_root(), Some(&f.priv_root()), &f.opts()).unwrap();
     let s = f.stacks();
     for id in ["rule.gone", "rule.gone-here"] {
         let e = s.find(id).unwrap();

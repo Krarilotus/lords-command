@@ -41,7 +41,7 @@ fn development_skills_install_per_checkout() {
             user_dir.display()
         ),
     );
-    let p = plan(&f.stacks(), &Options::default()).unwrap();
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
     let at = |path: std::path::PathBuf| {
         p.items.iter().find(|i| i.path == path).map(|i| i.action.clone())
     };
@@ -63,18 +63,14 @@ fn development_skills_install_per_checkout() {
         "{codex}"
     );
 
-    apply(&p, &f.path("backups")).unwrap();
+    apply(&p).unwrap();
     // A copy, not a link (orchestrator, 25 Oct: "managed copies for Claude (deletable with the worktree without
-    // harming the source)"), with its manifest.
+    // harming the source)"), recorded in the ledger; it ignores itself, so the exclude file needs no line for it.
     let installed = checkout.join(".claude/skills/spec-tests");
     assert!(fs::read_link(&installed).is_err() && installed.join("SKILL.md").is_file());
-    assert!(installed.join(lords_core::copies::RECORD).is_file());
+    assert!(lords_core::ledger::Ledger::load(&f.home()).unwrap().get(&installed).is_some());
     let exclude = fs::read_to_string(checkout.join(".git/info/exclude")).unwrap();
-    assert!(
-        exclude.lines().any(|l| l == "/.claude/skills/spec-tests/")
-            && !exclude.lines().any(|l| l == ".claude/skills" || l == ".claude/skills/"),
-        "{exclude}"
-    );
+    assert!(!exclude.contains(".claude/skills"), "{exclude}");
     assert_eq!(git(&checkout, &["status", "--porcelain"]), "");
 }
 
@@ -97,51 +93,75 @@ fn a_tracked_skill_of_the_same_name_is_a_clash() {
             checkout.display()
         ),
     );
-    let p = plan(&f.stacks(), &Options::default()).unwrap();
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
     assert!(p
         .items
         .iter()
         .any(|i| i.path == checkout.join(".claude/skills/verify") && i.action == Action::Conflict));
-    assert!(apply(&p, &f.path("backups")).is_err());
+    assert!(apply(&p).is_err());
     assert!(has(&f.check(), "skill-clash", "skill.verify"));
 }
 
 // Spec (above: "the four adapted skills are development skills, so their user-level junctions are dropped. The
-// non-OWL skills … aren't ours to manage; leave them untouched"): in a user-level skills dir, a plain copy of a
-// stack skill that no longer installs there is backed up and removed; a dir that is no stack skill stays.
+// non-OWL skills … aren't ours to manage; leave them untouched"; design: Ownership boundary, the changeover: "an
+// old copy is moved to the backup only on the owner's confirmation"): sync leaves every dir in a user-level skills
+// dir that the ledger doesn't hold, an older copy of a stack skill included; `set_aside`, the human's step, moves
+// one into a new backup dir, and `restore` moves it back.
 #[test]
-fn an_old_user_level_copy_of_a_development_skill_is_retired() {
+fn an_old_user_level_copy_goes_only_by_a_humans_step() {
     let f = Fixture::new();
-    skill(&f, "spec-tests", "roles: [coder]\n");
-    let dir = f.path("home/skills");
-    // An older copy of the stack's skill: its SKILL.md names it, and it has no file the stack's copy lacks.
-    f.write("home/skills/spec-tests/SKILL.md", "---\nname: spec-tests\n---\nAn old copy.\n");
-    f.write("home/skills/frontend-design/SKILL.md", "not ours\n");
-    // An inherited, third-party skill in the stack: the user's own copy of it stays.
-    f.write("pub/global/skills/vendor/SKILL.md", "---\nname: vendor\n---\nx\n");
-    let hash = lords_core::check::path_hash(&f.path("pub/global/skills/vendor")).unwrap();
-    f.write(
-        "pub/global/skills/vendor/lords.yaml",
-        &format!("id: skill.vendor\nkind: skill\ntitle: vendor\naudience: [all]\nroles: [coder]\nscope: global\nstatus: active\nvisibility: public\norigin:\n  type: inherited\n  repo: someone/skills\n  commit: 0123abc\n  path: skills/vendor\n  licence: MIT\n  sha256: {hash}\n"),
+    skill(
+        &f,
+        "spec-tests",
+        "roles: [coder]
+",
     );
-    f.write("home/skills/vendor/SKILL.md", "the user's own install\n");
+    let dir = f.path("home/skills");
+    f.write(
+        "home/skills/spec-tests/SKILL.md",
+        "---
+name: spec-tests
+---
+An old copy.
+",
+    );
+    f.write(
+        "home/skills/frontend-design/SKILL.md",
+        "not ours
+",
+    );
     f.write(
         "priv/stack.toml",
-        &format!("name = \"priv\"\nvisibility = \"private\"\nroles = [\"coder\"]\n[[targets]]\nname = \"skills\"\nadapter = \"codex\"\nkind = \"skills\"\npath = '{}'\n", dir.display()),
+        &format!(
+            "name = \"priv\"
+visibility = \"private\"
+roles = [\"coder\"]
+[[targets]]
+name = \"skills\"
+adapter = \"codex\"
+kind = \"skills\"
+path = '{}'
+",
+            dir.display()
+        ),
     );
-    let p = plan(&f.stacks(), &Options { user_only: true, ..Options::default() }).unwrap();
-    let action =
-        |name: &str| p.items.iter().find(|i| i.path == dir.join(name)).map(|i| i.action.clone());
-    assert_eq!(action("spec-tests"), Some(Action::RemoveDir));
-    assert_eq!(action("frontend-design"), None);
-    assert_eq!(action("vendor"), None, "an inherited skill's user copy stays");
-    apply(&p, &f.path("backups")).unwrap();
+    let p = plan(&f.stacks(), &Options { user_only: true, ..f.opts() }).unwrap();
+    assert!(p.items.iter().all(|i| !i.path.starts_with(&dir)), "{:#?}", p.items);
+    let set = lords_core::sync::set_aside(&f.home(), &[dir.join("spec-tests")]).unwrap();
     assert!(!dir.join("spec-tests").exists() && dir.join("frontend-design/SKILL.md").exists());
-    let manifest = f.read("backups/manifest.tsv");
-    assert_eq!(manifest.lines().filter(|l| l.starts_with("dir\t")).count(), 1, "{manifest}");
+    let backups = set.backups.unwrap();
     assert!(
-        texts_under(&f.path("backups/dirs")).iter().any(|t| t.contains("An old copy.")),
+        texts_under(&backups).iter().any(|t| t.contains("An old copy.")),
         "the copy is in the backup"
+    );
+    lords_core::sync::restore(&f.home(), &backups).unwrap();
+    assert_eq!(
+        f.read("home/skills/spec-tests/SKILL.md"),
+        "---
+name: spec-tests
+---
+An old copy.
+"
     );
 }
 

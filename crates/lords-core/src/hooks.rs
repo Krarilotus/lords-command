@@ -1,9 +1,12 @@
 //! `hooks install`: the privacy check as a repo's pre-commit and commit-msg hooks, in `.git/hooks` (design:
 //! Privacy).
 //! Never through `core.hooksPath`: a global hooks path whose dispatcher runs the repo's own hooks keeps working.
+//! A hook is the tool's only by its ledger record (design: Ownership boundary): any other hook there, readable or
+//! not, is the owner's (Sol review r2, R2-16). Every write goes through `fsguard`, and nothing is overwritten.
 
+use crate::fsguard;
 use crate::git;
-use std::fs;
+use crate::ledger::Ledger;
 use std::path::{Path, PathBuf};
 
 pub const MARKER: &str = "# lords-command: privacy check";
@@ -28,14 +31,48 @@ pub fn commit_msg_script(lords_exe: &Path, secrets_only: bool) -> String {
     format!("#!/bin/sh\n{MARKER} of the commit message (installed by `lords hooks install`).\nexec \"{exe}\" privacy --message \"$1\"{flag}\n")
 }
 
-/// Installs the pre-commit and commit-msg hooks. A hook there that isn't ours stops both, unless `force`, which
-/// backs each one up first.
-pub fn install(
-    repo: &Path,
-    lords_exe: &Path,
-    secrets_only: bool,
-    force: bool,
-) -> Result<Vec<Installed>, String> {
+/// Whether the hook at `hook` is the tool's: its ledger record, and still exactly what sync wrote there.
+fn ours(ledger: &Ledger, hook: &Path) -> Result<bool, String> {
+    Ok(match (ledger.get(hook), fsguard::read(hook)?) {
+        (Some(o), Some(bytes)) => o.sha == fsguard::sha(&bytes),
+        _ => false,
+    })
+}
+
+/// Puts `text` in as the hook at `hook`, replacing the tool's own hook there, and records it.
+fn put_hook(ledger: &mut Ledger, hook: &Path, text: &str, scope: &str) -> Result<(), String> {
+    let old = match fsguard::kind(hook)? {
+        fsguard::Kind::Missing => None,
+        _ => Some(fsguard::move_aside(hook)?),
+    };
+    if let Err(e) = fsguard::put_file(hook, text.as_bytes()) {
+        if let Some(old) = &old {
+            fsguard::move_back(old, hook)?;
+        }
+        return Err(e);
+    }
+    if let Some(old) = old {
+        fsguard::delete_file(&old)?;
+    }
+    fsguard::make_executable(hook)?;
+    ledger.record(hook, "file", &fsguard::sha(text.as_bytes()), scope);
+    Ok(())
+}
+
+/// A name beside `hook` that nothing has yet: where an owner's hook goes when `--force` replaces it.
+fn backup_name(hook: &Path) -> Result<PathBuf, String> {
+    let name = hook.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    for n in 0.. {
+        let suffix = if n == 0 { String::new() } else { format!("-{n}") };
+        let b = hook.with_file_name(format!("{name}.bak-{}{suffix}", crate::ops::today()));
+        if fsguard::kind(&b)? == fsguard::Kind::Missing {
+            return Ok(b);
+        }
+    }
+    unreachable!()
+}
+
+fn hooks_dir(repo: &Path) -> Result<PathBuf, String> {
     if let Ok(local) = git::run(repo, &["config", "--local", "--get", "core.hooksPath"]) {
         return Err(format!(
             "this repo sets core.hooksPath = {} locally, so .git/hooks would not run; unset it or point it at a dispatcher first",
@@ -44,43 +81,57 @@ pub fn install(
     }
     let common = git::run(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
     let dir = PathBuf::from(common.trim()).join("hooks");
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fsguard::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Installs the pre-commit and commit-msg hooks; `home` holds the ledger that records them. A hook there that isn't
+/// the tool's stops both, unless `force`, which moves each one to a new `<name>.bak-<date>` first.
+pub fn install(
+    repo: &Path,
+    lords_exe: &Path,
+    secrets_only: bool,
+    force: bool,
+    home: &Path,
+) -> Result<Vec<Installed>, String> {
+    let dir = hooks_dir(repo)?;
+    let mut ledger = Ledger::load(home)?;
     let hooks = [
         ("pre-commit", script(lords_exe, secrets_only)),
         ("commit-msg", commit_msg_script(lords_exe, secrets_only)),
     ];
-    let foreign = |name: &str| {
-        fs::read_to_string(dir.join(name)).is_ok_and(|existing| !existing.contains(MARKER))
-    };
+    let mut foreign = Vec::new();
+    for (name, _) in &hooks {
+        let hook = dir.join(name);
+        if fsguard::kind(&hook)? != fsguard::Kind::Missing && !ours(&ledger, &hook)? {
+            foreign.push(hook);
+        }
+    }
     if !force {
-        if let Some((name, _)) = hooks.iter().find(|(name, _)| foreign(name)) {
+        if let Some(hook) = foreign.first() {
             return Err(format!(
-                "{} exists and isn't ours; --force backs it up and replaces it",
-                dir.join(name).display()
+                "{} exists and isn't the tool's (no ledger record); --force moves it aside and replaces it",
+                hook.display()
             ));
         }
     }
     let global_hooks_path = git::run(repo, &["config", "--global", "--get", "core.hooksPath"])
         .ok()
         .map(|s| s.trim().to_string());
+    let scope = format!("hooks:{}", crate::ledger::key(&dir));
     let mut installed = Vec::new();
     for (name, text) in hooks {
         let hook = dir.join(name);
         let mut backup = None;
-        if foreign(name) {
-            let b = dir.join(format!("{name}.bak-{}", crate::ops::today()));
-            fs::rename(&hook, &b).map_err(|e| e.to_string())?;
+        if foreign.contains(&hook) {
+            let b = backup_name(&hook)?;
+            fsguard::move_to(&hook, &b)?;
             backup = Some(b);
         }
-        fs::write(&hook, text).map_err(|e| e.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))
-                .map_err(|e| e.to_string())?;
-        }
+        put_hook(&mut ledger, &hook, &text, &scope)?;
         installed.push(Installed { hook, backup, global_hooks_path: global_hooks_path.clone() });
     }
+    ledger.save(home)?;
     Ok(installed)
 }
 
@@ -148,44 +199,34 @@ exit $status
     )
 }
 
-/// Installs the post-checkout hook in the repo's own hooks dir (the common dir, so every worktree has it). A hook
-/// that isn't ours is kept as `post-checkout.before-lords` and chained; ours is replaced in place.
+/// Installs the post-checkout hook in the repo's own hooks dir (the common dir, so every worktree has it); `home`
+/// holds the ledger. A hook there that isn't the tool's moves to `post-checkout.before-lords` and is chained; the
+/// tool's own is replaced.
 pub fn install_post_checkout(
     repo: &Path,
     lords_exe: &Path,
     args: &SyncArgs,
+    home: &Path,
 ) -> Result<Installed, String> {
-    if let Ok(local) = git::run(repo, &["config", "--local", "--get", "core.hooksPath"]) {
-        return Err(format!(
-            "this repo sets core.hooksPath = {} locally, so .git/hooks would not run; unset it or point it at a dispatcher first",
-            local.trim()
-        ));
-    }
-    let common = git::run(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
-    let dir = PathBuf::from(common.trim()).join("hooks");
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dir = hooks_dir(repo)?;
+    let mut ledger = Ledger::load(home)?;
     let hook = dir.join("post-checkout");
     let mut backup = None;
-    if let Ok(existing) = fs::read_to_string(&hook) {
-        if !existing.contains(SYNC_MARKER) {
-            let chained = dir.join(CHAINED);
-            if chained.exists() {
-                return Err(format!(
-                    "{} isn't ours and {} exists already; merge them by hand first",
-                    hook.display(),
-                    chained.display()
-                ));
-            }
-            fs::rename(&hook, &chained).map_err(|e| e.to_string())?;
-            backup = Some(chained);
+    if fsguard::kind(&hook)? != fsguard::Kind::Missing && !ours(&ledger, &hook)? {
+        let chained = dir.join(CHAINED);
+        if fsguard::kind(&chained)? != fsguard::Kind::Missing {
+            return Err(format!(
+                "{} isn't the tool's and {} exists already; merge them by hand first",
+                hook.display(),
+                chained.display()
+            ));
         }
+        fsguard::move_to(&hook, &chained)?;
+        backup = Some(chained);
     }
-    fs::write(&hook, post_checkout_script(lords_exe, args)).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
-    }
+    let scope = format!("hooks:{}", crate::ledger::key(&dir));
+    put_hook(&mut ledger, &hook, &post_checkout_script(lords_exe, args), &scope)?;
+    ledger.save(home)?;
     let global_hooks_path = git::run(repo, &["config", "--global", "--get", "core.hooksPath"])
         .ok()
         .map(|s| s.trim().to_string());

@@ -220,29 +220,15 @@ what the public layers (public global, project and repo) would make of it, so th
 
 **Skills** go into each adapter's skills dir as copies, never links (orchestrator, 25 Oct: a `git worktree remove
 --force` on Git for Windows 2.42 followed a skill junction and emptied the stack's skill dirs; symlinks need admin
-rights or developer mode on Windows). Each copy carries an ownership record, `.lords/owned.toml`: the stack entry's
-id, its source dir and a SHA-256 per file. Built beside its place and renamed in, a copy is whole or absent. Its exact
-path is excluded from git, and `check` sizes the copies per place (about 33 KB per checkout today). Deleting it, with its worktree say, never reaches the stack.
-Sync refreshes a copy nobody changed when the stack's skill changes (the old one moves to the backup); a copy changed by
-hand is a conflict. A copy of a skill that no longer applies moves to the backup; nothing is deleted. A link of ours
-from an earlier version gives way to a copy (the link itself is removed, never recursively). A real dir without a
-manifest is the tool's only if it is a copy of a stack skill: its SKILL.md names it, it holds no link, and no file
-the stack's copy lacks. Every other dir stays. A real dir where a copy should go is moved to the backup first, and
-its diff is shown. Walks never follow a link. Codex reads the "Skills here" index in each place's file.
+rights or developer mode on Windows). A copy is a tool-owned dir (below): built beside its place and moved in whole,
+recorded in the ledger, refreshed whole when the stack's skill changes, removed when it no longer applies, and a
+conflict when someone changed it. A stack skill holding a link is a conflict, never a copy that silently lacks what the
+link points at. Its `.gitignore` of `*` keeps it out of git; `check` sizes the copies per place (about 33 KB per
+checkout today). Codex reads the "Skills here" index in each place's file.
 
-**What apply may touch** (the Sol review of 25 Oct): only the configured path, as a plain file. A target that is a
-link, or lies below one, is a conflict; so is one sync can't read as UTF-8, and a file whose marker lines aren't one
-begin line before one end line (markers count only as whole lines). Writes go through a new file renamed over the
-target, so nothing is ever half-written and a hardlink keeps its old bytes. Every byte outside the managed block
-stays, the line ending after the end marker included; a settings file changes only in its one key. Apply first
-checks every path is still as planned and refuses the whole plan otherwise. One apply runs at a time
-(`backups/apply.lock`).
-
-**Backups.** Each `--apply` gets a new dir, `~/.lords-command/backups/<date>-<pid>-<n>/`: replaced files under
-`files/` and moved dirs under `dirs/`, each at its whole path, and `manifest.tsv`, one line per change written before
-the change (including where each removed link pointed, and each file and link it created). `lords sync --restore
-<dir>` undoes it, last change first, leaving anything changed since. It refuses a plan with any conflict, before any
-stack file changes; import and retirement run only on a clean git checkout of their stack.
+**What apply may touch, and backups:** see the Ownership boundary below. In short: the tool's own paths, replaced
+whole while they match the ledger; the owner's files, one managed edit each, backed up; nothing through a link; and
+apply refuses a whole plan with a conflict, before any stack file changes.
 
 **Where each line comes from.** Composition keeps a map: output line → entry id → stack, file and line. The GUI
 shows it; `sync --json` prints it. The agent files carry only the text, plus one header comment naming the source.
@@ -258,8 +244,8 @@ hide repos' `AGENTS.md`. Without that exclude, the plan (and `check`, as info) s
 
 ## Ownership boundary
 
-*Proposed 25 Oct after the second Sol review; once built, it replaces the Sync paragraphs on skills, on what apply
-may touch, and on backups.* Two review rounds found the same class again and again: the tool *inferred* what was
+*Built 25 Oct after the second Sol review (crates/lords-core/src/fsguard.rs, ledger.rs; tests/ownership.rs).* Two
+review rounds found the same class again and again: the tool *inferred* what was
 its own (a dir by its name or contents, a record inside a copy, a link by where it points) and *edited in place*
 on a filesystem the owner also uses. Each patch closed one case and opened its neighbour. So sync stops inferring.
 
@@ -303,7 +289,10 @@ run under the same lock, after the plan is known to apply.
 
 **The changeover, once and with a human:** the 3a place files, the old `~/.codex/skills` copies and any other path
 from before the ledger are listed by `lords adopt --list`. Adopting a file records it only if it is byte for byte what
-sync would write now. Removing an old copy moves it into the backup only on the owner's confirmation.
+sync would write now (`lords adopt PATH...`). Anything else goes by `lords set-aside PATH... --yes`, which moves it
+whole into a new backup dir (refused for a ledger path, anything holding a link, or across volumes); `restore` moves
+it back. Both are a human's steps. `lords uninstall [--apply]` removes every tool-owned path in scope that still
+matches the ledger.
 
 **Out of git without editing git.** A tool-owned dir (a skill copy, `.lords/`) holds a `.gitignore` of `*`, so it
 ignores itself. Only the two root files need lines in `.git/info/exclude`.
