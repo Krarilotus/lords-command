@@ -53,9 +53,20 @@ colours, the words in the hover; `?` has the legend).
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-.	ools\package.ps1
+.\tools\package.ps1
 ```
 
 The ZIP (both exes, the example config, README, LICENSE) lands in `dist/`. Keep `config.txt` local.
+
+## > known limits
+
+- An automatic merge commit runs no privacy hook; run `lords privacy --history` before pushing a merge.
+- A staged submodule (gitlink) is refused by the privacy hook: it reads only file contents.
+- Sync removes nothing while the stacks have any problem, warnings included, or the plan has any conflict but a copy
+  the owner changed (a path from before the ledger counts): adopt or set it aside first.
+- The installed hooks run the `lords` that installed them; a later build at that path is what they run then.
+- `sync --stage install` imports and retires nothing, though its plan still notes the memory an apply would import.
+- Sync checks a path, then acts on it by name: one operator, and nothing relinking the places during an apply
+  ([design](docs/design.md), "Operating assumption").
 
 [MIT](LICENSE)
