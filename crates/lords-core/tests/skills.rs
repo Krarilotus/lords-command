@@ -1,7 +1,9 @@
 //! Where skills install (orchestrator decision, 25 Oct: "Development-role skills don't install at user level. They
 //! go into each checkout or workspace, as junctions under .claude/skills/ (Claude) and in the repo-file index
 //! (Codex) … Add each junction's exact path to .git/info/exclude, never the directory … check flags a name clash
-//! between a stack skill and a tracked one … User-level skill dirs keep only skills without roles").
+//! between a stack skill and a tracked one … User-level skill dirs keep only skills without roles"). Since the
+//! same day's incident, copies instead of junctions (orchestrator: "managed copies for Claude (deletable with the
+//! worktree without harming the source) plus the index for Codex"; tests/copies.rs).
 
 mod common;
 use common::*;
@@ -43,9 +45,9 @@ fn development_skills_install_per_checkout() {
     let at = |path: std::path::PathBuf| {
         p.items.iter().find(|i| i.path == path).map(|i| i.action.clone())
     };
-    assert_eq!(at(user_dir.join("any-run")), Some(Action::Link));
+    assert_eq!(at(user_dir.join("any-run")), Some(Action::Install));
     assert_eq!(at(user_dir.join("spec-tests")), None, "a development skill isn't user-level");
-    assert_eq!(at(checkout.join(".claude/skills/spec-tests")), Some(Action::Link));
+    assert_eq!(at(checkout.join(".claude/skills/spec-tests")), Some(Action::Install));
     assert_eq!(at(checkout.join(".claude/skills/any-run")), None);
     let codex = p
         .items
@@ -62,13 +64,14 @@ fn development_skills_install_per_checkout() {
     );
 
     apply(&p, &f.path("backups")).unwrap();
-    assert!(
-        fs::read_link(checkout.join(".claude/skills/spec-tests")).is_ok(),
-        "a link, not a copy"
-    );
+    // A copy, not a link (orchestrator, 25 Oct: "managed copies for Claude (deletable with the worktree without
+    // harming the source)"), with its manifest.
+    let installed = checkout.join(".claude/skills/spec-tests");
+    assert!(fs::read_link(&installed).is_err() && installed.join("SKILL.md").is_file());
+    assert!(installed.join(lords_core::copies::MANIFEST).is_file());
     let exclude = fs::read_to_string(checkout.join(".git/info/exclude")).unwrap();
     assert!(
-        exclude.lines().any(|l| l == "/.claude/skills/spec-tests")
+        exclude.lines().any(|l| l == "/.claude/skills/spec-tests/")
             && !exclude.lines().any(|l| l == ".claude/skills" || l == ".claude/skills/"),
         "{exclude}"
     );

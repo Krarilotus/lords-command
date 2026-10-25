@@ -303,8 +303,8 @@ fn repo_skills_are_indexed_in_place() {
         "{place}"
     );
     assert!(
-        p.items.iter().all(|i| !i.path.starts_with(&skills_dir) || i.action != Action::Link),
-        "never linked"
+        p.items.iter().all(|i| !i.path.starts_with(&skills_dir) || i.action != Action::Install),
+        "never installed"
     );
     assert!(!f.path("priv/repo/beta-core/skills").exists(), "nothing copied into the stack");
 }

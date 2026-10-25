@@ -21,16 +21,20 @@ pub enum Action {
     Create,
     Update,
     InSync,
-    /// Make a dir link to the stack's skill.
-    Link,
-    /// A link to an old place in a stack: point it at the current one.
-    Relink,
-    /// A real dir where the link goes: back it up, then link.
+    /// Install a copy of the stack's skill (with its manifest, `.lords-copy`).
+    Install,
+    /// A copy sync made, unchanged since, of an older version of the skill: move it to the backup, install anew.
+    Refresh,
+    /// A real dir that isn't sync's copy where the skill goes: move it to the backup, then install.
     ReplaceDir,
-    /// A link into a stack for a skill that no longer applies.
+    /// A link of ours (from an earlier version, which linked skills): remove the link itself, then install a copy.
+    ReplaceLink,
+    /// A copy sync made of a skill that no longer installs here: moved to the backup.
+    Uninstall,
+    /// A link of ours (from an earlier version) for a skill that no longer installs here: the link alone goes.
     Unlink,
-    /// A plain copy of a skill the stack made (own or adapted) where it no longer installs (an older install):
-    /// backed up, removed. Copies of inherited, third-party skills are the user's own and stay.
+    /// A plain copy of a skill the stack made (own or adapted), from before copies had manifests, where it no
+    /// longer installs: moved to the backup. Copies of inherited, third-party skills are the user's own and stay.
     RemoveDir,
     /// A temporary entry that has ended: `--apply` retires it in its stack (with a commit) before writing.
     RetireEntry,
@@ -49,13 +53,16 @@ pub struct Item {
     pub current: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proposed: Option<String>,
-    /// For `Link`, `Relink` and `ReplaceDir`: the stack dir the link points at.
+    /// For the installing actions: the stack's skill dir the copy comes from.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub link_to: Option<PathBuf>,
-    /// For `Relink` and `Unlink`: where the link points now (checked again before apply touches it, and kept in
-    /// the run's backups so the link can be put back).
+    pub copy_from: Option<PathBuf>,
+    /// For `ReplaceLink` and `Unlink`: where the link points now (checked again before apply touches it, and kept
+    /// in the run's backups).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_from: Option<PathBuf>,
+    /// For `Refresh` and `Uninstall`: the manifest hash of the copy there now (checked again before apply).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copy_hash: Option<String>,
     pub diff: String,
     pub notes: Vec<String>,
     #[serde(skip)]
@@ -70,8 +77,9 @@ impl Item {
             action,
             current: None,
             proposed: None,
-            link_to: None,
+            copy_from: None,
             link_from: None,
+            copy_hash: None,
             diff: String::new(),
             notes: Vec::new(),
             sources: Vec::new(),
@@ -140,6 +148,11 @@ pub fn write_guard(path: &Path) -> Result<(), String> {
     if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(format!("{} is a link; sync writes only plain files", display(path)));
     }
+    dirs_guard(path)
+}
+
+/// Why sync may not write below the dirs above `path`: one of them is a link.
+fn dirs_guard(path: &Path) -> Result<(), String> {
     for dir in path.ancestors().skip(1) {
         if fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
             let to = link_target(dir).map(|t| display(&t)).unwrap_or_else(|| "elsewhere".into());
@@ -598,33 +611,10 @@ fn skills_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec<Item>
     let mut items = Vec::new();
     for e in &wanted {
         let name = e.id().trim_start_matches("skill.").to_string();
-        items.push(link_item(stacks, &t.name, &dir.join(&name), e));
+        items.push(copy_item(stacks, &t.name, &dir.join(&name), e));
     }
-    let wanted_names: Vec<String> =
-        wanted.iter().map(|e| e.id().trim_start_matches("skill.").to_string()).collect();
-    let mut unmanaged = Vec::new();
-    for child in stack::sorted_children(&dir) {
-        let name = stack::file_name(&child);
-        if wanted_names.contains(&name) {
-            continue;
-        }
-        match link_target(&child) {
-            Some(to) if in_a_stack(stacks, &to) => {
-                let mut item = Item::new(&t.name, child.clone(), Action::Unlink);
-                item.link_from = Some(to);
-                items.push(item);
-            }
-            None if copy_of_ours(stacks, &child, &name) => {
-                let mut item = Item::new(&t.name, child.clone(), Action::RemoveDir);
-                item.notes.push(
-                    "a copy of a stack skill that no longer installs here; backed up, then removed"
-                        .into(),
-                );
-                items.push(item);
-            }
-            _ => unmanaged.push(name),
-        }
-    }
+    let (gone, unmanaged) = unwanted_skills(stacks, &t.name, &dir, &wanted);
+    items.extend(gone);
     if !unmanaged.is_empty() {
         let mut item = Item::new(&t.name, dir.clone(), Action::InSync);
         item.notes.push(format!("not from a stack, left alone: {}", unmanaged.join(", ")));
@@ -633,53 +623,141 @@ fn skills_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec<Item>
     items
 }
 
-/// The item that makes `link` a link to skill `e`'s dir in its stack (or says it already is).
-fn link_item(stacks: &Stacks, target: &str, link: &Path, e: &Entry) -> Item {
-    let link = link.to_path_buf();
-    let src = e.meta_file.parent().expect("a sidecar has a dir").to_path_buf();
-    {
-        let mut item = Item::new(target, link.clone(), Action::Link);
-        item.link_to = Some(src.clone());
-        if let Some(to) = link_target(&link) {
-            item.link_from = Some(to.clone());
-            item.action = if same_place(&to, &src) {
-                Action::InSync
-            } else if in_a_stack(stacks, &to) {
-                Action::Relink
-            } else {
-                item.notes.push(format!("a link to {} that isn't ours", to.display()));
-                Action::Conflict
-            };
-        } else if link.is_dir() {
-            item.action = Action::ReplaceDir;
-            let old = read(&link.join(stack::SKILL_FILE)).unwrap_or_default();
-            let new = read(&src.join(stack::SKILL_FILE)).unwrap_or_default();
-            item.diff = diff::unified(
-                &old,
-                &new,
-                &display(&link.join(stack::SKILL_FILE)),
-                &display(&src.join(stack::SKILL_FILE)),
-                3,
-            );
-            let extra: Vec<String> = stack::all_files(&link)
-                .iter()
-                .filter_map(|f| {
-                    f.strip_prefix(&link).ok().map(|r| r.to_string_lossy().replace('\\', "/"))
-                })
-                .filter(|r| !src.join(r).exists())
-                .collect();
-            if !extra.is_empty() {
-                item.notes.push(format!(
-                    "files only in the installed copy (kept in the backup): {}",
-                    extra.join(", ")
-                ));
-            }
-        } else if link.exists() {
-            item.action = Action::Conflict;
-            item.notes.push("a file where the skill's link goes".into());
+/// What goes from a skills dir: everything of sync's there for a skill not in `wanted` (a copy it made and nobody
+/// changed, a link of ours from an earlier version, a pre-manifest copy of a stack skill). Also the names it leaves
+/// alone.
+fn unwanted_skills(
+    stacks: &Stacks,
+    target: &str,
+    dir: &Path,
+    wanted: &[&Entry],
+) -> (Vec<Item>, Vec<String>) {
+    let names: Vec<String> =
+        wanted.iter().map(|e| e.id().trim_start_matches("skill.").to_string()).collect();
+    let (mut items, mut left) = (Vec::new(), Vec::new());
+    for child in stack::sorted_children(dir) {
+        let name = stack::file_name(&child);
+        if names.contains(&name) || name.starts_with('.') {
+            continue;
         }
-        item
+        if let Some(to) = link_target(&child) {
+            if in_a_stack(stacks, &to) {
+                let mut item = Item::new(target, child.clone(), Action::Unlink);
+                item.link_from = Some(to);
+                item.notes.push("a link of ours for a skill that no longer installs here".into());
+                items.push(item);
+            } else {
+                left.push(name);
+            }
+            continue;
+        }
+        if !fs::symlink_metadata(&child).is_ok_and(|m| m.is_dir()) {
+            left.push(name);
+            continue;
+        }
+        match crate::copies::state(&child) {
+            crate::copies::State::Clean(hash) => {
+                let mut item = Item::new(target, child.clone(), Action::Uninstall);
+                item.copy_hash = Some(hash);
+                item.notes.push(
+                    "sync's copy of a skill that no longer installs here; moved to the backup"
+                        .into(),
+                );
+                items.push(item);
+            }
+            crate::copies::State::Modified(what) => left.push(format!(
+                "{name} (sync's copy, changed by hand: {}; delete it yourself if it should go)",
+                what.join(", ")
+            )),
+            crate::copies::State::NotOurs if copy_of_ours(stacks, &child, &name) => {
+                let mut item = Item::new(target, child.clone(), Action::RemoveDir);
+                item.notes.push(
+                    "an older copy of a stack skill that no longer installs here; moved to the backup".into(),
+                );
+                items.push(item);
+            }
+            crate::copies::State::NotOurs => left.push(name),
+        }
     }
+    (items, left)
+}
+
+/// The item that makes `dest` a copy of skill `e` (or says it already is one).
+fn copy_item(stacks: &Stacks, target: &str, dest: &Path, e: &Entry) -> Item {
+    let src = e.meta_file.parent().expect("a sidecar has a dir").to_path_buf();
+    let mut item = Item::new(target, dest.to_path_buf(), Action::Install);
+    item.copy_from = Some(src.clone());
+    // The install path itself may be a link of ours (from an earlier version): handled below.
+    if let Err(err) = dirs_guard(dest) {
+        return conflict(target, dest, err);
+    }
+    let want = match crate::copies::manifest_of(&src) {
+        Ok((_, hash)) => hash,
+        Err(err) => return conflict(target, dest, err),
+    };
+    let skill_diff = |item: &mut Item| {
+        let old = read(&dest.join(stack::SKILL_FILE)).unwrap_or_default();
+        let new = read(&src.join(stack::SKILL_FILE)).unwrap_or_default();
+        item.diff = diff::unified(
+            &old,
+            &new,
+            &display(&dest.join(stack::SKILL_FILE)),
+            &display(&src.join(stack::SKILL_FILE)),
+            3,
+        );
+    };
+    let meta = fs::symlink_metadata(dest).ok();
+    if let Some(to) = link_target(dest) {
+        if in_a_stack(stacks, &to) {
+            item.action = Action::ReplaceLink;
+            item.link_from = Some(to);
+            item.notes.push(
+                "a link from an earlier version: the link alone goes, a copy takes its place"
+                    .into(),
+            );
+        } else {
+            return conflict(target, dest, format!("a link to {} that isn't ours", to.display()));
+        }
+    } else if meta.as_ref().is_some_and(|m| m.is_dir()) {
+        match crate::copies::state(dest) {
+            crate::copies::State::Clean(hash) if hash == want => item.action = Action::InSync,
+            crate::copies::State::Clean(hash) => {
+                item.action = Action::Refresh;
+                item.copy_hash = Some(hash);
+                skill_diff(&mut item);
+            }
+            crate::copies::State::Modified(what) => {
+                return conflict(
+                    target,
+                    dest,
+                    format!(
+                        "sync's copy, changed by hand ({}); move the change into the stack's skill, or delete the copy",
+                        what.join(", ")
+                    ),
+                );
+            }
+            crate::copies::State::NotOurs => {
+                item.action = Action::ReplaceDir;
+                skill_diff(&mut item);
+                let extra: Vec<String> = stack::all_files(dest)
+                    .iter()
+                    .filter_map(|f| {
+                        f.strip_prefix(dest).ok().map(|r| r.to_string_lossy().replace('\\', "/"))
+                    })
+                    .filter(|r| !src.join(r).exists())
+                    .collect();
+                if !extra.is_empty() {
+                    item.notes.push(format!(
+                        "files only in the installed dir (kept in the backup): {}",
+                        extra.join(", ")
+                    ));
+                }
+            }
+        }
+    } else if meta.is_some() {
+        return conflict(target, dest, "a file where the skill's copy goes");
+    }
+    item
 }
 
 /// The header line above the exclude patterns sync owns in a repo's `.git/info/exclude`.
@@ -905,7 +983,7 @@ fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Pl
             add_exclude(p, &format!("/{file}"));
         }
     }
-    // Development skills, linked into each checkout for harnesses that read a skills dir there. Each link's exact
+    // Development skills, copied into each checkout for harnesses that read a skills dir there. Each copy's exact
     // path is excluded, never the dir, so skills the repo tracks there stay visible to git.
     let skill_ctx = Context {
         audience: vec![Audience::Opus, Audience::Sol, Audience::Astra],
@@ -939,37 +1017,25 @@ fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Pl
                 if !place.workspace
                     && git::run(p, &["ls-files", &rel]).is_ok_and(|o| !o.trim().is_empty())
                 {
-                    let mut item = Item::new(&target, p.join(&rel), Action::Conflict);
-                    item.notes
-                        .push(format!("the repo tracks a skill at {rel}; rename one of them"));
-                    plan.items.push(item);
+                    plan.items.push(conflict(
+                        &target,
+                        &p.join(&rel),
+                        format!("the repo tracks a skill at {rel}; rename one of them"),
+                    ));
                     continue;
                 }
-                plan.items.push(link_item(stacks, &target, &p.join(&rel), e));
-                add_exclude(p, &format!("/{rel}"));
+                plan.items.push(copy_item(stacks, &target, &p.join(&rel), e));
+                add_exclude(p, &format!("/{rel}/"));
             }
-            // A link of ours here for a skill that no longer applies (ended, retired, another place's) goes
+            // What of sync's is here for a skill that no longer applies (ended, retired, another place's) goes
             // (Sol review, finding 19); anything else in the dir is the repo's or the owner's.
-            let wanted: Vec<String> =
-                skills.iter().map(|e| e.id().trim_start_matches("skill.").to_string()).collect();
-            for child in stack::sorted_children(&p.join(dir)) {
-                let name = stack::file_name(&child);
-                if wanted.contains(&name) {
-                    continue;
-                }
-                if let Some(to) = link_target(&child).filter(|to| in_a_stack(stacks, to)) {
-                    let mut item = Item::new(
-                        &format!("{} (skill {name})", place.label),
-                        child,
-                        Action::Unlink,
-                    );
-                    item.link_from = Some(to);
-                    item.notes
-                        .push("a link of ours for a skill that no longer applies here".into());
-                    plan.items.push(item);
-                    add_exclude(p, &format!("/{dir}/{name}"));
-                }
-            }
+            let (gone, _) = unwanted_skills(
+                stacks,
+                &format!("{} (skills)", place.label),
+                &p.join(dir),
+                &skills,
+            );
+            plan.items.extend(gone);
         }
     }
     // One composed file per role, at a stable untracked path, for briefs to point at (backbone requirement BB-3).
@@ -1413,16 +1479,22 @@ fn unchanged(item: &Item) -> Result<(), String> {
                 return stale("changed");
             }
         }
-        Action::Link => {
+        Action::Install => {
             write_guard(&item.path)?;
             if meta.is_some() {
                 return stale("something appeared");
             }
         }
-        Action::Relink | Action::Unlink => {
+        Action::ReplaceLink | Action::Unlink => {
             let now = link_target(&item.path);
             if !is_link || now.as_deref().map(norm) != item.link_from.as_deref().map(norm) {
                 return stale("the link changed");
+            }
+        }
+        Action::Refresh | Action::Uninstall => {
+            let clean = item.copy_hash.clone().map(crate::copies::State::Clean);
+            if is_link || clean.is_none() || Some(crate::copies::state(&item.path)) != clean {
+                return stale("the copy changed");
             }
         }
         Action::ReplaceDir | Action::RemoveDir => {
@@ -1465,29 +1537,31 @@ pub fn apply(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
                 backups.file(path, item.current.as_deref().unwrap_or("").as_bytes())?;
                 write_atomic(path, item.proposed.as_deref().unwrap_or("").as_bytes())?;
             }
-            Action::Link | Action::Relink | Action::ReplaceDir => {
-                let to = item.link_to.as_ref().expect("a link item has a target");
-                if item.action == Action::Relink {
-                    let old = item.link_from.as_ref().expect("a relink knows the old target");
-                    backups.link(path, old)?;
-                    remove_link(path)?;
+            Action::Install | Action::Refresh | Action::ReplaceDir | Action::ReplaceLink => {
+                let src = item.copy_from.as_ref().expect("an install item has a source");
+                match item.action {
+                    Action::Refresh | Action::ReplaceDir => {
+                        let dest = backups.dir_for(path)?;
+                        fs::rename(path, &dest).map_err(|e| format!("{}: {e}", path.display()))?;
+                    }
+                    Action::ReplaceLink => {
+                        let old =
+                            item.link_from.as_ref().expect("a replaced link knows its target");
+                        backups.link(path, old)?;
+                        remove_link(path)?;
+                    }
+                    _ => {}
                 }
-                if item.action == Action::ReplaceDir {
-                    let dest = backups.dir_for(path)?;
-                    fs::rename(path, &dest).map_err(|e| format!("{}: {e}", path.display()))?;
-                }
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                }
-                backups.created(path, "link", &field(to)?)?;
-                make_link(path, to)?;
+                let (_, hash) = crate::copies::manifest_of(src)?;
+                backups.created(path, "copy", &hash)?;
+                crate::copies::install(src, path)?;
             }
             Action::Unlink => {
                 let old = item.link_from.as_ref().expect("an unlink knows the old target");
                 backups.link(path, old)?;
                 remove_link(path)?;
             }
-            Action::RemoveDir => {
+            Action::Uninstall | Action::RemoveDir => {
                 let dest = backups.dir_for(path)?;
                 fs::rename(path, &dest).map_err(|e| format!("{}: {e}", path.display()))?;
             }
@@ -1524,6 +1598,13 @@ pub fn restore(backup_dir: &Path) -> Result<Vec<String>, String> {
                 Ok(_) => format!("kept {} (changed since apply)", path.display()),
                 Err(_) => format!("{} is gone already", path.display()),
             },
+            "created-copy" => {
+                if crate::copies::remove_clean(&path, detail)? {
+                    format!("removed the copy {}", path.display())
+                } else {
+                    format!("kept {} (not the copy apply made, or changed since)", path.display())
+                }
+            }
             "created-link" => match link_target(&path) {
                 Some(to) if norm(&to) == norm(Path::new(detail)) => {
                     remove_link(&path)?;

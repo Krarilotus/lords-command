@@ -5,6 +5,7 @@ pub mod adapters;
 pub mod check;
 pub mod compose;
 pub mod config;
+pub mod copies;
 pub mod diff;
 pub mod finding;
 pub mod frontmatter;

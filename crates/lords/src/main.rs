@@ -236,8 +236,8 @@ fn print_plan(plan: &sync::Plan) {
                     i.target,
                     i.path.display()
                 );
-                if let Some(to) = &i.link_to {
-                    println!("   -> {}", to.display());
+                if let Some(from) = &i.copy_from {
+                    println!("   from {}", from.display());
                 }
                 for n in &i.notes {
                     println!("   note: {n}");

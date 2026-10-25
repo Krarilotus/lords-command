@@ -925,11 +925,15 @@ impl App {
                         Action::Create => ("+", GREEN, "create"),
                         Action::Update => ("~", AMBER, "update"),
                         Action::InSync => ("=", dim(TEXT), "in sync"),
-                        Action::Link => ("↗", GREEN, "link to the stack"),
-                        Action::Relink => ("↻", AMBER, "point the link at the stack"),
-                        Action::ReplaceDir => ("⇆", AMBER, "back up the dir, then link"),
-                        Action::Unlink => ("✂", AMBER, "remove a stale link"),
-                        Action::RemoveDir => ("⌫", AMBER, "back up and remove an old copy"),
+                        Action::Install => ("↓", GREEN, "install a copy of the skill"),
+                        Action::Refresh => {
+                            ("↻", AMBER, "back up the old copy, install the new one")
+                        }
+                        Action::ReplaceDir => ("⇆", AMBER, "back up the dir, then install a copy"),
+                        Action::ReplaceLink => ("⇆", AMBER, "remove the old link, install a copy"),
+                        Action::Uninstall => ("⌫", AMBER, "move sync's copy to the backup"),
+                        Action::Unlink => ("✂", AMBER, "remove an old link"),
+                        Action::RemoveDir => ("⌫", AMBER, "move an old copy to the backup"),
                         Action::RetireEntry => {
                             ("⌛", AMBER, "an expired temporary entry: retired in its stack")
                         }
@@ -956,8 +960,8 @@ impl App {
             for n in &item.notes {
                 ui.label(mono(format!("· {n}"), AMBER));
             }
-            if let Some(to) = &item.link_to {
-                ui.label(mono(format!("→ {}", to.display()), BLUE));
+            if let Some(from) = &item.copy_from {
+                ui.label(mono(format!("from {}", from.display()), BLUE));
             }
             ScrollArea::vertical().id_salt("plan-diff").auto_shrink([false, false]).show(
                 ui,

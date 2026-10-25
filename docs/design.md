@@ -218,11 +218,16 @@ line of `AGENTS.md`, in order, in the override, and the include in the local fil
 **A repo's tracked `AGENTS.md`** is never written: it changes by a commit on the repo's own branches. Sync reports
 what the public layers (public global, project and repo) would make of it, so the maintainer can commit that.
 
-**Skills** go into each adapter's skills dir as directory links (junctions on Windows, symlinks elsewhere), never
-copies. A link is the tool's if it points inside a stack (dir by dir, resolved). Sync creates, re-points and removes
-only those links, and only the link itself, never recursively. A real dir is the tool's only if it is a copy of a
-stack skill: its SKILL.md names it, it holds no link, and no file the stack's copy lacks. Every other dir stays. A real
-dir where a link should go is moved to the backup first, and its diff is shown. Walks never follow a link.
+**Skills** go into each adapter's skills dir as copies, never links (orchestrator, 25 Oct: a `git worktree remove
+--force` on Git for Windows 2.42 followed a skill junction and emptied the stack's skill dirs; symlinks need admin
+rights or developer mode on Windows). Each copy holds a manifest, `.lords-copy`, with one hash per file. Built beside
+its place and renamed in, a copy is whole or absent. Deleting it, with its worktree say, never reaches the stack.
+Sync refreshes a copy nobody changed when the stack's skill changes (the old one moves to the backup); a copy changed by
+hand is a conflict. A copy of a skill that no longer applies moves to the backup; nothing is deleted. A link of ours
+from an earlier version gives way to a copy (the link itself is removed, never recursively). A real dir without a
+manifest is the tool's only if it is a copy of a stack skill: its SKILL.md names it, it holds no link, and no file
+the stack's copy lacks. Every other dir stays. A real dir where a copy should go is moved to the backup first, and
+its diff is shown. Walks never follow a link. Codex reads the "Skills here" index in each place's file.
 
 **What apply may touch** (the Sol review of 25 Oct): only the configured path, as a plain file. A target that is a
 link, or lies below one, is a conflict; so is one sync can't read as UTF-8, and a file whose marker lines aren't one

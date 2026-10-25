@@ -227,9 +227,10 @@ fn skill(f: &Fixture, name: &str, text: &str) {
     );
 }
 
-// Spec (Sync, skills): a skill is installed as a link to the stack's dir, never a copy; a real dir in its place
-// is backed up and replaced; dirs not from a stack are left alone; a link for a skill that no longer applies is
-// removed without touching the stack.
+// Spec (Sync, skills; orchestrator, 25 Oct: "managed copies for Claude (deletable with the worktree without
+// harming the source)"): a skill is installed as a copy with a manifest, never a link; a real dir in its place is
+// backed up and replaced; dirs not from a stack are left alone; sync's copy of a skill that no longer applies is
+// moved to the backup, and the stack keeps the skill.
 #[test]
 fn skills_are_links_into_the_stack() {
     let f = Fixture::new();
@@ -242,7 +243,7 @@ fn skills_are_links_into_the_stack() {
     let opts = Options { user_only: true, ..Options::default() };
     let p = plan(&f.stacks(), &opts).unwrap();
     let by = |name: &str| p.items.iter().find(|i| i.path.ends_with(name)).unwrap();
-    assert_eq!(by("old").action, Action::Link);
+    assert_eq!(by("old").action, Action::Install);
     assert_eq!(by("spec-tests").action, Action::ReplaceDir);
     assert!(by("spec-tests").diff.contains("-Old text.\n+New text."));
     assert!(p.items.iter().any(|i| i.notes.iter().any(|n| n.contains("left alone: mine"))));
@@ -251,9 +252,9 @@ fn skills_are_links_into_the_stack() {
     assert_eq!(
         f.read("home/skills/spec-tests/SKILL.md"),
         "---\nname: spec-tests\n---\nNew text.\n",
-        "through the link"
+        "the copy"
     );
-    assert!(fs::read_link(dir.join("spec-tests")).is_ok(), "a link, not a copy");
+    assert!(fs::read_link(dir.join("spec-tests")).is_err(), "a copy, not a link");
     assert_eq!(f.read("home/skills/mine/SKILL.md"), "mine\n");
     let manifest = f.read("backups/manifest.tsv");
     assert_eq!(manifest.lines().filter(|l| l.starts_with("dir\t")).count(), 1, "{manifest}");
@@ -268,7 +269,7 @@ fn skills_are_links_into_the_stack() {
         ),
     );
     let p = plan(&f.stacks(), &opts).unwrap();
-    assert_eq!(p.items.iter().find(|i| i.path.ends_with("old")).unwrap().action, Action::Unlink);
+    assert_eq!(p.items.iter().find(|i| i.path.ends_with("old")).unwrap().action, Action::Uninstall);
     apply(&p, &f.path("backups2")).unwrap();
     assert!(!dir.join("old").exists());
     assert!(f.path("pub/global/skills/old/SKILL.md").exists(), "the stack keeps the skill");

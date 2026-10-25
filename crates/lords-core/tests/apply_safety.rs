@@ -289,7 +289,7 @@ fn sibling_of_stack_is_not_owned() {
     let p = plan_all(&f);
     assert!(
         p.items.iter().all(|i| i.path != dir.join("foreign")
-            || !matches!(i.action, Action::Unlink | Action::Relink)),
+            || !matches!(i.action, Action::Unlink | Action::ReplaceLink)),
         "{:#?}",
         p.items
     );
