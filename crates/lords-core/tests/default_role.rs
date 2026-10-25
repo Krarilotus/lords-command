@@ -112,8 +112,10 @@ fn a_worktree_outside_the_repo_folder_gets_its_files_and_owner_records_stay() {
     let ledger = Ledger::load(&f.home()).unwrap();
     let wt_key = lords_core::ledger::key(&wt);
     assert!(
-        !ledger.owned.values().any(|o| owner_named(Path::new(&o.path))
-            || lords_core::ledger::key(Path::new(&o.path)) == wt_key),
+        !ledger
+            .owned
+            .values()
+            .any(|o| owner_named(&o.path()) || lords_core::ledger::key(&o.path()) == wt_key),
         "never recorded: {:?}",
         ledger.owned.keys().collect::<Vec<_>>()
     );
