@@ -249,6 +249,7 @@ fn evidence_stays_beside_the_rule() {
         public_only: false,
         skip_stores: vec![],
         roles: None,
+        by_reference: false,
     };
     let text = lords_core::compose::compose(&s, &ctx).text;
     assert!(text.contains("One writer per file.") && !text.contains("Two lanes"), "{text}");

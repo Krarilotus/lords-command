@@ -42,6 +42,33 @@ fn role_pointer(notes: &[&Entry]) -> Option<String> {
     ))
 }
 
+const INTENT_INTRO: &str =
+    "The owner's intent, binding. Read an entry's file before work its subject touches; the file is the full text.";
+
+/// The longest hook an index line shows; the file it points to has the whole description.
+pub const HOOK_CHARS: usize = 100;
+
+/// A hook cut at a word boundary to at most `HOOK_CHARS` characters, with "…" when cut.
+fn short_hook(hook: &str) -> String {
+    if hook.chars().count() <= HOOK_CHARS {
+        return hook.to_string();
+    }
+    let cut: String = hook.chars().take(HOOK_CHARS).collect();
+    let at_word =
+        cut.rfind(' ').filter(|i| *i > HOOK_CHARS / 2).map_or(cut.as_str(), |i| &cut[..i]);
+    format!("{}…", at_word.trim_end_matches([',', ';', ':', ' ', '-', '—']))
+}
+
+/// An entry's file as an index line shows it (the platform's separators).
+fn shown_path(e: &Entry) -> String {
+    let path = e.body_file.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        path.replace('/', "\\")
+    } else {
+        path
+    }
+}
+
 /// One memory index line: name, its one-line hook, and the file to read.
 pub fn index_line(e: &Entry) -> String {
     // A skill's own SKILL.md frontmatter names and describes it, as the harness shows it.
@@ -62,9 +89,8 @@ pub fn index_line(e: &Entry) -> String {
         .unwrap_or_else(|| e.id().trim_start_matches("memory.").to_string());
     let described =
         e.meta.description.clone().or_else(|| skill.then(|| own("description")).flatten());
-    let hook = described.as_deref().unwrap_or(&e.meta.title);
-    let path = e.body_file.to_string_lossy().into_owned();
-    let path = if cfg!(windows) { path.replace('/', "\\") } else { path };
+    let hook = short_hook(described.as_deref().unwrap_or(&e.meta.title));
+    let path = shown_path(e);
     if hook.trim().is_empty() || hook == name {
         format!("- {name} (`{path}`)")
     } else {
@@ -113,6 +139,10 @@ pub struct Context {
     /// every role); with an unknown one, role-specific entries are labelled, and role-specific notes are left out
     /// of the memory index for a pointer to them.
     pub roles: Option<Vec<String>>,
+    /// For files every role reads whole, under a byte limit for some harnesses (a place's agent files): owner
+    /// intent, and entries for only some roles, as index lines (title and file, read on demand) instead of their
+    /// text. Role files and user-level files carry the text.
+    pub by_reference: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -250,7 +280,26 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
 
     let mut lines: Vec<String> = Vec::new();
     let push_entry = |e: &Entry, lines: &mut Vec<String>, out: &mut Composed| {
-        if let Some(who) = only_for(e, ctx, &development) {
+        let who = only_for(e, ctx, &development);
+        // In a file every role reads under a byte limit, an entry for only some roles is a reference; the role
+        // files of the roles it binds carry its text.
+        let partial_role = ctx.roles.is_none()
+            && !e.meta.roles.is_empty()
+            && !development.iter().all(|r| e.meta.roles.contains(r));
+        if ctx.by_reference && partial_role {
+            let who = who.unwrap_or_else(|| e.meta.roles.join(", "));
+            lines.push(format!("- ({who} only) {} (`{}`)", e.meta.title, shown_path(e)));
+            out.sources.push(Source {
+                line: lines.len(),
+                id: e.id().to_string(),
+                stack: e.stack,
+                file: e.body_file.clone(),
+                file_line: e.body_line,
+            });
+            out.ids.push(e.id().to_string());
+            return;
+        }
+        if let Some(who) = who {
             lines.push(format!("({who} only)"));
         }
         for (i, l) in e.body.trim_matches('\n').lines().enumerate() {
@@ -286,6 +335,31 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             lines.push(String::new());
         }
         lines.push(format!("# {heading}"));
+        if kind == Kind::Intent && ctx.by_reference {
+            lines.push(String::new());
+            lines.push(INTENT_INTRO.into());
+            lines.push(String::new());
+            for e in section {
+                let mut ext: Vec<&Entry> = live
+                    .iter()
+                    .copied()
+                    .filter(|x| extension_of(x, &ids) == Some(e.id()))
+                    .collect();
+                ext.sort_by_key(|x| x.id().to_string());
+                for x in std::iter::once(e).chain(ext) {
+                    lines.push(format!("- {} (`{}`)", x.meta.title, shown_path(x)));
+                    out.sources.push(Source {
+                        line: lines.len(),
+                        id: x.id().to_string(),
+                        stack: x.stack,
+                        file: x.body_file.clone(),
+                        file_line: 1,
+                    });
+                    out.ids.push(x.id().to_string());
+                }
+            }
+            continue;
+        }
         for e in section {
             lines.push(String::new());
             push_entry(e, &mut lines, &mut out);

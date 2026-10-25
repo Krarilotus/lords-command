@@ -90,6 +90,7 @@ fn the_composed_view_maps_each_line_to_its_source() {
             public_only: false,
             skip_stores: vec![],
             roles: None,
+            by_reference: false,
         },
     );
     let v = view::composed(&s, &c);

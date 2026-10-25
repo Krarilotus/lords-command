@@ -173,6 +173,11 @@ assumes a worktree per agent.
   (the override replaces it, and Codex doesn't expand includes). A tracked file of either name is a conflict, and
   nothing is applied.
 
+**By reference in shared place files.** Every role reads a place's agent files whole, and Codex stops at 32 KiB
+(silent truncation; the limit is never raised). So owner intent, and any entry for only some roles, appear there as
+index lines (title and file, read on demand); rules for every development role stay inline. The role files carry the
+full text. Index hooks are cut at a word, at 100 characters.
+
 **Role files.** Every checkout and workspace also gets `.lords/role-<role>.md` for each declared role (excluded from
 git): everything that role follows there, standing alone (global, project, the place, notes), so a brief can point at
 the file and carry only the task. The role `product` gets no development rule.

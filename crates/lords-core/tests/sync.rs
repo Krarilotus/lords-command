@@ -14,6 +14,7 @@ fn global(audience: Vec<Audience>) -> Context {
         public_only: false,
         skip_stores: vec![],
         roles: None,
+        by_reference: false,
     }
 }
 
@@ -120,6 +121,7 @@ fn repo_layers_take_their_project_and_repo() {
             public_only: false,
             skip_stores: vec![],
             roles: None,
+            by_reference: false,
         },
     );
     assert_eq!(c.ids, ["rule.p", "fact.r", "fact.s"]);
@@ -131,6 +133,7 @@ fn repo_layers_take_their_project_and_repo() {
             public_only: true,
             skip_stores: vec![],
             roles: None,
+            by_reference: false,
         },
     );
     assert_eq!(c.ids, ["rule.g", "rule.p", "fact.r"]);
@@ -393,7 +396,14 @@ fn the_memory_index_goes_to_places_never_to_the_user_level() {
         };
         compose(
             &f.stacks(),
-            &Context { audience, layers, public_only: false, skip_stores: skip, roles: None },
+            &Context {
+                audience,
+                layers,
+                public_only: false,
+                skip_stores: skip,
+                roles: None,
+                by_reference: false,
+            },
         )
         .text
     };
@@ -560,6 +570,7 @@ fn role_ctx(roles: Option<Vec<&str>>) -> Context {
         public_only: false,
         skip_stores: vec![],
         roles: roles.map(|r| r.into_iter().map(String::from).collect()),
+        by_reference: false,
     }
 }
 

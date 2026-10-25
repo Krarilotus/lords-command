@@ -159,6 +159,7 @@ fn context(
         public_only: false,
         skip_stores: native_stores(stacks, adapter),
         roles: None,
+        by_reference: false,
     }
 }
 
@@ -521,6 +522,7 @@ pub fn role_composed(stacks: &Stacks, layers: Layers, role: &str) -> Composed {
         public_only: false,
         skip_stores: Vec::new(),
         roles: Some(vec![role.to_string()]),
+        by_reference: false,
     };
     compose::compose(stacks, &ctx)
 }
@@ -583,7 +585,7 @@ fn place_items(stacks: &Stacks, place: &Place, plan: &mut Plan) {
     };
     for adapter in chosen {
         let file = adapter.repo_file();
-        let ctx = context(stacks, adapter, adapter.audience(), place.layers(false));
+        let ctx = place_context(stacks, adapter, place.layers(false));
         let composed = compose::compose(stacks, &ctx);
         let text = adapter.render(&composed);
         for p in &place.paths {
@@ -623,6 +625,7 @@ fn place_items(stacks: &Stacks, place: &Place, plan: &mut Plan) {
         public_only: false,
         skip_stores: Vec::new(),
         roles: None,
+        by_reference: false,
     };
     let skills: Vec<&Entry> = compose::applicable(stacks, &skill_ctx)
         .into_iter()
@@ -703,6 +706,7 @@ fn place_items(stacks: &Stacks, place: &Place, plan: &mut Plan) {
             public_only: true,
             skip_stores: Vec::new(),
             roles: None,
+            by_reference: false,
         };
         let composed = compose::compose(stacks, &ctx);
         let proposed = compose::place_block(&current, &composed.text, false);
@@ -928,10 +932,15 @@ pub fn user_composed(stacks: &Stacks, adapter: &dyn Adapter) -> Composed {
 
 /// What an adapter's untracked file in a repo holds, before the tracked-instructions preamble.
 pub fn repo_composed(stacks: &Stacks, place: &str, adapter: &dyn Adapter) -> Composed {
-    compose::compose(
-        stacks,
-        &context(stacks, adapter, adapter.audience(), place_layers(stacks, place, false)),
-    )
+    compose::compose(stacks, &place_context(stacks, adapter, place_layers(stacks, place, false)))
+}
+
+/// A place's agent files: read whole, under a byte limit for some harnesses, so intent goes by reference there
+/// (orchestrator T1, 25 Oct); the role files carry its text.
+fn place_context(stacks: &Stacks, adapter: &dyn Adapter, layers: Layers) -> Context {
+    let mut ctx = context(stacks, adapter, adapter.audience(), layers);
+    ctx.by_reference = true;
+    ctx
 }
 
 /// A repo's or a workspace's layers, by name.
