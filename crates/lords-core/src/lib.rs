@@ -17,6 +17,7 @@ pub mod privacy;
 pub mod schema;
 pub mod stack;
 pub mod sync;
+pub mod view;
 
 pub use finding::{Finding, Severity};
 pub use stack::{Stack, Stacks};

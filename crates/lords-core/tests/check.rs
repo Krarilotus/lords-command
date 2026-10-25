@@ -385,7 +385,10 @@ fn an_agents_loose_frontmatter_still_loads_in_a_store() {
     let loose = "---\nname: facts\ndescription: Facts: what we know vs beliefs\n---\nbody\n";
     f.write("priv/global/memory/agent/facts.md", loose);
     assert_eq!(errors(&f.check()), Vec::<&str>::new(), "{:#?}", f.check());
-    assert_eq!(f.stacks().find("memory.agent.facts").unwrap().meta.title, "Facts: what we know vs beliefs");
+    assert_eq!(
+        f.stacks().find("memory.agent.facts").unwrap().meta.title,
+        "Facts: what we know vs beliefs"
+    );
     f.write("priv/global/rules/r.md", &loose.replace("name: facts", "id: rule.r\nkind: rule"));
     assert!(errors(&f.check()).contains(&"schema"));
 }
