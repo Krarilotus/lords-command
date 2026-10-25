@@ -98,3 +98,28 @@ fn a_tracked_skill_of_the_same_name_is_a_clash() {
     assert!(apply(&p, &f.path("backups")).is_err());
     assert!(has(&f.check(), "skill-clash", "skill.verify"));
 }
+
+// Spec (above: "the four adapted skills are development skills, so their user-level junctions are dropped. The
+// non-OWL skills … aren't ours to manage; leave them untouched"): in a user-level skills dir, a plain copy of a
+// stack skill that no longer installs there is backed up and removed; a dir that is no stack skill stays.
+#[test]
+fn an_old_user_level_copy_of_a_development_skill_is_retired() {
+    let f = Fixture::new();
+    skill(&f, "spec-tests", "roles: [coder]\n");
+    let dir = f.path("home/skills");
+    f.write("home/skills/spec-tests/SKILL.md", "an old copy\n");
+    f.write("home/skills/frontend-design/SKILL.md", "not ours\n");
+    f.write(
+        "priv/stack.toml",
+        &format!("name = \"priv\"\nvisibility = \"private\"\nroles = [\"coder\"]\n[[targets]]\nname = \"skills\"\nadapter = \"codex\"\nkind = \"skills\"\npath = '{}'\n", dir.display()),
+    );
+    let p = plan(&f.stacks(), &Options { user_only: true, ..Options::default() }).unwrap();
+    let action =
+        |name: &str| p.items.iter().find(|i| i.path == dir.join(name)).map(|i| i.action.clone());
+    assert_eq!(action("spec-tests"), Some(Action::RemoveDir));
+    assert_eq!(action("frontend-design"), None);
+    apply(&p, &f.path("backups")).unwrap();
+    assert!(!dir.join("spec-tests").exists() && dir.join("frontend-design/SKILL.md").exists());
+    let backed: Vec<_> = fs::read_dir(f.path("backups")).unwrap().flatten().collect();
+    assert_eq!(backed.len(), 1, "the copy is in the backup");
+}

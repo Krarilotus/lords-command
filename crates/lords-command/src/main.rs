@@ -920,6 +920,7 @@ impl App {
                         Action::Relink => ("↻", AMBER, "point the link at the stack"),
                         Action::ReplaceDir => ("⇆", AMBER, "back up the dir, then link"),
                         Action::Unlink => ("✂", AMBER, "remove a stale link"),
+                        Action::RemoveDir => ("⌫", AMBER, "back up and remove an old copy"),
                         Action::Report => ("◌", BLUE, "tracked: shown, never written"),
                         Action::Conflict => ("✕", RED, "conflict"),
                     };

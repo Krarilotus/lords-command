@@ -29,6 +29,8 @@ pub enum Action {
     ReplaceDir,
     /// A link into a stack for a skill that no longer applies.
     Unlink,
+    /// A plain copy of a stack skill where that skill no longer installs (an older install): backed up, removed.
+    RemoveDir,
     /// Shown, never written (a tracked file: it changes by a commit, not by sync).
     Report,
     /// Can't proceed; the reason is in the notes.
@@ -352,9 +354,25 @@ fn skills_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec<Item>
         if wanted_names.contains(&name) {
             continue;
         }
+        let copy_of_ours = || {
+            child.is_dir()
+                && stacks.entries().any(|e| {
+                    e.meta.kind == Kind::Skill
+                        && !matches!(e.meta.origin, crate::model::Origin::InRepo { .. })
+                        && e.id().trim_start_matches("skill.") == name
+                })
+        };
         match link_target(&child) {
             Some(to) if in_a_stack(stacks, &to) => {
                 items.push(Item::new(&t.name, child.clone(), Action::Unlink))
+            }
+            None if copy_of_ours() => {
+                let mut item = Item::new(&t.name, child.clone(), Action::RemoveDir);
+                item.notes.push(
+                    "a copy of a stack skill that no longer installs here; backed up, then removed"
+                        .into(),
+                );
+                items.push(item);
             }
             _ => unmanaged.push(name),
         }
@@ -887,6 +905,11 @@ pub fn apply(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
                 make_link(&item.path, to)?;
             }
             Action::Unlink => remove_link(&item.path)?,
+            Action::RemoveDir => {
+                fs::create_dir_all(backup_dir).map_err(|e| e.to_string())?;
+                fs::rename(&item.path, &backup)
+                    .map_err(|e| format!("{}: {e}", item.path.display()))?;
+            }
             Action::InSync | Action::Report | Action::Conflict => continue,
         }
         done.push(format!("{:?} {}", item.action, item.path.display()));
