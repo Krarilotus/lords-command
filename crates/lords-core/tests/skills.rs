@@ -68,7 +68,7 @@ fn development_skills_install_per_checkout() {
     // harming the source)"), with its manifest.
     let installed = checkout.join(".claude/skills/spec-tests");
     assert!(fs::read_link(&installed).is_err() && installed.join("SKILL.md").is_file());
-    assert!(installed.join(lords_core::copies::MANIFEST).is_file());
+    assert!(installed.join(lords_core::copies::RECORD).is_file());
     let exclude = fs::read_to_string(checkout.join(".git/info/exclude")).unwrap();
     assert!(
         exclude.lines().any(|l| l == "/.claude/skills/spec-tests/")

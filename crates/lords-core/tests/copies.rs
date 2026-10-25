@@ -150,3 +150,39 @@ fn dir_link(link: &Path, to: &Path) {
     #[cfg(not(windows))]
     std::os::unix::fs::symlink(to, link).unwrap();
 }
+
+// Spec (orchestrator, 25 Oct: "A copy carries an ownership record (`.lords/owned.toml`: stack entry id, source
+// path, sha256 per file)"; "Keep the copies out of git (exact-path excludes), and size them into the check"): the
+// record names the entry, its source dir and each file's hash; the copy's exact path is excluded; `check` sizes the
+// copies.
+#[test]
+fn a_copy_carries_its_ownership_record() {
+    let f = Fixture::new();
+    skill(&f, "spec-tests", "---\nname: spec-tests\n---\nSteps.\n");
+    let checkout = repo(&f);
+    apply(&plan_all(&f), &f.path("backups/one")).unwrap();
+    let installed = checkout.join(".claude/skills/spec-tests");
+    let record: toml::Value =
+        toml::from_str(&fs::read_to_string(installed.join(lords_core::copies::RECORD)).unwrap())
+            .unwrap();
+    assert_eq!(record["entry"].as_str(), Some("skill.spec-tests"));
+    let source = f
+        .path("pub/global/skills/spec-tests")
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    assert_eq!(record["source"].as_str(), Some(source.as_str()));
+    let sha = format!(
+        "{:x}",
+        <sha2::Sha256 as sha2::Digest>::digest(b"---\nname: spec-tests\n---\nSteps.\n")
+    );
+    assert_eq!(record["files"]["SKILL.md"].as_str(), Some(sha.as_str()));
+    assert!(record["files"].get("lords.yaml").is_none(), "the sidecar stays in the stack");
+    let exclude = fs::read_to_string(checkout.join(".git/info/exclude")).unwrap();
+    assert!(exclude.lines().any(|l| l == "/.claude/skills/spec-tests/"), "{exclude}");
+    assert_eq!(git(&checkout, &["status", "--porcelain"]), "");
+    let found = lords_core::sync::drift_findings(&f.stacks());
+    assert!(
+        found.iter().any(|x| x.code == "skill-copies" && x.message.contains("repo beta-core")),
+        "{found:#?}"
+    );
+}

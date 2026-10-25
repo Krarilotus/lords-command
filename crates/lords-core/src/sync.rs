@@ -691,7 +691,7 @@ fn copy_item(stacks: &Stacks, target: &str, dest: &Path, e: &Entry) -> Item {
     if let Err(err) = dirs_guard(dest) {
         return conflict(target, dest, err);
     }
-    let want = match crate::copies::manifest_of(&src) {
+    let want = match crate::copies::record_of(&src) {
         Ok((_, hash)) => hash,
         Err(err) => return conflict(target, dest, err),
     };
@@ -985,24 +985,7 @@ fn place_items(stacks: &Stacks, place: &Place, only: Option<&str>, plan: &mut Pl
     }
     // Development skills, copied into each checkout for harnesses that read a skills dir there. Each copy's exact
     // path is excluded, never the dir, so skills the repo tracks there stay visible to git.
-    let skill_ctx = Context {
-        audience: vec![Audience::Opus, Audience::Sol, Audience::Astra],
-        layers: place.layers(false),
-        public_only: false,
-        skip_stores: Vec::new(),
-        roles: None,
-        by_reference: false,
-        role_dir: None,
-        relative_to: None,
-        default_role: None,
-    };
-    let skills: Vec<&Entry> = compose::applicable(stacks, &skill_ctx)
-        .into_iter()
-        .filter(|e| {
-            e.meta.kind == Kind::Skill
-                && !matches!(e.meta.origin, crate::model::Origin::InRepo { .. })
-        })
-        .collect();
+    let skills = place_skills(stacks, place.layers(false));
     let skill_dirs: Vec<&str> = place_adapters(place)
         .iter()
         .filter(|a| only.is_none_or(|o| o == a.id()))
@@ -1552,7 +1535,7 @@ pub fn apply(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
                     }
                     _ => {}
                 }
-                let (_, hash) = crate::copies::manifest_of(src)?;
+                let (_, hash) = crate::copies::record_of(src)?;
                 backups.created(path, "copy", &hash)?;
                 crate::copies::install(src, path)?;
             }
@@ -1641,6 +1624,28 @@ pub fn restore(backup_dir: &Path) -> Result<Vec<String>, String> {
         done.push(step);
     }
     Ok(done)
+}
+
+/// The stack skills a place installs (copied into each checkout for harnesses that read a skills dir there).
+fn place_skills(stacks: &Stacks, layers: Layers) -> Vec<&Entry> {
+    let ctx = Context {
+        audience: vec![Audience::Opus, Audience::Sol, Audience::Astra],
+        layers,
+        public_only: false,
+        skip_stores: Vec::new(),
+        roles: None,
+        by_reference: false,
+        role_dir: None,
+        relative_to: None,
+        default_role: None,
+    };
+    compose::applicable(stacks, &ctx)
+        .into_iter()
+        .filter(|e| {
+            e.meta.kind == Kind::Skill
+                && !matches!(e.meta.origin, crate::model::Origin::InRepo { .. })
+        })
+        .collect()
 }
 
 /// What an adapter's user-level file holds: the composition sync writes (the GUI shows it line by line).
@@ -2047,6 +2052,36 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
                 enabled,
             });
         }
+        // The skill copies in each checkout and worktree (the adapters that read a skills dir there).
+        let copying = adapters::ALL.iter().any(|a| {
+            a.repo_skills_dir().is_some() && (ids.is_empty() || ids.iter().any(|i| i == a.id()))
+        });
+        let skills = place_skills(stacks, place_layers(stacks, &name, false));
+        if copying && !skills.is_empty() {
+            let mut parts: Vec<(String, usize)> = skills
+                .iter()
+                .map(|e| {
+                    let src = e.meta_file.parent().unwrap_or(Path::new("."));
+                    let n = crate::copies::copy_bytes(src).unwrap_or(0) as usize;
+                    (e.id().trim_start_matches("skill.").to_string(), n)
+                })
+                .collect();
+            let each: usize = parts.iter().map(|(_, n)| n).sum();
+            let paths = match private.manifest.repos.get(&name) {
+                Some(repo) => checkouts(repo).0.len().max(1),
+                None => 1,
+            };
+            parts.push((format!("in all {paths}"), each * paths));
+            out.push(Size {
+                place: label.clone(),
+                file: "skill copies".into(),
+                bytes: each,
+                reads: 0,
+                limit: None,
+                sections: parts,
+                enabled: true,
+            });
+        }
         for role in declared_roles(stacks) {
             let text = role_composed(stacks, place_layers(stacks, &name, true), &role).text;
             out.push(Size {
@@ -2066,7 +2101,22 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
 /// What one session in a place reads together (the user-level text, the place's own, and the tracked
 /// instructions it carries), against each adapter's limit.
 fn repo_size_findings(stacks: &Stacks) -> Vec<crate::Finding> {
-    sizes(stacks)
+    let all = sizes(stacks);
+    let copies = all.iter().filter(|s| s.file == "skill copies").map(|s| {
+        let total = s.sections.last().map_or(s.bytes, |(_, n)| *n);
+        crate::Finding::info(
+            "skill-copies",
+            format!(
+                "{}: skill copies take {} KB in each checkout or worktree, {} KB {}",
+                s.place,
+                s.bytes.div_ceil(1024),
+                total.div_ceil(1024),
+                s.sections.last().map(|(w, _)| w.as_str()).unwrap_or("")
+            ),
+        )
+    });
+    let copies: Vec<crate::Finding> = copies.collect();
+    let mut out: Vec<crate::Finding> = all
         .into_iter()
         .filter(|s| s.reads > s.bytes && s.over_line())
         .map(|s| {
@@ -2083,5 +2133,7 @@ fn repo_size_findings(stacks: &Stacks) -> Vec<crate::Finding> {
                 ),
             )
         })
-        .collect()
+        .collect();
+    out.extend(copies);
+    out
 }

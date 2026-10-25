@@ -220,8 +220,9 @@ what the public layers (public global, project and repo) would make of it, so th
 
 **Skills** go into each adapter's skills dir as copies, never links (orchestrator, 25 Oct: a `git worktree remove
 --force` on Git for Windows 2.42 followed a skill junction and emptied the stack's skill dirs; symlinks need admin
-rights or developer mode on Windows). Each copy holds a manifest, `.lords-copy`, with one hash per file. Built beside
-its place and renamed in, a copy is whole or absent. Deleting it, with its worktree say, never reaches the stack.
+rights or developer mode on Windows). Each copy carries an ownership record, `.lords/owned.toml`: the stack entry's
+id, its source dir and a SHA-256 per file. Built beside its place and renamed in, a copy is whole or absent. Its exact
+path is excluded from git, and `check` sizes the copies per place (about 33 KB per checkout today). Deleting it, with its worktree say, never reaches the stack.
 Sync refreshes a copy nobody changed when the stack's skill changes (the old one moves to the backup); a copy changed by
 hand is a conflict. A copy of a skill that no longer applies moves to the backup; nothing is deleted. A link of ours
 from an earlier version gives way to a copy (the link itself is removed, never recursively). A real dir without a
