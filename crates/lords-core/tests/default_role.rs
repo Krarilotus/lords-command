@@ -2,6 +2,9 @@
 //! reference, with the role-files line naming the default role's file first"), and worktrees outside the
 //! repo folder (orchestrator, 25 Oct: a project keeps them in `<project>/.local/wt/<package>`, owned per `.owner.toml`).
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod common;
 use common::*;
 use lords_core::ledger::Ledger;
