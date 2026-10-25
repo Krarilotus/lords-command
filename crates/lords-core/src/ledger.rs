@@ -11,14 +11,18 @@ const HEADER: &str =
     "# Lords Command: every path sync created and still owns. Sync rewrites this file; don't edit it by hand.";
 
 /// The ledger's format, written as `format = N` (Sol review r4, R4-05). A build reads only its own; there is no
-/// migration (no ledger existed before this one, 25 Oct). Raise it whenever a key, a hash or a field changes meaning.
-pub const FORMAT: u32 = 1;
+/// migration. Raise it whenever a key, a hash or a field changes meaning. Format 2 (design-simplification-r6, rule
+/// A) records a root and the parts below it, and computes the path; format 1 held only this PC's two hook records.
+pub const FORMAT: u32 = 2;
 
-/// One tool-owned path.
+/// One tool-owned path: the root it lies in and its parts below it. The path is computed, never stored, so a
+/// record is valid exactly when its root is still one sync verifies for its scope (`sync::plan`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Owned {
-    /// The path as sync wrote it.
-    pub path: String,
+    /// The root, as the plan verified it (a target's dir, a checkout, a workspace, a hooks dir).
+    pub root: String,
+    /// The names below the root.
+    pub parts: Vec<String>,
     /// "file" or "dir".
     pub kind: String,
     /// What sync put there: a file's SHA-256, or a dir's tree hash (`fsguard::tree_sha`).
@@ -85,16 +89,20 @@ fn well_formed(o: &Owned) -> Result<(), String> {
     {
         return Err(format!("sha `{}` (a SHA-256)", o.sha));
     }
-    let path = Path::new(&o.path);
-    if !path.is_absolute() {
-        return Err("a relative path".into());
+    if !Path::new(&o.root).is_absolute() {
+        return Err("a relative root".into());
+    }
+    if o.parts.is_empty() {
+        return Err("no parts below its root".into());
+    }
+    for part in &o.parts {
+        fsguard::Part::new(part)?;
     }
     match o.scope.split_once(':') {
         Some(("hooks", dir)) => {
-            let name =
-                path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let parent = path.parent().map(key).unwrap_or_default();
-            if parent != dir || !crate::hooks::NAMES.contains(&name.as_str()) || o.kind != "file" {
+            let hook =
+                matches!(o.parts.as_slice(), [n] if crate::hooks::NAMES.contains(&n.as_str()));
+            if key(Path::new(&o.root)) != dir || !hook || o.kind != "file" {
                 return Err(format!("not a hook in {dir}"));
             }
             Ok(())
@@ -106,6 +114,26 @@ fn well_formed(o: &Owned) -> Result<(), String> {
 
 pub fn file(home: &Path) -> PathBuf {
     home.join("state").join("ledger.toml")
+}
+
+impl Owned {
+    /// Its path: the root and the parts below it.
+    pub fn path(&self) -> PathBuf {
+        self.parts.iter().fold(PathBuf::from(&self.root), |p, part| p.join(part))
+    }
+
+    /// Its place below `root` (a root the plan verified for its scope, whose path is this record's root).
+    pub fn place(&self, root: &fsguard::Root) -> Result<fsguard::Contained, String> {
+        let parts: Vec<fsguard::Part> =
+            self.parts.iter().map(|p| fsguard::Part::new(p)).collect::<Result<_, _>>()?;
+        Ok(root.join(&parts))
+    }
+}
+
+/// The ledger's file as a place in the tool's home.
+fn place(home: &Path) -> Result<fsguard::Contained, String> {
+    let names = [fsguard::Part::new("state")?, fsguard::Part::new("ledger.toml")?];
+    Ok(fsguard::Root::home(home)?.join(&names))
 }
 
 impl Ledger {
@@ -162,16 +190,16 @@ impl Ledger {
                 format!(
                     "{}: the record of {} is wrong: {e}; sync does nothing until it is put right",
                     path.display(),
-                    o.path
+                    o.path().display()
                 )
             })?;
-            let k = key(Path::new(&o.path));
+            let k = key(&o.path());
             if let Some(other) = ledger.owned.insert(k, o.clone()) {
                 return Err(format!(
                     "{}: {} and {} are one path; sync does nothing until the ledger is put right",
                     path.display(),
-                    other.path,
-                    o.path
+                    other.path().display(),
+                    o.path().display()
                 ));
             }
         }
@@ -179,29 +207,31 @@ impl Ledger {
     }
 
     pub fn save(&self, home: &Path) -> Result<(), String> {
-        let path = file(home);
-        fsguard::create_dir_all(path.parent().expect("the ledger has a dir"))?;
+        let at = place(home)?;
+        fsguard::create_dir_all(&fsguard::Root::home(home)?.join(&[fsguard::Part::new("state")?]))?;
         let body = toml::to_string(self).map_err(|e| e.to_string())?;
-        fsguard::replace_own_file(&path, format!("{HEADER}\nformat = {FORMAT}\n{body}").as_bytes())
+        fsguard::replace_own_file(&at, format!("{HEADER}\nformat = {FORMAT}\n{body}").as_bytes())
     }
 
     /// The record of `path`. A record spelt otherwise (a case-only rename, say) counts only while both spellings
     /// exist and name one file by its identity (Sol review r3, R3-04): never two files whose keys merely agree.
     pub fn get(&self, path: &Path) -> Option<&Owned> {
         let o = self.owned.get(&key(path))?;
-        let recorded = Path::new(&o.path);
-        if recorded == path || fsguard::same_file(recorded, path).unwrap_or(false) {
+        let recorded = o.path();
+        if recorded == path || fsguard::same_file(&recorded, path).unwrap_or(false) {
             Some(o)
         } else {
             None
         }
     }
 
-    pub fn record(&mut self, path: &Path, kind: &str, sha: &str, scope: &str) {
+    /// Records a place sync just put there: its root and parts, so the path is the place's.
+    pub fn record(&mut self, at: &fsguard::Contained, kind: &str, sha: &str, scope: &str) {
         self.owned.insert(
-            key(path),
+            key(at.path()),
             Owned {
-                path: path.to_string_lossy().into_owned(),
+                root: at.root().path().to_string_lossy().into_owned(),
+                parts: at.parts().iter().map(|p| p.as_str().to_string()).collect(),
                 kind: kind.into(),
                 sha: sha.into(),
                 scope: scope.into(),

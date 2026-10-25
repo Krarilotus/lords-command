@@ -132,11 +132,12 @@ A **finding** is a matched span: file, line, pattern class and the matched text.
   the repo's own hooks (such as an attribution guard) keeps working.
 - **Guarantee 7, and its limit** (orchestrator, 25 Oct, decision 8). No personal detail reaches a public commit:
   this holds as long as commits run through the effective privacy hooks (standing rule: never skip hooks, never
-  repoint the hooks path). `lords check` verifies it for the public repo: the hooks Git runs (through
-  `core.hooksPath` if set; through the owner's attribution-guard dispatcher to the hook it delegates to, unless it
-  skips that hook with `attributionGuard.skipPreviousHook`) are both privacy hooks, or each that isn't is "not
-  verified". That says what holds when the check runs; it can't stop `--no-verify`, a hooks path set afterwards, or a
-  commit from another environment, and no hook can.
+  repoint the hooks path). `lords check` verifies it for the public repo by running the hooks, not by reading files
+  (design-simplification-r6, rule D): it makes a nonce file in the tool's home, runs `git hook run` for pre-commit and
+  commit-msg with `LORDS_HOOK_PROBE` set to the nonce, and deletes the file. A privacy hook answers only a nonce whose
+  file exists, so a value set anywhere else runs the check as ever. A hook whose answer doesn't come back, through
+  any hooks path or dispatcher, or a git that fails, is "not verified". That says what holds when the check runs; it
+  can't stop `--no-verify`, a hooks path set afterwards, or a commit from another environment, and no hook can.
 - **The repo's own commit check.** Where a repo tracks `tools/commit-check.sh`, the pre-commit hook runs it before the
   privacy check. Lords Command's runs `cargo fmt --check` and clippy with `-D warnings`, which carries the filesystem
   and process boundary (below).
@@ -291,6 +292,14 @@ no directory listing decides what goes. What goes is what the ledger holds and t
   UTF-16 unit to one), never by Unicode's full case mapping, which merges names NTFS keeps apart (`İ.txt` and
   `i̇.txt`). A record spelt otherwise than the path asked about counts only while both exist and are one file by
   volume and file id. `\\?\UNC\host\share` and `\\host\share` are one key.
+- **Places by types** (design-simplification-r6, rule A). fsguard changes nothing given as a plain path: only a
+  `Contained`, which `Root::join` makes from a root verified when it was made (a stack's dir, the tool's home, a
+  target's dir, a workspace, a checkout or worktree whose git top level is exactly that path and whose git dir is
+  there, git's hooks dir of one), or an `OwnerFile` the config or a verified checkout names. Every writer names its
+  root, or it doesn't compile: import, promotion and the other stack edits join validated parts under the stack's
+  root (R6-01), a discovered worktree passes the same check as a configured one (R6-02), set-aside takes a path only
+  within one of the plan's verified roots, and restore re-derives every manifest line under the current config,
+  refusing whole, with each line and its backup listed, when one doesn't.
 - **One grammar of places** (R4-01). A scope names roots and the slots sync writes in them, and both sync and the
   ledger check get every path from it, so they can't drift apart: a `target:<name>` skills target is its dir, with
   one dir per skill; a `target:<name>` instructions target with `via` is its shared file; `repo:<name>` and
@@ -307,8 +316,9 @@ no directory listing decides what goes. What goes is what the ledger holds and t
   or place the stack no longer declares is never acted on (no plan covers it) and is noted; it is checked again if
   that target comes back. Replacing or removing a path also checks that what is there is the kind its record says.
 - **Its format** (R4-05). The ledger states `format = N`; a build reads only its own, and any other or none is
-  refused ("ledger format N, this build reads M"). There is no migration: no ledger existed anywhere before format
-  1 (checked 25 Oct on all five machines).
+  refused ("ledger format N, this build reads M"). There is no migration. Format 2 (rule A) records a root and the
+  parts below it and computes the path, so a record is valid exactly when its root still verifies; format 1 held only
+  this PC's two hook records of 25 Oct, which are deleted and installed again.
 - **A save cut short** leaves the old ledger beside it as `.ledger.toml.lords-old-*`. While one is there, loading
   refuses and names the recovery: rename it back when `ledger.toml` is missing; otherwise the new one is in place,
   and the old one goes once checked.
@@ -339,6 +349,12 @@ be read, a git call that fails comes back as an error, and a decision on it refu
 (a missing state dir is no ledger). A read that turns an error into nothing is named `_lossy`, is for display only,
 and no decision calls one.
 
+**Removal only from a complete view** (design-simplification-r6, rule B). A plan removes or forgets a path only with
+a `Complete` witness, which planning makes only when the stacks and the config loaded with no error-level problem;
+apply refuses a removal without it, and `uninstall` refuses outright. With any load problem a skill that couldn't be
+read would look unwanted, so sync then installs and updates and removes nothing (R6-05), and says why. That is also
+what closes the swallowed-error class: an error elsewhere can only make sync write less, never delete.
+
 **Operating assumption** (R3-05). The promise that sync never acts through a link or outside a target holds under
 this assumption: one operator, and nothing else renames or relinks the place paths during an apply. The choke point
 checks a path, then acts on it by name: the check and the action are two steps, not one on an open handle. A
@@ -354,8 +370,11 @@ so no swapped path can redirect an action at all.
 **Owner-file edits** read the file and compare it with what was planned, then keep its bytes in the run's backup
 before anything moves; a backup that fails changes nothing (R3-02). Then the file moves aside, and what was moved is
 compared again. A mismatch means an edit since planning: the file goes back and that item fails, so nothing an owner
-wrote is lost, even during the apply. Otherwise the new file goes in with the old one's attributes (read-only,
-hidden and the rest, R3-06). Any error after the move puts the old file back. Backups are numbered files with a
+wrote is lost, even during the apply. Otherwise the new file goes in with the old one's attributes (R3-06), by an
+allowlist (design-simplification-r6, rule C): what can be set back (read-only, hidden, system, archive,
+not-indexed; the mode elsewhere) is kept, and any other bit (sparse, compressed, encrypted, offline, the cloud bits,
+a reparse point, a bit Windows adds later) refuses the item before anything moves. Any error after the move puts the
+old file back. Backups are numbered files with a
 manifest naming each original path, the hash sync wrote and the file's attributes. `restore` puts a file back, with
 its attributes (R4-03), only while it still holds exactly what sync wrote; anything else is left and reported.
 
@@ -363,9 +382,14 @@ its attributes (R4-03), only while it still holds exactly what sync wrote; anyth
 new files, whether they commit or not (R3-10): git is the stack's backup, so an edit cut short, or made with
 `--no-commit`, is undone from git. Outside git, a stack edit only writes new files. A file a stack edit rewrites keeps
 its attributes. Promoting an entry deletes its private files, so it refuses while they hold anything git can't give
-back or the promotion doesn't carry: an empty dir, a file outside the entry, a file that isn't text, or a file an
-owner marked read-only, hidden or system (R4-07, R5-05). `restore` keeps a file apply created once the owner has
-marked it so. Under `sync --apply` stack edits run under the same lock, after the
+back or the promotion doesn't carry: an empty dir, a file outside the entry, a file that isn't text, or any
+attribute but ARCHIVE or NORMAL on a file and DIRECTORY on a dir (rule C's allowlist: R4-07, R5-05, R6-06).
+`restore` keeps a file apply created once anything but what sync leaves is set on it.
+
+**The install stage** (design-simplification-r6, staged first use). `lords sync --apply --stage install` writes only
+tool-owned paths (create, install, update, refresh) and each repo's two git-exclude lines, place by place: a place
+with any conflict is skipped whole, and said. It removes nothing, edits no other owner file, and imports and retires
+nothing. Under `sync --apply` stack edits run under the same lock, after the
 plan is known to apply.
 
 **The changeover, once and with a human:** the 3a place files, the old `~/.codex/skills` copies and any other path

@@ -79,7 +79,7 @@ impl Fixture {
     }
 
     pub fn check(&self) -> Vec<Finding> {
-        lords_core::check::check(&self.stacks(), &Rules::public())
+        lords_core::check::check_at(&self.stacks(), &Rules::public(), &self.home())
     }
 
     pub fn git_init(&self, rel: &str) {
@@ -148,7 +148,17 @@ pub fn forge(home: &Path, root: &Path, parts: &[&str], kind: &str, scope: &str) 
     } else {
         lords_core::fsguard::sha(&fs::read(&path).unwrap())
     };
-    let mut ledger = lords_core::ledger::Ledger::load(home).unwrap();
-    ledger.record(&path, kind, &sha, scope);
-    ledger.save(home).unwrap();
+    // Written into the file as a person would, in the ledger's own format (2: root and parts).
+    let file = lords_core::ledger::file(home);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let mut text = fs::read_to_string(&file)
+        .unwrap_or_else(|_| format!("format = {}\n", lords_core::ledger::FORMAT));
+    let parts: Vec<String> = parts.iter().map(|p| format!("'{p}'")).collect();
+    text.push_str(&format!(
+        "\n[owned.'{}']\nroot = '{}'\nparts = [{}]\nkind = '{kind}'\nsha = '{sha}'\nscope = '{scope}'\n",
+        lords_core::ledger::key(&path),
+        root.display(),
+        parts.join(", ")
+    ));
+    fs::write(&file, text).unwrap();
 }

@@ -510,7 +510,7 @@ fn restore_undoes_an_apply_of_owner_files() {
     let run = apply(&plan_all(&f)).unwrap().backups.unwrap();
     assert!(new.exists());
     fs::write(&edited, "EDITED AFTER APPLY").unwrap();
-    let steps = lords_core::sync::restore(&f.home(), &run).unwrap();
+    let steps = lords_core::sync::restore(&plan_all(&f), &run).unwrap();
     assert_eq!(fs::read_to_string(&kept).unwrap(), "OWNER\n", "{steps:?}");
     assert!(!new.exists(), "{steps:?}");
     assert_eq!(fs::read_to_string(&edited).unwrap(), "EDITED AFTER APPLY", "{steps:?}");

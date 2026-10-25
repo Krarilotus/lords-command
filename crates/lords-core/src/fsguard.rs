@@ -222,14 +222,14 @@ fn beside(path: &Path, what: &str) -> Result<PathBuf, String> {
     Ok(dir.join(format!(".{name}.lords-{what}-{}-{nanos}-{n}", crate::process::id())))
 }
 
-pub fn create_dir_all(dir: &Path) -> Result<(), String> {
+fn create_dir_all_at(dir: &Path) -> Result<(), String> {
     check(dir)?;
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     check(dir)
 }
 
 /// Writes a new file where nothing is; refused when anything is there. Its bytes are on disk when this returns.
-pub fn create_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn create_file_at(path: &Path, bytes: &[u8]) -> Result<(), String> {
     check(path)?;
     let mut f = fs::OpenOptions::new()
         .write(true)
@@ -240,7 +240,7 @@ pub fn create_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 /// Appends one line to a file that is the tool's alone (a backup manifest); its bytes are on disk when this returns.
-pub fn append_line(path: &Path, line: &str) -> Result<(), String> {
+fn append_line_at(path: &Path, line: &str) -> Result<(), String> {
     check(path)?;
     let mut f = fs::OpenOptions::new()
         .append(true)
@@ -253,15 +253,8 @@ pub fn append_line(path: &Path, line: &str) -> Result<(), String> {
 
 /// Puts a file at `path`, where nothing may be: written beside it, then linked in (which fails if something
 /// appeared meanwhile), so `path` is absent or whole.
-///
-/// Spec (design-simplification-r6, rule A: "fsguard's mutating calls take no `&Path`"): a plain path doesn't
-/// compile, only a place built from a verified root.
-///
-/// ```compile_fail
-/// lords_core::fsguard::put_file(std::path::Path::new("anywhere"), b"bytes").unwrap();
-/// ```
-pub fn put_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    put_file_as(path, bytes, None)
+fn put_file_at(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    put_file_as_at(path, bytes, None)
 }
 
 #[cfg(test)]
@@ -286,13 +279,13 @@ fn link_in(staged: &Path, path: &Path) -> std::io::Result<()> {
 
 /// `put_file`, then the file attributes `like` (an owner file's, taken before it moved aside: Sol review r3, R3-06).
 /// If they can't be set, the new file goes again, so `path` is absent or whole with them.
-pub fn put_file_as(path: &Path, bytes: &[u8], like: Option<&Attrs>) -> Result<(), String> {
+fn put_file_as_at(path: &Path, bytes: &[u8], like: Option<&Attrs>) -> Result<(), String> {
     check(path)?;
     if let Some(dir) = path.parent() {
-        create_dir_all(dir)?;
+        create_dir_all_at(dir)?;
     }
     let staged = beside(path, "new")?;
-    create_file(&staged, bytes)?;
+    create_file_at(&staged, bytes)?;
     // Linking in is the only way a file appears at a sync path: on a volume without hard links sync refuses, never
     // writes in place (Sol review r4, R4-04: that left a partial file where the old one had to go back).
     let linked = link_in(&staged, path);
@@ -314,10 +307,20 @@ pub fn put_file_as(path: &Path, bytes: &[u8], like: Option<&Attrs>) -> Result<()
     Ok(())
 }
 
-/// A file's attributes that an owner may have set: on Windows read-only, hidden, system, archive and
-/// not-indexed; elsewhere its mode.
+/// A file's or dir's attributes, all of them (design-simplification-r6, rule C): on Windows its attribute bits,
+/// elsewhere its mode. Sync keeps exactly what it can set back and refuses the rest, by an allowlist, so a bit it
+/// has never heard of refuses too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Attrs(u32);
+
+/// Windows bits: the ones SetFileAttributes sets back (read-only, hidden, system, archive, not-indexed), NORMAL
+/// (no other bit), and DIRECTORY.
+#[cfg(windows)]
+const SETTABLE: u32 = 0x1 | 0x2 | 0x4 | 0x20 | 0x2000;
+#[cfg(windows)]
+const NORMAL: u32 = 0x80;
+#[cfg(windows)]
+const DIRECTORY: u32 = 0x10;
 
 impl Attrs {
     /// As a backup manifest stores them (Sol review r4, R4-03): `attrs:<hex>`.
@@ -330,47 +333,69 @@ impl Attrs {
         u32::from_str_radix(text.strip_prefix("attrs:")?, 16).ok().map(Attrs)
     }
 
-    /// Whether an owner set something git can't give back (Sol review r5, R5-05): on Windows read-only, hidden or
-    /// system; elsewhere a file the owner can't write.
-    pub fn unusual(&self) -> bool {
-        if cfg!(windows) {
-            self.0 & (0x1 | 0x2 | 0x4) != 0
-        } else {
-            self.0 & 0o200 == 0
+    /// What a replace keeps (rule C): the attributes it can set back on the new file, or, when anything else is set
+    /// (sparse, compressed, encrypted, offline, the cloud bits, a reparse point, integrity, a bit Windows adds
+    /// later), an error naming it: the item refuses.
+    pub fn keep(&self) -> Result<Attrs, String> {
+        #[cfg(windows)]
+        {
+            let other = self.0 & !(SETTABLE | NORMAL | DIRECTORY);
+            if other != 0 {
+                return Err(format!(
+                    "attributes 0x{other:x} it can't set back on a new file; sync leaves it as it is"
+                ));
+            }
+            Ok(Attrs(self.0 & SETTABLE))
+        }
+        #[cfg(unix)]
+        Ok(Attrs(self.0 & 0o7777))
+    }
+
+    /// Whether git alone gives this back (rule C, for promotion, whose only recovery is git): on Windows only ARCHIVE
+    /// or NORMAL on a file and nothing but DIRECTORY on a dir; elsewhere a mode git restores (owner read and write,
+    /// no set-id or sticky bit).
+    pub fn git_restores(&self, dir: bool) -> bool {
+        #[cfg(windows)]
+        {
+            let allowed = if dir { DIRECTORY } else { 0x20 | NORMAL };
+            self.0 & !allowed == 0
+        }
+        #[cfg(unix)]
+        {
+            let _ = dir;
+            self.0 & 0o7000 == 0 && self.0 & 0o600 == 0o600
         }
     }
 
-    /// `unusual` for a dir: hidden or system (a Windows dir's read-only bit only customises Explorer).
-    pub fn unusual_for_dir(&self) -> bool {
-        if cfg!(windows) {
-            self.0 & (0x2 | 0x4) != 0
-        } else {
-            self.unusual()
-        }
+    /// Whether only what sync itself leaves is set (ARCHIVE or NORMAL; a mode git restores): a file it created and
+    /// nobody marked since.
+    pub fn as_sync_leaves(&self) -> bool {
+        self.git_restores(false)
     }
 
-    /// The name of what is unusual, for a message.
+    /// The raw bits (Windows attributes; elsewhere the mode).
+    pub fn bits(&self) -> u32 {
+        self.0
+    }
+
+    /// The attributes, for a message.
     pub fn describe(&self) -> String {
         if cfg!(windows) {
-            let names = [(0x1, "read-only"), (0x2, "hidden"), (0x4, "system")];
-            let set: Vec<&str> =
-                names.iter().filter(|(b, _)| self.0 & b != 0).map(|(_, n)| *n).collect();
-            set.join(", ")
+            format!("attributes 0x{:x}", self.0)
         } else {
             format!("mode {:o}", self.0)
         }
     }
 }
 
-/// The attributes of the file at `path`.
+/// All the attributes of the file or dir at `path` (not following a link).
 pub fn attrs(path: &Path) -> Result<Attrs, String> {
     check(path)?;
     let m = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        // READONLY, HIDDEN, SYSTEM, ARCHIVE, NOT_CONTENT_INDEXED: the ones SetFileAttributes takes.
-        Ok(Attrs(m.file_attributes() & (0x1 | 0x2 | 0x4 | 0x20 | 0x2000)))
+        Ok(Attrs(m.file_attributes()))
     }
     #[cfg(unix)]
     {
@@ -384,8 +409,8 @@ fn set_attrs(path: &Path, a: &Attrs) -> Result<(), String> {
     {
         use std::os::windows::ffi::OsStrExt;
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-        // A file with no other attribute set is NORMAL (0x80); SetFileAttributes takes no 0.
-        let value = if a.0 == 0 { 0x80 } else { a.0 };
+        // Only what SetFileAttributes sets; a file with none of it is NORMAL, as SetFileAttributes takes no 0.
+        let value = if a.0 & SETTABLE == 0 { NORMAL } else { a.0 & SETTABLE };
         // SAFETY: `wide` is a NUL-terminated UTF-16 path that lives across the call; the call only reads it.
         let ok = unsafe {
             windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(wide.as_ptr(), value)
@@ -461,10 +486,10 @@ pub fn verify_inside(path: &Path, root: &Path) -> Result<(), String> {
 
 /// Builds `tree` as a new dir beside `path` and moves it into place, where nothing may be. Returns the hash of
 /// what was built, read back from disk.
-pub fn put_tree(path: &Path, tree: &Tree) -> Result<String, String> {
+fn put_tree_at(path: &Path, tree: &Tree) -> Result<String, String> {
     check(path)?;
     if let Some(dir) = path.parent() {
-        create_dir_all(dir)?;
+        create_dir_all_at(dir)?;
     }
     let staged = beside(path, "new")?;
     fs::create_dir(&staged).map_err(|e| format!("{}: {e}", staged.display()))?;
@@ -476,7 +501,7 @@ pub fn put_tree(path: &Path, tree: &Tree) -> Result<String, String> {
                 fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
             }
             if !is_dir_entry(rel) {
-                create_file(&to, bytes)?;
+                create_file_at(&to, bytes)?;
             }
         }
         let hash = tree_sha(&read_tree(&staged)?);
@@ -496,7 +521,7 @@ pub fn put_tree(path: &Path, tree: &Tree) -> Result<String, String> {
     });
     if done.is_err() {
         // Only the dir this call made, and nothing in it is a link: it was built here, file by file.
-        let _ = delete_tree(&staged);
+        let _ = delete_tree_at(&staged);
     }
     done
 }
@@ -521,7 +546,7 @@ fn inside(root: &Path, rel: &str) -> Result<PathBuf, String> {
 }
 
 /// Moves what is at `path` to a fresh name beside it and returns that name. Nothing is ever overwritten.
-pub fn move_aside(path: &Path) -> Result<PathBuf, String> {
+fn move_aside_at(path: &Path) -> Result<PathBuf, String> {
     check(path)?;
     let aside = beside(path, "old")?;
     fs::rename(path, &aside).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -529,7 +554,7 @@ pub fn move_aside(path: &Path) -> Result<PathBuf, String> {
 }
 
 /// Moves `from` back to `to`, where nothing may be (undoing a `move_aside`).
-pub fn move_back(from: &Path, to: &Path) -> Result<(), String> {
+fn move_back_at(from: &Path, to: &Path) -> Result<(), String> {
     check(from)?;
     check(to)?;
     if !nothing_at(to)? {
@@ -543,11 +568,11 @@ pub fn move_back(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 /// Moves a file or dir to `to`, a new path (into a backup, say); nothing is overwritten.
-pub fn move_to(from: &Path, to: &Path) -> Result<(), String> {
+fn move_to_at(from: &Path, to: &Path) -> Result<(), String> {
     check(from)?;
     check(to)?;
     if let Some(dir) = to.parent() {
-        create_dir_all(dir)?;
+        create_dir_all_at(dir)?;
     }
     if !nothing_at(to)? {
         return Err(format!("{} exists; nothing is overwritten", to.display()));
@@ -557,19 +582,20 @@ pub fn move_to(from: &Path, to: &Path) -> Result<(), String> {
 
 /// Replaces the file at `path` (or puts it where nothing is): the old one moves aside, the new one goes in, and the
 /// old one is deleted. For files that are the tool's alone: its ledger, a backup manifest.
-pub fn replace_own_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn replace_own_file_at(path: &Path, bytes: &[u8]) -> Result<(), String> {
     // The new file keeps the old one's attributes (Sol review r5, R5-05: a stack edit kept them nowhere).
     let (old, like) = match kind(path)? {
         Kind::Missing => (None, None),
         Kind::File => {
-            let like = attrs(path)?;
-            (Some(move_aside(path)?), Some(like))
+            // Kept exactly, or refused before anything moves (rule C).
+            let like = attrs(path)?.keep().map_err(|e| format!("{}: {e}", path.display()))?;
+            (Some(move_aside_at(path)?), Some(like))
         }
         Kind::Dir => return Err(format!("{} is a dir", path.display())),
     };
-    if let Err(e) = put_file_as(path, bytes, like.as_ref()) {
+    if let Err(e) = put_file_as_at(path, bytes, like.as_ref()) {
         if let Some(old) = &old {
-            return Err(match move_back(old, path) {
+            return Err(match move_back_at(old, path) {
                 Ok(()) => e,
                 Err(back) => format!(
                     "{e}; and the old file couldn't go back ({back}): it is at {}",
@@ -580,12 +606,12 @@ pub fn replace_own_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         return Err(e);
     }
     if let Some(old) = old {
-        delete_file(&old)?;
+        delete_file_at(&old)?;
     }
     Ok(())
 }
 
-pub fn delete_file(path: &Path) -> Result<(), String> {
+fn delete_file_at(path: &Path) -> Result<(), String> {
     match kind(path)? {
         Kind::File => fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display())),
         Kind::Missing => Ok(()),
@@ -595,7 +621,7 @@ pub fn delete_file(path: &Path) -> Result<(), String> {
 
 /// Deletes a dir and everything in it, following nothing: refused when it, a dir above it, or anything inside is a
 /// link; then file by file, bottom up, each entry checked again just before it goes.
-pub fn delete_tree(dir: &Path) -> Result<(), String> {
+fn delete_tree_at(dir: &Path) -> Result<(), String> {
     read_tree(dir)?;
     fn walk(dir: &Path) -> Result<(), String> {
         for e in fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
@@ -618,7 +644,7 @@ pub fn delete_tree(dir: &Path) -> Result<(), String> {
 }
 
 /// Makes a file executable (Unix); a no-op elsewhere.
-pub fn make_executable(path: &Path) -> Result<(), String> {
+fn make_executable_at(path: &Path) -> Result<(), String> {
     check(path)?;
     #[cfg(unix)]
     {
@@ -627,4 +653,339 @@ pub fn make_executable(path: &Path) -> Result<(), String> {
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- places (design-simplification-r6, rule A)
+//
+// Nothing here changes a path given as a `&Path`. A change takes a `Contained`, which only `Root::join` makes from a
+// root that was verified when it was made, or an `OwnerFile`, which only the config or a verified checkout names.
+// So every writer names its root, and a path no root contains can't be written, by construction.
+
+/// One name in a path below a root: not empty, no separator, not `.` or `..`, no drive or stream (`:`), no control
+/// character, nothing NTFS would trim (a final space or dot).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Part(String);
+
+impl Part {
+    pub fn new(name: &str) -> Result<Part, String> {
+        let bad = name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.ends_with([' ', '.'])
+            || name.chars().any(|c| matches!(c, '/' | '\\' | ':' | '\0') || c.is_control());
+        if bad {
+            return Err(format!(
+                "{name:?} is no name sync writes (a path part must be one plain name)"
+            ));
+        }
+        Ok(Part(name.to_string()))
+    }
+
+    /// A skill's name: a slug, as the schema's ids have it (Sol review r5, R5-02).
+    pub fn skill(name: &str) -> Result<Part, String> {
+        if !crate::stack::is_slug(name) {
+            return Err(format!(
+                "{name:?} is no skill name (a slug: lowercase letters, digits, `-` and `.`)"
+            ));
+        }
+        Part::new(name)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A dir sync may write below, verified when it was made: only these constructors make one.
+#[derive(Clone, Debug)]
+pub struct Root {
+    path: PathBuf,
+}
+
+impl Root {
+    fn at(path: PathBuf) -> Result<Root, String> {
+        if !path.is_absolute() {
+            return Err(format!("{}: not an absolute path", path.display()));
+        }
+        check(&path)?;
+        Ok(Root { path })
+    }
+
+    /// A loaded stack's dir: it holds its `stack.toml`.
+    pub fn stack(dir: &Path) -> Result<Root, String> {
+        let root = Root::at(dir.to_path_buf())?;
+        if kind(&root.path.join("stack.toml"))? != Kind::File {
+            return Err(format!("{}: no stack.toml, so no stack", dir.display()));
+        }
+        Ok(root)
+    }
+
+    /// The tool's own dir (its ledger, backups and lock).
+    pub fn home(dir: &Path) -> Result<Root, String> {
+        Root::at(dir.to_path_buf())
+    }
+
+    /// A target's dir: a skills target's own, or the dir of an instructions target's shared (`via`) file.
+    pub fn target(t: &crate::stack::Target) -> Result<Root, String> {
+        let dir = match (t.kind.as_str(), &t.via) {
+            ("skills", _) => crate::config::expand_home(&t.path),
+            ("instructions", Some(via)) => {
+                let file = crate::config::expand_home(via);
+                file.parent()
+                    .map(Path::to_path_buf)
+                    .ok_or_else(|| format!("{}: no dir", file.display()))?
+            }
+            _ => return Err(format!("target {} has no dir sync writes in", t.name)),
+        };
+        Root::at(dir)
+    }
+
+    /// A workspace's dir.
+    pub fn workspace(w: &crate::stack::Workspace) -> Result<Root, String> {
+        Root::at(crate::config::expand_home(&w.path))
+    }
+
+    /// A real checkout or worktree, configured or discovered alike (Sol review r5, R5-01; r6, R6-02): git's own top
+    /// level there is exactly this path, and its git dir is there. A dir that is none, a dir inside one, a stale
+    /// worktree git still lists, and a git that fails are all errors.
+    pub fn checkout(path: &Path) -> Result<Root, String> {
+        let top = crate::git::run(path, &["rev-parse", "--show-toplevel"])
+            .map_err(|e| format!("{} is no git checkout ({e})", path.display()))?;
+        if crate::ledger::key(Path::new(top.trim())) != crate::ledger::key(path) {
+            return Err(format!(
+                "{} is no checkout's root: git's top level there is {}",
+                path.display(),
+                top.trim()
+            ));
+        }
+        let git_dir = crate::git::run(path, &["rev-parse", "--absolute-git-dir"])?;
+        if kind(Path::new(git_dir.trim()))? != Kind::Dir {
+            return Err(format!("{}: its git dir {} is gone", path.display(), git_dir.trim()));
+        }
+        Root::at(path.to_path_buf())
+    }
+
+    /// A checkout's hooks dir, git's common one (every worktree runs it).
+    pub fn hooks(checkout: &Root) -> Result<Root, String> {
+        let common = crate::git::run(
+            &checkout.path,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        Root::at(PathBuf::from(common.trim()).join("hooks"))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The place `parts` names below this root.
+    pub fn join(&self, parts: &[Part]) -> Contained {
+        let path = parts.iter().fold(self.path.clone(), |p, part| p.join(&part.0));
+        Contained { root: self.clone(), parts: parts.to_vec(), path }
+    }
+
+    /// `path` as a place below this root, if it lies below it: its parts each a plain name (design review, point 2:
+    /// only ever below a root that was verified, never a root made from the path).
+    pub fn below(&self, path: &Path) -> Option<Contained> {
+        let (p, r) = (crate::ledger::key(path), crate::ledger::key(&self.path));
+        p.strip_prefix(&format!("{}/", r.trim_end_matches('/')))?;
+        let rel = path.strip_prefix(&self.path).ok().map(Path::to_path_buf).or_else(|| {
+            // The same path spelt otherwise (case, separators): its last components, as many as the key has.
+            let n = p.len() - r.len();
+            let tail = &p[p.len() - n + 1..];
+            let count = tail.split('/').count();
+            let comps: Vec<_> = path.components().collect();
+            Some(comps[comps.len().checked_sub(count)?..].iter().collect())
+        })?;
+        let parts: Vec<Part> = rel
+            .components()
+            .map(|c| match c {
+                Component::Normal(n) => Part::new(&n.to_string_lossy()).ok(),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        (!parts.is_empty()).then(|| self.join(&parts))
+    }
+
+    /// Makes the root's own dir where it isn't yet (a skills target, the tool's home, a new hooks dir).
+    pub fn create(&self) -> Result<(), String> {
+        create_dir_all_at(&self.path)
+    }
+}
+
+/// A path below a verified root: what fsguard's changes take.
+#[derive(Clone, Debug)]
+pub struct Contained {
+    root: Root,
+    parts: Vec<Part>,
+    path: PathBuf,
+}
+
+impl Contained {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn root(&self) -> &Root {
+        &self.root
+    }
+
+    pub fn parts(&self) -> &[Part] {
+        &self.parts
+    }
+
+    /// The place one more name below.
+    pub fn child(&self, part: Part) -> Contained {
+        let mut parts = self.parts.clone();
+        parts.push(part);
+        self.root.join(&parts)
+    }
+}
+
+/// An owner's file sync edits in one managed part: only the config names one (an instructions or settings target's
+/// path), or git does (a verified checkout's `info/exclude`).
+#[derive(Clone, Debug)]
+pub struct OwnerFile {
+    path: PathBuf,
+}
+
+impl OwnerFile {
+    /// An instructions or settings target's own file.
+    pub fn target(t: &crate::stack::Target) -> OwnerFile {
+        OwnerFile { path: crate::config::expand_home(&t.path) }
+    }
+
+    /// Tests only: an owner file at `path`, for a unit test of an owner edit.
+    #[cfg(test)]
+    pub fn for_test(path: &Path) -> OwnerFile {
+        OwnerFile { path: path.to_path_buf() }
+    }
+
+    /// A checkout's git exclude file, in git's common dir.
+    pub fn exclude(checkout: &Root) -> Result<OwnerFile, String> {
+        let common = crate::git::run(
+            &checkout.path,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        Ok(OwnerFile { path: PathBuf::from(common.trim()).join("info").join("exclude") })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::Contained {}
+    impl Sealed for super::OwnerFile {}
+}
+
+/// What fsguard's changes take: a `Contained` or an `OwnerFile`, and nothing else (sealed).
+pub trait Place: sealed::Sealed {
+    fn place(&self) -> &Path;
+}
+
+impl Place for Contained {
+    fn place(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Place for OwnerFile {
+    fn place(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// What `move_aside` moved: it goes back where it was, or goes.
+#[derive(Debug)]
+pub struct Aside {
+    at: PathBuf,
+    from: PathBuf,
+}
+
+impl Aside {
+    /// Where it is now, to read it.
+    pub fn path(&self) -> &Path {
+        &self.at
+    }
+
+    /// Back where it was, where nothing may be.
+    pub fn back(&self) -> Result<(), String> {
+        move_back_at(&self.at, &self.from)
+    }
+
+    /// Gone: a file, or a dir followed by nothing.
+    pub fn delete(self) -> Result<(), String> {
+        match kind(&self.at)? {
+            Kind::Dir => delete_tree_at(&self.at),
+            _ => delete_file_at(&self.at),
+        }
+    }
+}
+
+pub fn create_dir_all(p: &Contained) -> Result<(), String> {
+    create_dir_all_at(&p.path)
+}
+
+/// Writes a new file where nothing is; refused when anything is there.
+pub fn create_file(p: &Contained, bytes: &[u8]) -> Result<(), String> {
+    create_file_at(&p.path, bytes)
+}
+
+/// Appends one line to a file that is the tool's alone (a backup manifest).
+pub fn append_line(p: &Contained, line: &str) -> Result<(), String> {
+    append_line_at(&p.path, line)
+}
+
+/// Puts a file where nothing may be, absent or whole.
+///
+/// Spec (design-simplification-r6, rule A: "fsguard's mutating calls take no `&Path`"): a plain path doesn't
+/// compile, only a place built from a verified root.
+///
+/// ```compile_fail
+/// lords_core::fsguard::put_file(std::path::Path::new("anywhere"), b"bytes").unwrap();
+/// ```
+pub fn put_file(p: &impl Place, bytes: &[u8]) -> Result<(), String> {
+    put_file_at(p.place(), bytes)
+}
+
+/// `put_file`, then the attributes `like`.
+pub fn put_file_as(p: &impl Place, bytes: &[u8], like: Option<&Attrs>) -> Result<(), String> {
+    put_file_as_at(p.place(), bytes, like)
+}
+
+/// Builds `tree` beside the place and moves it in, where nothing may be; the hash of what was built.
+pub fn put_tree(p: &Contained, tree: &Tree) -> Result<String, String> {
+    put_tree_at(&p.path, tree)
+}
+
+/// Moves what is there to a fresh name beside it.
+pub fn move_aside(p: &impl Place) -> Result<Aside, String> {
+    let at = move_aside_at(p.place())?;
+    Ok(Aside { at, from: p.place().to_path_buf() })
+}
+
+/// Moves a file or dir to a new place (into a backup); nothing is overwritten.
+pub fn move_to(from: &impl Place, to: &Contained) -> Result<(), String> {
+    move_to_at(from.place(), &to.path)
+}
+
+/// Replaces a file that is the tool's alone, keeping its attributes or refusing.
+pub fn replace_own_file(p: &impl Place, bytes: &[u8]) -> Result<(), String> {
+    replace_own_file_at(p.place(), bytes)
+}
+
+pub fn delete_file(p: &impl Place) -> Result<(), String> {
+    delete_file_at(p.place())
+}
+
+/// Deletes a dir and everything in it, following nothing.
+pub fn delete_tree(p: &Contained) -> Result<(), String> {
+    delete_tree_at(&p.path)
+}
+
+pub fn make_executable(p: &Contained) -> Result<(), String> {
+    make_executable_at(&p.path)
 }

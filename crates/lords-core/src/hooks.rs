@@ -2,10 +2,11 @@
 //! Privacy).
 //! Never through `core.hooksPath`: a global hooks path whose dispatcher runs the repo's own hooks keeps working.
 //! A hook is the tool's only by its ledger record (design: Ownership boundary): any other hook there, readable or
-//! not, is the owner's (Sol review r2, R2-16). Every write goes through `fsguard`, and nothing is overwritten.
-//! Installing takes the apply lock, so the ledger has one writer at a time (Sol review r3, R3-09).
+//! not, is the owner's (Sol review r2, R2-16). Every write goes through `fsguard`, below the checkout's verified
+//! hooks root (design-simplification-r6, rule A), and nothing is overwritten. Installing takes the apply lock, so
+//! the ledger has one writer at a time (Sol review r3, R3-09).
 
-use crate::fsguard;
+use crate::fsguard::{self, Contained, Part, Root};
 use crate::git;
 use crate::ledger::Ledger;
 use crate::sync::ApplyLock;
@@ -27,95 +28,115 @@ pub struct Installed {
 /// clippy `-D warnings` a required part of Lords Command's commit check).
 pub const COMMIT_CHECK: &str = "tools/commit-check.sh";
 
-pub fn script(lords_exe: &Path, secrets_only: bool) -> String {
+/// The environment variable `lords check` sets to a nonce when it probes the hooks (design-simplification-r6, rule
+/// D and the review's point 1).
+pub const PROBE_VAR: &str = "LORDS_HOOK_PROBE";
+
+/// What a hook answers a probe with.
+pub fn probe_answer(nonce: &str, hook: &str) -> String {
+    format!("lords-hook-probe:{nonce}:{hook}")
+}
+
+/// The first lines of a privacy hook: it answers a probe, and does nothing else then, only when the variable is a
+/// nonce (32 hex digits) whose file `lords check` made in the tool's home just before. Any other value, set or
+/// exported anywhere, runs the check below unchanged, so the probe is no way around it.
+fn probe_lines(home: &Path, hook: &str) -> String {
+    let state = quoted(&home.join("state"));
+    let answer = probe_answer("$probe", hook);
+    format!(
+        "probe=\"${{{PROBE_VAR}:-}}\"\n\
+         case \"$probe\" in\n\
+         \x20 *[!0-9a-f]* | '') ;;\n\
+         \x20 *) if [ ${{#probe}} -eq 32 ] && [ -f {state}/probe-\"$probe\" ]; then echo \"{answer}\"; exit 0; fi ;;\n\
+         esac\n"
+    )
+}
+
+pub fn script(lords_exe: &Path, secrets_only: bool, home: &Path) -> String {
     let exe = lords_exe.to_string_lossy().replace('\\', "/");
     let flag = if secrets_only { " --secrets-only" } else { "" };
     format!(
         "#!/bin/sh\n{MARKER} of the staged files (installed by `lords hooks install`).\n\
+         {probe}\
          # The repo's own commit check first, where it tracks one ({COMMIT_CHECK}).\n\
          top=$(git rev-parse --show-toplevel) || exit 1\n\
          if git ls-files --error-unmatch -- \"{COMMIT_CHECK}\" >/dev/null 2>&1; then\n\
          \x20   sh \"$top/{COMMIT_CHECK}\" || exit $?\n\
          fi\n\
-         exec \"{exe}\" privacy --staged{flag}\n"
+         exec \"{exe}\" privacy --staged{flag}\n",
+        probe = probe_lines(home, "pre-commit"),
     )
 }
 
 /// The commit-msg hook: git passes the message file as `$1`.
-pub fn commit_msg_script(lords_exe: &Path, secrets_only: bool) -> String {
+pub fn commit_msg_script(lords_exe: &Path, secrets_only: bool, home: &Path) -> String {
     let exe = lords_exe.to_string_lossy().replace('\\', "/");
     let flag = if secrets_only { " --secrets-only" } else { "" };
-    format!("#!/bin/sh\n{MARKER} of the commit message (installed by `lords hooks install`).\nexec \"{exe}\" privacy --message \"$1\"{flag}\n")
+    format!(
+        "#!/bin/sh\n{MARKER} of the commit message (installed by `lords hooks install`).\n{probe}exec \"{exe}\" privacy --message \"$1\"{flag}\n",
+        probe = probe_lines(home, "commit-msg"),
+    )
 }
 
-/// Whether a commit in `repo` actually reaches both privacy hooks (orchestrator, 25 Oct, decision 8, for guarantee
-/// 7): the hook Git runs, through `core.hooksPath` if set; where that is the owner's attribution-guard dispatcher,
-/// the hook it delegates to (`attributionGuard.previousHooksPath`, else the repo's own `hooks/`), unless it skips
-/// that hook (`attributionGuard.skipPreviousHook`). One line per hook that isn't verified; none when both are.
-/// This says what holds now: a later change to the hooks path, `--no-verify` or another environment isn't
-/// prevented by it (design: Privacy, "Guarantee 7").
-pub fn privacy_dispatch(repo: &Path) -> Vec<String> {
+/// A fresh nonce: 32 hex digits no earlier probe used.
+fn nonce() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    fsguard::sha(format!("{}-{nanos}", crate::process::id()).as_bytes())[..32].to_string()
+}
+
+/// Whether a commit in `repo` reaches both privacy hooks, found out by running them (design-simplification-r6, rule
+/// D): `git hook run`, as a commit would run them, through any hooks path and dispatcher, with a nonce whose file
+/// is made in `home` right before and deleted right after. A hook verifies when its answer comes back; any other
+/// outcome, a git error included, is one line saying it isn't. This says what holds now: `--no-verify`, a hooks path
+/// set later, or a commit made elsewhere isn't prevented by it (design: Privacy, "Guarantee 7").
+pub fn privacy_dispatch(repo: &Path, home: &Path) -> Vec<String> {
+    let both = |why: String| vec![format!("pre-commit and commit-msg: not verified ({why})")];
+    let n = nonce();
+    let made = (|| -> Result<(Contained, Contained), String> {
+        let root = Root::home(home)?;
+        let state = root.join(&[Part::new("state")?]);
+        fsguard::create_dir_all(&state)?;
+        let probe = state.child(Part::new(&format!("probe-{n}"))?);
+        let message = state.child(Part::new(&format!("probe-{n}.msg"))?);
+        fsguard::create_file(&probe, b"")?;
+        fsguard::create_file(&message, b"a probe of the privacy hooks\n")?;
+        Ok((probe, message))
+    })();
+    let (probe, message) = match made {
+        Ok(m) => m,
+        Err(e) => return both(e),
+    };
     let mut problems = Vec::new();
-    let git_path = |args: &[&str]| git::run(repo, args).map(|s| PathBuf::from(s.trim()));
-    let (effective, common) = match (
-        git_path(&["rev-parse", "--path-format=absolute", "--git-path", "hooks"]),
-        git_path(&["rev-parse", "--path-format=absolute", "--git-common-dir"]),
-    ) {
-        (Ok(e), Ok(c)) => (e, c.join("hooks")),
-        (Err(e), _) | (_, Err(e)) => {
-            return vec![format!("pre-commit and commit-msg: not verified ({e})")]
+    for hook in ["pre-commit", "commit-msg"] {
+        let mut args = vec!["hook", "run", "--ignore-missing", hook];
+        let msg = message.path().to_string_lossy().into_owned();
+        if hook == "commit-msg" {
+            args.extend(["--", msg.as_str()]);
         }
-    };
-    let dispatcher = effective
-        .parent()
-        .map(|d| d.join("dispatch.sh"))
-        .and_then(|d| fsguard::read_string_lossy(&d))
-        .is_some_and(|t| t.contains("attribution-guard"));
-    // A config read that fails verifies nothing (never taken for "not set"); a file that can't be read below isn't
-    // a privacy hook, so it isn't verified either.
-    let config = |args: &[&str]| -> Result<Option<String>, String> {
-        if git::status(repo, args)? {
-            git::run(repo, args).map(Some)
-        } else {
-            Ok(None)
-        }
-    };
-    let (skipped, previous) = match (
-        config(&["config", "--get-all", "attributionGuard.skipPreviousHook"]),
-        config(&["config", "--path", "--get", "attributionGuard.previousHooksPath"]),
-    ) {
-        (Ok(s), Ok(p)) => (
-            s.map(|s| s.lines().map(|l| l.trim().to_string()).collect::<Vec<_>>())
-                .unwrap_or_default(),
-            p.map(|p| PathBuf::from(p.trim())),
-        ),
-        (Err(e), _) | (_, Err(e)) => {
-            return vec![format!("pre-commit and commit-msg: not verified ({e})")]
-        }
-    };
-    for (hook, command) in [("pre-commit", "privacy --staged"), ("commit-msg", "privacy --message")]
-    {
-        let runs = if dispatcher {
-            if skipped.iter().any(|s| s == hook) {
-                problems.push(format!(
-                    "{hook}: not verified: the attribution guard skips the repo's own {hook} (attributionGuard.skipPreviousHook)"
-                ));
-                continue;
+        let answer = probe_answer(&n, hook);
+        match crate::process::git_env(repo, &args, &[(PROBE_VAR, &n)]) {
+            Ok(out) => {
+                let said = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                if !out.status.success() || !said.contains(&answer) {
+                    problems.push(format!(
+                        "{hook}: not verified: a commit here doesn't reach the privacy hook (`git hook run {hook}` gave exit {:?} and no answer); `lords hooks install` puts it in the repo's own hooks dir",
+                        out.status.code()
+                    ));
+                }
             }
-            previous.as_ref().unwrap_or(&common).join(hook)
-        } else {
-            effective.join(hook)
-        };
-        match fsguard::read_string_lossy(&runs) {
-            Some(t) if t.contains(MARKER) && t.contains(command) => {}
-            Some(_) => problems.push(format!(
-                "{hook}: not verified: {} is no privacy hook; `lords hooks install` puts one in the repo's own hooks dir",
-                runs.display()
-            )),
-            None => problems.push(format!(
-                "{hook}: not verified: git runs {}, which isn't there; `lords hooks install` puts one in the repo's own hooks dir",
-                runs.display()
-            )),
+            Err(e) => problems.push(format!("{hook}: not verified ({e})")),
+        }
+    }
+    for f in [&probe, &message] {
+        if let Err(e) = fsguard::delete_file(f) {
+            problems.push(format!("the probe's file {} stays: {e}", f.path().display()));
         }
     }
     problems
@@ -130,19 +151,19 @@ fn ours(ledger: &Ledger, hook: &Path) -> Result<bool, String> {
 }
 
 /// Puts `text` in as the hook at `hook`, replacing the tool's own hook there, and records it.
-fn put_hook(ledger: &mut Ledger, hook: &Path, text: &str, scope: &str) -> Result<(), String> {
-    let old = match fsguard::kind(hook)? {
+fn put_hook(ledger: &mut Ledger, hook: &Contained, text: &str, scope: &str) -> Result<(), String> {
+    let old = match fsguard::kind(hook.path())? {
         fsguard::Kind::Missing => None,
         _ => Some(fsguard::move_aside(hook)?),
     };
     if let Err(e) = fsguard::put_file(hook, text.as_bytes()) {
         if let Some(old) = &old {
-            fsguard::move_back(old, hook)?;
+            old.back()?;
         }
         return Err(e);
     }
     if let Some(old) = old {
-        fsguard::delete_file(&old)?;
+        old.delete()?;
     }
     fsguard::make_executable(hook)?;
     ledger.record(hook, "file", &fsguard::sha(text.as_bytes()), scope);
@@ -150,19 +171,20 @@ fn put_hook(ledger: &mut Ledger, hook: &Path, text: &str, scope: &str) -> Result
 }
 
 /// A name beside `hook` that nothing has yet: where an owner's hook goes when `--force` replaces it.
-fn backup_name(hook: &Path) -> Result<PathBuf, String> {
-    let name = hook.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+fn backup_name(dir: &Root, name: &str) -> Result<Contained, String> {
     for n in 0.. {
         let suffix = if n == 0 { String::new() } else { format!("-{n}") };
-        let b = hook.with_file_name(format!("{name}.bak-{}{suffix}", crate::ops::today()));
-        if fsguard::kind(&b)? == fsguard::Kind::Missing {
+        let b = dir.join(&[Part::new(&format!("{name}.bak-{}{suffix}", crate::ops::today()))?]);
+        if fsguard::kind(b.path())? == fsguard::Kind::Missing {
             return Ok(b);
         }
     }
     unreachable!()
 }
 
-fn hooks_dir(repo: &Path) -> Result<PathBuf, String> {
+/// The repo's hooks dir as a verified root: the repo's checkout root (git's top level, exactly), then git's common
+/// hooks dir, made where it isn't yet.
+fn hooks_dir(repo: &Path) -> Result<Root, String> {
     if git::status(repo, &["config", "--local", "--get", "core.hooksPath"])? {
         let local = git::run(repo, &["config", "--local", "--get", "core.hooksPath"])?;
         return Err(format!(
@@ -170,14 +192,15 @@ fn hooks_dir(repo: &Path) -> Result<PathBuf, String> {
             local.trim()
         ));
     }
-    let common = git::run(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
-    let dir = PathBuf::from(common.trim()).join("hooks");
-    fsguard::create_dir_all(&dir)?;
+    let top = git::run(repo, &["rev-parse", "--show-toplevel"])?;
+    let dir = Root::hooks(&Root::checkout(Path::new(top.trim()))?)?;
+    dir.create()?;
     Ok(dir)
 }
 
-/// Installs the pre-commit and commit-msg hooks; `home` holds the ledger that records them. A hook there that isn't
-/// the tool's stops both, unless `force`, which moves each one to a new `<name>.bak-<date>` first.
+/// Installs the pre-commit and commit-msg hooks; `home` holds the ledger that records them and the probe's files. A
+/// hook there that isn't the tool's stops both, unless `force`, which moves each one to a new `<name>.bak-<date>`
+/// first.
 pub fn install(
     repo: &Path,
     lords_exe: &Path,
@@ -189,39 +212,43 @@ pub fn install(
     let _lock = ApplyLock::take(home, 60)?;
     let mut ledger = Ledger::load(home)?;
     let hooks = [
-        ("pre-commit", script(lords_exe, secrets_only)),
-        ("commit-msg", commit_msg_script(lords_exe, secrets_only)),
+        ("pre-commit", script(lords_exe, secrets_only, home)),
+        ("commit-msg", commit_msg_script(lords_exe, secrets_only, home)),
     ];
     let mut foreign = Vec::new();
     for (name, _) in &hooks {
-        let hook = dir.join(name);
-        if fsguard::kind(&hook)? != fsguard::Kind::Missing && !ours(&ledger, &hook)? {
-            foreign.push(hook);
+        let hook = dir.join(&[Part::new(name)?]);
+        if fsguard::kind(hook.path())? != fsguard::Kind::Missing && !ours(&ledger, hook.path())? {
+            foreign.push(name.to_string());
         }
     }
     if !force {
-        if let Some(hook) = foreign.first() {
+        if let Some(name) = foreign.first() {
             return Err(format!(
                 "{} exists and isn't the tool's (no ledger record); --force moves it aside and replaces it",
-                hook.display()
+                dir.path().join(name).display()
             ));
         }
     }
     let global_hooks_path = git::run(repo, &["config", "--global", "--get", "core.hooksPath"])
         .ok()
         .map(|s| s.trim().to_string());
-    let scope = format!("hooks:{}", crate::ledger::key(&dir));
+    let scope = format!("hooks:{}", crate::ledger::key(dir.path()));
     let mut installed = Vec::new();
     for (name, text) in hooks {
-        let hook = dir.join(name);
+        let hook = dir.join(&[Part::new(name)?]);
         let mut backup = None;
-        if foreign.contains(&hook) {
-            let b = backup_name(&hook)?;
+        if foreign.iter().any(|f| f == name) {
+            let b = backup_name(&dir, name)?;
             fsguard::move_to(&hook, &b)?;
-            backup = Some(b);
+            backup = Some(b.path().to_path_buf());
         }
         put_hook(&mut ledger, &hook, &text, &scope)?;
-        installed.push(Installed { hook, backup, global_hooks_path: global_hooks_path.clone() });
+        installed.push(Installed {
+            hook: hook.path().to_path_buf(),
+            backup,
+            global_hooks_path: global_hooks_path.clone(),
+        });
     }
     ledger.save(home)?;
     Ok(installed)
@@ -303,25 +330,25 @@ pub fn install_post_checkout(
     let dir = hooks_dir(repo)?;
     let _lock = ApplyLock::take(home, 60)?;
     let mut ledger = Ledger::load(home)?;
-    let hook = dir.join("post-checkout");
+    let hook = dir.join(&[Part::new("post-checkout")?]);
     let mut backup = None;
-    if fsguard::kind(&hook)? != fsguard::Kind::Missing && !ours(&ledger, &hook)? {
-        let chained = dir.join(CHAINED);
-        if fsguard::kind(&chained)? != fsguard::Kind::Missing {
+    if fsguard::kind(hook.path())? != fsguard::Kind::Missing && !ours(&ledger, hook.path())? {
+        let chained = dir.join(&[Part::new(CHAINED)?]);
+        if fsguard::kind(chained.path())? != fsguard::Kind::Missing {
             return Err(format!(
                 "{} isn't the tool's and {} exists already; merge them by hand first",
-                hook.display(),
-                chained.display()
+                hook.path().display(),
+                chained.path().display()
             ));
         }
         fsguard::move_to(&hook, &chained)?;
-        backup = Some(chained);
+        backup = Some(chained.path().to_path_buf());
     }
-    let scope = format!("hooks:{}", crate::ledger::key(&dir));
+    let scope = format!("hooks:{}", crate::ledger::key(dir.path()));
     put_hook(&mut ledger, &hook, &post_checkout_script(lords_exe, args), &scope)?;
     ledger.save(home)?;
     let global_hooks_path = git::run(repo, &["config", "--global", "--get", "core.hooksPath"])
         .ok()
         .map(|s| s.trim().to_string());
-    Ok(Installed { hook, backup, global_hooks_path })
+    Ok(Installed { hook: hook.path().to_path_buf(), backup, global_hooks_path })
 }

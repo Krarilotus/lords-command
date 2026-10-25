@@ -182,6 +182,28 @@ fn code_of(text: &str, keep_strings: bool) -> String {
     out
 }
 
+/// Code with each raw identifier's `r#` dropped (`r#fs` is `fs`): what the matches below see (Sol review r6,
+/// R6-04). A raw string (`r#"…"#`) is no identifier and keeps its `r#`.
+fn unraw(code: &str) -> String {
+    let c: Vec<char> = code.chars().collect();
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let mut out = String::new();
+    let mut i = 0;
+    while i < c.len() {
+        let raw = c[i] == 'r'
+            && c.get(i + 1) == Some(&'#')
+            && c.get(i + 2).is_some_and(|n| n.is_alphabetic() || *n == '_')
+            && !c[..i].last().is_some_and(|p| ident(*p));
+        if raw {
+            i += 2;
+            continue;
+        }
+        out.push(c[i]);
+        i += 1;
+    }
+    out
+}
+
 fn idents(s: &str) -> Vec<&str> {
     s.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|t| !t.is_empty()).collect()
 }
@@ -193,8 +215,8 @@ fn forbidden(file: &str, text: &str) -> Vec<String> {
     let allowed = modules_allowed(d);
     let squeeze = |s: String| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
     // Strings emptied for the module ban (a string naming a module reaches nothing), kept for the program names.
-    let code = squeeze(code_of(text, false));
-    let with_strings = squeeze(code_of(text, true));
+    let code = squeeze(unraw(&code_of(text, false)));
+    let with_strings = squeeze(unraw(&code_of(text, true)));
     let mut found = Vec::new();
     let ident = |c: char| c.is_alphanumeric() || c == '_';
     // A path through a module it may not reach, however spaced or split (`std :: fs`, `::std::fs`).
@@ -207,7 +229,7 @@ fn forbidden(file: &str, text: &str) -> Vec<String> {
         }
     }
     // `use` of std: no renamed std, no group or renamed import that reaches one of the three.
-    for chunk in code_of(text, false).split(';') {
+    for chunk in unraw(&code_of(text, false)).split(';') {
         let words = idents(chunk);
         if words.windows(3).any(|w| w == ["extern", "crate", "std"]) {
             found.push(format!("{file}: std named as an extern crate ({})", words.join(" ")));
@@ -263,7 +285,7 @@ fn forbidden(file: &str, text: &str) -> Vec<String> {
         // The OS's own calls, which no clippy path list covers: only the doors may use an FFI crate or declare
         // foreign functions (fsguard.rs uses `windows_sys` for attributes and file identity).
         for ffi in ["windows_sys", "winapi", "libc", "nix"] {
-            if idents(&code_of(text, false)).contains(&ffi) {
+            if idents(&unraw(&code_of(text, false))).contains(&ffi) {
                 found.push(format!("{file}: {ffi} (the OS's own calls, only in a door)"));
             }
         }
@@ -487,7 +509,8 @@ fn r5_03_the_commit_check_runs_clippy() {
     let check =
         fs::read_to_string(workspace().join("tools").join("commit-check.sh")).unwrap_or_default();
     assert!(check.contains("cargo clippy") && check.contains("-D warnings"), "{check}");
-    let hook = lords_core::hooks::script(Path::new("C:/lords/lords.exe"), false);
+    let hook =
+        lords_core::hooks::script(Path::new("C:/lords/lords.exe"), false, Path::new("C:/home"));
     assert!(hook.contains("tools/commit-check.sh"), "{hook}");
 }
 

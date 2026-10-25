@@ -24,7 +24,7 @@ fn the_entries_view_lists_both_stacks_with_their_worst_finding() {
         &entry("rule.b", "project:beta", "private", "links: [rule.none]\n", "B.\n"),
     );
     let s = f.stacks();
-    let found = lords_core::check::check(&s, &Rules::public());
+    let found = lords_core::check::check_at(&s, &Rules::public(), &f.home());
     let v = view::entries(&s, &found);
     let ids: Vec<&str> = v.iter().map(|e| e.id.as_str()).collect();
     assert_eq!(ids, ["rule.a", "rule.b"]);

@@ -26,9 +26,9 @@ fn forge(f: &Fixture, path: &Path, kind: &str, scope: &str) {
     } else {
         fsguard::sha(&fs::read(path).unwrap())
     };
-    let mut l = Ledger::default();
-    l.record(path, kind, &sha, scope);
-    l.save(&f.home()).unwrap();
+    let _ = sha;
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    common::forge(&f.home(), path.parent().unwrap(), &[&name], kind, scope);
 }
 
 fn skill(f: &Fixture, stack: &str, name: &str) {
@@ -278,7 +278,7 @@ fn r5_05_restore_keeps_a_created_file_the_owner_marked() {
         .backups
         .expect("a backup");
     hide(&file);
-    let steps = sync::restore(&f.home(), &backups);
+    let steps = sync::restore(&sync::plan(&f.stacks(), &f.opts()).unwrap(), &backups);
     assert!(file.is_file(), "{steps:?}");
     #[cfg(not(windows))]
     {
@@ -296,7 +296,7 @@ fn public_repo(f: &Fixture) {
 }
 
 fn hook_findings(f: &Fixture) -> Vec<String> {
-    lords_core::check::check(&f.stacks(), &lords_core::privacy::Rules::public())
+    lords_core::check::check_at(&f.stacks(), &lords_core::privacy::Rules::public(), &f.home())
         .into_iter()
         .filter(|x| x.code == "privacy-hooks")
         .map(|x| format!("{:?} {}", x.severity, x.message))
@@ -342,7 +342,15 @@ fn check_reports_a_hooks_path_that_bypasses_them() {
 /// A dispatcher like the owner's attribution guard: `<dir>/hooks/<name>` hands over to `<dir>/dispatch.sh`.
 fn guard(f: &Fixture) -> std::path::PathBuf {
     let dir = f.path("guard");
-    f.write("guard/dispatch.sh", "#!/bin/sh\n# attribution-guard dispatcher (test double)\n");
+    // It delegates as the owner's does (Sol review r6, R6-07: a double that runs nothing can't establish
+    // reachability): the repo's own hook, unless `attributionGuard.skipPreviousHook` names it.
+    f.write(
+        "guard/dispatch.sh",
+        "#!/bin/sh\n# attribution-guard dispatcher (test double)\nhook=$1\nshift\n\
+         if git config --get-all attributionGuard.skipPreviousHook | grep -qx -- \"$hook\"; then exit 0; fi\n\
+         common=$(git rev-parse --path-format=absolute --git-common-dir) || exit 1\n\
+         if [ -f \"$common/hooks/$hook\" ]; then exec sh \"$common/hooks/$hook\" \"$@\"; fi\nexit 0\n",
+    );
     for h in ["pre-commit", "commit-msg"] {
         f.write(
             &format!("guard/hooks/{h}"),
@@ -368,7 +376,11 @@ fn check_follows_the_attribution_guard_dispatcher() {
         found.iter().any(|m| m.contains("not verified") && m.contains("commit-msg")),
         "{found:?}"
     );
-    assert!(lords_core::check::check(&f.stacks(), &lords_core::privacy::Rules::public())
-        .iter()
-        .all(|x| x.code != "privacy-hooks" || x.severity != Severity::Error));
+    assert!(lords_core::check::check_at(
+        &f.stacks(),
+        &lords_core::privacy::Rules::public(),
+        &f.home()
+    )
+    .iter()
+    .all(|x| x.code != "privacy-hooks" || x.severity != Severity::Error));
 }

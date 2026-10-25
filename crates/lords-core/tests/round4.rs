@@ -42,10 +42,8 @@ fn plan(f: &Fixture) -> Result<sync::Plan, String> {
 
 /// A record of `path` as the tool's, holding what the file there holds now.
 fn forge(f: &Fixture, path: &Path, kind: &str, scope: &str) {
-    let sha = lords_core::fsguard::sha(&fs::read(path).unwrap());
-    let mut ledger = Ledger::load(&f.home()).unwrap();
-    ledger.record(path, kind, &sha, scope);
-    ledger.save(&f.home()).unwrap();
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    common::forge(&f.home(), path.parent().unwrap(), &[&name], kind, scope);
 }
 
 /// Plans and applies; whatever happens, the owner file at `rel` must still hold `OWNER`.
@@ -156,7 +154,7 @@ fn r4_03_restore_gives_back_the_attributes() {
         &format!("[[targets]]\nname = \"t\"\nadapter = \"codex\"\nkind = \"instructions\"\npath = '{}'\n", file.display()),
     );
     let backups = sync::apply(&plan(&f).unwrap()).unwrap().backups.expect("a backup");
-    let steps = sync::restore(&f.home(), &backups).unwrap();
+    let steps = sync::restore(&plan(&f).unwrap(), &backups).unwrap();
     assert_eq!(f.read("out/owner.md"), "OLD\n", "{steps:?}");
     let m = fs::metadata(&file).unwrap();
     assert!(m.permissions().readonly(), "read-only again");
@@ -176,9 +174,7 @@ fn r4_03_restore_gives_back_the_attributes() {
 #[test]
 fn r4_05_a_ledger_states_its_format_and_another_is_refused() {
     let f = Fixture::new();
-    let mut ledger = Ledger::default();
-    ledger.record(&f.path("x"), "file", &lords_core::fsguard::sha(b"X"), "target:t");
-    ledger.save(&f.home()).unwrap();
+    Ledger::default().save(&f.home()).unwrap();
     let text = f.read("lords-home/state/ledger.toml");
     assert!(text.contains("format = "), "{text}");
     f.write("lords-home/state/ledger.toml", &text.replace("format = ", "old_format = "));
@@ -192,9 +188,7 @@ fn r4_05_a_ledger_states_its_format_and_another_is_refused() {
 #[test]
 fn an_interrupted_ledger_save_is_never_read_as_empty() {
     let f = Fixture::new();
-    let mut ledger = Ledger::default();
-    ledger.record(&f.path("x"), "file", &lords_core::fsguard::sha(b"X"), "target:t");
-    ledger.save(&f.home()).unwrap();
+    Ledger::default().save(&f.home()).unwrap();
     let state = f.path("lords-home/state");
     fs::rename(state.join("ledger.toml"), state.join(".ledger.toml.lords-old-1-2-3")).unwrap();
     let err = Ledger::load(&f.home()).map(|l| l.owned.len()).unwrap_err();

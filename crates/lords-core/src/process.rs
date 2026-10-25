@@ -27,6 +27,16 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<Output, String> {
         .map_err(|e| format!("git {}: {e}", args.join(" ")))
 }
 
+/// Runs `git -C <dir> <args>` with these environment variables set, and waits for it (the hook probe).
+pub(crate) fn git_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<Output, String> {
+    let mut c = Command::new("git");
+    c.arg("-C").arg(dir).args(args);
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    c.output().map_err(|e| format!("git {}: {e}", args.join(" ")))
+}
+
 /// Shows a path in the file manager, or opens a link in the browser; doesn't wait.
 pub fn open_in_file_manager(target: &str) {
     #[cfg(windows)]

@@ -150,14 +150,14 @@ path = '{}'
     );
     let p = plan(&f.stacks(), &Options { user_only: true, ..f.opts() }).unwrap();
     assert!(p.items.iter().all(|i| !i.path.starts_with(&dir)), "{:#?}", p.items);
-    let set = lords_core::sync::set_aside(&f.home(), &[dir.join("spec-tests")]).unwrap();
+    let set = lords_core::sync::set_aside(&p, &[dir.join("spec-tests")]).unwrap();
     assert!(!dir.join("spec-tests").exists() && dir.join("frontend-design/SKILL.md").exists());
     let backups = set.backups.unwrap();
     assert!(
         texts_under(&backups).iter().any(|t| t.contains("An old copy.")),
         "the copy is in the backup"
     );
-    lords_core::sync::restore(&f.home(), &backups).unwrap();
+    lords_core::sync::restore(&p, &backups).unwrap();
     assert_eq!(
         f.read("home/skills/spec-tests/SKILL.md"),
         "---

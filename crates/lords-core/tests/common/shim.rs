@@ -22,7 +22,7 @@ pub fn apply_nothing(_f: &Fixture, home: &Path) -> Result<(), String> {
 }
 
 pub fn restore_run(f: &Fixture, backups: &Path) -> Result<Vec<String>, String> {
-    sync::restore(&f.home(), backups)
+    sync::restore(&sync::plan(&f.stacks(), &f.opts())?, backups)
 }
 
 pub fn import_apply(f: &Fixture) -> Result<(), String> {

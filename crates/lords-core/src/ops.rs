@@ -82,16 +82,40 @@ fn git_keeps(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes a stack file through `fsguard` (the operation has checked it with `git_keeps` first).
-fn stack_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
-        fsguard::create_dir_all(dir)?;
+/// A stack file as a place below its stack's verified root (design-simplification-r6, rule A): a path outside
+/// the stack, or with a part that is no plain name, is refused (Sol review r6, R6-01).
+fn stack_place(root: &Path, path: &Path) -> Result<fsguard::Contained, String> {
+    fsguard::Root::stack(root)?
+        .below(path)
+        .ok_or_else(|| format!("{} lies outside the stack {}", path.display(), root.display()))
+}
+
+/// Writes a stack file through `fsguard`, below the stack's root (the operation has checked it with `git_keeps`
+/// first).
+fn stack_write(root: &Path, path: &Path, bytes: &[u8]) -> Result<(), String> {
+    fsguard::replace_own_file(&stack_place(root, path)?, bytes)
+}
+
+/// The parts of a scope's layer dir below a stack's root, each a plain name, the scope's own a slug (R6-01: a
+/// scope `project:../../escaped` is no layer).
+fn layer_parts(scope: &Scope) -> Result<Vec<fsguard::Part>, String> {
+    let named = |kind: &str, name: &str| -> Result<Vec<fsguard::Part>, String> {
+        Ok(vec![fsguard::Part::new(kind)?, fsguard::Part::skill(name)?])
+    };
+    match scope {
+        Scope::Global => Ok(vec![fsguard::Part::new("global")?]),
+        Scope::Project(p) => named("project", p),
+        Scope::Repo(r) | Scope::Path { repo: r, .. } => named("repo", r),
+        Scope::Workspace(w) => named("workspace", w),
     }
-    fsguard::replace_own_file(path, bytes)
 }
 
 /// Writes keys into an entry's metadata file: frontmatter for Markdown, the whole file for a sidecar.
-fn set_meta_keys(meta_file: &Path, keys: &[(&str, Option<String>)]) -> Result<(), String> {
+fn set_meta_keys(
+    root: &Path,
+    meta_file: &Path,
+    keys: &[(&str, Option<String>)],
+) -> Result<(), String> {
     let text =
         fsguard::read_string(meta_file).map_err(|e| format!("{}: {e}", meta_file.display()))?;
     let new = if stack::file_name(meta_file) == SIDECAR {
@@ -99,7 +123,7 @@ fn set_meta_keys(meta_file: &Path, keys: &[(&str, Option<String>)]) -> Result<()
     } else {
         frontmatter::rewrite(&text, keys)
     };
-    stack_write(meta_file, new.as_bytes())
+    stack_write(root, meta_file, new.as_bytes())
 }
 
 // ---------------------------------------------------------------- retire
@@ -145,13 +169,13 @@ pub fn retire(stacks: &Stacks, r: &Retire) -> Result<Retired, String> {
         ("retired", Some(format!("date: {}\nreason: {}", r.date, quote(r.reason)))),
     ];
     git_keeps(&e.meta_file)?;
-    set_meta_keys(&e.meta_file, &keys)?;
-    // The stack must still load the entry, now retired; otherwise put the file back.
     let root = stacks.stack(e.stack).expect("the entry's stack is loaded").root.clone();
+    set_meta_keys(&root, &e.meta_file, &keys)?;
+    // The stack must still load the entry, now retired; otherwise put the file back.
     let ok =
         Stack::load(&root).ok().and_then(|s| s.find(r.id).map(|x| !x.active())).unwrap_or(false);
     if !ok {
-        fsguard::replace_own_file(&e.meta_file, &before)?;
+        fsguard::replace_own_file(&stack_place(&root, &e.meta_file)?, &before)?;
         return Err(format!("retiring `{}` would leave invalid metadata; nothing changed", r.id));
     }
     let commit = if r.commit && is_repo(&root) {
@@ -296,9 +320,14 @@ fn import_stores(
         if !src.is_dir() {
             return Err(format!("store `{}`: {} is not a dir", s.name, src.display()));
         }
-        let dest = private.layer_dir(&scope).join("memory").join(&s.name);
+        // Below the private stack's root, by parts: a scope or store name that is no plain name imports nothing.
+        let mut parts = layer_parts(&scope).map_err(|e| format!("store `{}`: {e}", s.name))?;
+        parts.push(fsguard::Part::new("memory")?);
+        parts.push(fsguard::Part::skill(&s.name).map_err(|e| format!("store `{}`: {e}", s.name))?);
+        let dest_place = fsguard::Root::stack(&private.root)?.join(&parts);
+        let dest = dest_place.path().to_path_buf();
         if write {
-            fsguard::create_dir_all(&dest)?;
+            fsguard::create_dir_all(&dest_place)?;
         }
         let defaults = dest.join(DEFAULTS);
         if write && !defaults.exists() {
@@ -309,7 +338,7 @@ fn import_stores(
                 s.scope, s.name
             );
             git_keeps(&defaults)?;
-            stack_write(&defaults, text.as_bytes())?;
+            stack_write(&private.root, &defaults, text.as_bytes())?;
         }
         let mut rep = Imported { store: s.name.clone(), ..Imported::default() };
         let mut seen = Vec::new();
@@ -335,7 +364,7 @@ fn import_stores(
                 Err(()) => {
                     if write {
                         git_keeps(&target)?;
-                        stack_write(&target, incoming.as_bytes())?;
+                        stack_write(&private.root, &target, incoming.as_bytes())?;
                     }
                     rep.added.push(name);
                 }
@@ -346,7 +375,7 @@ fn import_stores(
                     } else {
                         if write {
                             git_keeps(&target)?;
-                            stack_write(&target, merged.as_bytes())?;
+                            stack_write(&private.root, &target, merged.as_bytes())?;
                         }
                         rep.changed.push(name);
                     }
@@ -468,9 +497,8 @@ pub fn promote(
         fsguard::read_string(f)
             .map_err(|err| format!("{}: {err}; promotion carries text files only", f.display()))
     };
-    // Nothing git can't give back: a file the owner marked (read-only, hidden, system) refuses (r5, R5-05).
-    // A skill's dirs too: git keeps no dir attributes either (hidden or system; read-only on a Windows dir means
-    // nothing to git or to the owner's files).
+    // Nothing git can't give back (rule C's allowlist, R5-05, R6-06): a file with any attribute but ARCHIVE or
+    // NORMAL, or a skill dir with any but DIRECTORY, refuses.
     if is_skill {
         let mut dirs = vec![src_path.clone()];
         dirs.extend(
@@ -481,14 +509,14 @@ pub fn promote(
         );
         for d in dirs {
             let a = fsguard::attrs(&d)?;
-            if a.unusual_for_dir() {
+            if !a.git_restores(true) {
                 return Err(format!("{}: marked {}; git can't give that back once promotion deletes it. Clear it and promote again", d.display(), a.describe()));
             }
         }
     }
     for f in &e.files {
         let a = fsguard::attrs(f)?;
-        if a.unusual() {
+        if !a.git_restores(false) {
             return Err(format!("{}: marked {}; git can't give that back once promotion deletes it. Clear it and promote again", f.display(), a.describe()));
         }
     }
@@ -594,18 +622,19 @@ pub fn promote(
     // Write: public copy, then the private part, then remove the private original.
     for (f, text) in &files {
         let to = public.root.join(rel(&private.root, f));
-        stack_write(&to, text.as_bytes())?;
+        stack_write(&public.root, &to, text.as_bytes())?;
     }
     let mut part_path = None;
     if let Some((name, text)) = private_part {
         let p = e.meta_file.with_file_name(name);
-        stack_write(&p, text.as_bytes())?;
+        stack_write(&private.root, &p, text.as_bytes())?;
         part_path = Some(p);
     }
+    let src = stack_place(&private.root, &src_path)?;
     if is_skill {
-        fsguard::delete_tree(&src_path)?;
+        fsguard::delete_tree(&src)?;
     } else {
-        fsguard::delete_file(&src_path)?;
+        fsguard::delete_file(&src)?;
     }
     let mut commits = Vec::new();
     if commit {
@@ -747,7 +776,9 @@ pub fn edit(
         let failed: Vec<String> = files
             .iter()
             .zip(&before)
-            .filter_map(|(f, b)| fsguard::replace_own_file(f, b).err())
+            .filter_map(|(f, b)| {
+                stack_place(&stack.root, f).and_then(|at| fsguard::replace_own_file(&at, b)).err()
+            })
             .collect();
         if failed.is_empty() {
             String::new()
@@ -756,7 +787,7 @@ pub fn edit(
         }
     };
     if !keys.is_empty() {
-        set_meta_keys(&e.meta_file, &keys)?;
+        set_meta_keys(&stack.root, &e.meta_file, &keys)?;
     }
     if let Some(body) = &change.body {
         let text = fsguard::read_string(&e.body_file).map_err(|err| err.to_string())?;
@@ -767,7 +798,7 @@ pub fn edit(
         } else {
             body.clone()
         };
-        stack_write(&e.body_file, new.as_bytes())?;
+        stack_write(&stack.root, &e.body_file, new.as_bytes())?;
     }
     // The entry must still load, with no new problem in its files; otherwise put them back.
     let reloaded = Stack::load(&stack.root);

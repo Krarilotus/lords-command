@@ -23,7 +23,7 @@ usage:
   lords privacy FILE...
   lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit and commit-msg hooks
   lords hash PATH
-  lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--json] [--apply]
+  lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--stage install] [--json] [--apply]
   lords sync --restore BACKUP_DIR   undo one apply's owner-file edits, each only while it holds what sync wrote
   lords uninstall [--user | --repo NAME] [--apply]   remove the tool's paths that still match its ledger
   lords adopt [--list | PATH...]   record paths from before the ledger that hold exactly what sync writes there
@@ -192,15 +192,28 @@ fn print_applied(applied: &sync::Applied) {
     }
 }
 
+/// A plan of the current config for every target and place: what `restore` and `set-aside` check paths against.
+fn whole_plan(a: &mut Args, home: PathBuf) -> Result<sync::Plan, String> {
+    let p = paths(a)?;
+    let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    sync::plan(&stacks, &sync::Options { home, ..sync::Options::default() })
+}
+
 fn cmd_sync(mut a: Args) -> Result<bool, String> {
     let home = tool_home(&mut a)?;
     if let Some(dir) = a.value("--restore")? {
+        let plan = whole_plan(&mut a, home)?;
         a.done()?;
-        for line in sync::restore(&home, Path::new(&dir))? {
+        for line in sync::restore(&plan, Path::new(&dir))? {
             println!("{line}");
         }
         return Ok(true);
     }
+    let stage = match a.value("--stage")?.as_deref() {
+        None | Some("full") => sync::Stage::Full,
+        Some("install") => sync::Stage::Install,
+        Some(other) => return Err(format!("--stage {other}: `install` or `full`")),
+    };
     let apply = a.flag("--apply");
     let json = a.flag("--json");
     let user_only = a.flag("--user");
@@ -219,7 +232,7 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         ));
     }
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
-    let opts = sync::Options { repo, user_only, adapter, place, home, uninstall: false };
+    let opts = sync::Options { repo, user_only, adapter, place, home, uninstall: false, stage };
     let plan = sync::plan(&stacks, &opts)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_default());
@@ -295,6 +308,7 @@ fn cmd_adopt(mut a: Args) -> Result<bool, String> {
 fn cmd_set_aside(mut a: Args) -> Result<bool, String> {
     let home = tool_home(&mut a)?;
     let yes = a.flag("--yes");
+    let plan = whole_plan(&mut a, home)?;
     let mut named = Vec::new();
     while let Some(x) = a.positional() {
         named.push(PathBuf::from(x));
@@ -310,7 +324,7 @@ fn cmd_set_aside(mut a: Args) -> Result<bool, String> {
         println!("nothing moved: check each path, then run again with --yes");
         return Ok(true);
     }
-    print_applied(&sync::set_aside(&home, &named)?);
+    print_applied(&sync::set_aside(&plan, &named)?);
     Ok(true)
 }
 

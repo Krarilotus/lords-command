@@ -117,6 +117,11 @@ pub fn is_id(s: &str) -> bool {
 /// Runs every check over the stacks. `public_rules` is what the public stack is scanned with; the private
 /// stack is always scanned for secrets only.
 pub fn check(stacks: &Stacks, public_rules: &Rules) -> Vec<Finding> {
+    check_at(stacks, public_rules, &crate::sync::default_home().unwrap_or_default())
+}
+
+/// `check` with the tool's home given (where the hook probe's nonce goes; tests use their own).
+pub fn check_at(stacks: &Stacks, public_rules: &Rules, home: &Path) -> Vec<Finding> {
     let mut out: Vec<Finding> = stacks.all().flat_map(|s| s.problems.iter().cloned()).collect();
     ids(stacks, &mut out);
     declared(stacks, &mut out);
@@ -127,7 +132,7 @@ pub fn check(stacks: &Stacks, public_rules: &Rules) -> Vec<Finding> {
     skill_clashes(stacks, &mut out);
     temporaries(stacks, &crate::ops::today(), &mut out);
     privacy_of_entries(stacks, public_rules, &mut out);
-    privacy_hooks(stacks, &mut out);
+    privacy_hooks(stacks, home, &mut out);
     for n in &public_rules.notes {
         out.push(Finding::info("privacy-scope", n.clone()));
     }
@@ -139,26 +144,37 @@ pub fn check(stacks: &Stacks, public_rules: &Rules) -> Vec<Finding> {
 
 /// Guarantee 7 holds as long as commits run through the effective privacy hooks (orchestrator, 25 Oct, decision 8):
 /// the public stack's repo is checked for that, and each hook a commit wouldn't reach is "not verified".
-fn privacy_hooks(stacks: &Stacks, out: &mut Vec<Finding>) {
+fn privacy_hooks(stacks: &Stacks, home: &Path, out: &mut Vec<Finding>) {
     let root = &stacks.public.root;
-    let Some(top) = crate::git::toplevel(root) else {
-        // No repo is only where there is no `.git`; a git that fails where there is one verifies nothing (r5).
-        match crate::fsguard::kind_here(&root.join(".git")) {
-            Ok(crate::fsguard::Kind::Missing) => out.push(Finding::info(
+    // No repo only where git says so; any other git error verifies nothing (Sol review r6, R6-08).
+    let top = match crate::git::run(root, &["rev-parse", "--show-toplevel"]) {
+        Ok(t) => std::path::PathBuf::from(t.trim()),
+        Err(e) if e.contains("not a git repository") => {
+            out.push(Finding::info(
                 "privacy-hooks",
                 format!("{} is in no git repo: no commit to check", root.display()),
-            )),
-            _ => out.push(Finding::warning(
-                "privacy-hooks",
-                format!(
-                    "{}: pre-commit and commit-msg: not verified (git can't tell the repo)",
-                    root.display()
-                ),
-            )),
+            ));
+            return;
         }
-        return;
+        Err(e) => {
+            out.push(Finding::warning(
+                "privacy-hooks",
+                format!("{}: pre-commit and commit-msg: not verified ({e})", root.display()),
+            ));
+            return;
+        }
     };
-    for p in crate::hooks::privacy_dispatch(&top) {
+    if home.as_os_str().is_empty() {
+        out.push(Finding::warning(
+            "privacy-hooks",
+            format!(
+                "{}: pre-commit and commit-msg: not verified (no tool home for the probe)",
+                top.display()
+            ),
+        ));
+        return;
+    }
+    for p in crate::hooks::privacy_dispatch(&top, home) {
         out.push(Finding::warning("privacy-hooks", format!("{}: {p}", top.display())));
     }
 }

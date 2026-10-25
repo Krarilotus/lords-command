@@ -819,6 +819,7 @@ impl App {
             place: None,
             home: sync::default_home().unwrap_or_default(),
             uninstall: false,
+            stage: sync::Stage::Full,
         };
         let (pu, pr) = (paths.public.clone(), paths.private.clone());
         self.planning = Some(Task::start(ctx, move || {
@@ -883,6 +884,7 @@ impl App {
                             place: None,
                             home: sync::default_home().unwrap_or_default(),
                             uninstall: false,
+                            stage: sync::Stage::Full,
                         };
                         let (pu, pr) = (public.clone(), private.clone());
                         self.applying = Some(Task::start(ctx, move || {

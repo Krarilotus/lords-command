@@ -189,18 +189,22 @@ fn r2_01_a_junction_above_never_redirects_a_restore() {
 fn r2_02_an_owner_edit_made_mid_apply_survives() {
     let f = Fixture::new();
     rule(&f);
-    targets(&f, &instructions("slow", &f.path("out/slow")));
-    let mut p = plan_all(&f);
-    let mut later = p.items.iter().find(|i| i.path == f.path("out/slow")).unwrap().clone();
-    later.path = f.path("out/victim");
-    later.action = Action::Update;
-    later.current = Some("OLD".into());
-    later.proposed = Some("REPLACEMENT".into());
+    // Two targets, planned as sync plans them (an item's place is the plan's: design-simplification-r6, rule A):
+    // the victim's owner file is updated after the slow one's.
     f.write("out/victim", "OLD");
+    targets(
+        &f,
+        &format!(
+            "{}{}",
+            instructions("slow", &f.path("out/slow")),
+            instructions("victim", &f.path("out/victim"))
+        ),
+    );
+    let mut p = plan_all(&f);
     for i in p.items.iter_mut().filter(|i| i.path == f.path("out/slow")) {
         i.proposed = Some("X".repeat(96 * 1024 * 1024));
     }
-    p.items.push(later);
+    assert!(p.items.iter().any(|i| i.path == f.path("out/victim") && i.action == Action::Update));
     let (dir, victim) = (f.path("out"), f.path("out/victim"));
     let edit = std::thread::spawn(move || {
         assert!(wait_for(&dir, ".slow.lords-"), "the slow write's staging file appeared");

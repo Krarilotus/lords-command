@@ -7,7 +7,6 @@
 
 mod common;
 use common::*;
-use lords_core::ledger::Ledger;
 use lords_core::sync::{self, Action};
 use std::fs;
 use std::path::Path;
@@ -105,9 +104,7 @@ fn r3_03_a_ledger_entry_outside_its_target_refuses_everything() {
     skill(&f, "demo");
     targets(&f, &skills_target(&f.path("skills")));
     let outside = f.write("outside/owner.txt", "OWNER");
-    let mut ledger = Ledger::default();
-    ledger.record(&outside, "file", &lords_core::fsguard::sha(b"OWNER"), "target:skills");
-    ledger.save(&f.home()).unwrap();
+    forge(&f.home(), outside.parent().unwrap(), &["owner.txt"], "file", "target:skills");
     let result = plan(&f).and_then(|p| sync::apply(&p).map(|a| a.done));
     assert!(result.is_err(), "{result:?}");
     assert_eq!(f.read("outside/owner.txt"), "OWNER");
@@ -136,9 +133,7 @@ fn r3_04_two_distinct_files_are_two_identities() {
             combining.display()
         ),
     );
-    let mut ledger = Ledger::default();
-    ledger.record(&dotted, "file", &lords_core::fsguard::sha(b"SAME"), "target:t");
-    ledger.save(&f.home()).unwrap();
+    forge(&f.home(), dotted.parent().unwrap(), &["\u{130}.txt"], "file", "target:t");
     let result = plan(&f).and_then(|p| {
         let a = p.items.iter().find(|i| i.path == combining).map(|i| i.action.clone());
         assert_ne!(a, Some(Action::Update), "the unrecorded file is not the tool's");
