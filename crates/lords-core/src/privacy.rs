@@ -40,6 +40,7 @@ pub struct Hit {
     /// Byte range within the line.
     pub start: usize,
     pub end: usize,
+    /// The matched text. A deny phrase wrapped across lines runs on past `end`, into the next lines.
     pub text: String,
 }
 
@@ -157,30 +158,19 @@ fn patterns() -> &'static [Pattern] {
             p(Class::Secret, r"(?i)hooks\.slack\.com/services/[A-Za-z0-9/]+", 0),
             p(Class::Secret, r"(?i)discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]+", 0),
             p(Class::Secret, r#"(?i)https?://[^\s"'<>]*/webhooks?/[A-Za-z0-9_-]{16,}"#, 0),
+            // The named-key rule: after a secret-named key, any value of 16 or more token characters is a secret,
+            // whatever its alphabet. The patterns above match a secret's own shape or place and need no key.
             p(Class::Secret, r#"(?i)\b(?:password|passwd|secret|token|api[_-]?key)\s*[:=]\s*["']?([A-Za-z0-9/+_\-]{16,})"#, 1),
         ]
     })
 }
 
-/// A long value assigned to a secret-named key counts as a secret if it mixes letters and digits, or is letters
-/// only and either very long or changes case often (a token, not a word, an identifier or a path part).
-fn looks_random(s: &str) -> bool {
-    if s.chars().any(|c| c.is_ascii_digit()) {
-        return s.chars().any(|c| c.is_ascii_alphabetic());
-    }
-    if !s.chars().all(|c| c.is_ascii_alphabetic()) {
-        return false;
-    }
-    let b = s.as_bytes();
-    let changes =
-        b.windows(2).filter(|w| w[0].is_ascii_uppercase() != w[1].is_ascii_uppercase()).count();
-    b.len() >= 32 || (b.len() >= 20 && changes * 3 >= b.len())
-}
-
-/// Text as deny and fleet terms are compared: Unicode lower case, compatibility-decomposed (NFKD), each run of
-/// whitespace one space. Each folded byte keeps the byte range of the char it came from.
+/// Text as deny and fleet terms are compared: compatibility-decomposed (NFKD), Unicode default full case folding
+/// (ß and SS, ς and σ), decomposed again, each run of whitespace one space. Each folded byte keeps the byte range
+/// of the char it came from.
 fn fold(text: &str) -> (String, Vec<(usize, usize)>) {
     let nfkd = icu_normalizer::DecomposingNormalizerBorrowed::new_nfkd();
+    let case = icu_casemap::CaseMapper::new();
     let mut out = String::with_capacity(text.len());
     let mut from = Vec::with_capacity(text.len());
     let mut push = |out: &mut String, c: char, origin: (usize, usize)| {
@@ -196,10 +186,10 @@ fn fold(text: &str) -> (String, Vec<(usize, usize)>) {
         } else if c.is_ascii() {
             push(&mut out, c.to_ascii_lowercase(), origin);
         } else {
-            for d in nfkd.normalize_iter(c.to_lowercase()) {
-                for l in d.to_lowercase() {
-                    push(&mut out, l, origin);
-                }
+            // Folded text need not be normalised, so it is decomposed again (Unicode's compatibility caseless match).
+            let decomposed = nfkd.normalize(c.encode_utf8(&mut [0; 4])).into_owned();
+            for d in nfkd.normalize(&case.fold_string(&decomposed)).chars() {
+                push(&mut out, d, origin);
             }
         }
     }
@@ -218,9 +208,6 @@ pub fn scan(text: &str, rules: &Rules) -> Vec<Hit> {
         for p in patterns().iter().filter(|p| rules.classes.contains(&p.class)) {
             for caps in p.re.captures_iter(line) {
                 let Some(m) = caps.get(p.group) else { continue };
-                if p.group == 1 && p.class == Class::Secret && !looks_random(m.as_str()) {
-                    continue;
-                }
                 // A backslash escape before `@` (an `\n@AGENTS.md` include line in source) is not an address.
                 if p.class == Class::Contact && line[..m.start()].ends_with(char::from(92)) {
                     continue;
@@ -236,10 +223,9 @@ pub fn scan(text: &str, rules: &Rules) -> Vec<Hit> {
         }
     }
     // Terms match on the whole folded text, so a phrase wrapped across lines is found; the hit is placed on the
-    // line it starts on, its span ending at that line's end at most.
+    // line it starts on, its span ending at that line's end at most and its text the whole phrase.
     let (folded, from) = fold(text);
-    let starts: Vec<usize> =
-        std::iter::once(0).chain(text.match_indices('\n').map(|(i, _)| i + 1)).collect();
+    let starts = line_starts(text);
     for (class, terms) in [(Class::Fleet, &rules.hosts), (Class::Deny, &rules.deny)] {
         if !rules.classes.contains(&class) {
             continue;
@@ -272,23 +258,40 @@ pub fn scan(text: &str, rules: &Rules) -> Vec<Hit> {
     hits
 }
 
-/// Replaces each hit's span with `<private:class>`, the placeholder the owner then rewords.
+/// The byte offset each line starts at.
+fn line_starts(text: &str) -> Vec<usize> {
+    std::iter::once(0).chain(text.match_indices('\n').map(|(i, _)| i + 1)).collect()
+}
+
+/// Replaces each hit's span with `<private:class>`, the placeholder the owner then rewords. A phrase wrapped across
+/// lines is replaced whole, up to the end of its `text`.
 pub fn strip(text: &str, hits: &[Hit]) -> String {
+    let starts = line_starts(text);
+    let mut spans: Vec<(usize, usize, Class)> = hits
+        .iter()
+        .filter_map(|h| {
+            let line = *starts.get(h.line.checked_sub(1)?)?;
+            let s = line + h.start;
+            let e = if text.get(s..)?.starts_with(h.text.as_str()) {
+                s + h.text.len()
+            } else {
+                line + h.end
+            };
+            Some((s, e, h.class))
+        })
+        .collect();
+    spans.sort();
     let mut out = String::with_capacity(text.len());
-    for (i, line) in text.split_inclusive('\n').enumerate() {
-        let mut spans: Vec<&Hit> = hits.iter().filter(|h| h.line == i + 1).collect();
-        spans.sort_by_key(|h| h.start);
-        let mut pos = 0;
-        for h in spans {
-            if h.start < pos {
-                continue;
-            }
-            out.push_str(&line[pos..h.start]);
-            out.push_str(&format!("<private:{}>", h.class.name()));
-            pos = h.end;
+    let mut pos = 0;
+    for (s, e, class) in spans {
+        if s < pos {
+            continue;
         }
-        out.push_str(&line[pos..]);
+        out.push_str(&text[pos..s]);
+        out.push_str(&format!("<private:{}>", class.name()));
+        pos = e;
     }
+    out.push_str(&text[pos..]);
     out
 }
 
@@ -309,10 +312,28 @@ pub const BINARY_ATTR: &str = "lords-binary";
 
 /// A file's bytes as text to scan, and whether they are text. UTF-8 without NUL bytes and UTF-16 with a byte order
 /// mark are text. Anything else is scanned as its lossy UTF-8 reading plus its printable ASCII runs with NUL bytes
-/// dropped (which also reads UTF-16 without a byte order mark).
+/// dropped, and, if its NUL bytes look like UTF-16 without a byte order mark, its UTF-16 reading too; it stays
+/// not text, as that reading is a guess.
 pub fn decode(bytes: &[u8]) -> (String, bool) {
-    let utf16 = |be: bool| {
-        let units: Vec<u16> = bytes[2..]
+    match bytes {
+        [0xff, 0xfe, rest @ ..] => return (utf16(rest, false), true),
+        [0xfe, 0xff, rest @ ..] => return (utf16(rest, true), true),
+        _ => {}
+    }
+    if let Some(text) = utf8(bytes) {
+        return (text.to_string(), true);
+    }
+    let mut text = byte_text(bytes);
+    if let Some(be) = utf16_without_bom(bytes) {
+        text.push('\n');
+        text.push_str(&utf16(bytes, be));
+    }
+    (text, false)
+}
+
+fn utf16(bytes: &[u8], be: bool) -> String {
+    let units: Vec<u16> =
+        bytes
             .chunks_exact(2)
             .map(|c| {
                 if be {
@@ -322,16 +343,22 @@ pub fn decode(bytes: &[u8]) -> (String, bool) {
                 }
             })
             .collect();
-        String::from_utf16_lossy(&units)
-    };
-    match bytes {
-        [0xff, 0xfe, ..] => return (utf16(false), true),
-        [0xfe, 0xff, ..] => return (utf16(true), true),
-        _ => {}
-    }
-    match utf8(bytes) {
-        Some(text) => (text.to_string(), true),
-        None => (byte_text(bytes), false),
+    String::from_utf16_lossy(&units)
+}
+
+/// Whether bytes read as UTF-16 without a byte order mark, and if so big-endian. Each ASCII or Latin-1 char in
+/// UTF-16 has a NUL high byte: in text, many NUL bytes fall on one side (odd offsets little-endian, even ones
+/// big-endian) and few on the other.
+fn utf16_without_bom(bytes: &[u8]) -> Option<bool> {
+    let units = bytes.len() / 2;
+    let nul_at = |side: usize| bytes.iter().skip(side).step_by(2).filter(|&&b| b == 0).count();
+    let (even, odd) = (nul_at(0), nul_at(1));
+    if odd > 0 && odd * 8 >= units && even * 4 <= odd {
+        Some(false)
+    } else if even > 0 && even * 8 >= units && odd * 4 <= even {
+        Some(true)
+    } else {
+        None
     }
 }
 

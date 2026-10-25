@@ -8,6 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Unicode case folding for privacy terms; ICU4X like icu_normalizer, adds only its own data crate.
+icu_casemap = { version = "2", default-features = false, features = ["compiled_data"] }
 # Unicode normalisation (NFKD) for privacy terms; already in the tree through jsonschema's url → idna.
 icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
 jsonschema = { version = "0.33", default-features = false }

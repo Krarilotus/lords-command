@@ -18,7 +18,7 @@ usage:
   lords retire ID --reason TEXT [--superseded-by ID] [--date YYYY-MM-DD] [--no-commit]
   lords promote ID [--strip | --split] [--no-commit]
   lords privacy --staged [--secrets-only]   staged files and their paths; a binary needs `lords-binary` in .gitattributes
-  lords privacy --message FILE [--secrets-only]   a commit message (the commit-msg hook)
+  lords privacy --message FILE [--staged] [--secrets-only]   a commit message (the commit-msg hook)
   lords privacy --history [--private-stack DIR]   every commit's message and patch (the pre-push check)
   lords privacy FILE...
   lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit and commit-msg hooks
@@ -75,7 +75,7 @@ struct Paths {
 }
 
 fn paths(args: &mut Args) -> Result<Paths, String> {
-    let cfg = Config::discover();
+    let cfg = Config::load()?;
     let public = args.value("--public-stack")?.map(PathBuf::from).or(cfg.public).or_else(|| {
         let cwd = std::env::current_dir().ok()?;
         let top = git::toplevel(&cwd)?;
@@ -370,7 +370,8 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
     let rules = if secrets_only {
         Rules::secrets_only()
     } else {
-        let mut cfg = Config::discover();
+        // A config.txt that is there but can't be read fails the check: its private stack would be skipped.
+        let mut cfg = Config::load()?;
         if private_stack.is_some() {
             cfg.private = private_stack;
         }
@@ -408,7 +409,7 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
         println!("history: {} commits scanned, {} finding(s)", h.commits, h.hits.len());
         return Ok(h.hits.is_empty());
     }
-    let scan = if staged {
+    let mut scan = if staged {
         a.done()?;
         let top = git::toplevel(&cwd).ok_or("not in a git repo")?;
         privacy::scan_staged(&top, &rules)?
@@ -422,13 +423,14 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
         }
         // Named files have no .gitattributes to mark them: one that isn't text is refused.
         scan.unmarked = scan.binary.clone();
-        // A commit message has no NUL bytes, and its lossy reading keeps every readable part: never refused.
-        if let Some(m) = &message {
-            let bytes = std::fs::read(m).map_err(|e| format!("{m}: {e}"))?;
-            scan.add(PathBuf::from(m), &bytes, &rules);
-        }
         scan
     };
+    // The message is scanned with the staged or named files too. A commit message has no NUL bytes, and its lossy
+    // reading keeps every readable part: never refused.
+    if let Some(m) = &message {
+        let bytes = std::fs::read(m).map_err(|e| format!("{m}: {e}"))?;
+        scan.add(PathBuf::from(m), &bytes, &rules);
+    }
     for (p, h) in &scan.hits {
         eprintln!("{}", check::privacy_finding(p, h));
     }

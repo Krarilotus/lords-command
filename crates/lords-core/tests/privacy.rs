@@ -33,7 +33,6 @@ fn each_class_matches_its_shape() {
         ("~/.claude/CLAUDE.md and ~/.codex/AGENTS.md".to_string(), vec![]),
         // An `\n` escape before an include line in source, not an address.
         (format!("\"-->{}n{}AGENTS.md\"", char::from(92), '@'), vec![]),
-        ("token = \"anunbrokenwordwithoutdigits\"".to_string(), vec![]),
     ];
     for (text, want) in cases {
         assert_eq!(classes(&text, &r), want, "{text}");
@@ -136,7 +135,7 @@ fn deny_and_fleet_terms_match_unicode_case_and_normal_forms() {
 }
 
 // Spec (Sol review 25 Oct, finding 17: "Alphabetic API tokens are explicitly excluded"): a long letters-only value
-// assigned to a secret-named key is a secret; one ordinary word joined up stays prose.
+// assigned to a secret-named key is a secret. (Its exception for one ordinary word joined up went with R2-14.)
 #[test]
 fn a_letters_only_token_after_a_secret_key_is_a_secret() {
     let r = Rules::public();
@@ -146,9 +145,6 @@ fn a_letters_only_token_after_a_secret_key_is_a_secret() {
         classes(&format!("password: {}", "abcdefghijklmnopqrstuvwxyzabcdefgh"), &r),
         vec![Class::Secret]
     );
-    assert_eq!(classes("token = \"anunbrokenwordwithoutdigits\"", &r), vec![]);
-    assert_eq!(classes("token: TokenizerConfiguration", &r), vec![]);
-    assert_eq!(classes("secret: some_long_variable_name", &r), vec![]);
 }
 
 // Spec (Sol review 25 Oct, finding 25: "A CRLF-wrapped deny phrase bypasses scanning"): a multi-word deny term
@@ -160,6 +156,41 @@ fn a_deny_phrase_matches_across_line_breaks() {
     assert_eq!(classes("our secret\r\nproject here", &r), vec![Class::Deny]);
     assert_eq!(classes("our Secret \t\n  Project here", &r), vec![Class::Deny]);
     assert_eq!(classes("a secret\n\nprojector", &r), vec![]);
+}
+
+// Spec (Sol review r2, R2-13: "NFKD plus lowercase is not Unicode case folding"): deny terms match under full
+// Unicode case folding (sharp s and SS, final and medial sigma), either way round, and the hit is the original text.
+#[test]
+fn deny_terms_match_under_full_case_folding() {
+    let mut r = Rules::public();
+    r.deny = vec!["stra\u{df}e".into(), "\u{3bf}\u{3c3}".into()];
+    assert_eq!(classes("in der STRASSE hier", &r), vec![Class::Deny]);
+    assert_eq!(classes("a \u{3bf}\u{3c2} b", &r), vec![Class::Deny]);
+    r.deny = vec!["strasse".into()];
+    let hits = scan("die Stra\u{df}e.", &r);
+    assert_eq!(hits.iter().map(|h| h.text.as_str()).collect::<Vec<_>>(), ["Stra\u{df}e"]);
+}
+
+// Spec (Sol review r2, R2-14: "Shorter alphabetic API tokens still pass the generic secret gate"): after a
+// secret-named key, any value of at least 16 token characters is a secret, whatever its alphabet; a shorter one is
+// not.
+#[test]
+fn any_long_value_after_a_secret_named_key_is_a_secret() {
+    let r = Rules::public();
+    let lower = ["qxnwzrtplvbc", "jkhdfsmgayue"].concat();
+    assert_eq!(classes(&format!("api_key='{lower}'"), &r), vec![Class::Secret]);
+    assert_eq!(classes(&format!("TOKEN = \"{}\"", "QXNWZRTPLVBCJKHD"), &r), vec![Class::Secret]);
+    assert_eq!(classes(&format!("secret: {}", "qxnwzrtplvbcjkh"), &r), vec![]);
+}
+
+// Spec (Sol review r2, R2-22: "The new multiline deny hit is only partly stripped"): stripping a deny phrase
+// wrapped across lines replaces the whole phrase, every line of it.
+#[test]
+fn strip_removes_a_wrapped_private_phrase() {
+    let mut r = Rules::public();
+    r.deny = vec!["secret project".into()];
+    let text = "our secret\r\nproject here\nnext\n";
+    assert_eq!(strip(text, &scan(text, &r)), "our <private:deny> here\nnext\n");
 }
 
 /// A repo with `files` staged (not committed).
@@ -218,4 +249,24 @@ fn a_staged_file_name_is_scanned() {
     let scan = lords_core::privacy::scan_staged(&repo, &r).unwrap();
     let classes: Vec<Class> = scan.hits.iter().map(|(_, h)| h.class).collect();
     assert_eq!(classes, [Class::Deny, Class::Contact], "{:?}", scan.hits);
+}
+
+// Spec (Sol review r2, R2-15: "Marked BOM-less UTF-16 can still leak non-ASCII deny terms"): staged UTF-16 without
+// a byte order mark, little- or big-endian, is decoded and scanned, also in a file marked `lords-binary`.
+#[test]
+fn utf16_without_a_byte_order_mark_is_decoded() {
+    let f = Fixture::new();
+    let word = "Ask M\u{dc}LLER first\r\n";
+    let le: Vec<u8> = word.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let be: Vec<u8> = word.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
+    let attrs = b"*.dat lords-binary\n".as_slice();
+    let repo = staged_repo(&f, &[(".gitattributes", attrs), ("le.dat", &le), ("be.dat", &be)]);
+    let mut r = Rules::public();
+    r.deny = vec!["m\u{fc}ller".into()];
+    let scan = lords_core::privacy::scan_staged(&repo, &r).unwrap();
+    let mut found: Vec<String> =
+        scan.hits.iter().map(|(p, h)| format!("{} {:?}", p.display(), h.class)).collect();
+    found.sort();
+    assert_eq!(found, ["be.dat Deny", "le.dat Deny"], "{:?}", scan.hits);
+    assert!(scan.unmarked.is_empty(), "{:?}", scan.unmarked);
 }
