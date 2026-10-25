@@ -150,6 +150,50 @@ commits, not sync).
 Out of contract and stated, as before: tests, build scripts and dependencies (outside the boundary); the GUI's
 `Config::discover`; deliberate lint obfuscation (E); commits that skip hooks (D); the path-swap race (R3-05).
 
+## Where each finding is closed, at `2eb6b9d`
+
+Paths are below `crates/lords-core/` unless they start otherwise. "Test" names the spec test that shows it.
+
+| Finding | Closed by | Where | Test |
+|---|---|---|---|
+| R3-01 | small: tree hash covers dirs | `src/fsguard.rs:44` (`tree_sha`), `:176` (`read_tree`) | `round3::r3_01_*` |
+| R3-02 | small: backup before the move | `src/sync.rs:1906` (`owner_update`) | `round3::r3_02_*` |
+| R3-03 | A: record = verified root + slot parts | `src/sync.rs:474` (`placed`), `:512` (`check_ledger`); `src/ledger.rs:16` (format 2) | `round3::r3_03_*`, `round4::r4_01_*` |
+| R3-04 | small: NTFS upcase, file identity | `src/ledger.rs:46` (`key`), `:73` (`upcase`) | `round3::r3_04_*` |
+| R3-05 | stays: operating assumption; post-action check | `src/fsguard.rs:474` (`verify_inside`) | `round3_api::r3_05_*` |
+| R3-06 | C: keep what can be set back, refuse the rest | `src/fsguard.rs:339` (`keep`), `src/sync.rs:1906` | `round3::r3_06_*` |
+| R3-07 | small: every reading | `src/privacy.rs:335` (`readings`) | `round3::r3_07_*` |
+| R3-08 | E: clippy + text layer, run by the commit check | `clippy.toml`; `tests/fsguard_lint.rs`; `tools/commit-check.sh:10` | `fsguard_lint::*` |
+| R3-09 | small: hooks take the lock | `src/hooks.rs:212`; `src/sync.rs:1776` (`ApplyLock::take`) | `round3::r3_09_*` |
+| R3-10 | small: git keeps the old bytes; A places the edit | `src/ops.rs:45` (`git_keeps`), `:87` (`stack_place`) | `round3::r3_10_*` |
+| R4-01 | A: slots over verified roots | `src/sync.rs:474`, `:1184` (`checkouts`); `src/fsguard.rs:751` (`Root::checkout`) | `round4::r4_01_*` (3) |
+| R4-02 | small: every reading | `src/privacy.rs:335` | `round4::r4_02_*` |
+| R4-03 | C: restore sets the recorded attributes back | `src/sync.rs:2112` (`restore`) | `round4::r4_03_*` |
+| R4-04 | small: hard link only | `src/fsguard.rs:272` (`link_in`), `:282` | `sync.rs` unit test (seam) |
+| R4-05 | small: format, now 2 | `src/ledger.rs:16` | `round4::r4_05_*` |
+| R4-06 | E | as R3-08 | `fsguard_lint::r4_06_*` |
+| R4-07 | small: empty dir refuses | `src/ops.rs:617` | `round4::r4_07_*` |
+| R4 side | small: strict check; save cut short refuses | `src/fsguard.rs:62` (`check`); `src/ledger.rs:146` | `round4::check_*`, `round4::an_interrupted_*` |
+| R5-01 | A: `Root::checkout` | `src/fsguard.rs:751`; `src/sync.rs:1184` | `round5::r5_01_*` (3) |
+| R5-02 | A: `Part::skill` in the slots | `src/fsguard.rs:685` | `round5::r5_02_*` (2) |
+| R5-03 | E: clippy resolves | `clippy.toml` | `fsguard_lint::r5_03_*` |
+| R5-04 | small: strict listing; B for the harm | `src/fsguard.rs:110` (`list_dir`); `src/stack.rs:185` | `round5::r5_04_*` |
+| R5-05 | C: promotion's allowlist | `src/fsguard.rs:357` (`git_restores`); `src/ops.rs:512` | `round5::r5_05_*` (3) |
+| R5-06 | small: unique target names | `src/stack.rs:171` | `round5::r5_06_*` |
+| R6-01 | A: stack edits below `Root::stack` | `src/ops.rs:87` (`stack_place`), `:101` (`layer_parts`) | `round6::r6_01_*` |
+| R6-02 | A: one `Root::checkout` for all | `src/sync.rs:1184`; `src/fsguard.rs:751` | `round6::r6_02_*` (2) |
+| R6-03 | E: the runner runs the lint | `tools/commit-check.sh:10` | `fsguard_lint::r6_03_*` |
+| R6-04 | E: `r#` normalised | `tests/fsguard_lint.rs:187` (`unraw`) | `fsguard_lint::r6_04_*` |
+| R6-05 | B: the `Complete` witness | `src/sync.rs:106`, `:1719`, `:2049` | `round6::r6_05_*`, `round6::b_*` |
+| R6-06 | C: ARCHIVE or NORMAL only | `src/fsguard.rs:357`; `src/ops.rs:512` | `round6::r6_06_*` |
+| R6-07 | D: the probe | `src/hooks.rs:43` (`probe_lines`), `:95` (`privacy_dispatch`) | `round6::r6_07_*`; `crates/lords/tests/cli.rs` (2) |
+| R6-08 | D: any git error is not verified | `src/check.rs:147` (`privacy_hooks`) | `round6::r6_08_*` |
+| Review point 1 | D: a nonce with its file | `src/hooks.rs:43` | `cli::an_invented_probe_value_*`, `cli::a_probe_with_its_nonce_file_*` |
+| Review point 2 | A: set-aside within verified roots | `src/sync.rs:1894` (`containing`), `:2281` | `round6_api::set_aside_*` |
+| Review point 3 | A: restore re-derives or refuses | `src/sync.rs:2112` | `round6_api::restore_refuses_*` |
+| Rule A's acceptance | a plain path doesn't compile | `src/fsguard.rs:950` (doctest) | `cargo test --doc` |
+| Staged first use | the install stage | `src/sync.rs:1745` (`staged`) | `round6_api::the_install_stage_*` |
+
 ## Cost and order
 
 - **One implementation round, in this order:**
