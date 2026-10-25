@@ -662,9 +662,26 @@ fn make_executable_at(path: &Path) -> Result<(), String> {
 // So every writer names its root, and a path no root contains can't be written, by construction.
 
 /// One name in a path below a root: not empty, no separator, not `.` or `..`, no drive or stream (`:`), no control
-/// character, nothing NTFS would trim (a final space or dot).
+/// character or other character Windows refuses (`<>"|?*`), nothing NTFS would trim (a final space or dot), and no
+/// Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM0`-`COM9`, `LPT0`-`LPT9`, in any case and with any
+/// extension; Sol review r7, R7-09).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Part(String);
+
+/// A Windows device name: the part before the first dot, in any case (`COM` and `LPT` with a digit, `¹`, `²` or
+/// `³`, which Windows reserves too).
+fn device(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    if ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str()) {
+        return true;
+    }
+    let port = stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT"));
+    let mut rest = port.unwrap_or("").chars();
+    match (rest.next(), rest.next()) {
+        (Some(d), None) => d.is_ascii_digit() || matches!(d, '¹' | '²' | '³'),
+        _ => false,
+    }
+}
 
 impl Part {
     pub fn new(name: &str) -> Result<Part, String> {
@@ -672,7 +689,11 @@ impl Part {
             || name == "."
             || name == ".."
             || name.ends_with([' ', '.'])
-            || name.chars().any(|c| matches!(c, '/' | '\\' | ':' | '\0') || c.is_control());
+            || device(name)
+            || name.chars().any(|c| {
+                matches!(c, '/' | '\\' | ':' | '\0' | '<' | '>' | '"' | '|' | '?' | '*')
+                    || c.is_control()
+            });
         if bad {
             return Err(format!(
                 "{name:?} is no name sync writes (a path part must be one plain name)"
@@ -847,18 +868,29 @@ impl Contained {
 #[derive(Clone, Debug)]
 pub struct OwnerFile {
     path: PathBuf,
+    kind: OwnerKind,
+}
+
+/// Which owner file an `OwnerFile` is, set only by its constructor (Sol review r7, R7-02): what an apply stage may
+/// edit is decided by this, never by a label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerKind {
+    /// An instructions or settings target's own file.
+    Target,
+    /// A checkout's git exclude file.
+    Exclude,
 }
 
 impl OwnerFile {
     /// An instructions or settings target's own file.
     pub fn target(t: &crate::stack::Target) -> OwnerFile {
-        OwnerFile { path: crate::config::expand_home(&t.path) }
+        OwnerFile { path: crate::config::expand_home(&t.path), kind: OwnerKind::Target }
     }
 
     /// Tests only: an owner file at `path`, for a unit test of an owner edit.
     #[cfg(test)]
     pub fn for_test(path: &Path) -> OwnerFile {
-        OwnerFile { path: path.to_path_buf() }
+        OwnerFile { path: path.to_path_buf(), kind: OwnerKind::Target }
     }
 
     /// A checkout's git exclude file, in git's common dir.
@@ -867,11 +899,18 @@ impl OwnerFile {
             &checkout.path,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         )?;
-        Ok(OwnerFile { path: PathBuf::from(common.trim()).join("info").join("exclude") })
+        Ok(OwnerFile {
+            path: PathBuf::from(common.trim()).join("info").join("exclude"),
+            kind: OwnerKind::Exclude,
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn kind(&self) -> OwnerKind {
+        self.kind
     }
 }
 

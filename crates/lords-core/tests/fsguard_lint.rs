@@ -289,10 +289,23 @@ fn forbidden(file: &str, text: &str) -> Vec<String> {
                 found.push(format!("{file}: {ffi} (the OS's own calls, only in a door)"));
             }
         }
-        for ext in ["extern\"C\"", "extern\"system\"", "extern{", "#[link("] {
-            if with_strings.contains(ext) {
-                found.push(format!("{file}: {ext} (foreign functions, only in a door)"));
+        // Every `extern` but `extern crate` declares or defines a foreign function, whatever its ABI string (Sol
+        // review r7, R7-08): the word itself is matched, in code with comments and strings out.
+        let plain = unraw(&code_of(text, false));
+        for (at, _) in plain.match_indices("extern") {
+            let after = &plain[at + "extern".len()..];
+            if plain[..at].ends_with(ident) || after.starts_with(ident) {
+                continue;
             }
+            let next = after.trim_start();
+            let krate = next.strip_prefix("crate").is_some_and(|r| !r.starts_with(ident));
+            if !krate {
+                let shown: String = next.chars().take(20).collect();
+                found.push(format!("{file}: extern {shown} (foreign functions, only in a door)"));
+            }
+        }
+        if with_strings.contains("#[link(") {
+            found.push(format!("{file}: #[link( (foreign functions, only in a door)"));
         }
         for attr in ["cfg(", "cfg_attr("] {
             for (at, _) in code.match_indices(attr) {
@@ -558,4 +571,34 @@ fn r6_04_raw_identifiers_are_normalised() {
         .map(|(w, _)| *w)
         .collect();
     assert!(missed.is_empty(), "not caught: {missed:?}");
+}
+
+// Spec (Sol review r7, R7-08: "the text layer refuses every `extern \"<anything>\"` block and `extern` fn outside
+// the doors, whatever the ABI string"): every foreign block or function is caught in an ordinary source, whatever
+// its ABI; `extern crate` and the word in a name, a string or a comment are not foreign functions.
+#[test]
+fn r7_08_no_foreign_function_of_any_abi_outside_the_doors() {
+    let cases = [
+        ("C-unwind", "unsafe extern \"C-unwind\" { fn remove(p: *const u8) -> i32; }"),
+        ("system-unwind", "extern \"system-unwind\" { fn DeleteFileW(p: *const u16) -> i32; }"),
+        ("a raw ABI string", "extern r#\"C\"# { fn unlink(p: *const u8) -> i32; }"),
+        ("no ABI", "extern { fn unlink(p: *const u8) -> i32; }"),
+        ("a foreign fn", "pub extern \"efiapi\" fn f() {}"),
+        ("a foreign fn, no ABI", "extern fn f() {}"),
+        ("a link attribute", "#[link(name = \"c\")]\nunsafe extern \"C\" {}"),
+    ];
+    let missed: Vec<&str> = cases
+        .iter()
+        .filter(|(_, code)| forbidden("crates/lords-core/src/sync.rs", code).is_empty())
+        .map(|(w, _)| *w)
+        .collect();
+    assert!(missed.is_empty(), "not caught: {missed:?}");
+    for ok in [
+        "extern crate alloc;",
+        "let external = 1;",
+        "let s = \"extern \\\"C\\\" {\";",
+        "// extern \"C\" { }\nfn f() {}",
+    ] {
+        assert_eq!(forbidden("crates/lords-core/src/sync.rs", ok), Vec::<String>::new(), "{ok}");
+    }
 }

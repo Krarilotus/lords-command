@@ -89,6 +89,10 @@ pub struct Item {
     /// file the config names. An item without one changes nothing on disk.
     #[serde(skip)]
     pub(crate) dest: Dest,
+    /// The places the item belongs to, as planning made it there (Sol review r7, R7-03): a user target (its shared
+    /// `via` file too), a repo or a workspace. Never read back from a label.
+    #[serde(skip)]
+    pub(crate) units: Vec<Unit>,
 }
 
 /// Where an item acts, as fsguard's changes take it.
@@ -100,8 +104,41 @@ pub(crate) enum Dest {
     Owner(OwnerFile),
 }
 
-/// Proof that the stacks and the config loaded with no error-level problem (design-simplification-r6, rule B):
-/// only planning makes one (a private field), and only with one does a plan remove or forget anything.
+/// A place a plan is made of, as its config declares it: what the install stage skips whole for a conflict.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Unit {
+    /// The user-level target of this name.
+    Target(String),
+    Repo(String),
+    Workspace(String),
+}
+
+impl std::fmt::Display for Unit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unit::Target(n) => write!(f, "target {n}"),
+            Unit::Repo(n) => write!(f, "repo {n}"),
+            Unit::Workspace(n) => write!(f, "workspace {n}"),
+        }
+    }
+}
+
+/// What an item changes, by its type (Sol review r7, R7-02): the install stage keeps only the first two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Change {
+    /// A tool-owned path below a verified root.
+    ToolOwned,
+    /// A checkout's git exclude file (`OwnerKind::Exclude`).
+    ExcludeEdit,
+    /// Any other owner file.
+    OwnerEdit,
+    /// Nothing on disk.
+    Nothing,
+}
+
+/// Proof of a complete view (design-simplification-r6, rule B; Sol review r7, R7-04/R7-05): the stacks loaded with no
+/// problem of any level and the plan saw every place it declares. Only planning makes one (a private field), and
+/// only with one does a plan remove or forget anything.
 #[derive(Clone, Debug)]
 pub struct Complete(());
 
@@ -135,11 +172,22 @@ impl Item {
             diff: String::new(),
             notes: Vec::new(),
             sources: Vec::new(),
+            units: Vec::new(),
         }
     }
 
     pub fn changes(&self) -> bool {
         !matches!(self.action, Action::InSync | Action::Report)
+    }
+
+    /// What the item changes, from where it acts.
+    pub(crate) fn change(&self) -> Change {
+        match &self.dest {
+            Dest::Tool(_) => Change::ToolOwned,
+            Dest::Owner(o) if o.kind() == fsguard::OwnerKind::Exclude => Change::ExcludeEdit,
+            Dest::Owner(_) => Change::OwnerEdit,
+            Dest::None => Change::Nothing,
+        }
     }
 }
 
@@ -159,7 +207,7 @@ pub struct Plan {
     /// Every owner file the config names now: `restore` re-derives each manifest line against them (point 3).
     #[serde(skip)]
     pub owner_files: Vec<OwnerFile>,
-    /// Present only when the stacks and config loaded with no error-level problem (rule B).
+    /// Present only with a complete view (rule B, `Complete`).
     #[serde(skip)]
     pub complete: Option<Complete>,
 }
@@ -1664,21 +1712,29 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
                     adapters::ids().join(", ")
                 )
             })?;
+            let start = items.len();
             match t.kind.as_str() {
                 "instructions" => items.extend(instructions_items(&mut pl, t, adapter)),
                 "skills" => items.extend(skills_items(&mut pl, t, adapter)),
                 "settings" => items.push(settings_item(&mut pl, t, adapter)),
                 k => return Err(format!("target {}: unknown kind {k}", t.name)),
             }
+            for i in &mut items[start..] {
+                i.units = vec![Unit::Target(t.name.clone())];
+            }
         }
-        // Profiles sharing one `via` file plan it once; different texts for one file can't both be written.
+        // Profiles sharing one `via` file plan it once, as part of each of them; different texts for one file
+        // can't both be written.
         let mut kept: Vec<Item> = Vec::new();
         for item in items {
             match kept.iter_mut().find(|k| same_place(&k.path, &item.path)) {
-                Some(k) if k.proposed == item.proposed => {}
                 Some(k) => {
-                    k.action = Action::Conflict;
-                    k.notes.push(format!("{} wants different text in the same file", item.target));
+                    if k.proposed != item.proposed {
+                        k.action = Action::Conflict;
+                        k.notes
+                            .push(format!("{} wants different text in the same file", item.target));
+                    }
+                    k.units.extend(item.units);
                 }
                 None => kept.push(item),
             }
@@ -1691,14 +1747,22 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
             if opts.repo.as_deref().is_some_and(|r| r != name) {
                 continue;
             }
+            let start = pl.plan.items.len();
             repo_items(&mut pl, name, repo, opts.adapter.as_deref(), opts.place.as_deref());
+            for i in &mut pl.plan.items[start..] {
+                i.units = vec![Unit::Repo(name.clone())];
+            }
         }
         for (name, w) in &private.manifest.workspaces {
             if opts.repo.as_deref().is_some_and(|r| r != name) {
                 continue;
             }
             if opts.place.is_none() {
+                let start = pl.plan.items.len();
                 workspace_items(&mut pl, name, w, opts.adapter.as_deref());
+                for i in &mut pl.plan.items[start..] {
+                    i.units = vec![Unit::Workspace(name.clone())];
+                }
             }
         }
         if let Some(r) = &opts.repo {
@@ -1709,21 +1773,26 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
             }
         }
     }
-    // Removal only from a complete view (design-simplification-r6, rule B): with any error-level problem in the
-    // stacks, a skill that couldn't be read looks unwanted, so nothing is removed or forgotten; installs go on.
-    let problems = stacks
-        .all()
-        .flat_map(|s| s.problems.iter())
-        .filter(|p| p.severity == crate::Severity::Error)
+    // Removal only from a complete view (design-simplification-r6, rule B; Sol review r7, R7-04/R7-05): a problem of
+    // any level in the stacks, or any conflict but one at a path the plan wants (whose want it saw: a copy the owner
+    // changed, say), means something wanted may not have been seen (a declared checkout or workspace that isn't
+    // there, a target file that can't be read), so nothing is removed or forgotten; installs go on.
+    let problems = stacks.all().map(|s| s.problems.len()).sum::<usize>();
+    let conflicts = pl
+        .plan
+        .items
+        .iter()
+        .filter(|i| i.action == Action::Conflict && !pl.wanted.contains(&ledger::key(&i.path)))
         .count();
-    let complete = (problems == 0).then_some(Complete(()));
+    let complete = (problems == 0 && conflicts == 0).then_some(Complete(()));
+    let why = format!(
+        "the stacks loaded with {problems} problem(s) and the plan has {conflicts} conflict(s) where it couldn't see what is wanted (`lords check` and `lords sync` list them)"
+    );
     // Uninstall: nothing is wanted, so every tool-owned path in scope goes (owner files keep their blocks; `restore`
     // takes those back).
     if opts.uninstall {
         if complete.is_none() {
-            return Err(format!(
-                "uninstall needs stacks that load without problems, and they have {problems} (`lords check` lists them); nothing was planned"
-            ));
+            return Err(format!("uninstall needs a complete view, and {why}; nothing was planned"));
         }
         pl.plan.items.clear();
         pl.wanted.clear();
@@ -1732,7 +1801,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         (Stage::Install, _) => staged(&mut pl.plan),
         (Stage::Full, Some(_)) => pl.unwanted(),
         (Stage::Full, None) => pl.plan.notes.push(format!(
-            "removal held: the stacks loaded with {problems} problem(s) (`lords check` lists them), so nothing is removed or forgotten until they load whole"
+            "removal held: {why}, so nothing is removed or forgotten until both are none"
         )),
     }
     pl.plan.complete = complete;
@@ -1740,29 +1809,40 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
 }
 
 /// The install stage (design-simplification-r6, staged first use): of a plan, only tool-owned paths and each
-/// repo's git-exclude lines, place by place, all or nothing. A place (its items' target, up to ` (`) with any
-/// conflict is skipped whole, and said; no other owner file is edited and nothing is retired or removed.
+/// repo's git-exclude lines, place by place, all or nothing. What an item may do is its type (`Item::change`), the
+/// place it belongs to is its `units`, as planning set them (Sol review r7, R7-02/R7-03); no label decides either.
+/// A place with any conflict is skipped whole, and said; a conflict that belongs to no place skips everything. No
+/// other owner file is edited and nothing is retired or removed.
 fn staged(plan: &mut Plan) {
-    let place = |i: &Item| i.target.split(" (").next().unwrap_or(&i.target).to_string();
-    let mut blocked: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut blocked: BTreeMap<Option<&Unit>, Vec<String>> = BTreeMap::new();
     for i in plan.items.iter().filter(|i| i.action == Action::Conflict) {
-        blocked.entry(place(i)).or_default().push(format!(
-            "{}: {}",
-            i.path.display(),
-            i.notes.first().cloned().unwrap_or_default()
-        ));
+        let why = format!("{}: {}", i.path.display(), i.notes.first().cloned().unwrap_or_default());
+        if i.units.is_empty() {
+            blocked.entry(None).or_default().push(why.clone());
+        }
+        for u in &i.units {
+            blocked.entry(Some(u)).or_default().push(why.clone());
+        }
     }
-    for (p, why) in &blocked {
-        plan.notes.push(format!(
-            "install stage: {p} skipped whole, {} conflict(s), e.g. {}",
-            why.len(),
-            why[0]
-        ));
-    }
+    let notes: Vec<String> = blocked
+        .iter()
+        .map(|(u, why)| {
+            let what =
+                u.map_or("everything (a conflict of no one place)".into(), |u| u.to_string());
+            format!(
+                "install stage: {what} skipped whole, {} conflict(s), e.g. {}",
+                why.len(),
+                why[0]
+            )
+        })
+        .collect();
+    let all = blocked.contains_key(&None);
+    let blocked: BTreeSet<Unit> = blocked.into_keys().flatten().cloned().collect();
+    plan.notes.extend(notes);
     plan.items.retain(|i| {
-        !blocked.contains_key(&place(i))
-            && i.action != Action::RetireEntry
-            && (i.class == Class::Tool || i.target.ends_with("(git exclude)"))
+        !all && !i.units.iter().any(|u| blocked.contains(u))
+            && !matches!(i.action, Action::RetireEntry | Action::Remove | Action::Forget)
+            && matches!(i.change(), Change::ToolOwned | Change::ExcludeEdit)
     });
 }
 
@@ -2096,18 +2176,18 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
 
 /// One manifest line, re-derived under the current config.
 enum Undo {
-    Edit { owner: OwnerFile, name: String, written: String, attrs: Option<fsguard::Attrs> },
+    Edit { owner: OwnerFile, name: String, written: String, attrs: fsguard::Attrs },
     Created { owner: OwnerFile, written: String },
     Aside { to: Contained, from: Contained },
-    Skip(String),
 }
 
 /// Undoes one apply's owner-file edits from its backup dir, last first: a file gets its old bytes back, and a file
 /// apply created goes, each only while it still holds exactly what sync wrote (Sol review r2, R2-03). A path moved
 /// there by `set-aside` comes back where nothing is. Every line must re-derive under `plan`, the current config
 /// (design review, point 3): an edit's file one the config names now, a set-aside path within one of the plan's
-/// verified roots. If any doesn't, nothing changes, and each such line is listed with its path and where its
-/// bytes are in the backup; the tool never guesses. Tool-owned paths aren't restored: sync regenerates them, or
+/// verified roots, and an edited file one whose attributes as they are now sync may replace (rule C, as apply). If
+/// any doesn't, or a line doesn't parse, nothing changes, and each such line is listed with its path and where its
+/// bytes are in the backup; the tool never guesses or skips a line (Sol review r7, R7-06/R7-07). Tool-owned paths aren't restored: sync regenerates them, or
 /// `lords uninstall` removes them. Returns one line per step.
 pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
     let home = Root::home(&plan.home)?;
@@ -2130,22 +2210,41 @@ pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
         let path = PathBuf::from(f.get(1).copied().unwrap_or(""));
         let kept = |name: &str| format!("{}", backup_dir.join(name).display());
         match f.as_slice() {
-            ["edit", _, name, written, rest @ ..] => match owner(&path) {
-                Some(o) => undo.push((
-                    path.clone(),
-                    Undo::Edit {
-                        owner: o,
-                        name: name.to_string(),
-                        written: written.to_string(),
-                        attrs: rest.first().and_then(|a| fsguard::Attrs::parse(a)),
-                    },
-                )),
-                None => refused.push(format!(
-                    "{}: no file the config names now; its old bytes are in {}",
-                    path.display(),
-                    kept(name)
-                )),
-            },
+            ["edit", _, name, written, attrs] => {
+                let parsed = (Part::new(name), fsguard::Attrs::parse(attrs));
+                match (owner(&path), parsed) {
+                    (Some(o), (Ok(_), Some(attrs))) => {
+                        // The file as it is now must be one sync may replace, as apply checks it (Sol review r7,
+                        // R7-06): one with an attribute it can't set back is refused here, before any change.
+                        let now = match fsguard::kind(&path)? {
+                            fsguard::Kind::File => fsguard::attrs(&path)?.keep().err(),
+                            _ => None,
+                        };
+                        match now {
+                            Some(e) => refused.push(format!(
+                                "{}: {e}; its old bytes are in {}",
+                                path.display(),
+                                kept(name)
+                            )),
+                            None => undo.push((
+                                path.clone(),
+                                Undo::Edit {
+                                    owner: o,
+                                    name: name.to_string(),
+                                    written: written.to_string(),
+                                    attrs,
+                                },
+                            )),
+                        }
+                    }
+                    (None, _) => refused.push(format!(
+                        "{}: no file the config names now; its old bytes are in {}",
+                        path.display(),
+                        kept(name)
+                    )),
+                    (Some(_), _) => refused.push(format!("a manifest line that doesn't parse: {line:?}")),
+                }
+            }
             ["created", _, written] => match owner(&path) {
                 Some(o) => {
                     undo.push((path.clone(), Undo::Created { owner: o, written: written.to_string() }))
@@ -2167,7 +2266,8 @@ pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
                     )),
                 }
             }
-            _ => undo.push((path.clone(), Undo::Skip(line.to_string()))),
+            // A line that doesn't parse refuses the whole restore, never is skipped (Sol review r7, R7-07).
+            _ => refused.push(format!("a manifest line that doesn't parse: {line:?}")),
         }
     }
     if !refused.is_empty() {
@@ -2190,10 +2290,12 @@ pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
                 let old = fsguard::read(&backup_dir.join(&name))?.ok_or_else(|| {
                     format!("{}: the backup {name} is missing", backup_dir.display())
                 })?;
+                // Checked again as it is replaced, like apply (rule C; R7-06).
+                fsguard::attrs(&path)?.keep().map_err(|e| format!("{}: {e}", path.display()))?;
                 let aside = fsguard::move_aside(&owner)?;
                 if fsguard::read(aside.path())?.is_some_and(|b| fsguard::sha(&b) == written) {
                     // The owner file's attributes as apply found them (Sol review r4, R4-03).
-                    if let Err(e) = fsguard::put_file_as(&owner, &old, attrs.as_ref()) {
+                    if let Err(e) = fsguard::put_file_as(&owner, &old, Some(&attrs)) {
                         aside.back()?;
                         return Err(e);
                     }
@@ -2228,7 +2330,6 @@ pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
             Undo::Edit { .. } | Undo::Created { .. } => {
                 format!("kept {} (changed since apply)", path.display())
             }
-            Undo::Skip(line) => format!("skipped a manifest line: {line}"),
         };
         done.push(step);
     }

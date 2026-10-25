@@ -106,6 +106,32 @@ fn a_staged_binary_is_refused_unless_marked() {
     assert!(!o.status.success() && text(&o).contains("contact"), "{}", text(&o));
 }
 
+// Spec (Sol review r7, R7-01; guarantee 7: commits through the effective privacy hooks can't disclose a personal
+// detail): a type change that brings new bytes is refused by the installed hooks, and nothing is committed.
+#[test]
+fn the_hook_refuses_a_type_change_with_a_private_detail() {
+    let env = Env::new();
+    let repo = env.repo();
+    let o = env.lords(&repo, &["hooks", "install"]);
+    assert!(o.status.success(), "{}", text(&o));
+    fs::write(repo.join("file.md"), "clean\n").unwrap();
+    env.git(&repo, &["add", "file.md"]);
+    assert!(env.git(&repo, &["commit", "-q", "-m", "clean"]).status.success());
+    let head = text(&env.git(&repo, &["rev-parse", "HEAD"]));
+
+    fs::write(repo.join("file.md"), format!("Ask {}\n", ["alice", "example.org"].join("@")))
+        .unwrap();
+    let hash = text(&env.git(&repo, &["hash-object", "-w", "file.md"]));
+    // Index only: a link's mode, with no link made on disk.
+    let entry = format!("120000,{},file.md", hash.trim());
+    assert!(env.git(&repo, &["update-index", "--cacheinfo", &entry]).status.success());
+    let staged = text(&env.git(&repo, &["diff", "--cached", "--name-status"]));
+    assert!(staged.starts_with("T\t"), "a type change: {staged}");
+    let o = env.git(&repo, &["commit", "-q", "-m", "a type change"]);
+    assert!(!o.status.success() && text(&o).contains("contact"), "refused: {}", text(&o));
+    assert_eq!(text(&env.git(&repo, &["rev-parse", "HEAD"])), head, "nothing committed");
+}
+
 // Spec (Sol review 25 Oct, finding 14: "The installed hook cannot prevent private commit messages"): `hooks
 // install` also writes a commit-msg hook, so a clean commit with a private message is refused; `privacy --message`
 // checks a message file.

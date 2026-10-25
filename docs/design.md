@@ -141,7 +141,8 @@ A **finding** is a matched span: file, line, pattern class and the matched text.
 - **The repo's own commit check.** Where a repo tracks `tools/commit-check.sh`, the pre-commit hook runs it before the
   privacy check. Lords Command's runs `cargo fmt --check` and clippy with `-D warnings`, which carries the filesystem
   and process boundary (below).
-- **What it reads:** each staged file's content and its path, and the commit message. Deny and fleet terms match in
+- **What it reads:** the content and path of every staged entry that isn't a deletion (a type or mode change too,
+  R7-01), and the commit message. Deny and fleet terms match in
   any case (Unicode lower case, NFKD), a phrase across line breaks too.
 - **Encodings covered.** Every file, text or not, marked `lords-binary` or not, is scanned in each of these readings,
   and none is chosen over another (Sol review r3, R3-07; r4, R4-02: bytes that are valid UTF-8 can also be UTF-16
@@ -342,7 +343,9 @@ written whole beside it; on a volume without hard links sync refuses (R4-04). On
 and only `process.rs` reaches `std::process`: stated in `fsguard.rs`, enforced twice (R3-08, R4-06, R5-03). First,
 clippy's resolved `disallowed-types`/`disallowed-methods` (`clippy.toml`), which the commit check runs with
 `-D warnings`: the compiler resolves aliases, grouped `use` trees and raw identifiers. Second, `tests/fsguard_lint.rs`,
-which keeps a module ban and refuses whatever would switch the first off outside the two doors.
+which keeps a module ban and refuses whatever would switch the first off outside the two doors, and every `extern`
+but `extern crate` (a foreign block or function of any ABI, R7-08). A path part (`Part`) is one name Windows holds as
+an ordinary file: no device name (`CON`, `NUL`, `COM1`, `lpt9.log`, …) and none of `<>:"/\|?*` (R7-09).
 
 **Errors are never "nothing"** (R5-04). The guard's reads are strict: a dir that can't be listed, a file that can't
 be read, a git call that fails comes back as an error, and a decision on it refuses. Only "not found" means absent
@@ -350,10 +353,12 @@ be read, a git call that fails comes back as an error, and a decision on it refu
 and no decision calls one.
 
 **Removal only from a complete view** (design-simplification-r6, rule B). A plan removes or forgets a path only with
-a `Complete` witness, which planning makes only when the stacks and the config loaded with no error-level problem;
-apply refuses a removal without it, and `uninstall` refuses outright. With any load problem a skill that couldn't be
-read would look unwanted, so sync then installs and updates and removes nothing (R6-05), and says why. That is also
-what closes the swallowed-error class: an error elsewhere can only make sync write less, never delete.
+a `Complete` witness, which planning makes only when the stacks loaded with no problem of any level, warnings
+included, and the plan has no conflict but one at a path it wants (R7-04, R7-05): a declared checkout or workspace
+that isn't there, or a target file that can't be read, hides what is wanted. Apply refuses a removal without it, and
+`uninstall` refuses outright. With any load problem a skill that couldn't be read would look unwanted, so sync then
+installs and updates and removes nothing (R6-05), and says why. That is also what closes the swallowed-error class:
+an error elsewhere can only make sync write less, never delete.
 
 **Operating assumption** (R3-05). The promise that sync never acts through a link or outside a target holds under
 this assumption: one operator, and nothing else renames or relinks the place paths during an apply. The choke point
@@ -376,7 +381,10 @@ not-indexed; the mode elsewhere) is kept, and any other bit (sparse, compressed,
 a reparse point, a bit Windows adds later) refuses the item before anything moves. Any error after the move puts the
 old file back. Backups are numbered files with a
 manifest naming each original path, the hash sync wrote and the file's attributes. `restore` puts a file back, with
-its attributes (R4-03), only while it still holds exactly what sync wrote; anything else is left and reported.
+its attributes (R4-03), only while it still holds exactly what sync wrote; anything else is left and reported. It
+checks the file's attributes as they are now by the same allowlist as apply, and a manifest line that doesn't
+parse, like one that doesn't re-derive under the current config, refuses the whole restore before any change; no
+line is skipped (R7-06, R7-07).
 
 **Stack edits** (import, retirement, promotion, edit) touch only files git already tracks and holds unmodified, plus
 new files, whether they commit or not (R3-10): git is the stack's backup, so an edit cut short, or made with
@@ -389,7 +397,10 @@ attribute but ARCHIVE or NORMAL on a file and DIRECTORY on a dir (rule C's allow
 **The install stage** (design-simplification-r6, staged first use). `lords sync --apply --stage install` writes only
 tool-owned paths (create, install, update, refresh) and each repo's two git-exclude lines, place by place: a place
 with any conflict is skipped whole, and said. It removes nothing, edits no other owner file, and imports and retires
-nothing. Under `sync --apply` stack edits run under the same lock, after the
+nothing. Both are decided by type, never by a label (R7-02, R7-03): what an item changes comes from where it acts
+(a tool-owned place, or an owner file whose kind its constructor set: a target's file or a checkout's exclude file),
+and the place it belongs to (a user target with its shared `via` file, a repo, a workspace) is set as planning makes
+it there. Under `sync --apply` stack edits run under the same lock, after the
 plan is known to apply.
 
 **The changeover, once and with a human:** the 3a place files, the old `~/.codex/skills` copies and any other path

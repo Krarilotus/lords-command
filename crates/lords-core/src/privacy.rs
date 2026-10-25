@@ -442,10 +442,12 @@ pub fn scan_tree(repo: &Path, rules: &Rules) -> Result<Scan, String> {
     Ok(scan)
 }
 
-/// The staged version of every added, copied, modified or renamed file, and its path: what the commit would
-/// contain. Binary files the staged .gitattributes doesn't mark `lords-binary` are listed in `unmarked`.
+/// The staged version of every staged entry that isn't a deletion (added, copied, modified, renamed, a type or mode
+/// change, Sol review r7, R7-01), and its path: what the commit would contain. One whose staged version can't be
+/// read is an error, never left out. Binary files the staged .gitattributes doesn't mark `lords-binary` are listed
+/// in `unmarked`.
 pub fn scan_staged(repo: &Path, rules: &Rules) -> Result<Scan, String> {
-    let names = git::run(repo, &["diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"])?;
+    let names = git::run(repo, &["diff", "--cached", "--name-only", "--diff-filter=d", "-z"])?;
     let mut scan = Scan::default();
     for rel in names.split('\0').filter(|s| !s.is_empty()) {
         let bytes = git::bytes(repo, &["show", &format!(":{rel}")])?;
