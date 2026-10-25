@@ -62,6 +62,8 @@ fn retire_refuses_bad_requests() {
     ] {
         assert!(retire(&s, &args).is_err(), "{why}");
     }
+    // Git holds the file, so a retire without a commit may change it (Sol review r3, R3-10).
+    f.git_init("pub");
     let mut once = retire_args("rule.a", "r", None);
     once.commit = false;
     retire(&s, &once).unwrap();
@@ -282,6 +284,8 @@ fn edit_sets_declared_roles_only() {
         "name = \"priv\"\nvisibility = \"private\"\nroles = [\"orchestrator\"]\n",
     );
     f.write("priv/global/memory/n.md", &entry("memory.n", "global", "private", "", "Note.\n"));
+    // Git holds the file, so an edit without a commit may change it (Sol review r3, R3-10).
+    f.git_init("priv");
     let set = |roles: &[&str]| {
         let change = lords_core::ops::Edit {
             roles: Some(roles.iter().map(|r| r.to_string()).collect()),

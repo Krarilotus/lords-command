@@ -311,9 +311,10 @@ pub struct Scan {
 pub const BINARY_ATTR: &str = "lords-binary";
 
 /// A file's bytes as text to scan, and whether they are text. UTF-8 without NUL bytes and UTF-16 with a byte order
-/// mark are text. Anything else is scanned as its lossy UTF-8 reading plus its printable ASCII runs with NUL bytes
-/// dropped, and, if its NUL bytes look like UTF-16 without a byte order mark, its UTF-16 reading too; it stays
-/// not text, as that reading is a guess.
+/// mark are text. Anything else is not text, and is scanned as every reading it has: its lossy UTF-8 reading, its
+/// printable ASCII runs with NUL bytes dropped, and its UTF-16 readings, little- and big-endian, from its first byte
+/// and from its second. No count of NUL bytes decides whether a UTF-16 reading is scanned: text in a script without
+/// Latin letters has none (Sol review r3, R3-07).
 pub fn decode(bytes: &[u8]) -> (String, bool) {
     match bytes {
         [0xff, 0xfe, rest @ ..] => return (utf16(rest, false), true),
@@ -324,9 +325,11 @@ pub fn decode(bytes: &[u8]) -> (String, bool) {
         return (text.to_string(), true);
     }
     let mut text = byte_text(bytes);
-    if let Some(be) = utf16_without_bom(bytes) {
-        text.push('\n');
-        text.push_str(&utf16(bytes, be));
+    for from in [bytes, bytes.get(1..).unwrap_or_default()] {
+        for be in [false, true] {
+            text.push('\n');
+            text.push_str(&utf16(from, be));
+        }
     }
     (text, false)
 }
@@ -344,22 +347,6 @@ fn utf16(bytes: &[u8], be: bool) -> String {
             })
             .collect();
     String::from_utf16_lossy(&units)
-}
-
-/// Whether bytes read as UTF-16 without a byte order mark, and if so big-endian. Each ASCII or Latin-1 char in
-/// UTF-16 has a NUL high byte: in text, many NUL bytes fall on one side (odd offsets little-endian, even ones
-/// big-endian) and few on the other.
-fn utf16_without_bom(bytes: &[u8]) -> Option<bool> {
-    let units = bytes.len() / 2;
-    let nul_at = |side: usize| bytes.iter().skip(side).step_by(2).filter(|&&b| b == 0).count();
-    let (even, odd) = (nul_at(0), nul_at(1));
-    if odd > 0 && odd * 8 >= units && even * 4 <= odd {
-        Some(false)
-    } else if even > 0 && even * 8 >= units && odd * 4 <= even {
-        Some(true)
-    } else {
-        None
-    }
 }
 
 fn utf8(bytes: &[u8]) -> Option<&str> {

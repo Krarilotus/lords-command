@@ -40,11 +40,20 @@ fn rel<'a>(root: &Path, p: &'a Path) -> &'a Path {
 }
 
 /// Whether git keeps every byte that changing `path` replaces (design: Ownership boundary; Sol review r2, R2-05: a
-/// clean status alone proves nothing for an ignored file). Outside git there is nothing to check. An operation that
-/// commits checks each file it will change once, before its first write.
+/// clean status alone proves nothing for an ignored file). Every operation checks each file it will change once,
+/// before its first write, whether it commits or not (Sol review r3, R3-10): git is the stack's backup, so a stack
+/// edit replaces only bytes git holds. Outside git, only a new file can be written.
 fn git_keeps(path: &Path) -> Result<(), String> {
     let dir = path.parent().ok_or_else(|| format!("{}: no parent dir", path.display()))?;
-    let Some(top) = dir.exists().then(|| git::toplevel(dir)).flatten() else { return Ok(()) };
+    let Some(top) = dir.exists().then(|| git::toplevel(dir)).flatten() else {
+        return match fsguard::kind(path)? {
+            fsguard::Kind::Missing => Ok(()),
+            _ => Err(format!(
+                "{}: not in a git repo, so nothing could give back what this replaces; a stack lives in git",
+                path.display()
+            )),
+        };
+    };
     let name = rel(&top, path).to_string_lossy().replace('\\', "/");
     match fsguard::kind(path)? {
         fsguard::Kind::File => {
@@ -74,7 +83,7 @@ fn git_keeps(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes a stack file through `fsguard` (an operation that commits has checked it with `git_keeps` first).
+/// Writes a stack file through `fsguard` (the operation has checked it with `git_keeps` first).
 fn stack_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fsguard::create_dir_all(dir)?;
@@ -136,9 +145,7 @@ pub fn retire(stacks: &Stacks, r: &Retire) -> Result<Retired, String> {
         ("superseded_by", r.superseded_by.map(str::to_string)),
         ("retired", Some(format!("date: {}\nreason: {}", r.date, quote(r.reason)))),
     ];
-    if r.commit {
-        git_keeps(&e.meta_file)?;
-    }
+    git_keeps(&e.meta_file)?;
     set_meta_keys(&e.meta_file, &keys)?;
     // The stack must still load the entry, now retired; otherwise put the file back.
     let root = stacks.stack(e.stack).expect("the entry's stack is loaded").root.clone();
@@ -302,9 +309,7 @@ fn import_stores(
                 "# Metadata every memory file in this store shares (lords import).\nkind: memory\nscope: {}\naudience: [{audience}]\nstatus: active\nvisibility: private\norigin:\n  type: imported\n  store: {}\n",
                 s.scope, s.name
             );
-            if commit {
-                git_keeps(&defaults)?;
-            }
+            git_keeps(&defaults)?;
             stack_write(&defaults, text.as_bytes())?;
         }
         let mut rep = Imported { store: s.name.clone(), ..Imported::default() };
@@ -320,9 +325,7 @@ fn import_stores(
             match fs::read_to_string(&target) {
                 Err(_) => {
                     if write {
-                        if commit {
-                            git_keeps(&target)?;
-                        }
+                        git_keeps(&target)?;
                         stack_write(&target, incoming.as_bytes())?;
                     }
                     rep.added.push(name);
@@ -333,9 +336,7 @@ fn import_stores(
                         rep.unchanged += 1;
                     } else {
                         if write {
-                            if commit {
-                                git_keeps(&target)?;
-                            }
+                            git_keeps(&target)?;
                             stack_write(&target, merged.as_bytes())?;
                         }
                         rep.changed.push(name);
@@ -517,15 +518,14 @@ pub fn promote(
         }
     }
 
-    // Before any write of a promotion that commits, git must keep every byte it changes in either stack.
-    if commit {
-        for (f, _) in &files {
-            git_keeps(f)?;
-            git_keeps(&public.root.join(rel(&private.root, f)))?;
-        }
-        if let Some((name, _)) = &private_part {
-            git_keeps(&e.meta_file.with_file_name(name))?;
-        }
+    // Before any write of a promotion, committing or not, git must keep every byte it changes in either stack: a
+    // promotion cut short is then undone from git (Sol review r3, R3-10).
+    for (f, _) in &files {
+        git_keeps(f)?;
+        git_keeps(&public.root.join(rel(&private.root, f)))?;
+    }
+    if let Some((name, _)) = &private_part {
+        git_keeps(&e.meta_file.with_file_name(name))?;
     }
     // Write: public copy, then the private part, then remove the private original.
     for (f, text) in &files {
@@ -671,10 +671,8 @@ pub fn edit(
     } else {
         vec![e.meta_file.clone(), e.body_file.clone()]
     };
-    if commit {
-        for f in &files {
-            git_keeps(f)?;
-        }
+    for f in &files {
+        git_keeps(f)?;
     }
     let before: Vec<Vec<u8>> = files.iter().map(|f| fs::read(f).unwrap_or_default()).collect();
     let restore = || {

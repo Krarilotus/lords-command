@@ -3,7 +3,16 @@
 //! move or delete here ever lands somewhere other than the path it names. Nothing here overwrites: a new file or dir
 //! appears only where nothing was, and replacing means moving the old one aside first. Deletes follow nothing.
 //!
-//! A test (tests/fsguard.rs) fails if any other source file of the crate writes, renames, copies or removes.
+//! The boundary, exactly (Sol review r3, R3-08), which tests/fsguard_lint.rs enforces: in the run-time sources of
+//! the library, the CLI and the GUI (`src/` of each crate), nothing but this file calls std's filesystem functions
+//! that create, write, rename, copy, link, truncate, remove or change a file's metadata, in any spelling; and child
+//! processes start only in git.rs (`git`, whose writing commands change only the stack repo an operation names)
+//! and in the GUI's "open in the file manager" (which writes nothing itself). Build scripts (Cargo's `OUT_DIR`) and
+//! tests (their own temp dirs) are outside it.
+//!
+//! Each check here and the action after it are separate steps by path, not one step on an open handle: a process
+//! that swaps a checked dir for a junction in between could redirect the action. The design (Ownership boundary,
+//! "Operating assumption") says why that is accepted for now and what apply checks after each action.
 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -12,14 +21,22 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// A dir's contents, as sync builds them: each file's path inside (with `/`) and its bytes.
+/// A dir's contents, as sync builds them: each file's path inside (with `/`) and its bytes, and each dir inside,
+/// empty or not, as its path with a final `/` and no bytes, so a dir added to a copy changes its hash (Sol review
+/// r3, R3-01).
 pub type Tree = BTreeMap<String, Vec<u8>>;
+
+/// Whether a tree's entry is a dir (its path ends in `/`).
+pub fn is_dir_entry(rel: &str) -> bool {
+    rel.ends_with('/')
+}
 
 pub fn sha(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// A tree's hash: its files' paths and hashes, in order. A dir on disk and a tree in memory hash alike.
+/// A tree's hash: its entries' paths and hashes, in order (a dir's is that of no bytes; its final `/` sets it
+/// apart). A dir on disk and a tree in memory hash alike.
 pub fn tree_sha(tree: &Tree) -> String {
     let lines: String = tree.iter().map(|(r, b)| format!("{}  {r}\n", sha(b))).collect();
     sha(lines.as_bytes())
@@ -101,12 +118,17 @@ pub fn read_tree(dir: &Path) -> Result<Tree, String> {
                     c.display(),
                     root.display()
                 ));
-            } else if m.is_dir() {
+            }
+            let rel = c.strip_prefix(root).map_err(|e| e.to_string())?;
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if m.is_dir() {
+                tree.insert(format!("{rel}/"), Vec::new());
                 walk(root, &c, tree)?;
             } else if m.is_file() {
-                let rel = c.strip_prefix(root).map_err(|e| e.to_string())?;
                 let bytes = fs::read(&c).map_err(|e| format!("{}: {e}", c.display()))?;
-                tree.insert(rel.to_string_lossy().replace('\\', "/"), bytes);
+                tree.insert(rel, bytes);
+            } else {
+                return Err(format!("{} is neither a file nor a dir", c.display()));
             }
         }
         Ok(())
@@ -160,6 +182,12 @@ pub fn append_line(path: &Path, line: &str) -> Result<(), String> {
 /// Puts a file at `path`, where nothing may be: written beside it, then linked in (which fails if something
 /// appeared meanwhile), so `path` is absent or whole.
 pub fn put_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    put_file_as(path, bytes, None)
+}
+
+/// `put_file`, then the file attributes `like` (an owner file's, taken before it moved aside: Sol review r3, R3-06).
+/// If they can't be set, the new file goes again, so `path` is absent or whole with them.
+pub fn put_file_as(path: &Path, bytes: &[u8], like: Option<&Attrs>) -> Result<(), String> {
     check(path)?;
     if let Some(dir) = path.parent() {
         create_dir_all(dir)?;
@@ -167,14 +195,124 @@ pub fn put_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let staged = beside(path, "new")?;
     create_file(&staged, bytes)?;
     let linked = fs::hard_link(&staged, path).or_else(|e| match e.kind() {
-        // A volume without hardlinks: rename, after making sure nothing is there.
-        std::io::ErrorKind::Unsupported | std::io::ErrorKind::Other if !path.exists() => {
-            fs::rename(&staged, path)
+        // A volume without hardlinks: written in place, where nothing may be (never a rename, which on Windows
+        // replaces a file that appeared meanwhile: R3-05). Not whole until written; nothing is overwritten.
+        std::io::ErrorKind::Unsupported | std::io::ErrorKind::Other => {
+            create_file(path, bytes).map_err(std::io::Error::other)
         }
         _ => Err(e),
     });
     let _ = fs::remove_file(&staged);
-    linked.map_err(|e| format!("{}: {e}", path.display()))
+    linked.map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Some(a) = like {
+        if let Err(e) = set_attrs(path, a) {
+            fs::remove_file(path).map_err(|d| format!("{e}; and {}: {d}", path.display()))?;
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// A file's attributes that an owner may have set: on Windows read-only, hidden, system, archive and
+/// not-indexed; elsewhere its mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attrs(u32);
+
+/// The attributes of the file at `path`.
+pub fn attrs(path: &Path) -> Result<Attrs, String> {
+    check(path)?;
+    let m = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // READONLY, HIDDEN, SYSTEM, ARCHIVE, NOT_CONTENT_INDEXED: the ones SetFileAttributes takes.
+        Ok(Attrs(m.file_attributes() & (0x1 | 0x2 | 0x4 | 0x20 | 0x2000)))
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(Attrs(m.permissions().mode() & 0o7777))
+    }
+}
+
+fn set_attrs(path: &Path, a: &Attrs) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // A file with no other attribute set is NORMAL (0x80); SetFileAttributes takes no 0.
+        let value = if a.0 == 0 { 0x80 } else { a.0 };
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path that lives across the call; the call only reads it.
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(wide.as_ptr(), value)
+        };
+        if ok == 0 {
+            return Err(format!("{}: {}", path.display(), std::io::Error::last_os_error()));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(a.0))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Whether two paths name one file or dir, by the filesystem's identity of it (volume and file id), not by
+/// spelling (Sol review r3, R3-04). Both must exist.
+pub fn same_file(a: &Path, b: &Path) -> Result<bool, String> {
+    Ok(identity(a)? == identity(b)?)
+}
+
+#[cfg(windows)]
+fn identity(path: &Path) -> Result<(u32, u64), String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    check(path)?;
+    // Opened for no access at all (only its information is read), dirs too, and never through a link.
+    let f = fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value of that plain C struct.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is open for the call (`f` lives across it) and `info` is a valid place to write to.
+    let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) };
+    if ok == 0 {
+        return Err(format!("{}: {}", path.display(), std::io::Error::last_os_error()));
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Ok((info.dwVolumeSerialNumber, index))
+}
+
+#[cfg(unix)]
+fn identity(path: &Path) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::MetadataExt;
+    check(path)?;
+    let m = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok((m.dev(), m.ino()))
+}
+
+/// The check after an action (Sol review r3, R3-05): the path it acted on still lies inside `root` (its target, as
+/// the plan placed it) with no link on the way to it. An error means the filesystem changed under the action: apply
+/// stops and says where.
+pub fn verify_inside(path: &Path, root: &Path) -> Result<(), String> {
+    check(path).map_err(|e| format!("after acting on {}: {e}", path.display()))?;
+    let (p, r) = (crate::ledger::key(path), crate::ledger::key(root));
+    if p != r && !p.starts_with(&format!("{}/", r.trim_end_matches('/'))) {
+        return Err(format!(
+            "after acting on {}: it lies outside {}, the target the plan placed it in",
+            path.display(),
+            root.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Builds `tree` as a new dir beside `path` and moves it into place, where nothing may be. Returns the hash of
@@ -188,11 +326,14 @@ pub fn put_tree(path: &Path, tree: &Tree) -> Result<String, String> {
     fs::create_dir(&staged).map_err(|e| format!("{}: {e}", staged.display()))?;
     let built = (|| -> Result<String, String> {
         for (rel, bytes) in tree {
-            let to = inside(&staged, rel)?;
-            if let Some(d) = to.parent() {
+            let to = inside(&staged, rel.trim_end_matches('/'))?;
+            let dir = if is_dir_entry(rel) { Some(to.as_path()) } else { to.parent() };
+            if let Some(d) = dir {
                 fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
             }
-            create_file(&to, bytes)?;
+            if !is_dir_entry(rel) {
+                create_file(&to, bytes)?;
+            }
         }
         let hash = tree_sha(&read_tree(&staged)?);
         if hash != tree_sha(tree) {

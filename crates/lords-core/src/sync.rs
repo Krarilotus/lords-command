@@ -80,12 +80,18 @@ pub struct Item {
     pub notes: Vec<String>,
     #[serde(skip)]
     pub sources: Vec<Source>,
+    /// The target the path lies in, as planned: an owner file is its own; a tool-owned path lies in its scope's
+    /// target dir, checkout or workspace. Apply checks after each action that the path is still inside it, with no
+    /// link on the way (Sol review r3, R3-05).
+    #[serde(skip)]
+    pub root: PathBuf,
 }
 
 impl Item {
     fn new(target: &str, path: PathBuf, action: Action) -> Item {
         Item {
             target: target.to_string(),
+            root: path.clone(),
             path,
             action,
             class: Class::Owner,
@@ -244,11 +250,134 @@ struct Planner<'a> {
     /// A scope the plan covers, and with `--place` the one dir it's limited to.
     covered: Vec<(String, Option<PathBuf>)>,
     trees: BTreeMap<String, Result<std::sync::Arc<Tree>, String>>,
+    /// Where each scope's paths may lie, by scope (without its `/<adapter>`), worked out once per plan.
+    roots: BTreeMap<String, Vec<PathBuf>>,
+}
+
+/// Where a tool-owned path may lie in its root (design: Ownership boundary): a skills target holds one dir per
+/// skill; a place holds its adapters' files, its role dir and one dir per skill in an adapter's skills dir; a
+/// shared instructions file is its own root.
+fn shaped(kind: &str, root: &Path, path: &Path) -> bool {
+    let (p, r) = (ledger::key(path), ledger::key(root));
+    let Some(rel) = p.strip_prefix(&format!("{r}/")) else { return kind == "via" && p == r };
+    let one_below = |dir: &str| {
+        let d = ledger::key(&root.join(dir));
+        p.strip_prefix(&format!("{d}/")).is_some_and(|name| !name.is_empty() && !name.contains('/'))
+    };
+    match kind {
+        "skills" => !rel.contains('/'),
+        "place" => {
+            let named = |f: &str| p == ledger::key(&root.join(f));
+            named(ROLE_DIR)
+                || adapters::ALL
+                    .iter()
+                    .any(|a| named(a.repo_file()) || a.repo_skills_dir().is_some_and(&one_below))
+        }
+        _ => false,
+    }
 }
 
 impl Planner<'_> {
     fn cover(&mut self, scope: &str, under: Option<&Path>) {
         self.covered.push((scope.to_string(), under.map(Path::to_path_buf)));
+    }
+
+    /// The roots a scope names and the shape of paths in them: a target's dir (or shared file), a repo's
+    /// checkouts, worktrees and worktree roots, a workspace's dir. None for a scope naming nothing declared.
+    fn roots_of(&mut self, scope: &str) -> (&'static str, Vec<PathBuf>) {
+        let base = scope.split('/').next().unwrap_or(scope).to_string();
+        let Some(private) = self.stacks.private.as_ref() else { return ("", Vec::new()) };
+        let m = &private.manifest;
+        let (kind, name) = base.split_once(':').unwrap_or(("", ""));
+        let shape = match kind {
+            "target" => match m.targets.iter().find(|t| t.name == name) {
+                Some(t) if t.kind == "skills" => "skills",
+                Some(t) if t.via.is_some() => "via",
+                _ => "",
+            },
+            "repo" | "workspace" => "place",
+            _ => "",
+        };
+        let roots = self.roots.entry(base.clone()).or_insert_with(|| match kind {
+            "target" => m
+                .targets
+                .iter()
+                .filter(|t| t.name == name)
+                .flat_map(|t| match t.kind.as_str() {
+                    "skills" => vec![expand_home(&t.path)],
+                    _ => t.via.iter().map(|v| expand_home(v)).collect(),
+                })
+                .collect(),
+            "repo" => m
+                .repos
+                .get(name)
+                .map(|r| {
+                    let mut v = checkouts(r).0;
+                    v.extend(r.worktree_roots.iter().map(|w| expand_home(w)));
+                    v
+                })
+                .unwrap_or_default(),
+            "workspace" => {
+                m.workspaces.get(name).map(|w| vec![expand_home(&w.path)]).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        });
+        (shape, roots.clone())
+    }
+
+    /// The root of `scope` that `path` lies in, in the shape a tool-owned path there has (Sol review r3, R3-03).
+    fn placed(&mut self, scope: &str, path: &Path) -> Option<PathBuf> {
+        if let Some(dir) = scope.strip_prefix("hooks:") {
+            // The ledger checked the hook's name and dir when it loaded.
+            return path.parent().filter(|p| ledger::key(p) == dir).map(Path::to_path_buf);
+        }
+        let (shape, roots) = self.roots_of(scope);
+        roots.into_iter().find(|r| shaped(shape, r, path))
+    }
+
+    /// Whether the stack still declares what a scope names (a target, repo or workspace; a hooks dir always is).
+    fn declared(&self, scope: &str) -> bool {
+        let base = scope.split('/').next().unwrap_or(scope);
+        let Some(m) = self.stacks.private.as_ref().map(|p| &p.manifest) else { return false };
+        match base.split_once(':') {
+            Some(("target", n)) => m.targets.iter().any(|t| t.name == n),
+            Some(("repo", n)) => m.repos.contains_key(n),
+            Some(("workspace", n)) => m.workspaces.contains_key(n),
+            Some(("hooks", _)) => true,
+            _ => false,
+        }
+    }
+
+    /// Every ledger record lies where its scope says (Sol review r3, R3-03: a well-formed but false record could
+    /// otherwise make sync remove a path outside every target). A record whose path is gone only loses its record;
+    /// any other is an error, and nothing is planned or applied until the ledger is put right. A record of a scope
+    /// the stack no longer declares is never acted on (no plan covers it): it is noted, and checked again if its
+    /// target comes back.
+    fn check_ledger(&mut self) -> Result<(), String> {
+        let records: Vec<ledger::Owned> = self.ledger.owned.values().cloned().collect();
+        for o in records {
+            let path = PathBuf::from(&o.path);
+            if !self.declared(&o.scope) {
+                self.plan.notes.push(format!(
+                    "the ledger records {} for {}, which the stack no longer declares: left as it is, and never acted on; declare it again and `lords uninstall` removes it",
+                    o.path, o.scope
+                ));
+                continue;
+            }
+            if self.placed(&o.scope, &path).is_some()
+                || fsguard::kind(&path).is_ok_and(|k| k == fsguard::Kind::Missing)
+            {
+                continue;
+            }
+            return Err(format!(
+                "the ledger ({}) records {} for {}, but that is no place {} has; sync does nothing until the ledger is put right (nothing was changed)",
+                ledger::file(&self.plan.home).display(),
+                o.path,
+                o.scope,
+                o.scope
+            ));
+        }
+        Ok(())
     }
 
     /// A skill's copy, read once per plan.
@@ -287,6 +416,10 @@ impl Planner<'_> {
         item.class = Class::Tool;
         item.scope = scope.to_string();
         item.want = Some(want.clone());
+        match self.placed(scope, path) {
+            Some(root) => item.root = root,
+            None => return conflict(target, path, format!("no place {scope} has")),
+        }
         let mut current = String::new();
         match fsguard::kind(path) {
             Err(e) => return conflict(target, path, e),
@@ -336,6 +469,10 @@ impl Planner<'_> {
         item.class = Class::Tool;
         item.scope = scope.to_string();
         item.want = Some(want.clone());
+        match self.placed(scope, path) {
+            Some(root) => item.root = root,
+            None => return conflict(target, path, format!("no place {scope} has")),
+        }
         let mut old = Tree::new();
         match fsguard::kind(path) {
             Err(e) => return conflict(target, path, e),
@@ -363,10 +500,22 @@ impl Planner<'_> {
                 }
             }
         }
-        // The diff shows what changes in each file, by name.
+        // The diff shows what changes in each file, by name, and each dir that comes or goes.
         let text = |t: &Tree, r: &str| t.get(r).map(|b| String::from_utf8_lossy(b).into_owned());
         let names: BTreeSet<&String> = old.keys().chain(tree.keys()).collect();
         for r in names {
+            if fsguard::is_dir_entry(r) {
+                match (old.contains_key(r), tree.contains_key(r)) {
+                    (true, false) => {
+                        item.diff.push_str(&format!("- dir {}\n", display(&path.join(r))))
+                    }
+                    (false, true) => {
+                        item.diff.push_str(&format!("+ dir {}\n", display(&path.join(r))))
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             let (a, b) = (text(&old, r).unwrap_or_default(), text(&tree, r).unwrap_or_default());
             if a != b {
                 let label = display(&path.join(r));
@@ -399,6 +548,8 @@ impl Planner<'_> {
             item.class = Class::Tool;
             item.scope = o.scope.clone();
             item.have = Some(o.sha.clone());
+            // `check_ledger` let through only records in place, or whose path is gone (which only lose the record).
+            item.root = self.placed(&o.scope, &path).unwrap_or_else(|| path.clone());
             let now = match fsguard::kind(&path) {
                 Err(e) => {
                     item.action = Action::Report;
@@ -1180,7 +1331,9 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         wanted: BTreeSet::new(),
         covered: Vec::new(),
         trees: BTreeMap::new(),
+        roots: BTreeMap::new(),
     };
+    pl.check_ledger()?;
     // The memory index points at the stack's copies: say what an import would bring first.
     if !private.manifest.memory_stores.is_empty() {
         match crate::ops::import_preview(private, None) {
@@ -1280,12 +1433,12 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
 
 // ---------------------------------------------------------------- apply
 
-/// One apply at a time on this machine (a user's sync and a post-checkout hook's): a lock file in the tool's
-/// home, waited for up to `secs` seconds.
-struct ApplyLock(PathBuf);
+/// One writer of the ledger at a time on this machine (a user's sync, a post-checkout hook's, a hook
+/// installation): a lock file in the tool's home, waited for up to `secs` seconds.
+pub(crate) struct ApplyLock(PathBuf);
 
 impl ApplyLock {
-    fn take(home: &Path, secs: u64) -> Result<ApplyLock, String> {
+    pub(crate) fn take(home: &Path, secs: u64) -> Result<ApplyLock, String> {
         fsguard::create_dir_all(home)?;
         let lock = home.join("apply.lock");
         let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
@@ -1388,8 +1541,10 @@ fn stale(item: &Item, what: &str) -> String {
     format!("{}: {what} since the plan; plan again (it was left as it is)", item.path.display())
 }
 
-/// Puts an owner file's new text in: the file moves aside, what moved is compared with what was planned (an edit
-/// made since, even mid-apply, puts it back and stops), its bytes are kept in the run, and the new file goes in.
+/// Puts an owner file's new text in. Its bytes are compared with what was planned and kept in the run first, so a
+/// failed backup changes nothing (Sol review r3, R3-02); then it moves aside, what moved is compared again (an edit
+/// made since, even mid-apply, stops it), and the new file goes in with the old one's attributes (R3-06). Any error
+/// after the move puts the old file back.
 fn owner_update(item: &Item, run: &mut Run) -> Result<(), String> {
     let path = &item.path;
     let new = item.proposed.as_deref().unwrap_or("").as_bytes();
@@ -1401,16 +1556,29 @@ fn owner_update(item: &Item, run: &mut Run) -> Result<(), String> {
         run.created(path, &want)?;
         return fsguard::put_file(path, new);
     }
-    let aside = fsguard::move_aside(path)?;
-    let moved = fsguard::read(&aside)?.unwrap_or_default();
-    if Some(moved.as_slice()) != item.current.as_deref().map(str::as_bytes) {
-        fsguard::move_back(&aside, path)?;
+    let planned = item.current.as_deref().map(str::as_bytes);
+    let now = fsguard::read(path)?;
+    if now.as_deref() != planned {
         return Err(stale(item, "it changed"));
     }
-    run.edit(path, &moved, &want)?;
-    if let Err(e) = fsguard::put_file(path, new) {
-        fsguard::move_back(&aside, path)?;
-        return Err(e);
+    let now = now.unwrap_or_default();
+    let attrs = fsguard::attrs(path)?;
+    run.edit(path, &now, &want)?;
+    let aside = fsguard::move_aside(path)?;
+    let put = fsguard::read(&aside).and_then(|moved| {
+        if moved.as_deref() != Some(now.as_slice()) {
+            return Err(stale(item, "it changed"));
+        }
+        fsguard::put_file_as(path, new, Some(&attrs))
+    });
+    if let Err(e) = put {
+        return Err(match fsguard::move_back(&aside, path) {
+            Ok(()) => e,
+            Err(back) => format!(
+                "{e}; and the old file couldn't go back ({back}): it is at {}",
+                aside.display()
+            ),
+        });
     }
     fsguard::delete_file(&aside)
 }
@@ -1513,6 +1681,16 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
         };
         applied.backups = run.dir.clone();
         result?;
+        // The check after each action (design: Ownership boundary, "Operating assumption"; Sol review r3, R3-05).
+        if item.action != Action::Forget {
+            fsguard::verify_inside(&item.path, &item.root).map_err(|e| {
+                format!(
+                    "{e}. Apply stopped there; {} change(s) were made before it ({}). Check what happened at that path before you sync again",
+                    applied.done.len() + 1,
+                    applied.backups.as_ref().map_or("no owner file changed".into(), |b| format!("backups in {}", b.display()))
+                )
+            })?;
+        }
         applied.done.push(format!("{:?} {}", item.action, item.path.display()));
     }
     Ok(applied)

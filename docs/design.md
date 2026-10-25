@@ -132,8 +132,10 @@ A **finding** is a matched span: file, line, pattern class and the matched text.
   the repo's own hooks (such as an attribution guard) keeps working.
 - **What it reads:** each staged file's content and its path, and the commit message. Deny and fleet terms match in
   any case (Unicode lower case, NFKD), a phrase across line breaks too. UTF-16 with a byte order mark is read as
-  text; other non-text files are scanned as far as their bytes read as text, and the staged check refuses them unless
-  `.gitattributes` marks them `lords-binary` (e.g. `*.png binary lords-binary`).
+  text; other non-text files are scanned in every reading their bytes have (lossy UTF-8, ASCII runs, and UTF-16 both
+  ways from either of the first two bytes, whatever their count of NUL bytes: Sol review r3, R3-07), and the staged
+  check refuses them unless `.gitattributes` marks them `lords-binary` (e.g. `*.png binary lords-binary`). A marked
+  file is still scanned.
 - **Without a private stack** (CI, a stranger's clone), the deny and fleet classes are skipped. The check says so.
   A private stack that is configured but doesn't load, or a deny-list or fleet config that can't be read, fails it.
 - `privacy/allow.txt` lists accepted false positives as exact strings.
@@ -259,11 +261,24 @@ on a filesystem the owner also uses. Each patch closed one case and opened its n
 3. **Everything else**, which sync only reads, and never through a link.
 
 **The ledger** (`~/.lords-command/state/ledger.toml`) is the only proof of ownership. It lists every tool-owned path
-sync created: its normalized path (case-folded on Windows), what it is, and the SHA-256 of what sync put there (a
-dir's hash covers every file in it). A path that isn't in the ledger is not the tool's, whatever its name or
-contents: where sync wants to write and finds one, that's a conflict. Nothing in a copy says it's the tool's; there is
-no record to parse or forge, and no directory listing decides what goes. What goes is what the ledger holds and the
-stack no longer wants.
+sync created: its normalized path, what it is, its scope (the target, place or hooks dir it belongs to), and the
+SHA-256 of what sync put there (a dir's hash covers every file and every dir in it, empty ones too: Sol review r3,
+R3-01). A path that isn't in the ledger is not the tool's, whatever its name or contents: where sync wants to write
+and finds one, that's a conflict. Nothing in a copy says it's the tool's; there is no record to parse or forge, and
+no directory listing decides what goes. What goes is what the ledger holds and the stack no longer wants.
+
+- **Path identity** (R3-04). On Windows a path's key upper-cases each char on its own, as NTFS compares names (one
+  UTF-16 unit to one), never by Unicode's full case mapping, which merges names NTFS keeps apart (`İ.txt` and
+  `i̇.txt`). A record spelt otherwise than the path asked about counts only while both exist and are one file by
+  volume and file id. `\\?\UNC\host\share` and `\\host\share` are one key.
+- **Checked when read** (R3-03). Loading refuses a record that isn't well formed (kind, hash, scope, a hook's name
+  and dir) and two records of one path. Planning then refuses the whole plan when a record lies anywhere but in a
+  place its scope names, in the shape sync writes there: one dir per skill in a skills target, the shared file of a
+  `via` target, a place's adapter files, `.lords/` and one dir per skill in its adapters' skills dirs. A record whose
+  path is gone only loses its record. A record of a target or place the stack no longer declares is never acted on
+  (no plan covers it) and is noted; it is checked again if that target comes back.
+- **One writer.** Apply, adopt, set-aside, restore and hook installation (R3-09) take the apply lock before they
+  read the ledger.
 
 **Replacing a tool-owned path.** Sync builds the new version beside it, under a name unique to the run, created with
 `create_new`; it hashes what it built, not the source. It checks the old version still matches its ledger hash,
@@ -276,16 +291,30 @@ refuses a reparse point (junction, symlink) on the path or anywhere below it, an
 path that changed is left and reported.
 
 **Every filesystem step goes through one choke point** that refuses a reparse point anywhere from the drive root
-down to the path (ancestors included) before it reads, writes, moves or deletes there.
+down to the path (ancestors included) before it reads, writes, moves or deletes there. What exactly may change files
+outside it is stated in `fsguard.rs` and enforced by `tests/fsguard_lint.rs` (R3-08).
 
-**Owner-file edits** read the file, compute the new bytes, then move the file aside into the run's backup and compare
-what was moved with what was planned. A mismatch means an edit since planning: the file goes back and that item
-fails, so nothing an owner wrote is lost, even during the apply. Otherwise the new file is renamed in. Backups are
-numbered files with a manifest naming each original path and the hash sync wrote. `restore` puts a file back only
-while it still holds exactly what sync wrote; anything else is left and reported.
+**Operating assumption** (R3-05). The choke point checks a path, then acts on it by name: the check and the action
+are two steps, not one on an open handle. A process that swapped a checked dir for a junction between them could
+redirect the action. Lords Command runs on the owner's own PC, under the apply lock, and no concurrent agent renames
+its dirs; within that, the gap is accepted. Apply also checks after each action that its path still lies inside the
+target the plan placed it in, with no link on the way; if not, it stops there and says where. *v2 hardening:*
+handle-relative operations (open the target's root once, without following links, and create, rename and delete
+relative to that handle: `NtCreateFile` with a root directory on Windows, `openat`/`renameat`/`unlinkat` elsewhere),
+so no swapped path can redirect an action at all.
 
-**Stack edits** (import, retirement) touch only files git already tracks and holds unmodified, plus new files; they
-run under the same lock, after the plan is known to apply.
+**Owner-file edits** read the file and compare it with what was planned, then keep its bytes in the run's backup
+before anything moves; a backup that fails changes nothing (R3-02). Then the file moves aside, and what was moved is
+compared again. A mismatch means an edit since planning: the file goes back and that item fails, so nothing an owner
+wrote is lost, even during the apply. Otherwise the new file goes in with the old one's attributes (read-only,
+hidden and the rest, R3-06). Any error after the move puts the old file back. Backups are numbered files with a
+manifest naming each original path and the hash sync wrote. `restore` puts a file back only while it still holds
+exactly what sync wrote; anything else is left and reported.
+
+**Stack edits** (import, retirement, promotion, edit) touch only files git already tracks and holds unmodified, plus
+new files, whether they commit or not (R3-10): git is the stack's backup, so an edit cut short, or made with
+`--no-commit`, is undone from git. Outside git, a stack edit only writes new files. Under `sync --apply` they run
+under the same lock, after the plan is known to apply.
 
 **The changeover, once and with a human:** the 3a place files, the old `~/.codex/skills` copies and any other path
 from before the ledger are listed by `lords adopt --list`. Adopting a file records it only if it is byte for byte what

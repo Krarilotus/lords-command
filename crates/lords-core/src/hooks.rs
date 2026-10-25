@@ -3,13 +3,18 @@
 //! Never through `core.hooksPath`: a global hooks path whose dispatcher runs the repo's own hooks keeps working.
 //! A hook is the tool's only by its ledger record (design: Ownership boundary): any other hook there, readable or
 //! not, is the owner's (Sol review r2, R2-16). Every write goes through `fsguard`, and nothing is overwritten.
+//! Installing takes the apply lock, so the ledger has one writer at a time (Sol review r3, R3-09).
 
 use crate::fsguard;
 use crate::git;
 use crate::ledger::Ledger;
+use crate::sync::ApplyLock;
 use std::path::{Path, PathBuf};
 
 pub const MARKER: &str = "# lords-command: privacy check";
+
+/// The hooks the tool installs: the only names a `hooks:` ledger record may have.
+pub const NAMES: [&str; 3] = ["pre-commit", "commit-msg", "post-checkout"];
 
 pub struct Installed {
     pub hook: PathBuf,
@@ -95,6 +100,7 @@ pub fn install(
     home: &Path,
 ) -> Result<Vec<Installed>, String> {
     let dir = hooks_dir(repo)?;
+    let _lock = ApplyLock::take(home, 60)?;
     let mut ledger = Ledger::load(home)?;
     let hooks = [
         ("pre-commit", script(lords_exe, secrets_only)),
@@ -209,6 +215,7 @@ pub fn install_post_checkout(
     home: &Path,
 ) -> Result<Installed, String> {
     let dir = hooks_dir(repo)?;
+    let _lock = ApplyLock::take(home, 60)?;
     let mut ledger = Ledger::load(home)?;
     let hook = dir.join("post-checkout");
     let mut backup = None;

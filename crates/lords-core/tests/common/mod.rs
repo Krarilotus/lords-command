@@ -13,7 +13,9 @@ use tempfile::TempDir;
 pub fn isolate_git() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let cfg = std::env::temp_dir().join(format!("lords-test-gitconfig-{}", std::process::id()));
+        // In Cargo's temp dir for tests (under target/), not the system's, and one file however many runs (Sol
+        // review r3, R3-08: the old per-process file in %TEMP% stayed behind).
+        let cfg = Path::new(env!("CARGO_TARGET_TMPDIR")).join("lords-test-gitconfig");
         // Built at run time, so the repo's own privacy check doesn't see an address in this source.
         let email = ["test", "example.invalid"].join("@");
         fs::write(
