@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Krarilotus/lords-command/schema/entry.schema.json",
+  "title": "Lords Command entry metadata",
+  "description": "Frontmatter of a Markdown entry, a skill's lords.yaml sidecar, or (merged with the file's own keys) a memory file under lords.defaults.yaml. See docs/design.md.",
+  "type": "object",
+  "required": ["id", "kind", "title", "audience", "scope", "status", "visibility", "origin"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^(intent|rule|role|fact|status|template|skill|memory)\\.[a-z0-9][a-z0-9-]*(\\.[a-z0-9][a-z0-9-]*)*$",
+      "description": "<kind>.<slug>; unique across both stacks, never reused"
+    },
+    "kind": { "enum": ["intent", "rule", "role", "fact", "status", "template", "skill", "memory"] },
+    "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "audience": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "enum": ["opus", "sol", "astra", "all"] }
+    },
+    "scope": {
+      "type": "string",
+      "pattern": "^(global|project:[a-z0-9][a-z0-9-]*|repo:[a-z0-9][a-z0-9._-]*|path:[a-z0-9][a-z0-9._-]*:[^:]+)$"
+    },
+    "status": { "enum": ["active", "retired"] },
+    "superseded_by": { "type": "string", "description": "id of the successor; required when a retired entry has one" },
+    "retired": {
+      "type": "object",
+      "required": ["date", "reason"],
+      "properties": {
+        "date": { "type": "string", "format": "date" },
+        "reason": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "visibility": { "enum": ["public", "private"] },
+    "basis": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["quote", "date"],
+        "properties": {
+          "quote": { "type": "string", "minLength": 1 },
+          "date": { "type": "string", "format": "date" },
+          "by": { "type": "string", "default": "owner" },
+          "source": { "type": "string", "description": "where the quote was recorded" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "origin": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "own" } },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["type", "repo", "commit", "path", "licence"],
+          "properties": {
+            "type": { "enum": ["adapted", "inherited"] },
+            "repo": { "type": "string", "description": "source repository URL or owner/name" },
+            "commit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+            "path": { "type": "string" },
+            "licence": { "type": "string", "description": "SPDX id, or a path to the licence text kept beside the entry" },
+            "copyright": { "type": "string" },
+            "changes": { "type": "string", "description": "what was adapted; required in spirit for adapted, absent for inherited" },
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "inherited: hash of the verbatim source file(s), checked by `check`" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["type", "store", "file"],
+          "properties": {
+            "type": { "const": "imported" },
+            "store": { "type": "string", "description": "memory store name from stack.toml" },
+            "file": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "topics": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" } },
+    "overrides": { "type": "array", "uniqueItems": true, "items": { "type": "string" } },
+    "extends": { "type": "array", "uniqueItems": true, "maxItems": 1, "items": { "type": "string" } },
+    "order": { "type": "integer" },
+    "links": { "type": "array", "items": { "type": "string" } },
+    "name": { "type": "string", "description": "memory files: the agent's own slug (becomes memory.<name>)" },
+    "description": { "type": "string", "description": "memory files and skills: the agent-facing one-liner" },
+    "metadata": { "type": "object", "description": "memory files: the agent's own metadata, kept verbatim" }
+  },
+  "allOf": [
+    { "if": { "properties": { "status": { "const": "retired" } } }, "then": { "required": ["retired"] } },
+    { "if": { "properties": { "kind": { "const": "skill" } } }, "then": { "properties": { "id": { "pattern": "^skill\\." } } } },
+    { "if": { "properties": { "origin": { "properties": { "type": { "const": "inherited" } } } } }, "then": { "properties": { "origin": { "required": ["sha256"] } } } }
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Krarilotus/lords-command/schema/stack.schema.json",
+  "title": "Lords Command stack manifest (stack.toml)",
+  "description": "One per stack root. Targets, memory stores, local repo paths and the fleet config may appear only in a private stack (checked).",
+  "type": "object",
+  "required": ["name", "visibility"],
+  "properties": {
+    "name": { "type": "string" },
+    "visibility": { "enum": ["public", "private"] },
+    "projects": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9-]*$" },
+      "additionalProperties": {
+        "type": "object",
+        "properties": { "title": { "type": "string" } },
+        "additionalProperties": false
+      }
+    },
+    "repos": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9._-]*$" },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "project": { "type": "string" },
+          "checkouts": { "type": "array", "items": { "type": "string" }, "description": "private only: local checkout and worktree roots" },
+          "families": { "type": "array", "items": { "enum": ["claude", "codex"] }, "default": ["claude", "codex"] }
+        },
+        "additionalProperties": false
+      }
+    },
+    "targets": {
+      "type": "array",
+      "description": "private only: user-level instruction files and skill dirs",
+      "items": {
+        "type": "object",
+        "required": ["name", "family", "kind", "path"],
+        "properties": {
+          "name": { "type": "string" },
+          "family": { "enum": ["claude", "codex"] },
+          "kind": { "enum": ["instructions", "skills"] },
+          "path": { "type": "string", "description": "~ expands to the home dir" },
+          "audience": { "type": "array", "items": { "enum": ["opus", "sol", "astra"] } }
+        },
+        "additionalProperties": false
+      }
+    },
+    "memory_stores": {
+      "type": "array",
+      "description": "private only: agent memory dirs imported into memory/<name>/",
+      "items": {
+        "type": "object",
+        "required": ["name", "path", "scope"],
+        "properties": {
+          "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "path": { "type": "string" },
+          "scope": { "type": "string" },
+          "audience": { "type": "array", "items": { "enum": ["opus", "sol", "astra", "all"] } }
+        },
+        "additionalProperties": false
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "properties": {
+        "fleet_config": { "type": "string", "description": "private only: a fleet.toml whose host names count as private" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
