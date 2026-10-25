@@ -126,3 +126,56 @@ fn this_repo_passes_check_public_and_every_file_is_scanned() {
     let (scanned, binary) = (num("entries; "), num("scanned, "));
     assert_eq!(scanned + binary, files, "{line}");
 }
+
+// Spec (owner, 25 Oct: Claude's auto-memory "stays the write path, and `import` gives it history"; sync makes it
+// readable for the other harnesses "without a manual promotion"): `sync --apply` first imports what the agent
+// wrote since the last import, with a commit, then writes an index that points at the imported note.
+#[test]
+fn sync_apply_imports_new_memory_before_writing_the_index() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (public, private, mem, home) =
+        (d.join("pub"), d.join("priv"), d.join("agent-memory"), d.join("home"));
+    for p in [&public, &private, &mem] {
+        fs::create_dir_all(p).unwrap();
+    }
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    fs::write(
+        private.join("stack.toml"),
+        format!(
+            "name = \"priv\"\nvisibility = \"private\"\n[[memory_stores]]\nname = \"agent\"\npath = '{}'\nscope = \"global\"\n\
+             [[targets]]\nname = \"codex\"\nadapter = \"codex\"\nkind = \"instructions\"\npath = '{}'\n",
+            mem.display(),
+            home.join("AGENTS.md").display()
+        ),
+    )
+    .unwrap();
+    assert!(env.git(&private, &["init", "-q"]).status.success());
+    env.git(&private, &["add", "-A"]);
+    env.git(&private, &["commit", "-q", "-m", "start"]);
+    fs::write(mem.join("note.md"), "---\nname: note\ndescription: the hook line\n---\nThe note.\n")
+        .unwrap();
+
+    let args = [
+        "sync",
+        "--public-stack",
+        public.to_str().unwrap(),
+        "--private-stack",
+        private.to_str().unwrap(),
+    ];
+    let dry = env.lords(d, &args);
+    assert!(text(&dry).contains("memory store agent: 1 new"), "{}", text(&dry));
+    assert!(!home.join("AGENTS.md").exists(), "a dry run writes nothing");
+
+    let o = env.lords(d, &[&args[..], &["--apply"]].concat());
+    assert!(o.status.success(), "{}", text(&o));
+    let agents = fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    assert!(agents.contains("- note: the hook line (`"), "{agents}");
+    assert!(
+        agents.contains("global") && agents.contains("note.md`)"),
+        "points at the imported copy: {agents}"
+    );
+    let log =
+        String::from_utf8_lossy(&env.git(&private, &["log", "--format=%s"]).stdout).into_owned();
+    assert!(log.starts_with("Import memory from agent: 1 new, 0 changed"), "{log}");
+}

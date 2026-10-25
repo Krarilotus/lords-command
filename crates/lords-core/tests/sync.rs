@@ -8,7 +8,7 @@ use lords_core::sync::{apply, plan, Action, Options};
 use std::fs;
 
 fn global(audience: Vec<Audience>) -> Context {
-    Context { audience, layers: Layers::Global, public_only: false }
+    Context { audience, layers: Layers::Global, public_only: false, skip_stores: vec![] }
 }
 
 // Spec (Layers): composition takes the applicable entries, drops what an applicable entry overrides, orders by
@@ -108,12 +108,22 @@ fn repo_layers_take_their_project_and_repo() {
     let s = f.stacks();
     let c = compose(
         &s,
-        &Context { audience: vec![Audience::Opus], layers: layers(false), public_only: false },
+        &Context {
+            audience: vec![Audience::Opus],
+            layers: layers(false),
+            public_only: false,
+            skip_stores: vec![],
+        },
     );
     assert_eq!(c.ids, ["rule.p", "fact.r", "fact.s"]);
     let c = compose(
         &s,
-        &Context { audience: vec![Audience::Opus], layers: layers(true), public_only: true },
+        &Context {
+            audience: vec![Audience::Opus],
+            layers: layers(true),
+            public_only: true,
+            skip_stores: vec![],
+        },
     );
     assert_eq!(c.ids, ["rule.g", "rule.p", "fact.r"]);
 }
@@ -124,7 +134,7 @@ fn with_targets(f: &Fixture, targets: &str) {
 }
 
 fn target(name: &str, family: &str, kind: &str, path: &std::path::Path, extra: &str) -> String {
-    format!("[[targets]]\nname = \"{name}\"\nfamily = \"{family}\"\nkind = \"{kind}\"\npath = '{}'\n{extra}", path.display())
+    format!("[[targets]]\nname = \"{name}\"\nadapter = \"{family}\"\nkind = \"{kind}\"\npath = '{}'\n{extra}", path.display())
 }
 
 // Spec (Sync): the composed text goes between the markers and text outside them stays; `own_text = "replace"`
@@ -316,4 +326,80 @@ fn repo_targets_write_untracked_files_in_every_worktree() {
     let p = plan(&f.stacks(), &opts).unwrap();
     assert!(p.items.iter().any(|i| i.action == Action::Conflict));
     assert!(apply(&p, &f.path("backups3")).is_err());
+}
+
+fn memory_store(f: &Fixture, dir: &str, scope: &str, store: &str, audience: &str) {
+    f.write(
+        &format!("{dir}/lords.defaults.yaml"),
+        &format!("kind: memory\nscope: {scope}\naudience: [{audience}]\nstatus: active\nvisibility: private\norigin:\n  type: imported\n  store: {store}\n"),
+    );
+}
+
+// Spec (owner, 25 Oct: memory "still work[s] for claude but also [is] accessible for Codex"; design: Memory):
+// every adapter's output carries a memory index, one line per note with its name, its one-line hook and the
+// file to read; filtered by layer and audience; a store the harness loads by itself is left out of that
+// harness's index; the index is not rule text.
+#[test]
+fn every_adapter_gets_a_memory_index_except_for_its_native_store() {
+    let f = Fixture::new();
+    f.write("pub/global/rules/a.md", &entry("rule.a", "global", "public", "", "Rule A.\n"));
+    memory_store(&f, "priv/global/memory/agent", "global", "agent", "all");
+    f.write("priv/global/memory/agent/MEMORY.md", "- index\n");
+    f.write("priv/global/memory/agent/prompts.md", "---\nname: prompts-in-chat\ndescription: paste prompts as code blocks\n---\nBody that stays in the file.\n");
+    memory_store(&f, "priv/project/beta/memory/beta", "project:beta", "beta", "opus");
+    f.write(
+        "priv/project/beta/memory/beta/bench.md",
+        "---\nname: bench-layout\ndescription: benches by purpose\n---\nB\n",
+    );
+    let home = f.path("home");
+    let manifest = format!(
+        "name = \"priv\"\nvisibility = \"private\"\n[projects.beta]\n[repos.beta-core]\nproject = \"beta\"\n\
+         [[memory_stores]]\nname = \"agent\"\npath = '{h}'\nscope = \"global\"\nnative = [\"claude\"]\n\
+         {}{}",
+        target("claude", "claude", "instructions", &home.join("claude.md"), ""),
+        target("codex", "codex", "instructions", &home.join("codex.md"), ""),
+        h = home.display()
+    );
+    f.write("priv/stack.toml", &manifest);
+    fs::create_dir_all(&home).unwrap();
+    let p = plan(&f.stacks(), &Options { user_only: true, ..Options::default() }).unwrap();
+    let text =
+        |name: &str| p.items.iter().find(|i| i.target == name).unwrap().proposed.clone().unwrap();
+    let codex = text("codex");
+    let prompts = f.path("priv/global/memory/agent/prompts.md");
+    let line = format!(
+        "- prompts-in-chat: paste prompts as code blocks (`{}`)",
+        prompts.display().to_string().replace('/', std::path::MAIN_SEPARATOR_STR)
+    );
+    assert!(codex.contains(&format!("# Memory\n\nNotes agents wrote down earlier. Read a note's file when its topic comes up; notes are not rules.\n\n{line}\n")), "{codex}");
+    assert!(!codex.contains("Body that stays in the file"), "an index, not the note's text");
+    assert!(!codex.contains("bench-layout"), "a project note isn't in the user-level index");
+    assert!(!codex.contains("- index"), "the store's own index file is not a note");
+    assert!(!text("claude").contains("# Memory"), "claude loads the agent store by itself");
+
+    let repo = |audience| {
+        let layers = Layers::Repo {
+            repo: "beta-core".into(),
+            project: Some("beta".into()),
+            sub: None,
+            global: false,
+        };
+        compose(&f.stacks(), &Context { audience, layers, public_only: false, skip_stores: vec![] })
+            .text
+    };
+    assert!(repo(vec![Audience::Opus]).contains("- bench-layout: benches by purpose"));
+    assert!(
+        !repo(vec![Audience::Sol, Audience::Astra]).contains("bench-layout"),
+        "audience opus only"
+    );
+}
+
+// Spec (owner, 25 Oct: "one adapter per target, so a third harness is one more adapter"): a target names its
+// adapter; an unknown one is refused with the known ids listed.
+#[test]
+fn a_target_with_an_unknown_adapter_is_refused() {
+    let f = Fixture::new();
+    with_targets(&f, &target("x", "cursor", "instructions", &f.path("x.md"), ""));
+    let err = plan(&f.stacks(), &Options::default()).unwrap_err();
+    assert!(err.contains("unknown adapter `cursor`") && err.contains("claude, codex"), "{err}");
 }

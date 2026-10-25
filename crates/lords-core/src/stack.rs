@@ -33,8 +33,9 @@ pub struct Repo {
     pub checkouts: Vec<String>,
     #[serde(default = "yes")]
     pub worktrees: bool,
+    /// The adapters that get this repo's files (default: every adapter).
     #[serde(default)]
-    pub families: Vec<String>,
+    pub adapters: Vec<String>,
 }
 
 fn yes() -> bool {
@@ -45,7 +46,8 @@ fn yes() -> bool {
 #[serde(deny_unknown_fields)]
 pub struct Target {
     pub name: String,
-    pub family: String,
+    /// The adapter that writes this target (adapters.rs: `claude`, `codex`).
+    pub adapter: String,
     pub kind: String,
     pub path: String,
     #[serde(default)]
@@ -63,6 +65,9 @@ pub struct MemoryStore {
     pub scope: String,
     #[serde(default)]
     pub audience: Vec<String>,
+    /// Adapters whose harness already loads this store by itself: left out of their memory index.
+    #[serde(default)]
+    pub native: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

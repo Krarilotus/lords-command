@@ -1,14 +1,11 @@
 //! `sync` (design: Sync): a plan of what each target would become, as diffs; `apply` carries a plan out after
 //! backing up everything it replaces. Planning only reads.
 //!
-//! What each family loads (checked against the docs and live, 25 Oct 2026, docs/load-order.md):
-//! - Claude Code: the user file, then every `CLAUDE.md`, `.claude/CLAUDE.md` and `CLAUDE.local.md` from the
-//!   filesystem root down to the cwd. `AGENTS.md` is read only when none of those three exists in the cwd or
-//!   above. So a repo gets an untracked `CLAUDE.local.md`.
-//! - Codex: `$CODEX_HOME/AGENTS.md`, then per dir from the git root to the cwd `AGENTS.override.md`, else
-//!   `AGENTS.md`. So a repo gets an untracked `AGENTS.override.md`, which replaces the tracked file.
+//! Harness-neutral: each target names an adapter (adapters.rs), which says which agents it reaches and which
+//! untracked file it reads in a repo. Those facts are checked in docs/load-order.md.
 
-use crate::compose::{self, Composed, Context, Family, Layers, Source};
+use crate::adapters::{self, Adapter};
+use crate::compose::{self, Composed, Context, Layers, Source};
 use crate::config::expand_home;
 use crate::diff;
 use crate::git;
@@ -17,9 +14,6 @@ use crate::stack::{self, Stack, Stacks, Target};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-/// Codex stops reading instruction files past this many bytes (`project_doc_max_bytes`, default 32 KiB).
-pub const CODEX_LIMIT: usize = 32 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -93,13 +87,13 @@ pub struct Options {
     pub user_only: bool,
 }
 
-fn audience_of(names: &[String], family: Family) -> Vec<Audience> {
+fn audience_of(names: &[String], adapter: &dyn Adapter) -> Vec<Audience> {
     let parsed: Vec<Audience> = names
         .iter()
         .filter_map(|n| serde_json::from_value(serde_json::Value::String(n.clone())).ok())
         .collect();
     if parsed.is_empty() {
-        family.default_audience()
+        adapter.audience()
     } else {
         parsed
     }
@@ -139,24 +133,48 @@ fn file_item(target: &str, path: &Path, proposed: String, composed: &Composed) -
     item
 }
 
-fn instructions_item(stacks: &Stacks, t: &Target, family: Family) -> Item {
+/// Memory stores the adapter's harness loads by itself (stack.toml `native`).
+fn native_stores(stacks: &Stacks, adapter: &dyn Adapter) -> Vec<String> {
+    stacks
+        .private
+        .iter()
+        .flat_map(|p| p.manifest.memory_stores.iter())
+        .filter(|m| m.native.iter().any(|n| n == adapter.id()))
+        .map(|m| m.name.clone())
+        .collect()
+}
+
+fn context(
+    stacks: &Stacks,
+    adapter: &dyn Adapter,
+    audience: Vec<Audience>,
+    layers: Layers,
+) -> Context {
+    Context { audience, layers, public_only: false, skip_stores: native_stores(stacks, adapter) }
+}
+
+fn size_note(item: &mut Item, adapter: &dyn Adapter, text: &str) {
+    if let Some(limit) = adapter.byte_limit() {
+        if text.len() > limit / 2 {
+            item.notes.push(format!(
+                "{} bytes: {} reads at most {limit} bytes of instruction files in total, repo files included",
+                text.len(),
+                adapter.id()
+            ));
+        }
+    }
+}
+
+fn instructions_item(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Item {
     let path = expand_home(&t.path);
-    let ctx = Context {
-        audience: audience_of(&t.audience, family),
-        layers: Layers::Global,
-        public_only: false,
-    };
+    let ctx = context(stacks, adapter, audience_of(&t.audience, adapter), Layers::Global);
     let composed = compose::compose(stacks, &ctx);
     let replace = t.own_text.as_deref() == Some("replace");
     let current = read(&path).unwrap_or_default();
-    let proposed = compose::place_block(&current, &composed.text, replace);
+    let text = adapter.render(&composed);
+    let proposed = compose::place_block(&current, &text, replace);
     let mut item = file_item(&t.name, &path, proposed, &composed);
-    if family == Family::Codex && composed.text.len() > CODEX_LIMIT / 2 {
-        item.notes.push(format!(
-            "{} bytes: Codex reads at most {CODEX_LIMIT} bytes of instruction files in total, repo files included",
-            composed.text.len()
-        ));
-    }
+    size_note(&mut item, adapter, &text);
     if replace && !current.is_empty() && compose::current_block(&current).is_none() {
         item.notes.push(
             "own_text = replace: the text now in the file is replaced (it is backed up)".into(),
@@ -196,13 +214,9 @@ fn in_a_stack(stacks: &Stacks, p: &Path) -> bool {
     })
 }
 
-fn skills_items(stacks: &Stacks, t: &Target, family: Family) -> Vec<Item> {
+fn skills_items(stacks: &Stacks, t: &Target, adapter: &dyn Adapter) -> Vec<Item> {
     let dir = expand_home(&t.path);
-    let ctx = Context {
-        audience: audience_of(&t.audience, family),
-        layers: Layers::Global,
-        public_only: false,
-    };
+    let ctx = context(stacks, adapter, audience_of(&t.audience, adapter), Layers::Global);
     let wanted: Vec<&Entry> = compose::applicable(stacks, &ctx)
         .into_iter()
         .filter(|e| e.meta.kind == Kind::Skill)
@@ -300,16 +314,21 @@ fn checkouts(repo: &stack::Repo) -> Vec<PathBuf> {
     out
 }
 
-const UNTRACKED: [(Family, &str); 2] =
-    [(Family::Claude, "CLAUDE.local.md"), (Family::Codex, "AGENTS.override.md")];
-
 fn repo_items(stacks: &Stacks, name: &str, repo: &stack::Repo, plan: &mut Plan) {
     let project = stacks.repo_project(name);
-    let families: Vec<Family> = if repo.families.is_empty() {
-        vec![Family::Claude, Family::Codex]
-    } else {
-        repo.families.iter().filter_map(|f| Family::parse(f)).collect()
-    };
+    let mut chosen: Vec<&dyn Adapter> = Vec::new();
+    if repo.adapters.is_empty() {
+        chosen.extend(adapters::ALL.iter().copied());
+    }
+    for id in &repo.adapters {
+        match adapters::get(id) {
+            Some(a) => chosen.push(a),
+            None => plan.notes.push(format!(
+                "repo {name}: unknown adapter `{id}` (known: {})",
+                adapters::ids().join(", ")
+            )),
+        }
+    }
     let paths = checkouts(repo);
     if paths.is_empty() {
         plan.notes.push(format!("repo {name}: no checkouts declared"));
@@ -326,23 +345,13 @@ fn repo_items(stacks: &Stacks, name: &str, repo: &stack::Repo, plan: &mut Plan) 
             .push(format!("repo {name}: {path_entries} path-scoped entries are not written yet"));
     }
     let mut excludes: Vec<(PathBuf, Vec<&str>)> = Vec::new();
-    for family in &families {
-        let file = UNTRACKED
-            .iter()
-            .find(|(f, _)| f == family)
-            .map(|(_, n)| *n)
-            .expect("each family has a file");
-        let ctx = Context {
-            audience: family.default_audience(),
-            layers: Layers::Repo {
-                repo: name.into(),
-                project: project.clone(),
-                sub: None,
-                global: false,
-            },
-            public_only: false,
-        };
+    for adapter in chosen {
+        let file = adapter.repo_file();
+        let layers =
+            Layers::Repo { repo: name.into(), project: project.clone(), sub: None, global: false };
+        let ctx = context(stacks, adapter, adapter.audience(), layers);
         let composed = compose::compose(stacks, &ctx);
+        let text = adapter.render(&composed);
         for p in &paths {
             let target = format!("repo {name} ({file})");
             let path = p.join(file);
@@ -360,8 +369,10 @@ fn repo_items(stacks: &Stacks, name: &str, repo: &stack::Repo, plan: &mut Plan) 
                 continue;
             }
             let current = read(&path).unwrap_or_default();
-            let proposed = compose::place_block(&current, &composed.text, false);
-            plan.items.push(file_item(&target, &path, proposed, &composed));
+            let proposed = compose::place_block(&current, &text, false);
+            let mut item = file_item(&target, &path, proposed, &composed);
+            size_note(&mut item, adapter, &text);
+            plan.items.push(item);
             if let Ok(common) =
                 git::run(p, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
             {
@@ -409,6 +420,7 @@ fn repo_items(stacks: &Stacks, name: &str, repo: &stack::Repo, plan: &mut Plan) 
                 global: true,
             },
             public_only: true,
+            skip_stores: Vec::new(),
         };
         let composed = compose::compose(stacks, &ctx);
         let proposed = compose::place_block(&current, &composed.text, false);
@@ -426,13 +438,35 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         .as_ref()
         .ok_or("targets are declared in the private stack.toml; no private stack loaded")?;
     let mut plan = Plan::default();
+    // The memory index points at the stack's copies: say what an import would bring first.
+    if !private.manifest.memory_stores.is_empty() {
+        match crate::ops::import_preview(private, None) {
+            Ok(reports) => {
+                for r in reports.iter().filter(|r| !r.added.is_empty() || !r.changed.is_empty()) {
+                    plan.notes.push(format!(
+                        "memory store {}: {} new, {} changed since the last import; --apply imports them (one commit) before writing",
+                        r.store,
+                        r.added.len(),
+                        r.changed.len()
+                    ));
+                }
+            }
+            Err(e) => plan.notes.push(format!("memory stores: {e}")),
+        }
+    }
     if opts.repo.is_none() {
         for t in &private.manifest.targets {
-            let family = Family::parse(&t.family)
-                .ok_or_else(|| format!("target {}: unknown family {}", t.name, t.family))?;
+            let adapter = adapters::get(&t.adapter).ok_or_else(|| {
+                format!(
+                    "target {}: unknown adapter `{}` (known: {})",
+                    t.name,
+                    t.adapter,
+                    adapters::ids().join(", ")
+                )
+            })?;
             match t.kind.as_str() {
-                "instructions" => plan.items.push(instructions_item(stacks, t, family)),
-                "skills" => plan.items.extend(skills_items(stacks, t, family)),
+                "instructions" => plan.items.push(instructions_item(stacks, t, adapter)),
+                "skills" => plan.items.extend(skills_items(stacks, t, adapter)),
                 k => return Err(format!("target {}: unknown kind {k}", t.name)),
             }
         }

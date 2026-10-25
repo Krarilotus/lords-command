@@ -26,7 +26,7 @@
           "project": { "type": "string" },
           "checkouts": { "type": "array", "items": { "type": "string" }, "description": "private only: local checkouts; sync writes each one's untracked agent files" },
           "worktrees": { "type": "boolean", "default": true, "description": "also every worktree of each checkout (git worktree list)" },
-          "families": { "type": "array", "items": { "enum": ["claude", "codex"] }, "default": ["claude", "codex"] }
+          "adapters": { "type": "array", "items": { "type": "string" }, "description": "adapter ids that get this repo's files (default: all)" }
         },
         "additionalProperties": false
       }
@@ -36,10 +36,10 @@
       "description": "private only: user-level instruction files and skill dirs",
       "items": {
         "type": "object",
-        "required": ["name", "family", "kind", "path"],
+        "required": ["name", "adapter", "kind", "path"],
         "properties": {
           "name": { "type": "string" },
-          "family": { "enum": ["claude", "codex"] },
+          "adapter": { "type": "string", "description": "the adapter that writes this target, e.g. claude, codex" },
           "kind": { "enum": ["instructions", "skills"] },
           "path": { "type": "string", "description": "~ expands to the home dir" },
           "audience": { "type": "array", "items": { "enum": ["opus", "sol", "astra"] } },
@@ -58,7 +58,8 @@
           "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
           "path": { "type": "string" },
           "scope": { "type": "string" },
-          "audience": { "type": "array", "items": { "enum": ["opus", "sol", "astra", "all"] } }
+          "audience": { "type": "array", "items": { "enum": ["opus", "sol", "astra", "all"] }, "description": "who may read its notes (default all)" },
+          "native": { "type": "array", "items": { "type": "string" }, "description": "adapters whose harness loads this store by itself" }
         },
         "additionalProperties": false
       }

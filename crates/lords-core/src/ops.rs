@@ -157,6 +157,20 @@ fn carry_keys(incoming: &str, existing: &str) -> String {
 }
 
 pub fn import(private: &Stack, only: Option<&str>, commit: bool) -> Result<Vec<Imported>, String> {
+    import_stores(private, only, true, commit)
+}
+
+/// What `import` would copy, without writing anything (sync's dry run shows it).
+pub fn import_preview(private: &Stack, only: Option<&str>) -> Result<Vec<Imported>, String> {
+    import_stores(private, only, false, false)
+}
+
+fn import_stores(
+    private: &Stack,
+    only: Option<&str>,
+    write: bool,
+    commit: bool,
+) -> Result<Vec<Imported>, String> {
     if private.visibility() != Visibility::Private {
         return Err("memory imports go into the private stack".into());
     }
@@ -181,9 +195,11 @@ pub fn import(private: &Stack, only: Option<&str>, commit: bool) -> Result<Vec<I
             return Err(format!("store `{}`: {} is not a dir", s.name, src.display()));
         }
         let dest = private.layer_dir(&scope).join("memory").join(&s.name);
-        fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+        if write {
+            fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+        }
         let defaults = dest.join(DEFAULTS);
-        if !defaults.exists() {
+        if write && !defaults.exists() {
             let audience =
                 if s.audience.is_empty() { "all".to_string() } else { s.audience.join(", ") };
             let text = format!(
@@ -204,7 +220,9 @@ pub fn import(private: &Stack, only: Option<&str>, commit: bool) -> Result<Vec<I
             let target = dest.join(&name);
             match fs::read_to_string(&target) {
                 Err(_) => {
-                    fs::write(&target, &incoming).map_err(|e| e.to_string())?;
+                    if write {
+                        fs::write(&target, &incoming).map_err(|e| e.to_string())?;
+                    }
                     rep.added.push(name);
                 }
                 Ok(existing) => {
@@ -212,7 +230,9 @@ pub fn import(private: &Stack, only: Option<&str>, commit: bool) -> Result<Vec<I
                     if merged == existing {
                         rep.unchanged += 1;
                     } else {
-                        fs::write(&target, merged).map_err(|e| e.to_string())?;
+                        if write {
+                            fs::write(&target, merged).map_err(|e| e.to_string())?;
+                        }
                         rep.changed.push(name);
                     }
                 }

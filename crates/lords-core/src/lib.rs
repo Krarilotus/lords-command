@@ -1,6 +1,7 @@
 //! Lords Command's core: stacks of entries, their check, privacy and the commands that change them.
 //! The CLI and the GUI both call this; neither shells out to the other.
 
+pub mod adapters;
 pub mod check;
 pub mod compose;
 pub mod config;

@@ -44,8 +44,8 @@ The secret part of the privacy check runs on both.
 Projects and repos are declared in a stack's `stack.toml`; a repo names its project, if it has one. A local checkout
 path is private, so it lives only in the private `stack.toml`.
 
-**Composition** for a context (agent family, and optionally a repo and a path within it) takes every active entry
-whose scope matches and whose audience includes that family. It then applies the relations below and orders the result
+**Composition** for a context (the agents a target reaches, and optionally a repo and a path within it) takes every
+active entry whose scope matches and whose audience includes those agents. It then applies the relations below and orders the result
 by section (intent, roles, rules, facts, status), then layer, then `order`, then id.
 
 **Narrower layers change broader ones only by explicit id:**
@@ -138,19 +138,19 @@ A **finding** is a matched span: file, line, pattern class and the matched text.
 Targets are declared in the private `stack.toml`, since their paths are private. The public repo ships the generic
 defaults (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.claude/skills`, `~/.codex/skills`).
 
-Which file each family actually loads, and in what order, is in [load-order.md](load-order.md) (docs and live runs,
-25 Oct 2026). Sync is built on exactly those facts.
+Each target names an **adapter** (below). Which file each harness actually loads, and in what order, is in
+[load-order.md](load-order.md) (docs and live runs, 25 Oct 2026); the adapters encode exactly those facts.
 
 **Instruction files.** The composed text goes between `<!-- lords-command:begin -->` and `<!-- lords-command:end -->`.
 - Text outside the markers is the owner's and stays untouched, unless the target sets `own_text = "replace"` (used
   once a file's old text has moved into entries).
 - *Drift* means the file differs from a fresh composition; `check` reports it for the user-level targets.
 
-**User-level files** (one per family and per Claude profile in use) get public global plus private global.
+**User-level files** (one per adapter and per profile in use) get public global plus private global.
 
 **A repo** (`lords sync --repo <name>`) gets its project, repo and path layers in untracked files: the global
 layers already come from the user-level files.
-- Every checkout and worktree gets the file each family reads after the tracked ones: `CLAUDE.local.md` (Claude) and
+- Every checkout and worktree gets the file each adapter's harness reads after the tracked ones: `CLAUDE.local.md` (Claude) and
   `AGENTS.override.md` (Codex).
 - Both names go into the repo's shared `.git/info/exclude`, so worktrees stay clean.
 - For Claude, a `CLAUDE.local.md` also stops the tracked `AGENTS.md` from loading; for Codex, the override replaces
@@ -160,7 +160,7 @@ layers already come from the user-level files.
 **A repo's tracked `AGENTS.md`** is never written: it changes by a commit on the repo's own branches. Sync reports
 what the public layers (public global, project and repo) would make of it, so the maintainer can commit that.
 
-**Skills** go into each family's skills dir as directory links (junctions on Windows, symlinks elsewhere), never
+**Skills** go into each adapter's skills dir as directory links (junctions on Windows, symlinks elsewhere), never
 copies. A link is the tool's if it points into a stack. Sync creates, re-points and removes only those links, and
 leaves every other dir alone. A real dir where a link should go is moved to the backup first, and its diff is shown.
 
@@ -171,20 +171,43 @@ It refuses a plan with any conflict.
 shows it; `sync --json` prints it. The agent files carry only the text, plus one header comment naming the source.
 
 **Audience.** Sol and Astra both read `~/.codex`, so a user-level Codex file can't tell them apart. An entry for
-only one of them is labelled ("(Sol only)") where it stands. Opus is the Claude family.
+only one of them is labelled ("(Sol only)") where it stands. Opus is reached through the Claude adapter.
 
 **Open: two Claude profiles.** With `CLAUDE_CONFIG_DIR` pointing at a second profile, `~/.claude/CLAUDE.md` still
 loads as an ancestor project file wherever the working dir is under home. If both profile files carry the global
 text, sessions under home read it twice, and the non-empty ancestor file keeps hiding repos' `AGENTS.md`. Which
 profile file holds the text is the owner's choice per machine (private `stack.toml`).
 
-## Import and memory
+## Adapters
 
-`import` copies what agents wrote into their memory dirs into the private stack's `memory/<store>/` and commits it,
-so memory has history. Agents keep writing to their own dirs, which stay live. Lords Command doesn't write memory back.
+The stack format belongs to no harness: entries are Markdown with neutral metadata, layers are directories, and
+nothing in an entry names a harness's file or convention. Claude Code and Codex are two sync **targets**, each
+written by one adapter (`crates/lords-core/src/adapters.rs`). An adapter says:
+- which agents its files reach by default (Claude: Opus; Codex: Sol, Astra);
+- which untracked file its harness reads in a repo (`CLAUDE.local.md`, `AGENTS.override.md`);
+- how much instruction text the harness reads in total (Codex: 32 KiB), so sync can warn;
+- how composed text is written for it (both write the same Markdown today).
 
-Memory that should bind every agent is promoted by hand: it becomes an intent, rule or fact entry, and the memory
-entry is retired with `superseded_by`.
+`stack.toml` names adapters by id (`adapter = "codex"` on a target, `adapters = [...]` on a repo). A third harness
+is one more adapter and its facts in load-order.md; the stacks don't change.
+
+## Memory
+
+Agents keep their own memory dirs as the write path (Claude's auto-memory, for one). Lords Command reads them; it
+never writes memory back.
+- **`import`** copies each store's notes verbatim into the private stack's `<layer>/memory/<store>/` and commits,
+  so memory has history. A store's `scope` puts it in a layer; its `audience` (default all) says who may read it.
+- **Every adapter's output carries a memory index:** the user-level files for global notes, each repo's files for its
+  project and repo notes, filtered by audience. One line per note: name, the note's one-line hook, and the path of
+  its copy in the stack.
+  - Harnesses read a note's file when its topic comes up. Codex was checked to do this; it doesn't expand `@path`
+    imports, so an index is the form every harness can use (load-order.md).
+  - A store that a harness already loads by itself is marked `native = ["<adapter>"]` and left out of that adapter's
+    index, so it isn't read twice.
+- **`sync --apply` imports first** (one commit), then writes, so the index points at the notes as they are. A dry run
+  says how many notes an import would bring.
+- **A note binds nobody.** The index is introduced as notes, not rules. Making a note binding is a promotion: it
+  becomes an intent, rule or fact entry, and the memory entry is retired with `superseded_by`.
 
 ## Check
 

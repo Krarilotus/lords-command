@@ -1,4 +1,4 @@
-# Which instruction files each agent family loads
+# Which instruction files each harness loads
 
 Checked 25 Oct 2026 against the vendors' docs and with live runs (Claude Code 2.1.310, Codex CLI 0.164.0). Sync
 relies on exactly these facts; re-check them when either tool changes.
@@ -58,17 +58,25 @@ Live runs:
 - **A dir with both files:** `AGENTS.override.md` was read and `AGENTS.md` ignored.
 - **A sub-dir with its own `AGENTS.md`:** the root's then the sub-dir's.
 - **The global `~/.codex/AGENTS.md`** loaded in both runs.
+- **A memory index line** (`- name: hook (\`<path>\`)`) in `AGENTS.md`, pointing at a file outside the workspace:
+  asked a question only that file answers, Codex read it and answered, under the read-only sandbox. Without the line
+  (control), it answered "unknown".
+- **An `@<path>` line is not expanded:** told not to read files, Codex didn't know a word that existed only in the
+  imported file. So memory reaches Codex as an index, not an import.
 
 ## What sync does with this
 
-| Target | File written | Why |
+The adapters (`crates/lords-core/src/adapters.rs`) encode these facts.
+
+| Target (adapter) | File written | Why |
 |---|---|---|
-| Claude user level | the profile's `CLAUDE.md` (each profile in use) | the user file |
-| Codex user level | `$CODEX_HOME/AGENTS.md` | the global file |
-| a repo, Claude | untracked `CLAUDE.local.md` in every checkout and worktree | loads after the tracked files and stops a stale tracked `AGENTS.md` from loading; the stack's repo layers replace it |
-| a repo, Codex | untracked `AGENTS.override.md` in every checkout and worktree | replaces the tracked `AGENTS.md` in that dir |
+| user level (claude) | the profile's `CLAUDE.md` (each profile in use) | the user file |
+| user level (codex) | `$CODEX_HOME/AGENTS.md` | the global file |
+| a repo (claude) | untracked `CLAUDE.local.md` in every checkout and worktree | loads after the tracked files and stops a stale tracked `AGENTS.md` from loading; the stack's repo layers replace it |
+| a repo (codex) | untracked `AGENTS.override.md` in every checkout and worktree | replaces the tracked `AGENTS.md` in that dir |
 | a repo's tracked `AGENTS.md` | nothing: reported only | it changes by a commit on the repo's own branches, which sync never makes |
 
-Both untracked files go into the repo's shared `.git/info/exclude`, so the worktrees stay clean. With two Claude
+Every one of these files also carries the memory index for its layers (see the design's Memory section). Both
+untracked files go into the repo's shared `.git/info/exclude`, so the worktrees stay clean. With two Claude
 profiles in use, `~/.claude/CLAUDE.md` also loads under the other profile. The private stack decides which profile
 file carries the global text (see the design's open question).

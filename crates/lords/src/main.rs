@@ -172,8 +172,9 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     let repo = a.value("--repo")?;
     let p = paths(&mut a)?;
     a.done()?;
-    let stacks = Stacks::load(&p.public, p.private.as_deref())?;
-    let plan = sync::plan(&stacks, &sync::Options { repo, user_only })?;
+    let mut stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    let opts = sync::Options { repo, user_only };
+    let mut plan = sync::plan(&stacks, &opts)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_default());
     } else {
@@ -184,6 +185,18 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
             println!("dry run: nothing written (`--apply` writes, after backing up every target)");
         }
         return Ok(true);
+    }
+    // Memory first, so the index points at the notes as they are now; then plan again from the new stack.
+    if let Some(private) = &stacks.private {
+        if !private.manifest.memory_stores.is_empty() {
+            for r in ops::import(private, None, true)? {
+                if let Some(c) = r.commit {
+                    println!("imported memory from {}: commit {c}", r.store);
+                }
+            }
+            stacks = Stacks::load(&p.public, p.private.as_deref())?;
+            plan = sync::plan(&stacks, &opts)?;
+        }
     }
     let home = lords_core::config::home().ok_or("no home dir")?;
     let stamp = format!("{}-{}", ops::today(), std::process::id());
