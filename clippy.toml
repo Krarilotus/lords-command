@@ -1,0 +1,37 @@
+# The filesystem and process boundary, resolved by the compiler (Sol review r5, R5-03; orchestrator, 25 Oct,
+# decision 3): only crates/lords-core/src/fsguard.rs reaches std's filesystem and only process.rs std's processes.
+# Those two files allow these lints; tests/fsguard_lint.rs refuses an `allow` or `expect` of them anywhere else in
+# the runtime sources. Clippy resolves paths, so an alias, a grouped `use` or a raw identifier names the same item.
+# tools/commit-check.sh runs clippy with `-D warnings` before every commit.
+
+disallowed-types = [
+    { path = "std::fs::File", reason = "files open only in fsguard.rs" },
+    { path = "std::fs::OpenOptions", reason = "files open only in fsguard.rs" },
+    { path = "std::fs::DirBuilder", reason = "dirs are made only in fsguard.rs" },
+    { path = "std::process::Command", reason = "processes start only in process.rs" },
+]
+
+disallowed-methods = [
+    { path = "std::fs::canonicalize", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::copy", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::create_dir", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::create_dir_all", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::exists", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::hard_link", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::metadata", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::read", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::read_dir", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::read_link", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::read_to_string", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::remove_dir", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::remove_dir_all", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::remove_file", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::rename", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::set_permissions", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::soft_link", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::symlink_metadata", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::fs::write", reason = "the filesystem only through fsguard.rs" },
+    { path = "std::os::windows::fs::symlink_file", reason = "links are never made", allow-invalid = true },
+    { path = "std::os::windows::fs::symlink_dir", reason = "links are never made", allow-invalid = true },
+    { path = "std::os::unix::fs::symlink", reason = "links are never made", allow-invalid = true },
+]

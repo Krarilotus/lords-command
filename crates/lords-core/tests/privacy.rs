@@ -1,6 +1,9 @@
 //! The privacy check, against docs/design.md (Privacy). Samples are assembled at run time so this file itself
 //! passes the repo's privacy check.
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod common;
 use common::*;
 use lords_core::privacy::{fleet_hosts, scan, strip, Class, Rules};

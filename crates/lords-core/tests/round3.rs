@@ -2,6 +2,9 @@
 //! each stating its property. Committed before the fixes and run red on their parent, 3546e9e. The one finding whose
 //! test needs a new call (R3-05, the check after each action) is in round3_api.rs.
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod common;
 use common::*;
 use lords_core::ledger::Ledger;

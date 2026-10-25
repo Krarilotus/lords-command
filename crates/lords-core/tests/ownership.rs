@@ -2,6 +2,9 @@
 //! Harness/notes/2026-10-25-sol-review-lords-command-r2.md). Each states its property; each failed on 83f450e where
 //! the finding reproduces there (run there with that commit's version of common/shim.rs).
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod common;
 use common::*;
 #[path = "common/shim.rs"]

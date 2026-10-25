@@ -2,6 +2,9 @@
 //! reference (an index line plus the file, read on demand, like memory), with the full text only in the role
 //! files … Don't raise Codex's byte limit: silent truncation is the failure").
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod common;
 use common::*;
 use lords_core::sync::{plan, Options};

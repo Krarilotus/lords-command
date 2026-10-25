@@ -120,7 +120,8 @@ impl Adapter for Codex {
     /// The override replaces the tracked `AGENTS.md` and Codex doesn't expand includes, so the tracked text is
     /// carried inline (and re-planned when a checkout's `AGENTS.md` changes).
     fn repo_preamble(&self, checkout: &Path) -> Option<String> {
-        let text = fsguard::read_string(checkout.join("AGENTS.md")).ok()?;
+        // Lossy here; sync's writer refuses a checkout whose AGENTS.md is there but can't be read (r5).
+        let text = fsguard::read_string_lossy(checkout.join("AGENTS.md"))?;
         let text = text.trim_end().to_string();
         (!text.is_empty()).then_some(text)
     }

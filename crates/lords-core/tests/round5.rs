@@ -4,6 +4,9 @@
 //! on the reviewer's (Harness/scratch/lords-command-eff/r5/review_r5.rs). The lint's tables are in fsguard_lint.rs,
 //! the hard-link seam (R4-04) is a unit test in sync.rs.
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod common;
 use common::*;
 use lords_core::finding::Severity;

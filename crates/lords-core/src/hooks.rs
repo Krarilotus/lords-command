@@ -23,10 +23,22 @@ pub struct Installed {
     pub global_hooks_path: Option<String>,
 }
 
+/// The repo's own commit check, which the pre-commit hook runs first where the repo tracks one (orchestrator, 25 Oct:
+/// clippy `-D warnings` a required part of Lords Command's commit check).
+pub const COMMIT_CHECK: &str = "tools/commit-check.sh";
+
 pub fn script(lords_exe: &Path, secrets_only: bool) -> String {
     let exe = lords_exe.to_string_lossy().replace('\\', "/");
     let flag = if secrets_only { " --secrets-only" } else { "" };
-    format!("#!/bin/sh\n{MARKER} of the staged files (installed by `lords hooks install`).\nexec \"{exe}\" privacy --staged{flag}\n")
+    format!(
+        "#!/bin/sh\n{MARKER} of the staged files (installed by `lords hooks install`).\n\
+         # The repo's own commit check first, where it tracks one ({COMMIT_CHECK}).\n\
+         top=$(git rev-parse --show-toplevel) || exit 1\n\
+         if git ls-files --error-unmatch -- \"{COMMIT_CHECK}\" >/dev/null 2>&1; then\n\
+         \x20   sh \"$top/{COMMIT_CHECK}\" || exit $?\n\
+         fi\n\
+         exec \"{exe}\" privacy --staged{flag}\n"
+    )
 }
 
 /// The commit-msg hook: git passes the message file as `$1`.
@@ -34,6 +46,79 @@ pub fn commit_msg_script(lords_exe: &Path, secrets_only: bool) -> String {
     let exe = lords_exe.to_string_lossy().replace('\\', "/");
     let flag = if secrets_only { " --secrets-only" } else { "" };
     format!("#!/bin/sh\n{MARKER} of the commit message (installed by `lords hooks install`).\nexec \"{exe}\" privacy --message \"$1\"{flag}\n")
+}
+
+/// Whether a commit in `repo` actually reaches both privacy hooks (orchestrator, 25 Oct, decision 8, for guarantee
+/// 7): the hook Git runs, through `core.hooksPath` if set; where that is the owner's attribution-guard dispatcher,
+/// the hook it delegates to (`attributionGuard.previousHooksPath`, else the repo's own `hooks/`), unless it skips
+/// that hook (`attributionGuard.skipPreviousHook`). One line per hook that isn't verified; none when both are.
+/// This says what holds now: a later change to the hooks path, `--no-verify` or another environment isn't
+/// prevented by it (design: Privacy, "Guarantee 7").
+pub fn privacy_dispatch(repo: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+    let git_path = |args: &[&str]| git::run(repo, args).map(|s| PathBuf::from(s.trim()));
+    let (effective, common) = match (
+        git_path(&["rev-parse", "--path-format=absolute", "--git-path", "hooks"]),
+        git_path(&["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+    ) {
+        (Ok(e), Ok(c)) => (e, c.join("hooks")),
+        (Err(e), _) | (_, Err(e)) => {
+            return vec![format!("pre-commit and commit-msg: not verified ({e})")]
+        }
+    };
+    let dispatcher = effective
+        .parent()
+        .map(|d| d.join("dispatch.sh"))
+        .and_then(|d| fsguard::read_string_lossy(&d))
+        .is_some_and(|t| t.contains("attribution-guard"));
+    // A config read that fails verifies nothing (never taken for "not set"); a file that can't be read below isn't
+    // a privacy hook, so it isn't verified either.
+    let config = |args: &[&str]| -> Result<Option<String>, String> {
+        if git::status(repo, args)? {
+            git::run(repo, args).map(Some)
+        } else {
+            Ok(None)
+        }
+    };
+    let (skipped, previous) = match (
+        config(&["config", "--get-all", "attributionGuard.skipPreviousHook"]),
+        config(&["config", "--path", "--get", "attributionGuard.previousHooksPath"]),
+    ) {
+        (Ok(s), Ok(p)) => (
+            s.map(|s| s.lines().map(|l| l.trim().to_string()).collect::<Vec<_>>())
+                .unwrap_or_default(),
+            p.map(|p| PathBuf::from(p.trim())),
+        ),
+        (Err(e), _) | (_, Err(e)) => {
+            return vec![format!("pre-commit and commit-msg: not verified ({e})")]
+        }
+    };
+    for (hook, command) in [("pre-commit", "privacy --staged"), ("commit-msg", "privacy --message")]
+    {
+        let runs = if dispatcher {
+            if skipped.iter().any(|s| s == hook) {
+                problems.push(format!(
+                    "{hook}: not verified: the attribution guard skips the repo's own {hook} (attributionGuard.skipPreviousHook)"
+                ));
+                continue;
+            }
+            previous.as_ref().unwrap_or(&common).join(hook)
+        } else {
+            effective.join(hook)
+        };
+        match fsguard::read_string_lossy(&runs) {
+            Some(t) if t.contains(MARKER) && t.contains(command) => {}
+            Some(_) => problems.push(format!(
+                "{hook}: not verified: {} is no privacy hook; `lords hooks install` puts one in the repo's own hooks dir",
+                runs.display()
+            )),
+            None => problems.push(format!(
+                "{hook}: not verified: git runs {}, which isn't there; `lords hooks install` puts one in the repo's own hooks dir",
+                runs.display()
+            )),
+        }
+    }
+    problems
 }
 
 /// Whether the hook at `hook` is the tool's: its ledger record, and still exactly what sync wrote there.
@@ -78,7 +163,8 @@ fn backup_name(hook: &Path) -> Result<PathBuf, String> {
 }
 
 fn hooks_dir(repo: &Path) -> Result<PathBuf, String> {
-    if let Ok(local) = git::run(repo, &["config", "--local", "--get", "core.hooksPath"]) {
+    if git::status(repo, &["config", "--local", "--get", "core.hooksPath"])? {
+        let local = git::run(repo, &["config", "--local", "--get", "core.hooksPath"])?;
         return Err(format!(
             "this repo sets core.hooksPath = {} locally, so .git/hooks would not run; unset it or point it at a dispatcher first",
             local.trim()

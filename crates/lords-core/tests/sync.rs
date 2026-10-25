@@ -1,5 +1,8 @@
 //! Composition and `sync`, against docs/design.md (Layers, Sync) and docs/load-order.md.
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod common;
 use common::*;
 use lords_core::compose::{compose, Context, Layers, BEGIN, END};

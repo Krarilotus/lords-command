@@ -56,13 +56,13 @@ fn git_keeps(path: &Path) -> Result<(), String> {
     let name = rel(&top, path).to_string_lossy().replace('\\', "/");
     match fsguard::kind(path)? {
         fsguard::Kind::File => {
-            if git::run(&top, &["ls-files", "--error-unmatch", "--", &name]).is_err() {
+            if !git::status(&top, &["ls-files", "--error-unmatch", "--", &name])? {
                 return Err(format!(
                     "{}: git doesn't track it, so it couldn't give back what this replaces; commit it first",
                     path.display()
                 ));
             }
-            if git::run(&top, &["diff", "--quiet", "HEAD", "--", &name]).is_err() {
+            if !git::status(&top, &["diff", "--quiet", "HEAD", "--", &name])? {
                 return Err(format!(
                     "{}: has uncommitted changes; commit them first",
                     path.display()
@@ -70,7 +70,7 @@ fn git_keeps(path: &Path) -> Result<(), String> {
             }
         }
         fsguard::Kind::Missing => {
-            if git::run(&top, &["check-ignore", "-q", "--", &name]).is_ok() {
+            if git::status(&top, &["check-ignore", "-q", "--", &name])? {
                 return Err(format!(
                     "{}: git ignores it, so it couldn't be committed",
                     path.display()
@@ -313,7 +313,11 @@ fn import_stores(
         }
         let mut rep = Imported { store: s.name.clone(), ..Imported::default() };
         let mut seen = Vec::new();
-        for f in stack::sorted_children(&src).into_iter().filter(|f| f.is_file()) {
+        for f in stack::sorted_children(&src)? {
+            // A source entry whose kind can't be told stops the import, never is skipped (r5, R5-04's class).
+            if fsguard::kind_here(&f)? != fsguard::Kind::File {
+                continue;
+            }
             let name = stack::file_name(&f);
             if !name.ends_with(".md") {
                 continue;
@@ -321,8 +325,14 @@ fn import_stores(
             seen.push(name.clone());
             let incoming = fsguard::read_string(&f).map_err(|e| format!("{}: {e}", f.display()))?;
             let target = dest.join(&name);
-            match fsguard::read_string(&target) {
-                Err(_) => {
+            // Only a file that isn't there is new; one that can't be read stops the import (r5, R5-04's class).
+            let existing = match fsguard::read_string(&target) {
+                Ok(t) => Ok(t),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(()),
+                Err(e) => return Err(format!("{}: {e}", target.display())),
+            };
+            match existing {
+                Err(()) => {
                     if write {
                         git_keeps(&target)?;
                         stack_write(&target, incoming.as_bytes())?;
@@ -343,7 +353,7 @@ fn import_stores(
                 }
             }
         }
-        for f in stack::sorted_children(&dest) {
+        for f in stack::sorted_children(&dest)? {
             let name = stack::file_name(&f);
             if name.ends_with(".md") && !seen.contains(&name) {
                 rep.absent_in_source.push(name);
@@ -447,12 +457,43 @@ pub fn promote(
         e.meta_file.clone()
     };
     let dest_path = public.root.join(rel(&private.root, &src_path));
-    if dest_path.exists() {
+    // Strict: a destination whose state can't be told is never taken for none (r5, R5-04's class).
+    if fsguard::kind(&dest_path)? != fsguard::Kind::Missing {
         return Err(format!("{} already exists", dest_path.display()));
     }
     let mut hits: Vec<(PathBuf, Hit)> = Vec::new();
+    // Every file is read whole or the promotion stops: an unreadable or non-UTF-8 file is never promoted as an
+    // empty one (Sol review r5, R5-04's class).
+    let read = |f: &Path| {
+        fsguard::read_string(f)
+            .map_err(|err| format!("{}: {err}; promotion carries text files only", f.display()))
+    };
+    // Nothing git can't give back: a file the owner marked (read-only, hidden, system) refuses (r5, R5-05).
+    // A skill's dirs too: git keeps no dir attributes either (hidden or system; read-only on a Windows dir means
+    // nothing to git or to the owner's files).
+    if is_skill {
+        let mut dirs = vec![src_path.clone()];
+        dirs.extend(
+            fsguard::read_tree(&src_path)?
+                .keys()
+                .filter(|r| fsguard::is_dir_entry(r))
+                .map(|r| src_path.join(r.trim_end_matches('/'))),
+        );
+        for d in dirs {
+            let a = fsguard::attrs(&d)?;
+            if a.unusual_for_dir() {
+                return Err(format!("{}: marked {}; git can't give that back once promotion deletes it. Clear it and promote again", d.display(), a.describe()));
+            }
+        }
+    }
     for f in &e.files {
-        let text = fsguard::read_string(f).unwrap_or_default();
+        let a = fsguard::attrs(f)?;
+        if a.unusual() {
+            return Err(format!("{}: marked {}; git can't give that back once promotion deletes it. Clear it and promote again", f.display(), a.describe()));
+        }
+    }
+    for f in &e.files {
+        let text = read(f)?;
         hits.extend(privacy::scan(&text, rules).into_iter().map(|h| (f.clone(), h)));
     }
     if !hits.is_empty() {
@@ -480,7 +521,7 @@ pub fn promote(
     let mut files: Vec<(PathBuf, String)> = Vec::new();
     let mut private_part = None;
     for f in &e.files {
-        let text = fsguard::read_string(f).unwrap_or_default();
+        let text = read(f)?;
         let mine: Vec<Hit> = hits.iter().filter(|(p, _)| p == f).map(|(_, h)| h.clone()).collect();
         let text = match mode {
             Promote::Split if !mine.is_empty() => {
@@ -697,11 +738,21 @@ pub fn edit(
     for f in &files {
         git_keeps(f)?;
     }
-    let before: Vec<Vec<u8>> =
-        files.iter().map(|f| fsguard::read_bytes(f).unwrap_or_default()).collect();
-    let restore = || {
-        for (f, b) in files.iter().zip(&before) {
-            let _ = fsguard::replace_own_file(f, b);
+    let before: Vec<Vec<u8>> = files
+        .iter()
+        .map(|f| fsguard::read_bytes(f).map_err(|e| format!("{}: {e}", f.display())))
+        .collect::<Result<_, _>>()?;
+    // Puts the files back as they were; what can't go back is said (git still holds it: R3-10).
+    let restore = || -> String {
+        let failed: Vec<String> = files
+            .iter()
+            .zip(&before)
+            .filter_map(|(f, b)| fsguard::replace_own_file(f, b).err())
+            .collect();
+        if failed.is_empty() {
+            String::new()
+        } else {
+            format!("; and putting the files back failed: {} (git holds them)", failed.join("; "))
         }
     };
     if !keys.is_empty() {
@@ -730,8 +781,10 @@ pub fn edit(
             .map(|p| p.message.clone()),
     };
     if let Some(why) = broken {
-        restore();
-        return Err(format!("that edit would break `{id}` ({why}); nothing changed"));
+        let undo = restore();
+        let changed =
+            if undo.is_empty() { "nothing changed" } else { "it was undone where it could be" };
+        return Err(format!("that edit would break `{id}` ({why}); {changed}{undo}"));
     }
     if commit && is_repo(&stack.root) {
         let rels: Vec<&Path> = files.iter().map(|f| rel(&stack.root, f)).collect();

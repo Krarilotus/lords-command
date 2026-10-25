@@ -50,32 +50,38 @@ pub fn source_hash(entry: &Entry) -> String {
     match entry.meta.kind {
         crate::model::Kind::Skill => {
             let dir = entry.meta_file.parent().expect("a sidecar has a dir");
-            dir_hash(dir)
+            dir_hash_or_unreadable(dir)
         }
         _ => hex(Sha256::digest(normalise_eol(entry.body.as_bytes()))),
     }
 }
 
-pub fn dir_hash(dir: &Path) -> String {
+/// A skill dir's hash, or for one that can't be read a text that is no SHA-256: it never equals a recorded hash,
+/// so the entry shows as changed, with the reason (Sol review r5, R5-04's class: never a hash of what could be read).
+pub fn dir_hash_or_unreadable(dir: &Path) -> String {
+    dir_hash(dir).unwrap_or_else(|e| format!("unreadable: {e}"))
+}
+
+pub fn dir_hash(dir: &Path) -> Result<String, String> {
     let mut h = Sha256::new();
-    for f in crate::stack::all_files(dir) {
+    for f in crate::stack::all_files(dir)? {
         if f.file_name().is_some_and(|n| n == SIDECAR) {
             continue;
         }
         let rel = f.strip_prefix(dir).unwrap_or(&f).to_string_lossy().replace('\\', "/");
-        let bytes = fsguard::read_bytes(&f).unwrap_or_default();
+        let bytes = fsguard::read_bytes(&f).map_err(|e| format!("{}: {e}", f.display()))?;
         h.update(rel.as_bytes());
         h.update([0]);
         h.update(normalise_eol(&bytes));
         h.update([0]);
     }
-    hex(h.finalize())
+    Ok(hex(h.finalize()))
 }
 
 /// The hash for `lords hash`: a dir as a skill, a file with frontmatter by its body, any other file whole.
 pub fn path_hash(path: &Path) -> Result<String, String> {
     if path.is_dir() {
-        return Ok(dir_hash(path));
+        return dir_hash(path);
     }
     let text = fsguard::read_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let body = crate::frontmatter::split(&text).body;
@@ -121,6 +127,7 @@ pub fn check(stacks: &Stacks, public_rules: &Rules) -> Vec<Finding> {
     skill_clashes(stacks, &mut out);
     temporaries(stacks, &crate::ops::today(), &mut out);
     privacy_of_entries(stacks, public_rules, &mut out);
+    privacy_hooks(stacks, &mut out);
     for n in &public_rules.notes {
         out.push(Finding::info("privacy-scope", n.clone()));
     }
@@ -128,6 +135,32 @@ pub fn check(stacks: &Stacks, public_rules: &Rules) -> Vec<Finding> {
         a.severity.cmp(&b.severity).then_with(|| a.file.cmp(&b.file)).then(a.line.cmp(&b.line))
     });
     out
+}
+
+/// Guarantee 7 holds as long as commits run through the effective privacy hooks (orchestrator, 25 Oct, decision 8):
+/// the public stack's repo is checked for that, and each hook a commit wouldn't reach is "not verified".
+fn privacy_hooks(stacks: &Stacks, out: &mut Vec<Finding>) {
+    let root = &stacks.public.root;
+    let Some(top) = crate::git::toplevel(root) else {
+        // No repo is only where there is no `.git`; a git that fails where there is one verifies nothing (r5).
+        match crate::fsguard::kind_here(&root.join(".git")) {
+            Ok(crate::fsguard::Kind::Missing) => out.push(Finding::info(
+                "privacy-hooks",
+                format!("{} is in no git repo: no commit to check", root.display()),
+            )),
+            _ => out.push(Finding::warning(
+                "privacy-hooks",
+                format!(
+                    "{}: pre-commit and commit-msg: not verified (git can't tell the repo)",
+                    root.display()
+                ),
+            )),
+        }
+        return;
+    };
+    for p in crate::hooks::privacy_dispatch(&top) {
+        out.push(Finding::warning("privacy-hooks", format!("{}: {p}", top.display())));
+    }
 }
 
 fn ids(stacks: &Stacks, out: &mut Vec<Finding>) {
@@ -436,10 +469,25 @@ fn privacy_of_entries(stacks: &Stacks, public_rules: &Rules, out: &mut Vec<Findi
         let rules = if stack.visibility() == Visibility::Public { public_rules } else { &secrets };
         for e in &stack.entries {
             for f in &e.files {
-                let Ok(text) = fsguard::read_string(f) else { continue };
-                for h in privacy::scan(&text, rules) {
-                    out.push(privacy_finding(f, &h).entry(e.id()));
+                // Every file is scanned, whatever it is: one that can't be read is an error, never skipped, and
+                // one that isn't UTF-8 is scanned in all its readings, as the staged check does (r5, R5-04's class).
+                let bytes = match fsguard::read_bytes(f) {
+                    Ok(b) => b,
+                    Err(err) => {
+                        out.push(
+                            Finding::error("unreadable", format!("{}: {err}", f.display()))
+                                .at(f, None)
+                                .entry(e.id()),
+                        );
+                        continue;
+                    }
+                };
+                let mut scan = privacy::Scan::default();
+                scan.add(f.clone(), &bytes, rules);
+                for (_, h) in &scan.hits {
+                    out.push(privacy_finding(f, h).entry(e.id()));
                 }
+                let text = privacy::decode(&bytes).0;
                 if stack.visibility() == Visibility::Public && text.contains("<private:") {
                     out.push(
                         Finding::warning("placeholder", "a stripped detail still needs rewording")

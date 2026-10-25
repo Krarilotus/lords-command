@@ -1171,7 +1171,7 @@ fn style(ctx: &egui::Context) {
     // egui's fonts lack some glyphs (✦ ♟ ⚒ ◷); Windows' symbol font, if present, fills in.
     let symbols = std::env::var_os("WINDIR")
         .map(|dir| Path::new(&dir).join("Fonts").join("seguisym.ttf"))
-        .and_then(|path| lords_core::fsguard::read_bytes(path).ok());
+        .and_then(lords_core::fsguard::read_bytes_lossy);
     if let Some(bytes) = symbols {
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert("symbols".into(), egui::FontData::from_owned(bytes).into());

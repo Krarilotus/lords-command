@@ -1,6 +1,9 @@
 //! The `lords` binary end to end. Child processes get an empty home and global git config, so no real home
 //! dir, user hook or setting is read or touched.
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

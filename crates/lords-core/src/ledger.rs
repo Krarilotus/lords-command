@@ -118,7 +118,9 @@ impl Ledger {
         // A save cut short leaves the old ledger beside, under the name `fsguard::move_aside` gave it: never read
         // as no ledger (orchestrator, 25 Oct).
         let dir = path.parent().expect("the ledger has a dir");
-        let mut aside: Vec<PathBuf> = fsguard::list_dir(dir)
+        // Only a state dir that isn't there means no ledger; one that can't be listed refuses (Sol review r5,
+        // R5-04).
+        let mut aside: Vec<PathBuf> = fsguard::list_dir(dir)?
             .into_iter()
             .filter(|p| {
                 p.file_name()

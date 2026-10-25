@@ -5,6 +5,9 @@
 //! same day's incident, copies instead of junctions (orchestrator: "managed copies for Claude (deletable with the
 //! worktree without harming the source) plus the index for Codex"; tests/copies.rs).
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod common;
 use common::*;
 use lords_core::sync::{apply, plan, Action, Options};

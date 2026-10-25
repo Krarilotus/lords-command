@@ -2,6 +2,9 @@
 //! (orchestrator, 25 Oct: a spec test that composes the real private stack's largest place "and asserts it's under
 //! the line, so it can't creep back up"). Read-only: it composes and measures, and writes nothing.
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use lords_core::config::Config;
 use lords_core::sync::{sizes, SIZE_WARN_PERCENT};
 use lords_core::Stacks;

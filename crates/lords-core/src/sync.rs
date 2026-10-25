@@ -160,10 +160,21 @@ fn audience_of(names: &[String], adapter: &dyn Adapter) -> Vec<Audience> {
     }
 }
 
-/// Best-effort text of a file sync only reads (a skill's SKILL.md for a diff, a tracked file it carries), read
-/// through the guard.
-fn read(path: &Path) -> Option<String> {
+/// The text of a file sync only shows (the tracked `AGENTS.md` it reports, the lock's holder), `None` on any
+/// error: for display only, never a decision (Sol review r5, R5-04's class; the inventory names each caller).
+fn read_lossy(path: &Path) -> Option<String> {
     fsguard::read_text(path).ok().flatten()
+}
+
+/// A file's text for a check: `None` when it isn't there; an error is a finding, never taken for a missing file.
+fn read_or_finding(path: &Path, out: &mut Vec<crate::Finding>) -> Option<String> {
+    match fsguard::read_text(path) {
+        Ok(t) => t,
+        Err(e) => {
+            out.push(crate::Finding::error("unreadable", e).at(path, None));
+            None
+        }
+    }
 }
 
 fn conflict(target: &str, path: &Path, note: impl Into<String>) -> Item {
@@ -251,7 +262,7 @@ struct Planner<'a> {
     covered: Vec<(String, Option<PathBuf>)>,
     trees: BTreeMap<String, Result<std::sync::Arc<Tree>, String>>,
     /// Each scope's roots and the slots in them, worked out once per plan.
-    places: BTreeMap<String, (Vec<PathBuf>, Vec<Slot>)>,
+    places: BTreeMap<String, Result<Places, String>>,
 }
 
 /// Every place sync puts a tool-owned path (design: Ownership boundary), as one grammar: a scope names roots (a
@@ -273,14 +284,16 @@ enum Slot {
 }
 
 impl Slot {
-    /// The path of this slot in `root`; `name` is the skill's, for the two skill slots.
-    fn path(self, root: &Path, name: &str) -> PathBuf {
+    /// The path of this slot in `root`; `name` is the skill's, for the two skill slots, and must be a name a skill
+    /// can have: a slug, as the schema's ids (Sol review r5, R5-02). `None` for any other name.
+    fn path(self, root: &Path, name: &str) -> Option<PathBuf> {
+        let skill = |dir: PathBuf| stack::is_slug(name).then(|| dir.join(name));
         match self {
-            Slot::TargetSkill => root.join(name),
-            Slot::Shared => root.to_path_buf(),
-            Slot::AdapterFile(a) => root.join(a.repo_file()),
-            Slot::RoleDir => root.join(ROLE_DIR),
-            Slot::AdapterSkill(a) => root.join(a.repo_skills_dir().unwrap_or("")).join(name),
+            Slot::TargetSkill => skill(root.to_path_buf()),
+            Slot::Shared => Some(root.to_path_buf()),
+            Slot::AdapterFile(a) => Some(root.join(a.repo_file())),
+            Slot::RoleDir => Some(root.join(ROLE_DIR)),
+            Slot::AdapterSkill(a) => skill(root.join(a.repo_skills_dir()?)),
         }
     }
 
@@ -291,6 +304,9 @@ impl Slot {
         }
     }
 }
+
+/// A scope's roots and the slots in them.
+type Places = (Vec<PathBuf>, Vec<Slot>);
 
 /// A place's ledger scope: `repo:<name>` (or `workspace:<name>`) for what every adapter's agents read, with
 /// `/<adapter>` for one adapter's files.
@@ -318,73 +334,79 @@ impl Planner<'_> {
 
     /// The roots a scope names and the slots sync writes there; none for a scope that names nothing declared, or
     /// an adapter its place doesn't write for. A repo's roots are its real checkouts and worktrees, never the
-    /// dirs worktrees are kept in (R4-01).
-    fn places_of(&mut self, scope: &str) -> (Vec<PathBuf>, Vec<Slot>) {
+    /// dirs worktrees are kept in (R4-01), and a repo whose `checkouts` name anything else is an error (R5-01).
+    /// Target names are unique (the stack refuses two of one name: R5-06), so `target:<name>` is one target.
+    fn places_of(&mut self, scope: &str) -> Result<Places, String> {
         let stacks = self.stacks;
         self.places
             .entry(scope.to_string())
             .or_insert_with(|| {
-                let Some(m) = stacks.private.as_ref().map(|p| &p.manifest) else {
-                    return (Vec::new(), Vec::new());
-                };
+                let none = Ok((Vec::new(), Vec::new()));
+                let Some(m) = stacks.private.as_ref().map(|p| &p.manifest) else { return none };
                 let (base, adapter) = match scope.split_once('/') {
                     Some((b, a)) => (b, Some(a)),
                     None => (scope, None),
                 };
                 let (kind, name) = base.split_once(':').unwrap_or(("", ""));
                 let place = |roots: Vec<PathBuf>, declared: &[String]| match adapter {
-                    None => (roots, vec![Slot::RoleDir]),
+                    None => Ok((roots, vec![Slot::RoleDir])),
                     Some(id) => match place_adapters(declared).into_iter().find(|a| a.id() == id) {
                         Some(a) => {
                             let mut slots = vec![Slot::AdapterFile(a)];
                             if a.repo_skills_dir().is_some() {
                                 slots.push(Slot::AdapterSkill(a));
                             }
-                            (roots, slots)
+                            Ok((roots, slots))
                         }
-                        None => (Vec::new(), Vec::new()),
+                        None => Ok((Vec::new(), Vec::new())),
                     },
                 };
                 match (kind, adapter) {
                     ("target", None) => match m.targets.iter().find(|t| t.name == name) {
                         Some(t) if t.kind == "skills" => {
-                            (vec![expand_home(&t.path)], vec![Slot::TargetSkill])
+                            Ok((vec![expand_home(&t.path)], vec![Slot::TargetSkill]))
                         }
                         Some(t) if t.kind == "instructions" => {
-                            (t.via.iter().map(|v| expand_home(v)).collect(), vec![Slot::Shared])
+                            Ok((t.via.iter().map(|v| expand_home(v)).collect(), vec![Slot::Shared]))
                         }
-                        _ => (Vec::new(), Vec::new()),
+                        _ => none,
                     },
                     ("repo", _) => match m.repos.get(name) {
-                        Some(r) => place(checkouts(r).0, &r.adapters),
-                        None => (Vec::new(), Vec::new()),
+                        Some(r) => place(
+                            checkouts(r).map_err(|e| format!("repo {name}: {e}"))?.0,
+                            &r.adapters,
+                        ),
+                        None => none,
                     },
                     ("workspace", _) => match m.workspaces.get(name) {
                         Some(w) => place(vec![expand_home(&w.path)], &w.adapters),
-                        None => (Vec::new(), Vec::new()),
+                        None => none,
                     },
-                    _ => (Vec::new(), Vec::new()),
+                    _ => none,
                 }
             })
             .clone()
     }
 
     /// The root of `scope` in which a slot of that scope, of `kind`, produces exactly `path` (Sol review r3,
-    /// R3-03; r4, R4-01). A skill slot takes the path's last name as the skill's.
-    fn placed(&mut self, scope: &str, path: &Path, kind: &str) -> Option<PathBuf> {
+    /// R3-03; r4, R4-01). A skill slot takes the path's last name as the skill's, and only a name a skill can have
+    /// (r5, R5-02). An error when the scope's place is misconfigured (R5-01).
+    fn placed(&mut self, scope: &str, path: &Path, kind: &str) -> Result<Option<PathBuf>, String> {
         if let Some(dir) = scope.strip_prefix("hooks:") {
             // The ledger checked the hook's name and dir when it loaded.
-            return path
+            return Ok(path
                 .parent()
                 .filter(|p| kind == "file" && ledger::key(p) == dir)
-                .map(Path::to_path_buf);
+                .map(Path::to_path_buf));
         }
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let want = ledger::key(path);
-        let (roots, slots) = self.places_of(scope);
-        roots.into_iter().find(|root| {
-            slots.iter().any(|s| s.kind() == kind && ledger::key(&s.path(root, &name)) == want)
-        })
+        let (roots, slots) = self.places_of(scope)?;
+        Ok(roots.into_iter().find(|root| {
+            slots.iter().any(|s| {
+                s.kind() == kind && s.path(root, &name).is_some_and(|p| ledger::key(&p) == want)
+            })
+        }))
     }
 
     /// Whether the stack still declares what a scope names (a target, repo or workspace; a hooks dir always is).
@@ -416,9 +438,15 @@ impl Planner<'_> {
                 ));
                 continue;
             }
-            if self.placed(&o.scope, &path, &o.kind).is_some()
-                || fsguard::kind(&path).is_ok_and(|k| k == fsguard::Kind::Missing)
-            {
+            let placed = self.placed(&o.scope, &path, &o.kind).map_err(|e| {
+                format!(
+                    "the ledger ({}) records {} for {}, whose place is misconfigured: {e}; sync does nothing until it is put right (nothing was changed)",
+                    ledger::file(&self.plan.home).display(),
+                    o.path,
+                    o.scope
+                )
+            })?;
+            if placed.is_some() || fsguard::kind(&path).is_ok_and(|k| k == fsguard::Kind::Missing) {
                 continue;
             }
             return Err(format!(
@@ -469,8 +497,9 @@ impl Planner<'_> {
         item.scope = scope.to_string();
         item.want = Some(want.clone());
         match self.placed(scope, path, "file") {
-            Some(root) => item.root = root,
-            None => return conflict(target, path, format!("no place {scope} has")),
+            Ok(Some(root)) => item.root = root,
+            Ok(None) => return conflict(target, path, format!("no place {scope} has")),
+            Err(e) => return conflict(target, path, e),
         }
         let mut current = String::new();
         match fsguard::kind(path) {
@@ -522,8 +551,9 @@ impl Planner<'_> {
         item.scope = scope.to_string();
         item.want = Some(want.clone());
         match self.placed(scope, path, "dir") {
-            Some(root) => item.root = root,
-            None => return conflict(target, path, format!("no place {scope} has")),
+            Ok(Some(root)) => item.root = root,
+            Ok(None) => return conflict(target, path, format!("no place {scope} has")),
+            Err(e) => return conflict(target, path, e),
         }
         let mut old = Tree::new();
         match fsguard::kind(path) {
@@ -601,7 +631,11 @@ impl Planner<'_> {
             item.scope = o.scope.clone();
             item.have = Some(o.sha.clone());
             // `check_ledger` let through only records in place, or whose path is gone (which only lose the record).
-            item.root = self.placed(&o.scope, &path, &o.kind).unwrap_or_else(|| path.clone());
+            item.root = self
+                .placed(&o.scope, &path, &o.kind)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| path.clone());
             let now = match fsguard::kind(&path) {
                 Err(e) => {
                     item.action = Action::Report;
@@ -610,12 +644,25 @@ impl Planner<'_> {
                     continue;
                 }
                 Ok(fsguard::Kind::Missing) => None,
-                Ok(fsguard::Kind::File) if o.kind == "file" => {
-                    fsguard::read(&path).ok().flatten().map(|b| fsguard::sha(&b))
-                }
-                Ok(fsguard::Kind::Dir) if o.kind == "dir" => {
-                    fsguard::read_tree(&path).ok().map(|t| fsguard::tree_sha(&t))
-                }
+                // What can't be read is reported and left, never taken for gone (Sol review r5, R5-04's class).
+                Ok(fsguard::Kind::File) if o.kind == "file" => match fsguard::read(&path) {
+                    Ok(b) => Some(fsguard::sha(&b.unwrap_or_default())),
+                    Err(e) => {
+                        item.action = Action::Report;
+                        item.notes.push(format!("can't read it ({e}); left as it is"));
+                        self.plan.items.push(item);
+                        continue;
+                    }
+                },
+                Ok(fsguard::Kind::Dir) if o.kind == "dir" => match fsguard::read_tree(&path) {
+                    Ok(t) => Some(fsguard::tree_sha(&t)),
+                    Err(e) => {
+                        item.action = Action::Report;
+                        item.notes.push(format!("can't read it ({e}); left as it is"));
+                        self.plan.items.push(item);
+                        continue;
+                    }
+                },
                 Ok(_) => Some(String::new()),
             };
             match now {
@@ -694,7 +741,8 @@ fn instructions_items(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Ve
     ctx.roles = roles_of(t);
     let composed = compose::compose(pl.stacks, &ctx);
     let replace = t.own_text.as_deref() == Some("replace");
-    let current = fsguard::read_text(&path).ok().flatten().unwrap_or_default();
+    // Only for the `own_text = replace` note; `owner_block_item` reads the file strictly.
+    let current = read_lossy(&path).unwrap_or_default();
     let text = adapter.render(&composed);
     let mut items = Vec::new();
     let scope = format!("target:{}", t.name);
@@ -702,7 +750,7 @@ fn instructions_items(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Ve
     let block = match &t.via {
         None => text.clone(),
         Some(via) => {
-            let shared = Slot::Shared.path(&expand_home(via), "");
+            let shared = Slot::Shared.path(&expand_home(via), "").expect("a slot without a name");
             let Some(line) = adapter.import_line(&shared) else {
                 return vec![conflict(
                     &t.name,
@@ -960,7 +1008,14 @@ fn skills_items(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Vec<Item
     let mut items = Vec::new();
     for e in wanted {
         let name = e.id().trim_start_matches("skill.").to_string();
-        let dest = Slot::TargetSkill.path(&dir, &name);
+        let Some(dest) = Slot::TargetSkill.path(&dir, &name) else {
+            items.push(conflict(
+                &t.name,
+                &dir.join(&name),
+                format!("skill {}: no skill name sync writes", e.id()),
+            ));
+            continue;
+        };
         match pl.tree_of(e) {
             Ok(tree) => items.push(pl.tool_dir(&t.name, &scope, &dest, tree)),
             Err(err) => items.push(conflict(&t.name, &dest, format!("skill {}: {err}", e.id()))),
@@ -1019,8 +1074,10 @@ fn excludes_text(current: &str, files: &[String]) -> String {
 }
 
 /// Every checkout and (if asked) worktree of a repo, and the worktrees skipped for lying outside
-/// `worktree_roots`.
-fn checkouts(repo: &stack::Repo) -> (Vec<PathBuf>, Vec<PathBuf>) {
+/// `worktree_roots`. A configured checkout counts only where git's own top level is exactly that path (Sol review
+/// r5, R5-01; decision 1): a dir that is no checkout, or one inside a checkout, refuses the whole place, as does a
+/// git call that fails. A worktree is one git lists, at the root git gives.
+fn checkouts(repo: &stack::Repo) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
     let roots: Vec<String> = repo.worktree_roots.iter().map(|r| norm(&expand_home(r))).collect();
     let inside = |p: &Path| {
         let p = norm(p);
@@ -1031,12 +1088,22 @@ fn checkouts(repo: &stack::Repo) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut seen: Vec<String> = Vec::new();
     for c in &repo.checkouts {
         let c = expand_home(c);
+        let top = git::run(&c, &["rev-parse", "--show-toplevel"]).map_err(|e| {
+            format!("checkout {} is no git checkout ({e}); put the checkout's root in `checkouts` of the private stack.toml", c.display())
+        })?;
+        if ledger::key(Path::new(top.trim())) != ledger::key(&c) {
+            return Err(format!(
+                "checkout {} is no checkout's root: git's top level there is {}; put that root in `checkouts` of the private stack.toml",
+                c.display(),
+                top.trim()
+            ));
+        }
         seen.push(norm(&c));
         out.push(c.clone());
         if !repo.worktrees {
             continue;
         }
-        let Ok(list) = git::run(&c, &["worktree", "list", "--porcelain"]) else { continue };
+        let list = git::run(&c, &["worktree", "list", "--porcelain"])?;
         for w in list.lines().filter_map(|l| l.strip_prefix("worktree ")).map(PathBuf::from) {
             if seen.contains(&norm(&w)) {
                 continue;
@@ -1049,7 +1116,7 @@ fn checkouts(repo: &stack::Repo) -> (Vec<PathBuf>, Vec<PathBuf>) {
             }
         }
     }
-    (out, skipped)
+    Ok((out, skipped))
 }
 
 /// Where sync writes a place's files: a repo (its checkouts and worktrees) or a workspace (one dir, no git).
@@ -1151,46 +1218,71 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
     }
     // The two root files are the only lines sync keeps in a repo's exclude file; its dirs ignore themselves.
     let mut excludes: Vec<(PathBuf, Vec<String>)> = Vec::new();
-    let mut add_exclude = |p: &Path, what: &str| {
+    // A git that fails here is a conflict, never a repo without an exclude file (Sol review r5, decision 1).
+    let mut add_exclude = |p: &Path, what: &str| -> Result<(), String> {
         if place.workspace {
-            return;
+            return Ok(());
         }
-        if let Ok(common) =
-            git::run(p, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        {
-            let ex = PathBuf::from(common.trim()).join("info").join("exclude");
-            match excludes.iter_mut().find(|(e, _)| *e == ex) {
-                Some((_, files)) if !files.iter().any(|f| f == what) => {
-                    files.push(what.to_string())
-                }
-                Some(_) => {}
-                None => excludes.push((ex, vec![what.to_string()])),
-            }
+        let common = git::run(p, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+        let ex = PathBuf::from(common.trim()).join("info").join("exclude");
+        match excludes.iter_mut().find(|(e, _)| *e == ex) {
+            Some((_, files)) if !files.iter().any(|f| f == what) => files.push(what.to_string()),
+            Some(_) => {}
+            None => excludes.push((ex, vec![what.to_string()])),
         }
+        Ok(())
     };
     for adapter in chosen.iter().copied() {
         let file = adapter.repo_file();
         let scope = place_scope(place, Some(adapter));
         for p in &place.paths {
             let target = format!("{} ({file})", place.label);
-            let path = Slot::AdapterFile(adapter).path(p, "");
+            let path = Slot::AdapterFile(adapter).path(p, "").expect("a slot without a name");
             if !p.is_dir() {
                 pl.plan.items.push(conflict(&target, &path, "checkout not found"));
                 continue;
             }
-            if !place.workspace && git::run(p, &["ls-files", "--error-unmatch", file]).is_ok() {
-                pl.plan.items.push(conflict(
-                    &target,
-                    &path,
-                    format!("{file} is tracked here; sync writes only untracked files"),
-                ));
+            let tracked = if place.workspace {
+                Ok(false)
+            } else {
+                git::status(p, &["ls-files", "--error-unmatch", "--", file])
+            };
+            match tracked {
+                Ok(false) => {}
+                Ok(true) => {
+                    pl.plan.items.push(conflict(
+                        &target,
+                        &path,
+                        format!("{file} is tracked here; sync writes only untracked files"),
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    pl.plan.items.push(conflict(&target, &path, e));
+                    continue;
+                }
+            }
+            // The tracked AGENTS.md this file may carry: one that is there but can't be read is a conflict, never
+            // left out (r5, R5-04's class).
+            let agents = p.join("AGENTS.md");
+            if let Err(e) = fsguard::read_string(&agents) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    pl.plan.items.push(conflict(
+                        &target,
+                        &path,
+                        format!("{}: {e}", agents.display()),
+                    ));
+                    continue;
+                }
+            }
+            if let Err(e) = add_exclude(p, &format!("/{file}")) {
+                pl.plan.items.push(conflict(&target, &path, e));
                 continue;
             }
             let (text, composed) = place_text(pl.stacks, place.layers(false), adapter, p);
             let mut item = pl.tool_file(&target, &scope, &path, text.clone(), &composed);
             size_note(&mut item, adapter, &text);
             pl.plan.items.push(item);
-            add_exclude(p, &format!("/{file}"));
         }
     }
     // Development skills, copied into each checkout for harnesses that read a skills dir there.
@@ -1203,17 +1295,34 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
             for e in &skills {
                 let name = e.id().trim_start_matches("skill.").to_string();
                 let rel = format!("{dir}/{name}");
-                let dest = Slot::AdapterSkill(adapter).path(p, &name);
                 let target = format!("{} (skill {name})", place.label);
-                if !place.workspace
-                    && git::run(p, &["ls-files", &rel]).is_ok_and(|o| !o.trim().is_empty())
-                {
+                let Some(dest) = Slot::AdapterSkill(adapter).path(p, &name) else {
                     pl.plan.items.push(conflict(
                         &target,
-                        &dest,
-                        format!("the repo tracks a skill at {rel}; rename one of them"),
+                        &p.join(&rel),
+                        format!("skill {}: no skill name sync writes", e.id()),
                     ));
                     continue;
+                };
+                let tracked = if place.workspace {
+                    Ok(String::new())
+                } else {
+                    git::run(p, &["ls-files", "--", &rel])
+                };
+                match tracked {
+                    Ok(o) if o.trim().is_empty() => {}
+                    Ok(_) => {
+                        pl.plan.items.push(conflict(
+                            &target,
+                            &dest,
+                            format!("the repo tracks a skill at {rel}; rename one of them"),
+                        ));
+                        continue;
+                    }
+                    Err(e) => {
+                        pl.plan.items.push(conflict(&target, &dest, e));
+                        continue;
+                    }
                 }
                 match pl.tree_of(e) {
                     Ok(tree) => {
@@ -1251,7 +1360,7 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
         let item = pl.tool_dir(
             &format!("{} (role files)", place.label),
             &scope,
-            &Slot::RoleDir.path(p, ""),
+            &Slot::RoleDir.path(p, "").expect("a slot without a name"),
             tree.clone(),
         );
         pl.plan.items.push(item);
@@ -1277,7 +1386,7 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
     }
     // The tracked AGENTS.md of the first checkout: what the public layers would make it. Shown, never written.
     let tracked = place.paths[0].join("AGENTS.md");
-    if let Some(current) = read(&tracked) {
+    if let Some(current) = read_lossy(&tracked) {
         let ctx = Context {
             audience: vec![Audience::Opus, Audience::Sol, Audience::Astra],
             layers: place.layers(true),
@@ -1312,7 +1421,15 @@ fn repo_items(
     only: Option<&str>,
     only_path: Option<&Path>,
 ) {
-    let (mut paths, skipped) = checkouts(repo);
+    let (mut paths, skipped) = match checkouts(repo) {
+        Ok(c) => c,
+        Err(e) => {
+            // The place refuses whole (Sol review r5, R5-01): nothing is planned in any of its checkouts.
+            let first = repo.checkouts.first().map(|c| expand_home(c)).unwrap_or_default();
+            pl.plan.items.push(conflict(&format!("repo {name}"), &first, e));
+            return;
+        }
+    };
     if let Some(one) = only_path {
         paths.retain(|p| same_place(p, one));
         if paths.is_empty() {
@@ -1500,7 +1617,7 @@ impl ApplyLock {
                     return Err(format!(
                         "another apply holds {} ({}); if none is running, delete that file",
                         lock.display(),
-                        read(&lock).unwrap_or_default().trim()
+                        read_lossy(&lock).unwrap_or_default().trim()
                     ))
                 }
                 Err(e) => return Err(e),
@@ -1784,7 +1901,10 @@ pub fn restore(home: &Path, backup_dir: &Path) -> Result<Vec<String>, String> {
         };
         let step = match f.as_slice() {
             ["edit", _, name, written, ..] if holds(written)? => {
-                let old = fsguard::read(&backup_dir.join(name))?.unwrap_or_default();
+                // A numbered backup that isn't there stops the restore, never puts an empty file back (r5).
+                let old = fsguard::read(&backup_dir.join(name))?.ok_or_else(|| {
+                    format!("{}: the backup {name} is missing", backup_dir.display())
+                })?;
                 // The owner file's attributes as apply found them (Sol review r4, R4-03).
                 let attrs = f.get(4).and_then(|a| fsguard::Attrs::parse(a));
                 let aside = fsguard::move_aside(&path)?;
@@ -1799,6 +1919,14 @@ pub fn restore(home: &Path, backup_dir: &Path) -> Result<Vec<String>, String> {
                     fsguard::move_back(&aside, &path)?;
                     format!("kept {} (changed while restoring)", path.display())
                 }
+            }
+            // A file the owner has since marked (read-only, hidden, system) is theirs to remove (r5, R5-05).
+            ["created", _, written] if holds(written)? && fsguard::attrs(&path)?.unusual() => {
+                format!(
+                    "kept {} (marked {} since apply)",
+                    path.display(),
+                    fsguard::attrs(&path)?.describe()
+                )
             }
             ["created", _, written] if holds(written)? => {
                 let aside = fsguard::move_aside(&path)?;
@@ -2104,14 +2232,17 @@ pub fn keeps_in_order(tracked: &str, file: &str) -> Result<(), (usize, String)> 
 pub fn verbatim_findings(stacks: &Stacks) -> Vec<crate::Finding> {
     let Some(private) = &stacks.private else { return Vec::new() };
     let mut dirs: Vec<PathBuf> = Vec::new();
-    for repo in private.manifest.repos.values() {
-        dirs.extend(checkouts(repo).0);
+    let mut out = Vec::new();
+    for (name, repo) in &private.manifest.repos {
+        match checkouts(repo) {
+            Ok((paths, _)) => dirs.extend(paths),
+            Err(e) => out.push(crate::Finding::error("checkouts", format!("repo {name}: {e}"))),
+        }
     }
     dirs.extend(private.manifest.workspaces.values().map(|w| expand_home(&w.path)));
-    let mut out = Vec::new();
     for d in dirs {
-        let Some(tracked) = read(&d.join("AGENTS.md")) else { continue };
-        if let Some(over) = read(&d.join("AGENTS.override.md")) {
+        let Some(tracked) = read_or_finding(&d.join("AGENTS.md"), &mut out) else { continue };
+        if let Some(over) = read_or_finding(&d.join("AGENTS.override.md"), &mut out) {
             if let Err((n, line)) = keeps_in_order(&tracked, &over) {
                 out.push(
                     crate::Finding::error(
@@ -2122,7 +2253,7 @@ pub fn verbatim_findings(stacks: &Stacks) -> Vec<crate::Finding> {
                 );
             }
         }
-        if let Some(local) = read(&d.join("CLAUDE.local.md")) {
+        if let Some(local) = read_or_finding(&d.join("CLAUDE.local.md"), &mut out) {
             if !local.lines().any(|l| l.trim() == "@AGENTS.md") {
                 out.push(
                     crate::Finding::error(
@@ -2149,7 +2280,8 @@ pub fn shadow_findings(stacks: &Stacks) -> Vec<crate::Finding> {
     }
     let mut skipped_all: Vec<(String, PathBuf)> = Vec::new();
     for (name, repo) in &private.manifest.repos {
-        let (paths, skipped) = checkouts(repo);
+        // A misconfigured repo is an error in `verbatim_findings`; it has no worktrees to list here.
+        let Ok((paths, skipped)) = checkouts(repo) else { continue };
         if claude(&repo.adapters) {
             places.extend(paths.into_iter().map(|p| (format!("repo {name}"), p)));
         }
@@ -2289,7 +2421,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
                 .collect();
             let each: usize = parts.iter().map(|(_, n)| n).sum();
             let paths = match private.manifest.repos.get(&name) {
-                Some(repo) => checkouts(repo).0.len().max(1),
+                Some(repo) => checkouts(repo).map_or(repo.checkouts.len(), |c| c.0.len()).max(1),
                 None => 1,
             };
             parts.push((format!("in all {paths}"), each * paths));
@@ -2385,7 +2517,8 @@ mod tests {
         fsguard::fail_links(false);
         assert!(result.is_err(), "{result:?}");
         assert_eq!(fsguard::read(&path).unwrap().as_deref(), Some(&b"OLD\n"[..]));
-        assert_eq!(fsguard::attrs(&path).unwrap(), before);
+        // The attributes an owner sets (read-only, hidden, system); Windows itself sets "archive" on a rename.
+        assert_eq!(fsguard::attrs(&path).unwrap().describe(), before.describe());
         assert_eq!(fsguard::list_dir(path.parent().unwrap()).map(|v| v.len()).ok(), Some(1));
     }
 }

@@ -2,6 +2,9 @@
 //! and the action are separate steps, so apply checks each path again after acting on it. That check is a new call,
 //! so this file doesn't build on 3546e9e (its red run); round3.rs has the others.
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod common;
 use common::*;
 use lords_core::fsguard;

@@ -163,15 +163,51 @@ impl Stack {
         }
         let manifest: Manifest = serde_json::from_value(value)
             .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+        // Target names are unique, so a `target:<name>` ledger scope names one target (Sol review r5, R5-06).
+        let mut names: Vec<&str> = manifest.targets.iter().map(|t| t.name.as_str()).collect();
+        names.sort();
+        if let Some(w) = names.windows(2).find(|w| w[0] == w[1]) {
+            return Err(format!(
+                "{}: two targets are named `{}`; target names must be unique",
+                manifest_path.display(),
+                w[0]
+            ));
+        }
         let mut stack =
             Stack { root: root.to_path_buf(), manifest, entries: Vec::new(), problems: Vec::new() };
         if stack.visibility() == Visibility::Public {
             stack.check_public_manifest(&manifest_path);
         }
-        for (dir, scope) in layer_dirs(root) {
+        for (dir, scope) in layer_dirs(root)? {
             stack.load_layer(&dir, &scope);
         }
+        // A dir that couldn't be read leaves the stack incomplete: it doesn't load (R5-04's class, decision 4).
+        if let Some(p) = stack.problems.iter().find(|p| p.code == UNREADABLE) {
+            return Err(format!("{}: {}", root.display(), p.message));
+        }
         Ok(stack)
+    }
+
+    /// A dir's children, sorted; an error is recorded as an `unreadable` problem, which fails the load.
+    fn children(&mut self, dir: &Path) -> Vec<PathBuf> {
+        match sorted_children(dir) {
+            Ok(v) => v,
+            Err(e) => {
+                self.problems.push(Finding::error(UNREADABLE, e).at(dir, None));
+                Vec::new()
+            }
+        }
+    }
+
+    /// A dir's plain files, as `all_files`; an error is recorded as an `unreadable` problem.
+    fn files_of(&mut self, dir: &Path) -> Vec<PathBuf> {
+        match all_files(dir) {
+            Ok(v) => v,
+            Err(e) => {
+                self.problems.push(Finding::error(UNREADABLE, e).at(dir, None));
+                Vec::new()
+            }
+        }
     }
 
     fn check_public_manifest(&mut self, path: &Path) {
@@ -190,7 +226,7 @@ impl Stack {
     }
 
     fn load_layer(&mut self, dir: &Path, scope: &Scope) {
-        for child in sorted_children(dir) {
+        for child in self.children(dir) {
             let name = file_name(&child);
             if child.is_file() {
                 self.problems.push(
@@ -206,7 +242,7 @@ impl Stack {
                 continue;
             };
             if kind == Kind::Skill {
-                for skill in sorted_children(&child) {
+                for skill in self.children(&child) {
                     if skill.is_dir() {
                         self.load_skill(&skill, scope);
                     } else {
@@ -230,7 +266,7 @@ impl Stack {
                 return;
             }
         };
-        for child in sorted_children(dir) {
+        for child in self.children(dir) {
             let name = file_name(&child);
             let not_entry = name == DEFAULTS
                 || name == ".gitkeep"
@@ -330,7 +366,7 @@ impl Stack {
                     .at(&sidecar, None),
             );
         }
-        let files = all_files(dir);
+        let files = self.files_of(dir);
         self.push_entry(meta, Kind::Skill, scope, &sidecar, &skill_file, body, 1, files);
     }
 
@@ -418,12 +454,11 @@ impl Stack {
                 continue;
             };
             for rel in &repo.skills {
-                for dir in sorted_children(&checkout.join(rel))
-                    .into_iter()
-                    .filter(|d| d.join(SKILL_FILE).is_file())
-                {
+                let dirs = self.children(&checkout.join(rel));
+                for dir in dirs.into_iter().filter(|d| d.join(SKILL_FILE).is_file()) {
                     let file = dir.join(SKILL_FILE);
-                    let body = fsguard::read_string(&file).unwrap_or_default();
+                    // Only shown in the skills index: an unreadable SKILL.md shows no hook (inventory: lossy).
+                    let body = fsguard::read_string_lossy(&file).unwrap_or_default();
                     let front = frontmatter::split(&body)
                         .yaml
                         .map(parse_yaml)
@@ -454,7 +489,7 @@ impl Stack {
                         origin: crate::model::Origin::InRepo {
                             repo: name.clone(),
                             path,
-                            sha256: crate::check::dir_hash(&dir),
+                            sha256: crate::check::dir_hash_or_unreadable(&dir),
                         },
                         topics: Vec::new(),
                         overrides: Vec::new(),
@@ -465,6 +500,7 @@ impl Stack {
                         description: text("description"),
                         metadata: None,
                     };
+                    let files = self.files_of(&dir);
                     self.entries.push(Entry {
                         meta,
                         scope: Scope::Repo(name.clone()),
@@ -473,7 +509,7 @@ impl Stack {
                         body_file: file,
                         body,
                         body_line: 1,
-                        files: all_files(&dir),
+                        files,
                     });
                 }
             }
@@ -525,6 +561,16 @@ fn derive_store_fields(merged: &mut Map<String, Value>, file: &Path) {
     }
 }
 
+/// Whether `s` is a slug as the entry schema's ids have them after `<kind>.`: lowercase letters, digits and `-`,
+/// in dot-separated parts that each start with a letter or digit (schema/entry.schema.json, `id`).
+pub fn is_slug(s: &str) -> bool {
+    !s.is_empty()
+        && s.split('.').all(|part| {
+            part.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                && part.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        })
+}
+
 pub fn slug(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
@@ -572,53 +618,62 @@ fn read_yaml_file(path: &Path) -> Result<Option<Map<String, Value>>, String> {
     }
 }
 
-fn layer_dirs(root: &Path) -> Vec<(PathBuf, Scope)> {
+fn layer_dirs(root: &Path) -> Result<Vec<(PathBuf, Scope)>, String> {
     let mut out = vec![(root.join("global"), Scope::Global)];
-    for p in sorted_children(&root.join("project")) {
+    for p in sorted_children(&root.join("project"))? {
         if p.is_dir() {
             out.push((p.clone(), Scope::Project(file_name(&p))));
         }
     }
-    for r in sorted_children(&root.join("repo")) {
+    for r in sorted_children(&root.join("repo"))? {
         if r.is_dir() {
             out.push((r.clone(), Scope::Repo(file_name(&r))));
         }
     }
-    for w in sorted_children(&root.join("workspace")) {
+    for w in sorted_children(&root.join("workspace"))? {
         if w.is_dir() {
             out.push((w.clone(), Scope::Workspace(file_name(&w))));
         }
     }
-    out
+    Ok(out)
 }
 
-pub fn sorted_children(dir: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = fsguard::list_dir(dir);
+/// The code of a problem that a dir or file of the stack couldn't be read: the stack doesn't load.
+pub const UNREADABLE: &str = "unreadable";
+
+/// A dir's children, sorted; none for a dir that isn't there, an error for one that can't be listed.
+pub fn sorted_children(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut v = fsguard::list_dir(dir)?;
     v.sort();
-    v
+    Ok(v)
 }
 
 /// Every plain file under `dir`. Links (junctions, symlinks) are never followed, so a walk stays inside `dir` and
-/// ends (Sol review, finding 18); `has_links` says whether there were any.
-pub fn all_files(dir: &Path) -> Vec<PathBuf> {
+/// ends (Sol review, finding 18). Anything that can't be listed or told apart is an error, never skipped (r5,
+/// R5-04's class).
+pub fn all_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
-    for c in sorted_children(dir) {
-        match fsguard::is_link_at(&c) {
-            Some(false) if c.is_dir() => out.extend(all_files(&c)),
-            Some(false) if c.is_file() => out.push(c),
-            _ => {}
+    for c in sorted_children(dir)? {
+        if fsguard::link_at(&c)? {
+            continue;
+        }
+        match fsguard::kind_here(&c)? {
+            fsguard::Kind::Dir => out.extend(all_files(&c)?),
+            fsguard::Kind::File => out.push(c),
+            fsguard::Kind::Missing => {}
         }
     }
-    out
+    Ok(out)
 }
 
-/// Whether `dir` holds a link anywhere below it (not following links).
-pub fn has_links(dir: &Path) -> bool {
-    sorted_children(dir).iter().any(|c| match fsguard::is_link_at(c) {
-        Some(true) => true,
-        Some(false) => c.is_dir() && has_links(c),
-        None => false,
-    })
+/// Whether `dir` holds a link anywhere below it (not following links); an error when that can't be told.
+pub fn has_links(dir: &Path) -> Result<bool, String> {
+    for c in sorted_children(dir)? {
+        if fsguard::link_at(&c)? || (c.is_dir() && has_links(&c)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn file_name(p: &Path) -> String {

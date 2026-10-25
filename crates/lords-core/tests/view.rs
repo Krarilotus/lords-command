@@ -1,6 +1,9 @@
 //! The serialisable views (owner, 25 Oct: "one local web UI"; orchestrator: "a thin, serialisable view model …
 //! one function per view, with tests").
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod common;
 use common::*;
 use lords_core::compose::{compose, Context, Layers};

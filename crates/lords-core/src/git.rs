@@ -29,6 +29,22 @@ pub fn bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     }
 }
 
+/// A git command that answers yes or no by its exit status (`ls-files --error-unmatch`, `check-ignore -q`,
+/// `diff --quiet`, `config --get`): `true` for 0, `false` for 1, and an error for anything else, so a git that
+/// failed never reads as "no" (Sol review r5, decision 1: "a failed git call never means untracked").
+pub fn status(dir: &Path, args: &[&str]) -> Result<bool, String> {
+    let out = crate::process::git(dir, args)?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
+}
+
 pub fn toplevel(dir: &Path) -> Option<PathBuf> {
     run(dir, &["rev-parse", "--show-toplevel"]).ok().map(|s| PathBuf::from(s.trim()))
 }

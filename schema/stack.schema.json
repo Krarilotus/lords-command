@@ -69,7 +69,7 @@
         "type": "object",
         "required": ["name", "adapter", "kind", "path"],
         "properties": {
-          "name": { "type": "string" },
+          "name": { "type": "string", "description": "unique among the targets: the ledger names a target by it (`target:<name>`), and the stack refuses two of one name" },
           "adapter": { "type": "string", "description": "the adapter that writes this target, e.g. claude, codex" },
           "kind": { "enum": ["instructions", "skills", "settings"] },
           "path": { "type": "string", "description": "~ expands to the home dir" },

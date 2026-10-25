@@ -3,6 +3,9 @@
 //! proven before a removal, ended entries leave every output). One test per round-1 finding; each failed before its
 //! fix. Since the ownership boundary (design), a few state the stricter rule that replaced the first fix.
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod common;
 use common::*;
 use lords_core::sync::{apply, plan, Action, Plan};

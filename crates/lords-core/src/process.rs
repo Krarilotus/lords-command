@@ -3,6 +3,9 @@
 //! calls it; its writing commands change only the stack repo an operation names) and the file manager, which the
 //! GUI asks to show a path or open a link, and which writes nothing itself.
 
+// The door: the one place the resolved boundary lints allow (clippy.toml).
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::path::Path;
 use std::process::{Command, Output};
 

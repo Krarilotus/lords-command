@@ -1,5 +1,8 @@
 //! `check`, against docs/design.md (sections named in each spec line).
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod common;
 use common::*;
 use lords_core::Severity;

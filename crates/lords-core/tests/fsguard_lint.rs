@@ -7,9 +7,16 @@
 //! way is still caught, no call that changes a file and no child process. fsguard.rs may reach `std::fs` and
 //! `std::os`, process.rs `std::process`, each nothing else of the three.
 //!
-//! A module ban here rather than clippy's `disallowed-types`/`disallowed-methods`: this repo's hooks don't run
-//! clippy, `cargo test` does run this; and a ban of the whole module needs no list of its functions, which is what
-//! let `DirBuilder` through.
+//! This text layer is the second of two (Sol review r5, R5-03; decision 3). The first is clippy's resolved
+//! `disallowed-types`/`disallowed-methods` (clippy.toml), which tools/commit-check.sh runs before every commit: the
+//! compiler resolves aliases, grouped `use` trees and raw identifiers, which no text match can (R5-03's three
+//! spellings got past this layer alone). This layer keeps the module ban and refuses whatever would switch the
+//! first one off in an ordinary source: an `allow`/`expect` of `clippy::disallowed_*`, `clippy::style`,
+//! `clippy::all` or `warnings`, and code clippy never sees (`cfg(clippy)`); and it checks that clippy.toml names
+//! every door and no Cargo.toml loosens it.
+
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -236,6 +243,49 @@ fn forbidden(file: &str, text: &str) -> Vec<String> {
             }
         }
     }
+    // Nothing in an ordinary source switches the resolved check off (decision 3): no `allow`/`expect` of the
+    // boundary lints, their group, all of clippy or every warning, and no code clippy doesn't compile.
+    if d == Door::None {
+        for attr in ["allow(", "expect("] {
+            for (at, _) in code.match_indices(attr) {
+                let args = code[at + attr.len()..].split(')').next().unwrap_or("");
+                let off = args.split(',').find(|a| {
+                    a.starts_with("clippy::disallowed_")
+                        || ["clippy::style", "clippy::all", "warnings"].contains(a)
+                });
+                if let Some(a) = off {
+                    found.push(format!(
+                        "{file}: {attr}{a}) switches the resolved boundary check off"
+                    ));
+                }
+            }
+        }
+        // The OS's own calls, which no clippy path list covers: only the doors may use an FFI crate or declare
+        // foreign functions (fsguard.rs uses `windows_sys` for attributes and file identity).
+        for ffi in ["windows_sys", "winapi", "libc", "nix"] {
+            if idents(&code_of(text, false)).contains(&ffi) {
+                found.push(format!("{file}: {ffi} (the OS's own calls, only in a door)"));
+            }
+        }
+        for ext in ["extern\"C\"", "extern\"system\"", "extern{", "#[link("] {
+            if with_strings.contains(ext) {
+                found.push(format!("{file}: {ext} (foreign functions, only in a door)"));
+            }
+        }
+        for attr in ["cfg(", "cfg_attr("] {
+            for (at, _) in code.match_indices(attr) {
+                let inside = code[at..].split(']').next().unwrap_or("");
+                if inside
+                    .match_indices("clippy")
+                    .any(|(i, _)| !inside[i + "clippy".len()..].starts_with("::"))
+                {
+                    found.push(format!(
+                        "{file}: {inside} hides code from the resolved boundary check"
+                    ));
+                }
+            }
+        }
+    }
     let programs = programs_allowed(d);
     for (at, _) in with_strings.match_indices("Command::new(") {
         let arg = &with_strings[at + "Command::new(".len()..];
@@ -439,4 +489,23 @@ fn r5_03_the_commit_check_runs_clippy() {
     assert!(check.contains("cargo clippy") && check.contains("-D warnings"), "{check}");
     let hook = lords_core::hooks::script(Path::new("C:/lords/lords.exe"), false);
     assert!(hook.contains("tools/commit-check.sh"), "{hook}");
+}
+
+// Spec (the lint class's inventory, orchestrator 25 Oct: "list every place in the code where the class can occur"):
+// the OS's own calls reach the filesystem past clippy's path lists, so only a door may use an FFI crate or declare
+// foreign functions. Written with its fix (the matcher is in this file).
+#[test]
+fn r5_03_no_ffi_outside_the_doors() {
+    let cases = [
+        ("windows-sys", "use windows_sys::Win32::Storage::FileSystem::DeleteFileW;"),
+        ("libc", "unsafe { libc::unlink(p) };"),
+        ("a foreign block", "extern \"system\" { fn DeleteFileW(p: *const u16) -> i32; }"),
+    ];
+    let missed: Vec<&str> = cases
+        .iter()
+        .filter(|(_, code)| forbidden("crates/lords-core/src/sync.rs", code).is_empty())
+        .map(|(w, _)| *w)
+        .collect();
+    assert!(missed.is_empty(), "not caught: {missed:?}");
+    assert_eq!(forbidden("crates/lords-core/src/fsguard.rs", cases[0].1), Vec::<String>::new());
 }

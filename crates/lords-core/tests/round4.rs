@@ -3,6 +3,9 @@
 //! run red on their parent, 67d07b1. R4-04 (the no-hard-link fallback, removed) has no test: it needs a volume
 //! without hard links. R4-06 is the lint's own table, in fsguard_lint.rs.
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod common;
 use common::*;
 use lords_core::ledger::Ledger;

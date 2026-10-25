@@ -2,6 +2,9 @@
 //! junction and emptied the stack's skill dirs: "managed copies for Claude (deletable with the worktree without
 //! harming the source) plus the index for Codex"; design: Ownership boundary: the ledger, not the copy, says whose).
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod common;
 use common::*;
 use lords_core::sync::{apply, plan, Action, Plan};

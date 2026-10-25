@@ -15,6 +15,9 @@
 //! that swaps a checked dir for a junction in between could redirect the action. The design (Ownership boundary,
 //! "Operating assumption") says why that is accepted for now and what apply checks after each action.
 
+// The door: the one place the resolved boundary lints allow (clippy.toml).
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
@@ -78,7 +81,9 @@ pub fn check(path: &Path) -> Result<(), String> {
 // ---------------------------------------------------------------- plain reads
 //
 // For the stacks, configs and files sync only shows or scans: like std's, they follow links. Nothing sync decides
-// to write, move or delete is read through these.
+// to write, move or delete is read through these. They are strict: every error comes back (Sol review r5, R5-04;
+// decision 4). The `_lossy` ones turn an error into "nothing" and are for display only: no safety decision calls
+// one (the design's swallowed-errors inventory names each caller).
 
 /// A file's bytes (std's `fs::read`).
 pub fn read_bytes(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
@@ -90,15 +95,43 @@ pub fn read_string(path: impl AsRef<Path>) -> std::io::Result<String> {
     fs::read_to_string(path)
 }
 
-/// The paths in a dir, unsorted; none when it can't be read.
-pub fn list_dir(dir: &Path) -> Vec<PathBuf> {
-    fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect()
+/// A file's bytes for display, `None` on any error (fonts in the GUI).
+pub fn read_bytes_lossy(path: impl AsRef<Path>) -> Option<Vec<u8>> {
+    fs::read(path).ok()
 }
 
-/// What is at a path, not following a link there: `Some(true)` a link, `Some(false)` anything else, `None` when
-/// it can't be read.
-pub fn is_link_at(path: &Path) -> Option<bool> {
-    fs::symlink_metadata(path).ok().map(|m| is_link(&m))
+/// A file's text for display, `None` on any error.
+pub fn read_string_lossy(path: impl AsRef<Path>) -> Option<String> {
+    fs::read_to_string(path).ok()
+}
+
+/// The paths in a dir, unsorted. A dir that isn't there has none; any other error (the dir can't be opened, or an
+/// entry can't be read while listing it) comes back.
+pub fn list_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", dir.display())),
+    };
+    entries.map(|e| e.map(|e| e.path()).map_err(|e| format!("{}: {e}", dir.display()))).collect()
+}
+
+/// What is at a path itself, not following a link there and not checking the dirs above (a stack or a source dir,
+/// read as std reads it): `Missing`, `File` or `Dir`; a link is an error, as is anything that can't be told.
+pub fn kind_here(path: &Path) -> Result<Kind, String> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Kind::Missing),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+        Ok(m) if is_link(&m) => Err(format!("{} is a link", path.display())),
+        Ok(m) if m.is_dir() => Ok(Kind::Dir),
+        Ok(m) if m.is_file() => Ok(Kind::File),
+        Ok(_) => Err(format!("{} is neither a file nor a dir", path.display())),
+    }
+}
+
+/// Whether what is at a path is a link, not following it; an error when that can't be told.
+pub fn link_at(path: &Path) -> Result<bool, String> {
+    fs::symlink_metadata(path).map(|m| is_link(&m)).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// What is at a path (checked first).
@@ -224,6 +257,26 @@ pub fn put_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     put_file_as(path, bytes, None)
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests only: makes every following `hard_link` on this thread fail as on a volume without hard links (Sol review
+/// r4, R4-04; r5, decision 7).
+#[cfg(test)]
+pub fn fail_links(on: bool) {
+    FAIL_LINKS.with(|f| f.set(on));
+}
+
+fn link_in(staged: &Path, path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_LINKS.with(|f| f.get()) {
+        return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+    }
+    fs::hard_link(staged, path)
+}
+
 /// `put_file`, then the file attributes `like` (an owner file's, taken before it moved aside: Sol review r3, R3-06).
 /// If they can't be set, the new file goes again, so `path` is absent or whole with them.
 pub fn put_file_as(path: &Path, bytes: &[u8], like: Option<&Attrs>) -> Result<(), String> {
@@ -235,7 +288,8 @@ pub fn put_file_as(path: &Path, bytes: &[u8], like: Option<&Attrs>) -> Result<()
     create_file(&staged, bytes)?;
     // Linking in is the only way a file appears at a sync path: on a volume without hard links sync refuses, never
     // writes in place (Sol review r4, R4-04: that left a partial file where the old one had to go back).
-    let linked = fs::hard_link(&staged, path);
+    let linked = link_in(&staged, path);
+    // The staging name is this run's own and never read again: a leftover is harmless (inventory: out of contract).
     let _ = fs::remove_file(&staged);
     linked.map_err(|e| match e.kind() {
         std::io::ErrorKind::AlreadyExists => format!("{}: {e}", path.display()),
@@ -267,6 +321,37 @@ impl Attrs {
     /// From the manifest's form; `None` for anything else.
     pub fn parse(text: &str) -> Option<Attrs> {
         u32::from_str_radix(text.strip_prefix("attrs:")?, 16).ok().map(Attrs)
+    }
+
+    /// Whether an owner set something git can't give back (Sol review r5, R5-05): on Windows read-only, hidden or
+    /// system; elsewhere a file the owner can't write.
+    pub fn unusual(&self) -> bool {
+        if cfg!(windows) {
+            self.0 & (0x1 | 0x2 | 0x4) != 0
+        } else {
+            self.0 & 0o200 == 0
+        }
+    }
+
+    /// `unusual` for a dir: hidden or system (a Windows dir's read-only bit only customises Explorer).
+    pub fn unusual_for_dir(&self) -> bool {
+        if cfg!(windows) {
+            self.0 & (0x2 | 0x4) != 0
+        } else {
+            self.unusual()
+        }
+    }
+
+    /// The name of what is unusual, for a message.
+    pub fn describe(&self) -> String {
+        if cfg!(windows) {
+            let names = [(0x1, "read-only"), (0x2, "hidden"), (0x4, "system")];
+            let set: Vec<&str> =
+                names.iter().filter(|(b, _)| self.0 & b != 0).map(|(_, n)| *n).collect();
+            set.join(", ")
+        } else {
+            format!("mode {:o}", self.0)
+        }
     }
 }
 
@@ -397,7 +482,7 @@ pub fn put_tree(path: &Path, tree: &Tree) -> Result<String, String> {
         Ok(hash)
     })();
     let done = built.and_then(|hash| {
-        if fs::symlink_metadata(path).is_ok() {
+        if !nothing_at(path)? {
             return Err(format!("{}: something appeared there meanwhile", path.display()));
         }
         fs::rename(&staged, path).map_err(|e| format!("{}: {e}", path.display())).map(|()| hash)
@@ -407,6 +492,16 @@ pub fn put_tree(path: &Path, tree: &Tree) -> Result<String, String> {
         let _ = delete_tree(&staged);
     }
     done
+}
+
+/// Whether nothing is at `path` (not following a link there): only "not found" is nothing, and an error that
+/// can't tell refuses, so a rename (which replaces on Windows) never lands on a file that is there (r5, R5-04's class).
+fn nothing_at(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
 }
 
 /// A path inside `root` for `rel`, which must stay inside (no `..`, no root or drive).
@@ -430,7 +525,7 @@ pub fn move_aside(path: &Path) -> Result<PathBuf, String> {
 pub fn move_back(from: &Path, to: &Path) -> Result<(), String> {
     check(from)?;
     check(to)?;
-    if fs::symlink_metadata(to).is_ok() {
+    if !nothing_at(to)? {
         return Err(format!(
             "{}: something is there now; {} keeps the old one",
             to.display(),
@@ -447,7 +542,7 @@ pub fn move_to(from: &Path, to: &Path) -> Result<(), String> {
     if let Some(dir) = to.parent() {
         create_dir_all(dir)?;
     }
-    if fs::symlink_metadata(to).is_ok() {
+    if !nothing_at(to)? {
         return Err(format!("{} exists; nothing is overwritten", to.display()));
     }
     fs::rename(from, to).map_err(|e| format!("{}: {e}", from.display()))
@@ -456,14 +551,24 @@ pub fn move_to(from: &Path, to: &Path) -> Result<(), String> {
 /// Replaces the file at `path` (or puts it where nothing is): the old one moves aside, the new one goes in, and the
 /// old one is deleted. For files that are the tool's alone: its ledger, a backup manifest.
 pub fn replace_own_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let old = match kind(path)? {
-        Kind::Missing => None,
-        Kind::File => Some(move_aside(path)?),
+    // The new file keeps the old one's attributes (Sol review r5, R5-05: a stack edit kept them nowhere).
+    let (old, like) = match kind(path)? {
+        Kind::Missing => (None, None),
+        Kind::File => {
+            let like = attrs(path)?;
+            (Some(move_aside(path)?), Some(like))
+        }
         Kind::Dir => return Err(format!("{} is a dir", path.display())),
     };
-    if let Err(e) = put_file(path, bytes) {
+    if let Err(e) = put_file_as(path, bytes, like.as_ref()) {
         if let Some(old) = &old {
-            let _ = move_back(old, path);
+            return Err(match move_back(old, path) {
+                Ok(()) => e,
+                Err(back) => format!(
+                    "{e}; and the old file couldn't go back ({back}): it is at {}",
+                    old.display()
+                ),
+            });
         }
         return Err(e);
     }

@@ -1,5 +1,8 @@
 //! A consuming project's requirements on the backbone (BB-1..9), as the orchestrator accepted them.
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod common;
 use common::*;
 use lords_core::model::Origin;
@@ -285,7 +288,7 @@ fn repo_skills_are_indexed_in_place() {
             assert_eq!((repo.as_str(), path.as_str()), ("beta-core", "v2/.claude/skills/review"));
             assert_eq!(
                 *sha256,
-                lords_core::check::dir_hash(&checkout.join("v2/.claude/skills/review"))
+                lords_core::check::dir_hash(&checkout.join("v2/.claude/skills/review")).unwrap()
             );
         }
         o => panic!("origin {o:?}"),

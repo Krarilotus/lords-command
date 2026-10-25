@@ -130,6 +130,16 @@ A **finding** is a matched span: file, line, pattern class and the matched text.
 - **It runs** in `check` and as the public repo's pre-commit and commit-msg hooks. They live in `.git/hooks/`
   (installed by `lords hooks install`), never through `core.hooksPath`, so a global hooks path that dispatches to
   the repo's own hooks (such as an attribution guard) keeps working.
+- **Guarantee 7, and its limit** (orchestrator, 25 Oct, decision 8). No personal detail reaches a public commit:
+  this holds as long as commits run through the effective privacy hooks (standing rule: never skip hooks, never
+  repoint the hooks path). `lords check` verifies it for the public repo: the hooks Git runs (through
+  `core.hooksPath` if set; through the owner's attribution-guard dispatcher to the hook it delegates to, unless it
+  skips that hook with `attributionGuard.skipPreviousHook`) are both privacy hooks, or each that isn't is "not
+  verified". That says what holds when the check runs; it can't stop `--no-verify`, a hooks path set afterwards, or a
+  commit from another environment, and no hook can.
+- **The repo's own commit check.** Where a repo tracks `tools/commit-check.sh`, the pre-commit hook runs it before the
+  privacy check. Lords Command's runs `cargo fmt --check` and clippy with `-D warnings`, which carries the filesystem
+  and process boundary (below).
 - **What it reads:** each staged file's content and its path, and the commit message. Deny and fleet terms match in
   any case (Unicode lower case, NFKD), a phrase across line breaks too.
 - **Encodings covered.** Every file, text or not, marked `lords-binary` or not, is scanned in each of these readings,
@@ -286,7 +296,11 @@ no directory listing decides what goes. What goes is what the ledger holds and t
   one dir per skill; a `target:<name>` instructions target with `via` is its shared file; `repo:<name>` and
   `workspace:<name>` are the place's real checkouts and worktrees (never the dirs worktrees are kept in) or its
   workspace dir, with `.lords/`; `…/<adapter>` adds that adapter's file and one dir per skill in its skills dir, for
-  an adapter the place writes for.
+  an adapter the place writes for. A skill's name is a slug, as the schema's ids have it (R5-02): no other name is a
+  skill slot, though a retired skill's copy stays removable. A configured checkout is a root only where git's own
+  top level is exactly that path; a dir that is no checkout, a dir inside one, or a git call that fails refuses the
+  whole place, for the writer and for any record (R5-01). Target names are unique, so `target:<name>` is one target
+  (R5-06).
 - **Checked when read** (R3-03, R4-01). Loading refuses a record that isn't well formed (kind, hash, scope, a hook's
   name and dir) and two records of one path. Planning then refuses the whole plan when a record's path, kind and
   scope aren't exactly a slot of that scope. A record whose path is gone only loses its record. A record of a target
@@ -315,8 +329,15 @@ path that changed is left and reported.
 down to the path (ancestors included) before it reads, writes, moves or deletes there, and refuses a path whose
 metadata it can't read for any reason but "not found". A file appears at a sync path only as a hard link to a file
 written whole beside it; on a volume without hard links sync refuses (R4-04). Only `fsguard.rs` reaches `std::fs`,
-and only `process.rs` reaches `std::process`: stated in `fsguard.rs`, enforced by `tests/fsguard_lint.rs` (R3-08,
-R4-06).
+and only `process.rs` reaches `std::process`: stated in `fsguard.rs`, enforced twice (R3-08, R4-06, R5-03). First,
+clippy's resolved `disallowed-types`/`disallowed-methods` (`clippy.toml`), which the commit check runs with
+`-D warnings`: the compiler resolves aliases, grouped `use` trees and raw identifiers. Second, `tests/fsguard_lint.rs`,
+which keeps a module ban and refuses whatever would switch the first off outside the two doors.
+
+**Errors are never "nothing"** (R5-04). The guard's reads are strict: a dir that can't be listed, a file that can't
+be read, a git call that fails comes back as an error, and a decision on it refuses. Only "not found" means absent
+(a missing state dir is no ledger). A read that turns an error into nothing is named `_lossy`, is for display only,
+and no decision calls one.
 
 **Operating assumption** (R3-05). The promise that sync never acts through a link or outside a target holds under
 this assumption: one operator, and nothing else renames or relinks the place paths during an apply. The choke point
@@ -340,9 +361,11 @@ its attributes (R4-03), only while it still holds exactly what sync wrote; anyth
 
 **Stack edits** (import, retirement, promotion, edit) touch only files git already tracks and holds unmodified, plus
 new files, whether they commit or not (R3-10): git is the stack's backup, so an edit cut short, or made with
-`--no-commit`, is undone from git. Outside git, a stack edit only writes new files. Promoting a skill deletes its
-private dir, so it refuses while that dir holds anything git can't give back or the promotion doesn't carry: an
-empty dir, or a file outside the entry (R4-07). Under `sync --apply` stack edits run under the same lock, after the
+`--no-commit`, is undone from git. Outside git, a stack edit only writes new files. A file a stack edit rewrites keeps
+its attributes. Promoting an entry deletes its private files, so it refuses while they hold anything git can't give
+back or the promotion doesn't carry: an empty dir, a file outside the entry, a file that isn't text, or a file an
+owner marked read-only, hidden or system (R4-07, R5-05). `restore` keeps a file apply created once the owner has
+marked it so. Under `sync --apply` stack edits run under the same lock, after the
 plan is known to apply.
 
 **The changeover, once and with a human:** the 3a place files, the old `~/.codex/skills` copies and any other path

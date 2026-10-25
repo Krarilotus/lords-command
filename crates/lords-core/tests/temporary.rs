@@ -2,6 +2,9 @@
 //! don't poison the context with them forever as being temporary in the past"; orchestrator: an end condition and a
 //! review date on every one; ended ones reported, never composed, retired by sync with a commit).
 
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod common;
 use common::*;
 use lords_core::compose::{compose, Context, Layers};

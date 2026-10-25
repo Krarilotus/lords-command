@@ -73,7 +73,9 @@ impl Rules {
 
     /// Adds the allow-list of a stack (`privacy/allow.txt`), if it has one.
     pub fn with_allow_from(mut self, stack_root: &Path) -> Rules {
-        if let Ok(text) = fsguard::read_string(stack_root.join("privacy").join("allow.txt")) {
+        // Lossy on purpose: an allow-list that can't be read allows nothing, so the check only finds more.
+        if let Some(text) = fsguard::read_string_lossy(stack_root.join("privacy").join("allow.txt"))
+        {
             self.allow.extend(list_lines(&text).map(str::to_string));
         }
         self
@@ -415,7 +417,14 @@ pub fn tree_files(repo: &Path) -> Result<Vec<PathBuf>, String> {
         .split('\0')
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .filter(|p| repo.join(p).is_file())
+        // Only a listed path that isn't there (deleted in the worktree) or is a dir (a submodule) goes; one whose
+        // kind can't be told stays, so reading it fails loudly (Sol review r5, R5-04's class).
+        .filter(|p| {
+            !matches!(
+                crate::fsguard::kind_here(&repo.join(p)),
+                Ok(crate::fsguard::Kind::Missing | crate::fsguard::Kind::Dir)
+            )
+        })
         .collect();
     files.sort();
     files.dedup();
