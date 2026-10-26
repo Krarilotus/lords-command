@@ -67,5 +67,7 @@ The ZIP (both exes, the example config, README, LICENSE) lands in `dist/`. Keep 
 - `sync --stage install` imports and retires nothing, though its plan still notes the memory an apply would import.
 - Sync checks a path, then acts on it by name: one operator, and nothing relinking the places during an apply
   ([design](docs/design.md), "Operating assumption").
+- Before an exclude edit, sync reads `core.excludesFile`; when that git call fails for any reason, not only when it is
+  unset, it uses `~/.config/git/ignore` instead.
 
 [MIT](LICENSE)
