@@ -1243,6 +1243,20 @@ fn excludes_text(current: &str, files: &[String]) -> String {
     out
 }
 
+/// Whether an exclude edit from `current` to `proposed` only adds patterns: none goes, and none added is a negation
+/// (`!…`). Such an edit can only hide paths, never show one, so it needs no listing (orchestrator, 26 Oct).
+/// Comments and blank lines aren't patterns.
+fn only_adds(current: &str, proposed: &str) -> bool {
+    let patterns = |text: &str| -> BTreeSet<String> {
+        text.lines()
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .collect()
+    };
+    let (before, after) = (patterns(current), patterns(proposed));
+    before.is_subset(&after) && after.difference(&before).all(|p| !p.starts_with('!'))
+}
+
 /// The untracked paths an exclude edit from `current` to `proposed` would newly show in `git status`, in every
 /// worktree that shares the file (git lists them from `checkout`; orchestrator, 26 Oct: "plan exclude edits per
 /// common dir, so a place's dry run sees what its edit does to the other places"). Each place is listed twice by
@@ -1609,7 +1623,7 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
         let proposed = excludes_text(&current, &files);
         // The file is shared by every worktree of the repo: an edit that would show a path in any of their `git
         // status` is planned as a conflict, whichever place asked for it (orchestrator, 26 Oct).
-        if proposed != current {
+        if proposed != current && !only_adds(&current, &proposed) {
             match newly_shown(&checkout, &current, &proposed) {
                 Ok(shown) if shown.is_empty() => {}
                 Ok(shown) => {
@@ -3062,6 +3076,19 @@ fn repo_size_findings(stacks: &Stacks) -> Vec<crate::Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Spec (orchestrator, 26 Oct: "an edit that only adds lines can't reveal anything, so it needs no untracked
+    // listing at all"): an edit only adds when it removes no pattern and adds no negation (`!`), which could reveal
+    // a path; comments and blank lines don't count.
+    #[test]
+    fn an_exclude_edit_only_adds_when_it_removes_nothing_and_negates_nothing() {
+        assert!(only_adds("# git's own\n", "# git's own\n# Lords Command\n/CLAUDE.local.md\n"));
+        assert!(only_adds("a\n", "a\n\n# a comment\nb\n"));
+        assert!(only_adds("a\n# old comment\n", "a\nb\n"), "a comment going is no pattern going");
+        assert!(!only_adds("a\nb\n", "a\n"), "a pattern going can reveal a path");
+        assert!(!only_adds("a\n", "a\n!b\n"), "a negation can reveal a path");
+        assert!(!only_adds(".lords/\n", "/CLAUDE.local.md\n"));
+    }
 
     // Spec (Sol review r4, R4-04; r5, decision 7: "a `cfg(test)` seam that injects `Unsupported` at `hard_link`.
     // Assert the final path is absent or the old file is back with its bytes and attributes"): an owner update

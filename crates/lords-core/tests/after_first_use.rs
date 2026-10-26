@@ -97,3 +97,20 @@ fn a_failed_git_call_names_its_exit_status() {
     let err = lords_core::git::status(&f.path("plain"), &["diff", "--quiet"]).unwrap_err();
     assert!(err.contains("exit code") || err.contains("exit status"), "{err}");
 }
+
+// Spec (orchestrator, 26 Oct: "an edit that only adds lines can't reveal anything, so it needs no untracked listing
+// at all"): an exclude edit that only adds lines lists no worktree: one where any listing fails doesn't stop it.
+#[test]
+fn an_exclude_edit_that_only_adds_lines_lists_no_worktree() {
+    let f = Fixture::new();
+    let (repo, _wt, exclude) = repo_with_worktree(&f);
+    fs::write(&exclude, "# git's own\n").unwrap();
+    // A second worktree git still lists, where every git call fails: its `.git` points nowhere.
+    let broken = f.path("wts/b");
+    git(&repo, &["worktree", "add", "-q", "-b", "b", broken.to_str().unwrap()]);
+    fs::write(broken.join(".git"), format!("gitdir: {}\n", f.path("nowhere").display())).unwrap();
+    let opts = sync::Options { repo: Some("proj".into()), place: Some(repo.clone()), ..f.opts() };
+    let p = sync::plan(&f.stacks(), &opts).unwrap();
+    let ex = exclude_item(&p);
+    assert_eq!(ex.action, Action::Update, "{:?}", ex.notes);
+}
