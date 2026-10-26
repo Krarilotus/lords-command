@@ -17,6 +17,10 @@ pub fn id() -> u32 {
     std::process::id()
 }
 
+/// What a finished child process left: its status, stdout and stderr (git.rs names it without reaching
+/// `std::process`).
+pub(crate) type Ran = Output;
+
 /// Runs `git -C <dir> <args>` and waits for it.
 pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<Output, String> {
     Command::new("git")
