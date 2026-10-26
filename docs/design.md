@@ -127,7 +127,8 @@ A **finding** is a matched span: file, line, pattern class and the matched text.
 | fleet | host names read from the fleet config that the private `stack.toml` names | public |
 | deny | each line of the private `privacy/deny.txt` (names, projects, hosts, phrases) | public |
 
-- **It runs** in `check` and as the public repo's pre-commit and commit-msg hooks. They live in `.git/hooks/`
+- **It runs** in `check` and as the public repo's pre-commit, pre-merge-commit (an automatic merge commit runs that
+  instead of pre-commit) and commit-msg hooks. They live in `.git/hooks/`
   (installed by `lords hooks install`), never through `core.hooksPath`, so a global hooks path that dispatches to
   the repo's own hooks (such as an attribution guard) keeps working.
 - **Guarantee 7, and its limit** (orchestrator, 25 Oct, decision 8). No personal detail reaches a public commit:
@@ -198,7 +199,10 @@ assumes a worktree per agent.
 - Every checkout gets files, and so does every worktree under the repo's `worktree_roots` (the others are skipped
   and listed). Each gets the file its adapter's harness reads after the tracked ones: `CLAUDE.local.md` (Claude) and
   `AGENTS.override.md` (Codex).
-- Both names go into the repo's shared `.git/info/exclude`, so worktrees stay clean.
+- Both names go into the repo's shared `.git/info/exclude`, so worktrees stay clean. The file is one for all
+  worktrees, so an edit to it is planned across them: any place's plan lists every worktree's untracked paths before
+  and after the edit (`git ls-files --others`, with each version's lines), and an edit that would show a path in any
+  worktree's `git status` is a conflict naming it, to be set aside first.
 - The checkout's tracked `AGENTS.md` still loads beside the stack's text, as each adapter allows: Claude's file
   starts with `@AGENTS.md` (a `CLAUDE.local.md` alone would hide it), and Codex's override carries its text inline
   (the override replaces it, and Codex doesn't expand includes). A tracked file of either name is a conflict, and

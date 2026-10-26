@@ -159,7 +159,11 @@ fn privacy_hooks(stacks: &Stacks, home: &Path, out: &mut Vec<Finding>) {
         Err(e) => {
             out.push(Finding::warning(
                 "privacy-hooks",
-                format!("{}: pre-commit and commit-msg: not verified ({e})", root.display()),
+                format!(
+                    "{}: {}: not verified ({e})",
+                    root.display(),
+                    crate::hooks::PRIVACY.join(", ")
+                ),
             ));
             return;
         }
@@ -168,8 +172,9 @@ fn privacy_hooks(stacks: &Stacks, home: &Path, out: &mut Vec<Finding>) {
         out.push(Finding::warning(
             "privacy-hooks",
             format!(
-                "{}: pre-commit and commit-msg: not verified (no tool home for the probe)",
-                top.display()
+                "{}: {}: not verified (no tool home for the probe)",
+                top.display(),
+                crate::hooks::PRIVACY.join(", ")
             ),
         ));
         return;

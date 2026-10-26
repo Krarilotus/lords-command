@@ -21,7 +21,7 @@ usage:
   lords privacy --message FILE [--staged] [--secrets-only]   a commit message (the commit-msg hook)
   lords privacy --history [--private-stack DIR]   every commit's message and patch (the pre-push check)
   lords privacy FILE...
-  lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit and commit-msg hooks
+  lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit, pre-merge-commit and commit-msg hooks
   lords hash PATH
   lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--stage install] [--json] [--apply]
   lords sync --restore BACKUP_DIR   undo one apply's owner-file edits, each only while it holds what sync wrote
@@ -617,7 +617,10 @@ fn cmd_hooks(mut a: Args) -> Result<bool, String> {
         }
     }
     if let Some(g) = installed.first().and_then(|r| r.global_hooks_path.as_ref()) {
-        println!("note: global core.hooksPath = {g}; its dispatcher must run .git/hooks/pre-commit and commit-msg for this to take effect");
+        println!(
+            "note: global core.hooksPath = {g}; its dispatcher must run .git/hooks/{} for this to take effect",
+            hooks::PRIVACY.join(", ")
+        );
     }
     Ok(true)
 }

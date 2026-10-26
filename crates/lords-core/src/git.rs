@@ -1,18 +1,25 @@
 //! git through its CLI, so the user's config and hooks apply; the process starts in process.rs.
 
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
+
+/// A git call that didn't succeed, with how it ended (its exit status or signal, as the OS reports it) and what it
+/// said: an empty message can't hide whether git ran at all (orchestrator, 26 Oct).
+fn failed(args: &[&str], status: impl Display, stderr: &[u8], stdout: &[u8]) -> String {
+    format!(
+        "git {} failed ({status}): {}{}",
+        args.join(" "),
+        String::from_utf8_lossy(stderr).trim(),
+        String::from_utf8_lossy(stdout).trim()
+    )
+}
 
 pub fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
     let out = crate::process::git(dir, args)?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
-        Err(format!(
-            "git {} failed: {}{}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim(),
-            String::from_utf8_lossy(&out.stdout).trim()
-        ))
+        Err(failed(args, out.status, &out.stderr, &out.stdout))
     }
 }
 
@@ -21,11 +28,7 @@ pub fn bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     if out.status.success() {
         Ok(out.stdout)
     } else {
-        Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
+        Err(failed(args, out.status, &out.stderr, &[]))
     }
 }
 
@@ -37,11 +40,7 @@ pub fn status(dir: &Path, args: &[&str]) -> Result<bool, String> {
     match out.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
-        _ => Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )),
+        _ => Err(failed(args, out.status, &out.stderr, &out.stdout)),
     }
 }
 

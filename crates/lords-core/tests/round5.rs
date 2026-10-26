@@ -351,7 +351,8 @@ fn guard(f: &Fixture) -> std::path::PathBuf {
          common=$(git rev-parse --path-format=absolute --git-common-dir) || exit 1\n\
          if [ -f \"$common/hooks/$hook\" ]; then exec sh \"$common/hooks/$hook\" \"$@\"; fi\nexit 0\n",
     );
-    for h in ["pre-commit", "commit-msg"] {
+    // Every hook the owner's guard wraps that a commit runs, pre-merge-commit too (as its `hooks/` dir has).
+    for h in lords_core::hooks::PRIVACY {
         f.write(
             &format!("guard/hooks/{h}"),
             &format!("#!/bin/sh\nexec \"$(dirname -- \"$0\")/../dispatch.sh\" {h} \"$@\"\n"),

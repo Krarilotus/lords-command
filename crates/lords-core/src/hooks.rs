@@ -1,5 +1,5 @@
-//! `hooks install`: the privacy check as a repo's pre-commit and commit-msg hooks, in `.git/hooks` (design:
-//! Privacy).
+//! `hooks install`: the privacy check as a repo's pre-commit, pre-merge-commit and commit-msg hooks, in
+//! `.git/hooks` (design: Privacy).
 //! Never through `core.hooksPath`: a global hooks path whose dispatcher runs the repo's own hooks keeps working.
 //! A hook is the tool's only by its ledger record (design: Ownership boundary): any other hook there, readable or
 //! not, is the owner's (Sol review r2, R2-16). Every write goes through `fsguard`, below the checkout's verified
@@ -15,7 +15,10 @@ use std::path::{Path, PathBuf};
 pub const MARKER: &str = "# lords-command: privacy check";
 
 /// The hooks the tool installs: the only names a `hooks:` ledger record may have.
-pub const NAMES: [&str; 3] = ["pre-commit", "commit-msg", "post-checkout"];
+pub const NAMES: [&str; 4] = ["pre-commit", "pre-merge-commit", "commit-msg", "post-checkout"];
+
+/// The privacy hooks, which a commit or an automatic merge commit runs; `lords check` verifies each by its probe.
+pub const PRIVACY: [&str; 3] = ["pre-commit", "pre-merge-commit", "commit-msg"];
 
 pub struct Installed {
     pub hook: PathBuf,
@@ -52,7 +55,18 @@ fn probe_lines(home: &Path, hook: &str) -> String {
     )
 }
 
+/// The pre-commit hook: the repo's own commit check, then the privacy check of the staged files.
 pub fn script(lords_exe: &Path, secrets_only: bool, home: &Path) -> String {
+    staged_script("pre-commit", lords_exe, secrets_only, home)
+}
+
+/// The pre-merge-commit hook, which an automatic merge commit runs instead of pre-commit: the same checks of what
+/// the merge stages (orchestrator, 26 Oct).
+pub fn merge_script(lords_exe: &Path, secrets_only: bool, home: &Path) -> String {
+    staged_script("pre-merge-commit", lords_exe, secrets_only, home)
+}
+
+fn staged_script(hook: &str, lords_exe: &Path, secrets_only: bool, home: &Path) -> String {
     let exe = lords_exe.to_string_lossy().replace('\\', "/");
     let flag = if secrets_only { " --secrets-only" } else { "" };
     format!(
@@ -64,7 +78,7 @@ pub fn script(lords_exe: &Path, secrets_only: bool, home: &Path) -> String {
          \x20   sh \"$top/{COMMIT_CHECK}\" || exit $?\n\
          fi\n\
          exec \"{exe}\" privacy --staged{flag}\n",
-        probe = probe_lines(home, "pre-commit"),
+        probe = probe_lines(home, hook),
     )
 }
 
@@ -93,7 +107,7 @@ fn nonce() -> String {
 /// outcome, a git error included, is one line saying it isn't. This says what holds now: `--no-verify`, a hooks path
 /// set later, or a commit made elsewhere isn't prevented by it (design: Privacy, "Guarantee 7").
 pub fn privacy_dispatch(repo: &Path, home: &Path) -> Vec<String> {
-    let both = |why: String| vec![format!("pre-commit and commit-msg: not verified ({why})")];
+    let both = |why: String| vec![format!("{}: not verified ({why})", PRIVACY.join(", "))];
     let n = nonce();
     let made = (|| -> Result<(Contained, Contained), String> {
         let root = Root::home(home)?;
@@ -110,7 +124,7 @@ pub fn privacy_dispatch(repo: &Path, home: &Path) -> Vec<String> {
         Err(e) => return both(e),
     };
     let mut problems = Vec::new();
-    for hook in ["pre-commit", "commit-msg"] {
+    for hook in PRIVACY {
         let mut args = vec!["hook", "run", "--ignore-missing", hook];
         let msg = message.path().to_string_lossy().into_owned();
         if hook == "commit-msg" {
@@ -126,8 +140,8 @@ pub fn privacy_dispatch(repo: &Path, home: &Path) -> Vec<String> {
                 );
                 if !out.status.success() || !said.contains(&answer) {
                     problems.push(format!(
-                        "{hook}: not verified: a commit here doesn't reach the privacy hook (`git hook run {hook}` gave exit {:?} and no answer); `lords hooks install` puts it in the repo's own hooks dir",
-                        out.status.code()
+                        "{hook}: not verified: a commit here doesn't reach the privacy hook (`git hook run {hook}` gave {} and no answer); `lords hooks install` puts it in the repo's own hooks dir",
+                        out.status
                     ));
                 }
             }
@@ -198,8 +212,8 @@ fn hooks_dir(repo: &Path) -> Result<Root, String> {
     Ok(dir)
 }
 
-/// Installs the pre-commit and commit-msg hooks; `home` holds the ledger that records them and the probe's files. A
-/// hook there that isn't the tool's stops both, unless `force`, which moves each one to a new `<name>.bak-<date>`
+/// Installs the privacy hooks (`PRIVACY`); `home` holds the ledger that records them and the probe's files. A hook
+/// there that isn't the tool's stops them all, unless `force`, which moves each one to a new `<name>.bak-<date>`
 /// first.
 pub fn install(
     repo: &Path,
@@ -213,6 +227,7 @@ pub fn install(
     let mut ledger = Ledger::load(home)?;
     let hooks = [
         ("pre-commit", script(lords_exe, secrets_only, home)),
+        ("pre-merge-commit", merge_script(lords_exe, secrets_only, home)),
         ("commit-msg", commit_msg_script(lords_exe, secrets_only, home)),
     ];
     let mut foreign = Vec::new();

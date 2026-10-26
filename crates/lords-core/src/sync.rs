@@ -1243,6 +1243,57 @@ fn excludes_text(current: &str, files: &[String]) -> String {
     out
 }
 
+/// The untracked paths an exclude edit from `current` to `proposed` would newly show in `git status`, in every
+/// worktree that shares the file (git lists them from `checkout`; orchestrator, 26 Oct: "plan exclude edits per
+/// common dir, so a place's dry run sees what its edit does to the other places"). Each place is listed twice by
+/// `git ls-files --others --directory`, with each version's lines as its patterns and the same per-dir
+/// `.gitignore` and global excludes, so the difference is the edit's alone. A git that fails is an error.
+fn newly_shown(checkout: &Path, current: &str, proposed: &str) -> Result<Vec<String>, String> {
+    let patterns = |text: &str| -> Vec<String> {
+        text.lines()
+            .map(|l| l.trim_end_matches('\r'))
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .map(str::to_string)
+            .collect()
+    };
+    let (before, after) = (patterns(current), patterns(proposed));
+    let global = match git::run(checkout, &["config", "--path", "--get", "core.excludesFile"]) {
+        Ok(p) => Some(PathBuf::from(p.trim())),
+        Err(_) => crate::config::home().map(|h| h.join(".config").join("git").join("ignore")),
+    }
+    .filter(|p| p.is_file());
+    let list = git::run(checkout, &["worktree", "list", "--porcelain"])?;
+    let mut shown = Vec::new();
+    for place in list.lines().filter_map(|l| l.strip_prefix("worktree ")).map(PathBuf::from) {
+        if !place.is_dir() {
+            continue;
+        }
+        let listed = |pats: &[String]| -> Result<BTreeSet<String>, String> {
+            let mut args: Vec<String> =
+                ["ls-files", "-z", "--others", "--directory", "--no-empty-directory"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+            args.push("--exclude-per-directory=.gitignore".into());
+            if let Some(g) = &global {
+                args.push(format!("--exclude-from={}", g.display()));
+            }
+            for p in pats {
+                args.push(format!("--exclude={p}"));
+            }
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            Ok(git::run(&place, &args)?
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect())
+        };
+        let (now, then) = (listed(&before)?, listed(&after)?);
+        shown.extend(then.difference(&now).map(|p| format!("{}/{p}", place.display())));
+    }
+    Ok(shown)
+}
+
 /// Every checkout and (if asked) worktree of a repo, as roots verified by `Root::checkout`, the worktrees skipped
 /// for lying outside `worktree_roots`, and one note per worktree git lists that is no checkout (stale).
 /// Configured and discovered roots get the same check (design-simplification-r6, rule A; Sol review r6, R6-02). A
@@ -1391,7 +1442,8 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
         ));
     }
     // The two root files are the only lines sync keeps in a repo's exclude file; its dirs ignore themselves.
-    let mut excludes: Vec<(OwnerFile, Vec<String>)> = Vec::new();
+    // Each with a checkout it serves, from which git lists every worktree that shares it.
+    let mut excludes: Vec<(OwnerFile, PathBuf, Vec<String>)> = Vec::new();
     // A git that fails here is a conflict, never a repo without an exclude file (Sol review r5, decision 1). The
     // exclude file is the one git names for this verified checkout (rule A).
     let mut add_exclude = |root: &Root, what: &str| -> Result<(), String> {
@@ -1399,10 +1451,11 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
             return Ok(());
         }
         let ex = OwnerFile::exclude(root)?;
-        match excludes.iter_mut().find(|(e, _)| ledger::key(e.path()) == ledger::key(ex.path())) {
-            Some((_, files)) if !files.iter().any(|f| f == what) => files.push(what.to_string()),
+        match excludes.iter_mut().find(|(e, _, _)| ledger::key(e.path()) == ledger::key(ex.path()))
+        {
+            Some((_, _, files)) if !files.iter().any(|f| f == what) => files.push(what.to_string()),
             Some(_) => {}
-            None => excludes.push((ex, vec![what.to_string()])),
+            None => excludes.push((ex, root.path().to_path_buf(), vec![what.to_string()])),
         }
         Ok(())
     };
@@ -1543,22 +1596,42 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
         );
         pl.plan.items.push(item);
     }
-    for (ex, files) in excludes {
+    for (ex, checkout, files) in excludes {
         pl.plan.owner_files.push(ex.clone());
+        let label = format!("{} (git exclude)", place.label);
         let current = match fsguard::read_text(ex.path()) {
             Ok(c) => c.unwrap_or_default(),
             Err(e) => {
-                pl.plan.items.push(conflict(
-                    &format!("{} (git exclude)", place.label),
-                    ex.path(),
-                    e,
-                ));
+                pl.plan.items.push(conflict(&label, ex.path(), e));
                 continue;
             }
         };
         let proposed = excludes_text(&current, &files);
+        // The file is shared by every worktree of the repo: an edit that would show a path in any of their `git
+        // status` is planned as a conflict, whichever place asked for it (orchestrator, 26 Oct).
+        if proposed != current {
+            match newly_shown(&checkout, &current, &proposed) {
+                Ok(shown) if shown.is_empty() => {}
+                Ok(shown) => {
+                    pl.plan.items.push(conflict(
+                        &label,
+                        ex.path(),
+                        format!(
+                            "the edit would show {} untracked path(s) in git status where this file is shared, e.g. {}; set them aside first (`lords set-aside`)",
+                            shown.len(),
+                            shown.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+                        ),
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    pl.plan.items.push(conflict(&label, ex.path(), e));
+                    continue;
+                }
+            }
+        }
         pl.plan.items.push(owner_file_item(
-            &format!("{} (git exclude)", place.label),
+            &label,
             ex.path(),
             Dest::Owner(ex.clone()),
             proposed,

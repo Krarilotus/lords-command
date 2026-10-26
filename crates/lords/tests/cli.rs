@@ -151,6 +151,48 @@ fn the_hook_refuses_a_staged_gitlink() {
     assert_eq!(text(&env.git(&repo, &["rev-parse", "HEAD"])), head, "nothing committed");
 }
 
+// Spec (orchestrator, 26 Oct: "`pre-merge-commit` with the same staged privacy scan; `hooks install` writes it
+// too"): an automatic merge commit that would bring a private detail is refused by the installed hooks, and
+// nothing is committed; a clean merge goes through.
+#[test]
+fn the_hook_refuses_a_private_merge_commit() {
+    let env = Env::new();
+    let repo = env.repo();
+    fs::write(repo.join("README"), "clean\n").unwrap();
+    env.git(&repo, &["add", "README"]);
+    assert!(env.git(&repo, &["commit", "-q", "-m", "base"]).status.success());
+    let main = text(&env.git(&repo, &["branch", "--show-current"]));
+    // Both branches made before the hooks are in: one leaks, one is clean.
+    env.git(&repo, &["switch", "-q", "-c", "leak"]);
+    fs::write(repo.join("notes.md"), format!("Ask {}\n", ["alice", "example.org"].join("@")))
+        .unwrap();
+    env.git(&repo, &["add", "notes.md"]);
+    assert!(env.git(&repo, &["commit", "-q", "-m", "leak"]).status.success());
+    env.git(&repo, &["switch", "-q", main.trim()]);
+    env.git(&repo, &["switch", "-q", "-c", "clean"]);
+    fs::write(repo.join("other.md"), "clean\n").unwrap();
+    env.git(&repo, &["add", "other.md"]);
+    assert!(env.git(&repo, &["commit", "-q", "-m", "clean"]).status.success());
+    env.git(&repo, &["switch", "-q", main.trim()]);
+    fs::write(repo.join("third.md"), "clean\n").unwrap();
+    env.git(&repo, &["add", "third.md"]);
+    assert!(env
+        .git(&repo, &["commit", "-q", "-m", "so a merge isn't a fast-forward"])
+        .status
+        .success());
+
+    let o = env.lords(&repo, &["hooks", "install"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(repo.join(".git/hooks/pre-merge-commit").is_file(), "{}", text(&o));
+    let head = text(&env.git(&repo, &["rev-parse", "HEAD"]));
+    let o = env.git(&repo, &["merge", "--no-ff", "-m", "merge leak", "leak"]);
+    assert!(!o.status.success() && text(&o).contains("contact"), "refused: {}", text(&o));
+    env.git(&repo, &["merge", "--abort"]);
+    assert_eq!(text(&env.git(&repo, &["rev-parse", "HEAD"])), head, "nothing committed");
+    let o = env.git(&repo, &["merge", "--no-ff", "-m", "merge clean", "clean"]);
+    assert!(o.status.success(), "{}", text(&o));
+}
+
 // Spec (Sol review 25 Oct, finding 14: "The installed hook cannot prevent private commit messages"): `hooks
 // install` also writes a commit-msg hook, so a clean commit with a private message is refused; `privacy --message`
 // checks a message file.

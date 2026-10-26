@@ -17,7 +17,7 @@ lords check [--public] [--strict] [--json]   every check over both stacks; --pub
 lords import [--store NAME]                  agents' memory dirs into the private stack, committed
 lords retire ID --reason TEXT [--superseded-by ID]
 lords promote ID [--strip | --split]         private → public, only once nothing private is left
-lords hooks install [--secrets-only]         the privacy check as this repo's pre-commit and commit-msg hooks
+lords hooks install [--secrets-only]         the privacy check as this repo's pre-commit, pre-merge-commit and commit-msg hooks
 lords privacy --staged | --message FILE | FILE...
 lords hash PATH                              the sha256 an inherited entry records
 ```
@@ -60,7 +60,6 @@ The ZIP (both exes, the example config, README, LICENSE) lands in `dist/`. Keep 
 
 ## > known limits
 
-- An automatic merge commit runs no privacy hook; run `lords privacy --history` before pushing a merge.
 - A staged submodule (gitlink) is refused by the privacy hook: it reads only file contents.
 - Sync removes nothing while the stacks have any problem, warnings included, or the plan has any conflict but a copy
   the owner changed (a path from before the ledger counts): adopt or set it aside first.
@@ -68,10 +67,5 @@ The ZIP (both exes, the example config, README, LICENSE) lands in `dist/`. Keep 
 - `sync --stage install` imports and retires nothing, though its plan still notes the memory an apply would import.
 - Sync checks a path, then acts on it by name: one operator, and nothing relinking the places during an apply
   ([design](docs/design.md), "Operating assumption").
-- A repo's worktrees share one `info/exclude`, so one place's exclude edit changes what `git status` shows in all the
-  others, which a `--place` plan doesn't see. In a repo whose worktrees still hold `.lords/` from before the ledger,
-  set all of them aside before the first install.
-- A git call that fails says so without its exit status: an empty "failed:" may be the machine (git couldn't run
-  under load), not the repo.
 
 [MIT](LICENSE)
