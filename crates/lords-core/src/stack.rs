@@ -444,7 +444,9 @@ impl Stack {
 
     /// backbone requirement BB-8: skills tracked in a repo (stack.toml `skills` on a repo) are entries where they are: id
     /// `skill.<repo>.<dir>`, origin in-repo with their path and hash. Nothing is copied into the stack, and sync
-    /// never links them.
+    /// never links them. Only a dir whose `SKILL.md` git tracks is the repo's: sync's own copies, or anything else
+    /// untracked in that dir, are not (orchestrator, 26 Oct). A git that fails there indexes nothing and is a
+    /// problem, never an index of whatever is on disk.
     fn index_repo_skills(&mut self) {
         let repos: Vec<(String, Repo)> =
             self.manifest.repos.iter().map(|(n, r)| (n.clone(), r.clone())).collect();
@@ -454,8 +456,25 @@ impl Stack {
                 continue;
             };
             for rel in &repo.skills {
+                let tracked = match crate::git::run(&checkout, &["ls-files", "-z", "--", rel]) {
+                    Ok(out) => out
+                        .split('\0')
+                        .filter(|f| !f.is_empty())
+                        .map(|f| checkout.join(f))
+                        .collect::<Vec<PathBuf>>(),
+                    Err(e) => {
+                        self.problems.push(
+                            Finding::error(UNREADABLE, format!("repo {name}'s skills: {e}"))
+                                .at(checkout.join(rel), None),
+                        );
+                        continue;
+                    }
+                };
+                let is_tracked = |file: &Path| {
+                    tracked.iter().any(|t| crate::ledger::key(t) == crate::ledger::key(file))
+                };
                 let dirs = self.children(&checkout.join(rel));
-                for dir in dirs.into_iter().filter(|d| d.join(SKILL_FILE).is_file()) {
+                for dir in dirs.into_iter().filter(|d| is_tracked(&d.join(SKILL_FILE))) {
                     let file = dir.join(SKILL_FILE);
                     // Only shown in the skills index: an unreadable SKILL.md shows no hook (inventory: lossy).
                     let body = fsguard::read_string_lossy(&file).unwrap_or_default();
