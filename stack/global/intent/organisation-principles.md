@@ -38,6 +38,10 @@ basis:
 - quote: "its easier to replace a separated module or component rather than some hardstuck stuff in the main code base, and that should be the philosophy anyways for many other parts as well to be modular flexible and scaleable by design"
   date: 2026-10-20
   by: owner
+- quote: "the hierarchical orchestration exists for a reason, and that is not to micromanage and give a bit of agency to each one, so they can also freely question the design and actually give good feedback on thigns that otherwise get missed"
+  date: 2026-10-26
+  by: owner
+  source: "principle 3, \"Don't micromanage\""
 evidence:
 - summary: Disk overflow from leaked per-process test stores and caches "came up multiple times"; resource lifecycle by mechanism was asked for instead of sweeps
   date: 2026-10-25
