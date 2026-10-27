@@ -21,8 +21,46 @@ pub fn id() -> u32 {
 /// `std::process`).
 pub(crate) type Ran = Output;
 
+/// The variables that tie a git process to one repo, as `git rev-parse --local-env-vars` lists them (git 2.56):
+/// a hook gets some of them from the git that runs it. Git clears them itself when it enters a submodule.
+const LOCAL_VARS: [&str; 15] = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// `git -C <dir> <args>` for the repo at `dir` alone: none of the variables that tie git to the repo this process
+/// was started from reach it (finding F1, 27 Oct: a hook's `GIT_INDEX_FILE` made another repo's `ls-files` read
+/// the commit's index).
+fn command(dir: &Path, args: &[&str]) -> Command {
+    let mut c = Command::new("git");
+    c.arg("-C").arg(dir).args(args);
+    for v in LOCAL_VARS {
+        c.env_remove(v);
+    }
+    c
+}
+
 /// Runs `git -C <dir> <args>` and waits for it.
 pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<Output, String> {
+    command(dir, args).output().map_err(|e| format!("git {}: {e}", args.join(" ")))
+}
+
+/// Runs `git -C <dir> <args>` with the git variables this process got, and waits for it: only for reading the
+/// index of the commit a hook checks, which `git commit <paths>` names in `GIT_INDEX_FILE`.
+pub(crate) fn git_inherited(dir: &Path, args: &[&str]) -> Result<Output, String> {
     Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -33,8 +71,7 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<Output, String> {
 
 /// Runs `git -C <dir> <args>` with these environment variables set, and waits for it (the hook probe).
 pub(crate) fn git_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<Output, String> {
-    let mut c = Command::new("git");
-    c.arg("-C").arg(dir).args(args);
+    let mut c = command(dir, args);
     for (k, v) in env {
         c.env(k, v);
     }

@@ -40,6 +40,15 @@ impl Env {
         self.cmd(env!("CARGO_BIN_EXE_lords"), cwd).args(args).output().unwrap()
     }
 
+    /// `lords` with these variables set, as a git hook sets them.
+    fn lords_env(&self, cwd: &Path, args: &[&str], vars: &[(&str, &Path)]) -> Output {
+        let mut c = self.cmd(env!("CARGO_BIN_EXE_lords"), cwd);
+        for (k, v) in vars {
+            c.env(k, v);
+        }
+        c.args(args).output().unwrap()
+    }
+
     fn git(&self, cwd: &Path, args: &[&str]) -> Output {
         self.cmd("git", cwd).args(args).output().unwrap()
     }
@@ -922,4 +931,117 @@ fn a_public_stack_repo_pre_push_runs_the_public_check() {
         .unwrap();
     let o = push();
     assert!(!o.status.success() && text(&o).contains("notes.md"), "{}", text(&o));
+}
+
+// Spec (finding F1, 27 Oct: under a real `git commit` the hook's `check --stack` loaded 219 entries where `git hook
+// run` loaded 225, because a hook's `GIT_INDEX_FILE` reached lords' git calls into other repos): what `lords`
+// loads from a repo doesn't depend on the git variables of the repo it was started from. A repo's tracked skill is
+// an entry with and without a `GIT_INDEX_FILE` naming another repo's index.
+#[test]
+fn a_hooks_git_variables_dont_change_what_other_repos_hold() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (public, private, other) = (d.join("pub"), d.join("priv"), d.join("other"));
+    let skills = d.join("skilled");
+    for p in [&public, &private, &skills.join("skills/tidy"), &other] {
+        fs::create_dir_all(p).unwrap();
+    }
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    fs::write(
+        private.join("stack.toml"),
+        format!(
+            "name = \"priv\"\nvisibility = \"private\"\n[repos.skilled]\ncheckouts = ['{}']\nskills = ['skills']\n",
+            skills.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        skills.join("skills/tidy/SKILL.md"),
+        "---\nname: tidy\ndescription: Tidy up.\n---\nTidy.\n",
+    )
+    .unwrap();
+    for r in [&skills, &other] {
+        assert!(env.git(r, &["init", "-q"]).status.success());
+    }
+    env.git(&skills, &["add", "-A"]);
+    fs::write(other.join("x.md"), "x\n").unwrap();
+    env.git(&other, &["add", "-A"]);
+    let args = [
+        "check",
+        "--stack",
+        "--public-stack",
+        public.to_str().unwrap(),
+        "--private-stack",
+        private.to_str().unwrap(),
+    ];
+    let loaded = "0 public and 1 private entries";
+    let plain = text(&env.lords(d, &args));
+    assert!(plain.contains(loaded), "{plain}");
+    let index = other.join(".git/index");
+    let hooked = text(&env.lords_env(d, &args, &[("GIT_INDEX_FILE", &index)]));
+    assert!(hooked.contains(loaded), "{hooked}");
+}
+
+// Spec (Privacy: the hook checks "what the commit would contain"): `git commit <path>` commits from a temporary
+// index git names in the hook's `GIT_INDEX_FILE`, so the staged scan reads that index. A user path that only the
+// commit's own index holds is refused.
+#[test]
+fn a_commit_of_named_paths_is_scanned_as_it_commits() {
+    let env = Env::new();
+    let repo = env.repo();
+    fs::write(repo.join("notes.md"), "clean\n").unwrap();
+    env.git(&repo, &["add", "notes.md"]);
+    assert!(env.git(&repo, &["commit", "-q", "-m", "start"]).status.success());
+    let o = env.lords(&repo, &["hooks", "install"]);
+    assert!(o.status.success(), "{}", text(&o));
+    // Changed in the working tree only: `.git/index` still holds the clean text.
+    fs::write(repo.join("notes.md"), format!("logs in C:\\{}\\alice\\logs\n", "Users")).unwrap();
+    let o = env.git(&repo, &["commit", "-q", "-m", "named", "--", "notes.md"]);
+    assert!(!o.status.success() && text(&o).contains("path"), "{}", text(&o));
+}
+
+// Spec (orchestrator, 27 Oct, on F1: "one proof that a git call from inside a hook into another repo reads that
+// repo's own index"): a real `git commit -a` in a private stack repo runs its pre-commit hook, whose `check --stack`
+// loads the skill another repo tracks, as `git hook run` does. `-a` (as `git commit <paths>`) hands the hook an
+// absolute `GIT_INDEX_FILE`, which named the stack repo's index for every repo `lords` read.
+#[test]
+fn a_commit_hook_reads_another_repo_from_its_own_index() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (public, private, skilled) = (d.join("pub"), d.join("priv"), d.join("skilled"));
+    for p in [&public, &private.join("global/rules"), &skilled.join("skills/tidy")] {
+        fs::create_dir_all(p).unwrap();
+    }
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    fs::write(
+        private.join("stack.toml"),
+        format!(
+            "name = \"priv\"\nvisibility = \"private\"\n[repos.skilled]\ncheckouts = ['{}']\nskills = ['skills']\n",
+            skilled.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        skilled.join("skills/tidy/SKILL.md"),
+        "---\nname: tidy\ndescription: Tidy up.\n---\nTidy.\n",
+    )
+    .unwrap();
+    let cfg = d.join("home/.lords-command");
+    fs::create_dir_all(&cfg).unwrap();
+    fs::write(cfg.join("config.txt"), format!("public = {}\n", public.display())).unwrap();
+    for r in [&skilled, &private] {
+        assert!(env.git(r, &["init", "-q"]).status.success());
+        env.git(r, &["add", "-A"]);
+        assert!(env.git(r, &["commit", "-q", "-m", "start"]).status.success());
+    }
+    let o = env.lords(&private, &["hooks", "install", "--secrets-only"]);
+    assert!(o.status.success(), "{}", text(&o));
+    fs::write(private.join("global/rules/t.md"), temporary_rule(true)).unwrap();
+    env.git(&private, &["add", "-A"]);
+    // The skill and the rule: what `lords check` loads outside any hook.
+    let loaded = "0 public and 2 private entries";
+    let run = env.git(&private, &["hook", "run", "pre-commit"]);
+    assert!(text(&run).contains(loaded), "{}", text(&run));
+    let commit = env.git(&private, &["commit", "-a", "-m", "a rule"]);
+    assert!(commit.status.success() && text(&commit).contains(loaded), "{}", text(&commit));
 }

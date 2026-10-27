@@ -59,7 +59,22 @@ fn git(dir: &Path, args: &[&str]) -> Result<crate::process::Ran, String> {
 }
 
 pub fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = git(dir, args)?;
+    text(args, git(dir, args)?)
+}
+
+/// `run` on the index of the commit a hook checks: the git variables this process got reach it, so a hook of
+/// `git commit <paths>` reads the commit's own temporary index. Every other call is for its repo alone (`run`).
+pub fn run_index(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = started(
+        args,
+        || crate::process::git_inherited(dir, args),
+        |out| out.status.code(),
+        std::thread::sleep,
+    )?;
+    text(args, out)
+}
+
+fn text(args: &[&str], out: crate::process::Ran) -> Result<String, String> {
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {

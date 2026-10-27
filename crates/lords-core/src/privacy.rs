@@ -449,7 +449,8 @@ pub fn scan_tree(repo: &Path, rules: &Rules) -> Result<Scan, String> {
 /// the staged .gitattributes doesn't mark `lords-binary` are listed in `unmarked`.
 pub fn scan_staged(repo: &Path, rules: &Rules) -> Result<Scan, String> {
     // Raw records, NUL-separated: `:<old mode> <new mode> <old id> <new id> <status>`, then the path.
-    let raw = git::run(
+    // The index a hook names (a `git commit <paths>` commits from a temporary one), not the repo's own.
+    let raw = git::run_index(
         repo,
         &["diff", "--cached", "--raw", "--no-abbrev", "--no-renames", "--diff-filter=d", "-z"],
     )?;
@@ -481,7 +482,7 @@ pub fn scan_staged(repo: &Path, rules: &Rules) -> Result<Scan, String> {
         let paths: Vec<String> =
             scan.binary.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         args.extend(paths.iter().map(String::as_str));
-        let out = git::run(repo, &args)?;
+        let out = git::run_index(repo, &args)?;
         // `-z` output: path, attribute, value, each NUL-terminated.
         let fields: Vec<&str> = out.split('\0').collect();
         let marked: BTreeSet<&str> =
