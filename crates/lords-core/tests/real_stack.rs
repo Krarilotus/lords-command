@@ -1,12 +1,13 @@
-//! The real stacks, where this machine has them: the files sync would write stay under the size warning line
-//! (orchestrator, 25 Oct: a spec test that composes the real private stack's largest place "and asserts it's under
-//! the line, so it can't creep back up"). Read-only: it composes and measures, and writes nothing.
+//! The real stacks, where this machine has them: `sizes` measures every place sync would write. How big those files
+//! are today is the stacks' state, not the code's: `lords check` warns past the warning line and sync refuses a file
+//! past its harness's limit (orchestrator, 27 Oct, moving the 25 Oct size assertion there). Read-only: it composes
+//! and measures, and writes nothing.
 
 // Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use lords_core::config::Config;
-use lords_core::sync::{sizes, SIZE_WARN_PERCENT};
+use lords_core::sync::sizes;
 use lords_core::Stacks;
 use std::path::PathBuf;
 
@@ -24,11 +25,10 @@ fn real_stacks() -> Option<Stacks> {
     Stacks::load(&root.join("stack"), Some(&private)).ok()
 }
 
-// Spec (above): every place the private stack declares a checkout or dir for is measured, and each place's file
-// for an adapter with a limit, read with that adapter's user-level file, stays under SIZE_WARN_PERCENT of the
-// limit, measured with absolute paths as sync writes them.
+// Spec (above): every place the private stack declares a checkout or dir for is measured for an adapter with a
+// limit, so the check's warning and sync's refusal see each one.
 #[test]
-fn every_place_on_this_machine_stays_under_the_size_line() {
+fn every_place_on_this_machine_is_measured_against_a_limit() {
     let Some(stacks) = real_stacks() else {
         eprintln!("no private stack on this machine: the real places aren't measured");
         return;
@@ -42,10 +42,8 @@ fn every_place_on_this_machine_stays_under_the_size_line() {
     let declared = declared.chain(workspaces.map(|w| format!("workspace {w}")));
     for place in declared {
         assert!(
-            all.iter().any(|s| s.place == place && s.limit.is_some() && s.reads > s.bytes),
+            all.iter().any(|s| s.place == place && s.limit.is_some()),
             "{place} is measured with a limited adapter"
         );
     }
-    let over: Vec<String> = all.iter().filter(|s| s.over_line()).map(|s| s.describe()).collect();
-    assert!(over.is_empty(), "past {SIZE_WARN_PERCENT}% of the limit: {over:#?}");
 }

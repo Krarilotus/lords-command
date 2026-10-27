@@ -471,7 +471,7 @@ never writes memory back.
 | adapted or inherited entry without repo, commit, path and licence; inherited skill differs from its recorded source hash | error |
 | privacy findings (public stack: all classes; private stack: secret) | error |
 | deployed target drifted from a fresh composition | warning |
-| an adapter's composed text past 75 % of its size limit (a user-level file; a repo's files plus the user level) | warning |
+| a place's file past 75 % of its adapter's limit on project files (the user-level file is outside it); past the limit, sync doesn't write it and fails | warning |
 | an entry naming a topic or role its stack doesn't list | error |
 | near-duplicate text across entries (shingled similarity over normalised sentences) | candidate |
 | same topic, conflicting numbers or keywords, no relation named | candidate |

@@ -16,7 +16,8 @@ pub trait Adapter: Sync {
     fn audience(&self) -> Vec<Audience>;
     /// The untracked file it reads in every checkout, after (or instead of) the tracked ones.
     fn repo_file(&self) -> &'static str;
-    /// The most instruction text it reads in total, if it has a limit.
+    /// The most text it reads of a project's instruction files, past which it cuts them, if it has a limit; its
+    /// user-level file isn't counted.
     fn byte_limit(&self) -> Option<usize> {
         None
     }
@@ -102,8 +103,10 @@ impl Adapter for ClaudeCode {
 }
 
 /// Codex: `$CODEX_HOME/AGENTS.md`; `AGENTS.override.md` per checkout, which replaces the tracked `AGENTS.md`.
-/// It reads at most `project_doc_max_bytes` (32 KiB) of instruction files in total, and doesn't expand `@path`
-/// imports, so memory reaches it as an index it reads on demand.
+/// It reads at most `project_doc_max_bytes` (32 KiB) of the project's files, from the repo root down to the working
+/// dir, and cuts the rest without a word; `$CODEX_HOME/AGENTS.md` is read whole, outside that budget (openai/codex
+/// 0d68383: codex-rs/core/src/agents_md.rs:68-92 and 142-178, codex-rs/codex-home/src/instructions/mod.rs:41-78).
+/// It doesn't expand `@path` imports, so memory reaches it as an index it reads on demand.
 pub struct Codex;
 
 impl Adapter for Codex {

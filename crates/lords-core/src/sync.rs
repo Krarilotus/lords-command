@@ -103,6 +103,8 @@ pub struct Item {
 pub(crate) enum ConflictKind {
     /// A tool-owned copy sync planned in full that no longer matches its ledger record.
     ModifiedCopy,
+    /// A place's file past its harness's limit, which would be cut: the install fails (orchestrator, 27 Oct).
+    OverLimit,
     /// Every other conflict: a place that is missing or can't be read, a path that isn't the tool's, a config clash.
     #[default]
     Other,
@@ -224,6 +226,10 @@ pub struct Plan {
     /// Present only with a complete view (rule B, `Complete`).
     #[serde(skip)]
     pub complete: Option<Complete>,
+    /// A place's file isn't written because its harness would cut it, so the sync that planned it fails. Set
+    /// before the install stage drops a blocked place's items.
+    #[serde(skip)]
+    pub over_limit: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -877,10 +883,30 @@ fn over_size(adapter: &dyn Adapter, bytes: usize) -> Option<usize> {
     adapter.byte_limit().filter(|limit| bytes * 100 > limit * SIZE_WARN_PERCENT)
 }
 
-fn size_note(item: &mut Item, adapter: &dyn Adapter, text: &str) {
+/// A place's file past the warning line: a note; past the harness's hard limit: a conflict, so the file isn't
+/// written and the old one stays, as the harness would cut its end off without a word (orchestrator, 27 Oct).
+fn size_note(item: &mut Item, adapter: &dyn Adapter, text: &str, composed: &Composed) {
+    if let Some(limit) = adapter.byte_limit().filter(|limit| text.len() > *limit) {
+        let mut largest = sections(text, &adapter.render(composed));
+        largest.sort_by(|a, b| b.1.cmp(&a.1));
+        let largest: Vec<String> =
+            largest.iter().take(3).map(|(s, n)| format!("{s} {n}")).collect();
+        item.action = Action::Conflict;
+        item.conflict = ConflictKind::OverLimit;
+        item.notes.insert(
+            0,
+            format!(
+                "{} bytes, past {}'s limit of {limit}, which would cut the end off: not written, the old file stays; largest sections: {}",
+                text.len(),
+                adapter.id(),
+                largest.join(", ")
+            ),
+        );
+        return;
+    }
     if let Some(limit) = over_size(adapter, text.len()) {
         item.notes.push(format!(
-            "{} bytes: {} reads at most {limit} bytes of instruction files in total, repo files included",
+            "{} bytes: {} reads at most {limit} bytes of a project's instruction files, from the repo root down to the working dir, and cuts the rest",
             text.len(),
             adapter.id()
         ));
@@ -920,14 +946,13 @@ fn instructions_items(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Ve
                     ),
                 )];
             };
-            let mut s = pl.tool_file(
+            let s = pl.tool_file(
                 &format!("shared text ({})", t.name),
                 &scope,
                 &shared,
                 text.clone(),
                 &composed,
             );
-            size_note(&mut s, adapter, &text);
             items.push(s);
             if composed.text.is_empty() {
                 String::new()
@@ -938,10 +963,8 @@ fn instructions_items(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Ve
     };
     let owner = OwnerFile::target(t);
     pl.plan.owner_files.push(owner.clone());
+    // No size note: a harness's limit is on a place's project files, and a user-level file is read whole (Codex).
     let mut item = owner_block_item(&t.name, &owner, &block, replace, &composed);
-    if t.via.is_none() {
-        size_note(&mut item, adapter, &text);
-    }
     if replace && !current.is_empty() && compose::current_block(&current).is_none() {
         item.notes.push(
             "own_text = replace: the text now in the file is replaced (it is backed up)".into(),
@@ -1525,7 +1548,7 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
             }
             let (text, composed) = place_text(pl.stacks, place.layers(false), adapter, p);
             let mut item = pl.tool_file(&target, &scope, &at, text.clone(), &composed);
-            size_note(&mut item, adapter, &text);
+            size_note(&mut item, adapter, &text, &composed);
             pl.plan.items.push(item);
         }
     }
@@ -1921,6 +1944,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         .filter(|i| i.action == Action::Conflict && i.conflict != ConflictKind::ModifiedCopy)
         .count();
     let complete = (problems == 0 && conflicts == 0).then_some(Complete(()));
+    pl.plan.over_limit = pl.plan.items.iter().any(|i| i.conflict == ConflictKind::OverLimit);
     let why = format!(
         "the stacks loaded with {problems} problem(s) and the plan has {conflicts} conflict(s) where it couldn't see what is wanted (`lords check` and `lords sync` list them)"
     );
@@ -2894,10 +2918,10 @@ pub struct Size {
     /// The adapter's file, or a role file.
     pub file: String,
     pub bytes: usize,
-    /// What a session there reads in total: this file plus the adapter's user-level file (0 for user-level
-    /// files and role files, which are read on their own).
+    /// What counts against the limit: this file (the user-level file is outside a place's budget; 0 for role
+    /// files and skill copies).
     pub reads: usize,
-    /// The adapter's limit on what it reads, if any.
+    /// The adapter's limit on a place's project files, if any; none at the user level.
     pub limit: Option<usize>,
     /// Bytes by part: "tracked AGENTS.md", "header" (markers and the lines before the first heading), then each
     /// heading.
@@ -2959,17 +2983,16 @@ fn sections(text: &str, composed: &str) -> Vec<(String, usize)> {
 pub fn sizes(stacks: &Stacks) -> Vec<Size> {
     let Some(private) = &stacks.private else { return Vec::new() };
     let mut out = Vec::new();
-    let mut user = std::collections::BTreeMap::new();
     for adapter in adapters::ALL.iter().copied() {
         let text = adapter.render(&user_composed(stacks, adapter));
-        user.insert(adapter.id(), text.len());
+        // The limit is on a place's project files; the user-level file is read whole (adapters.rs, `byte_limit`).
         out.push(Size {
             place: "user level".into(),
             adapter: adapter.id().to_string(),
             file: adapter.id().to_string(),
             bytes: text.len(),
             reads: text.len(),
-            limit: adapter.byte_limit(),
+            limit: None,
             sections: sections(&text, &text),
             enabled: true,
         });
@@ -2994,7 +3017,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
                 adapter: adapter.id().to_string(),
                 file: adapter.repo_file().to_string(),
                 bytes: text.len(),
-                reads: text.len() + user[adapter.id()],
+                reads: text.len(),
                 limit: adapter.byte_limit(),
                 sections: sections(&text, &rendered),
                 enabled,
@@ -3048,8 +3071,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
     out
 }
 
-/// What one session in a place reads together (the user-level text, the place's own, and the tracked
-/// instructions it carries), against each adapter's limit.
+/// Each place's file (with the tracked instructions it carries) against its adapter's limit.
 fn repo_size_findings(stacks: &Stacks) -> Vec<crate::Finding> {
     let all = sizes(stacks);
     let copies = all.iter().filter(|s| s.file == "skill copies").map(|s| {
@@ -3068,21 +3090,8 @@ fn repo_size_findings(stacks: &Stacks) -> Vec<crate::Finding> {
     let copies: Vec<crate::Finding> = copies.collect();
     let mut out: Vec<crate::Finding> = all
         .into_iter()
-        .filter(|s| s.reads > s.bytes && s.over_line())
-        .map(|s| {
-            crate::Finding::warning(
-                "size",
-                format!(
-                    "{}: {} reads {} bytes there ({} its file, {} user level); its limit is {}",
-                    s.place,
-                    s.file,
-                    s.reads,
-                    s.bytes,
-                    s.reads - s.bytes,
-                    s.limit.unwrap_or(0)
-                ),
-            )
-        })
+        .filter(|s| s.over_line())
+        .map(|s| crate::Finding::warning("size", s.describe()))
         .collect();
     out.extend(copies);
     out

@@ -13,7 +13,7 @@ const USAGE: &str = "\
 lords: one home for how you work with agents
 
 usage:
-  lords check [--public] [--strict] [--json]
+  lords check [--public | --stack] [--strict] [--json]   --stack: the entries only (a stack repo's pre-commit)
   lords import [--store NAME] [--no-commit]
   lords retire ID --reason TEXT [--superseded-by ID] [--date YYYY-MM-DD] [--no-commit]
   lords promote ID [--strip | --split] [--no-commit]
@@ -21,7 +21,7 @@ usage:
   lords privacy --message FILE [--staged] [--secrets-only]   a commit message (the commit-msg hook)
   lords privacy --history [--private-stack DIR]   every commit's message and patch (the pre-push check)
   lords privacy FILE...
-  lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit, pre-merge-commit and commit-msg hooks
+  lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit, pre-merge-commit and commit-msg hooks; in a stack repo also `check --stack` and a pre-push
   lords hash PATH
   lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--stage install] [--json] [--apply]
   lords sync --restore BACKUP_DIR   undo one apply's owner-file edits, each only while it holds what sync wrote
@@ -117,17 +117,25 @@ fn public_rules(public: &Path, private: Option<&Stack>) -> Result<Rules, String>
 
 fn cmd_check(mut a: Args) -> Result<bool, String> {
     let public_only = a.flag("--public");
+    let stack_only = a.flag("--stack");
     let strict = a.flag("--strict");
     let json = a.flag("--json");
     let explicit = a.words.iter().any(|w| w == "--public-stack");
+    let explicit_private = a.words.iter().any(|w| w == "--private-stack");
     let mut p = paths(&mut a)?;
     a.done()?;
-    // `--public` checks the repo it runs in (the pre-push check), not whatever config.txt points at.
-    if public_only && !explicit {
-        let here =
-            std::env::current_dir().ok().and_then(|d| git::toplevel(&d)).map(|t| t.join("stack"));
-        if let Some(stack) = here.filter(|s| s.join("stack.toml").is_file()) {
+    // `--public` and `--stack` check the repo they run in (its hooks), not whatever config.txt points at.
+    let top = std::env::current_dir().ok().and_then(|d| git::toplevel(&d));
+    if (public_only || stack_only) && !explicit {
+        if let Some(stack) =
+            top.as_ref().map(|t| t.join("stack")).filter(|s| s.join("stack.toml").is_file())
+        {
             p.public = stack;
+        }
+    }
+    if stack_only && !explicit_private {
+        if let Some(t) = top.filter(|t| t.join("stack.toml").is_file()) {
+            p.private = Some(t);
         }
     }
     let private = p.private.as_deref().map(Stack::load).transpose()?;
@@ -155,8 +163,14 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     // Loaded as sync loads them (the repos' own skills are entries too), so check measures what sync writes.
     drop(private);
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
-    let mut findings = check::check(&stacks, &rules);
-    findings.extend(drift(&stacks));
+    // `--stack`: the entries only, without drift (the slow part) or the hook probe, for a stack repo's pre-commit.
+    let findings = if stack_only {
+        check::check_stack(&stacks, &rules)
+    } else {
+        let mut f = check::check(&stacks, &rules);
+        f.extend(drift(&stacks));
+        f
+    };
     print_findings(&findings, json);
     if !json {
         let n = |v| stacks.stack(v).map(|s| s.entries.len()).unwrap_or(0);
@@ -239,21 +253,23 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     } else {
         print_plan(&plan);
     }
+    // A place skipped because its file would be cut never reads as success, planned or applied.
+    let whole = !plan.over_limit;
     if !apply {
         if !json {
             println!(
                 "dry run: nothing written (`--apply` writes; owner files are backed up first)"
             );
         }
-        return Ok(true);
+        return Ok(whole);
     }
     // One worktree (its post-checkout hook): only its files, no import or retiring, which commit to the stack.
     if opts.place.is_some() {
         print_applied(&sync::apply(&plan)?);
-        return Ok(true);
+        return Ok(whole);
     }
     print_applied(&sync::import_and_apply(&p.public, p.private.as_deref(), &opts)?);
-    Ok(true)
+    Ok(whole)
 }
 
 /// `lords uninstall`: removes every tool-owned path in scope that still matches its ledger record.
@@ -667,8 +683,8 @@ fn cmd_compose(mut a: Args) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Every file sync writes for agents, measured as written: bytes by section, and what a session reads in total
-/// against the adapter's limit.
+/// Every file sync writes for agents, measured as written: bytes by section, and a place's file against its
+/// adapter's limit.
 fn cmd_sizes(mut a: Args) -> Result<bool, String> {
     let json = a.flag("--json");
     let p = paths(&mut a)?;
@@ -682,10 +698,10 @@ fn cmd_sizes(mut a: Args) -> Result<bool, String> {
     let mut over = false;
     for s in &sizes {
         let reads = match s.limit {
-            Some(l) if s.reads > s.bytes => {
+            Some(l) => {
                 let mark = if s.over_line() { "  OVER the warning line" } else { "" };
                 over |= s.over_line();
-                format!(", a session reads {} of {l} ({}%){mark}", s.reads, s.reads * 100 / l)
+                format!(", {} of its limit {l} ({}%){mark}", s.reads, s.reads * 100 / l)
             }
             _ => String::new(),
         };

@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 pub const MARKER: &str = "# lords-command: privacy check";
 
 /// The hooks the tool installs: the only names a `hooks:` ledger record may have.
-pub const NAMES: [&str; 4] = ["pre-commit", "pre-merge-commit", "commit-msg", "post-checkout"];
+pub const NAMES: [&str; 5] =
+    ["pre-commit", "pre-merge-commit", "commit-msg", "pre-push", "post-checkout"];
 
 /// The privacy hooks, which a commit or an automatic merge commit runs; `lords check` verifies each by its probe.
 pub const PRIVACY: [&str; 3] = ["pre-commit", "pre-merge-commit", "commit-msg"];
@@ -57,18 +58,30 @@ fn probe_lines(home: &Path, hook: &str) -> String {
 
 /// The pre-commit hook: the repo's own commit check, then the privacy check of the staged files.
 pub fn script(lords_exe: &Path, secrets_only: bool, home: &Path) -> String {
-    staged_script("pre-commit", lords_exe, secrets_only, home)
+    staged_script("pre-commit", lords_exe, secrets_only, false, home)
 }
 
 /// The pre-merge-commit hook, which an automatic merge commit runs instead of pre-commit: the same checks of what
 /// the merge stages (orchestrator, 26 Oct).
 pub fn merge_script(lords_exe: &Path, secrets_only: bool, home: &Path) -> String {
-    staged_script("pre-merge-commit", lords_exe, secrets_only, home)
+    staged_script("pre-merge-commit", lords_exe, secrets_only, false, home)
 }
 
-fn staged_script(hook: &str, lords_exe: &Path, secrets_only: bool, home: &Path) -> String {
+/// `stack`: the repo is a stack repo, whose entries `lords check --stack` checks before the privacy check.
+fn staged_script(
+    hook: &str,
+    lords_exe: &Path,
+    secrets_only: bool,
+    stack: bool,
+    home: &Path,
+) -> String {
     let exe = lords_exe.to_string_lossy().replace('\\', "/");
     let flag = if secrets_only { " --secrets-only" } else { "" };
+    let stack = if stack {
+        format!("# A stack repo: its entries, as `lords check` sees them.\n\"{exe}\" check --stack || exit $?\n")
+    } else {
+        String::new()
+    };
     format!(
         "#!/bin/sh\n{MARKER} of the staged files (installed by `lords hooks install`).\n\
          {probe}\
@@ -77,9 +90,31 @@ fn staged_script(hook: &str, lords_exe: &Path, secrets_only: bool, home: &Path) 
          if git ls-files --error-unmatch -- \"{COMMIT_CHECK}\" >/dev/null 2>&1; then\n\
          \x20   sh \"$top/{COMMIT_CHECK}\" || exit $?\n\
          fi\n\
+         {stack}\
          exec \"{exe}\" privacy --staged{flag}\n",
         probe = probe_lines(home, hook),
     )
+}
+
+/// A stack repo's pre-push hook (orchestrator, 27 Oct): every commit's message and patch, secrets only where the
+/// stack is private; a public stack's whole tree too, as `lords check --public` checks it.
+fn pre_push_script(lords_exe: &Path, secrets_only: bool) -> String {
+    let exe = lords_exe.to_string_lossy().replace('\\', "/");
+    let tail = if secrets_only {
+        format!("exec \"{exe}\" privacy --history --secrets-only\n")
+    } else {
+        format!("\"{exe}\" privacy --history || exit $?\nexec \"{exe}\" check --public\n")
+    };
+    format!(
+        "#!/bin/sh\n{MARKER} of the history to push (installed by `lords hooks install`).\n{tail}"
+    )
+}
+
+/// Whether the repo tracks a stack: `stack.toml` at its top (the private stack) or `stack/stack.toml` (the public).
+fn is_stack_repo(repo: &Path) -> Result<bool, String> {
+    Ok(!git::run(repo, &["ls-files", "--", ":/stack.toml", ":/stack/stack.toml"])?
+        .trim()
+        .is_empty())
 }
 
 /// The commit-msg hook: git passes the message file as `$1`.
@@ -225,11 +260,18 @@ pub fn install(
     let dir = hooks_dir(repo)?;
     let _lock = ApplyLock::take(home, 60)?;
     let mut ledger = Ledger::load(home)?;
-    let hooks = [
-        ("pre-commit", script(lords_exe, secrets_only, home)),
-        ("pre-merge-commit", merge_script(lords_exe, secrets_only, home)),
+    let stack = is_stack_repo(repo)?;
+    let mut hooks = vec![
+        ("pre-commit", staged_script("pre-commit", lords_exe, secrets_only, stack, home)),
+        (
+            "pre-merge-commit",
+            staged_script("pre-merge-commit", lords_exe, secrets_only, stack, home),
+        ),
         ("commit-msg", commit_msg_script(lords_exe, secrets_only, home)),
     ];
+    if stack {
+        hooks.push(("pre-push", pre_push_script(lords_exe, secrets_only)));
+    }
     let mut foreign = Vec::new();
     for (name, _) in &hooks {
         let hook = dir.join(&[Part::new(name)?]);

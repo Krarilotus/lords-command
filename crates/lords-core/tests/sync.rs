@@ -675,18 +675,29 @@ fn product_runs_get_no_notes() {
 }
 
 // Spec (orchestrator, 25 Oct: "check warns when an adapter's composed output passes 75 % of its size limit (Codex
-// 32 KiB)"): past 75 % there is a `size` warning naming the target; below it, none.
+// 32 KiB)"; 27 Oct, from Codex's source: the limit is on a place's project files, the user-level file is read
+// whole): past 75 % a place's Codex file gets a `size` warning naming the adapter; below it, none.
 #[test]
 fn check_warns_before_an_adapter_cuts_text() {
     let warned = |bytes: usize| {
         let f = Fixture::new();
+        std::fs::create_dir_all(f.path("work")).unwrap();
         f.write(
-            "pub/global/rules/big.md",
-            &entry("rule.big", "global", "public", "", &format!("{}\n", "x".repeat(bytes))),
+            "priv/workspace/work/rules/big.md",
+            &entry(
+                "rule.big",
+                "workspace:work",
+                "private",
+                "",
+                &format!("{}\n", "x".repeat(bytes)),
+            ),
         );
         with_targets(
             &f,
-            &target("codex", "codex", "instructions", &f.path("home/.codex/AGENTS.md"), ""),
+            &format!(
+                "[workspaces.work]\npath = '{}'\nadapters = [\"codex\"]\n",
+                f.path("work").display()
+            ),
         );
         lords_core::sync::drift_findings(&f.stacks(), &f.home())
             .iter()

@@ -122,6 +122,16 @@ pub fn check(stacks: &Stacks, public_rules: &Rules) -> Vec<Finding> {
 
 /// `check` with the tool's home given (where the hook probe's nonce goes; tests use their own).
 pub fn check_at(stacks: &Stacks, public_rules: &Rules, home: &Path) -> Vec<Finding> {
+    findings(stacks, public_rules, Some(home))
+}
+
+/// `check` without the hook probe: what a stack repo's own pre-commit runs, where probing the hooks would run them
+/// again (orchestrator, 27 Oct).
+pub fn check_stack(stacks: &Stacks, public_rules: &Rules) -> Vec<Finding> {
+    findings(stacks, public_rules, None)
+}
+
+fn findings(stacks: &Stacks, public_rules: &Rules, probe_home: Option<&Path>) -> Vec<Finding> {
     let mut out: Vec<Finding> = stacks.all().flat_map(|s| s.problems.iter().cloned()).collect();
     ids(stacks, &mut out);
     declared(stacks, &mut out);
@@ -132,7 +142,9 @@ pub fn check_at(stacks: &Stacks, public_rules: &Rules, home: &Path) -> Vec<Findi
     skill_clashes(stacks, &mut out);
     temporaries(stacks, &crate::ops::today(), &mut out);
     privacy_of_entries(stacks, public_rules, &mut out);
-    privacy_hooks(stacks, home, &mut out);
+    if let Some(home) = probe_home {
+        privacy_hooks(stacks, home, &mut out);
+    }
     for n in &public_rules.notes {
         out.push(Finding::info("privacy-scope", n.clone()));
     }

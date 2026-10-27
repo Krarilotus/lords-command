@@ -688,3 +688,238 @@ fn a_probe_with_its_nonce_file_is_answered() {
         text(&m)
     );
 }
+
+/// A public stack repo (`pubrepo/stack`) and a private stack repo (`priv`), each with one commit; the private stack
+/// declares a user-level file sync hasn't written yet, so the full check reports drift.
+fn stack_repos(env: &Env) -> (PathBuf, PathBuf) {
+    let d = env.dir.path();
+    let (public, private) = (d.join("pubrepo"), d.join("priv"));
+    for p in [&public.join("stack"), &private.join("global/rules")] {
+        fs::create_dir_all(p).unwrap();
+    }
+    fs::write(public.join("stack/stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n")
+        .unwrap();
+    fs::write(
+        private.join("stack.toml"),
+        "name = \"priv\"\nvisibility = \"private\"\n[[targets]]\nname = \"user\"\nadapter = \"claude\"\nkind = \"instructions\"\npath = \"~/.claude/CLAUDE.md\"\n",
+    )
+    .unwrap();
+    for r in [&public, &private] {
+        assert!(env.git(r, &["init", "-q"]).status.success());
+        env.git(r, &["add", "-A"]);
+        assert!(env.git(r, &["commit", "-q", "-m", "start"]).status.success());
+    }
+    (public, private)
+}
+
+/// A temporary rule, with or without the review date its schema requires.
+fn temporary_rule(review_by: bool) -> String {
+    format!(
+        "---\nid: rule.t\nkind: rule\ntitle: T\naudience: [all]\nscope: global\nstatus: active\nvisibility: private\ntemporary:\n  until: 2099-01-01\n{}  reason: a test\norigin:\n  type: own\n---\nA rule for a while.\n",
+        if review_by { "  review_by: 2099-01-01\n" } else { "" }
+    )
+}
+
+fn commits(env: &Env, repo: &Path) -> usize {
+    String::from_utf8_lossy(&env.git(repo, &["rev-list", "--count", "HEAD"]).stdout)
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+// Spec (orchestrator, 27 Oct: "The install refuses to write any place's file that would exceed its provider's hard
+// limit (Codex 32,768 bytes). It names the place, the size and the largest sections, and leaves the old file in
+// place"; past it, Codex cuts the file's end without a word): a workspace's Codex file under the limit is written;
+// once a rule grows it past the limit, the install leaves the old file as it was and says why.
+#[test]
+fn the_install_never_writes_a_file_past_its_harness_limit() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (public, private, work) = (d.join("pub"), d.join("priv"), d.join("work"));
+    for p in [&public, &private.join("global/rules"), &work] {
+        fs::create_dir_all(p).unwrap();
+    }
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    fs::write(
+        private.join("stack.toml"),
+        format!(
+            "name = \"priv\"\nvisibility = \"private\"\n[workspaces.work]\npath = '{}'\nadapters = [\"codex\"]\n",
+            work.display()
+        ),
+    )
+    .unwrap();
+    let rule = |body: &str| {
+        format!("---\nid: rule.big\nkind: rule\ntitle: Big\naudience: [all]\nscope: workspace:work\nstatus: active\nvisibility: private\norigin:\n  type: own\n---\n{body}\n")
+    };
+    fs::write(private.join("global/rules/big.md"), rule("A short rule.")).unwrap();
+    assert!(env.git(&private, &["init", "-q"]).status.success());
+    env.git(&private, &["add", "-A"]);
+    env.git(&private, &["commit", "-q", "-m", "start"]);
+    let plan = [
+        "sync",
+        "--stage",
+        "install",
+        "--public-stack",
+        public.to_str().unwrap(),
+        "--private-stack",
+        private.to_str().unwrap(),
+    ];
+    let args = [&plan[..], &["--apply"]].concat();
+    let o = env.lords(d, &args);
+    assert!(o.status.success(), "{}", text(&o));
+    let file = work.join("AGENTS.override.md");
+    let before = fs::read_to_string(&file).unwrap();
+    assert!(before.contains("A short rule."), "{before}\n{}", text(&o));
+
+    let long = "Each line of this rule is long enough to count. ".repeat(700);
+    fs::write(private.join("global/rules/big.md"), rule(&long)).unwrap();
+    env.git(&private, &["commit", "-q", "-am", "a long rule"]);
+    let o = env.lords(d, &args);
+    let out = text(&o);
+    assert_eq!(fs::read_to_string(&file).unwrap(), before, "{out}");
+    assert!(out.contains("32768") && out.contains("Rules"), "{out}");
+    // A skipped place never reads as success, neither the install nor the fresh plan that verifies it.
+    assert!(!o.status.success(), "{out}");
+    let fresh = env.lords(d, &plan);
+    assert!(!fresh.status.success(), "{}", text(&fresh));
+}
+
+// Spec (Codex's source, openai/codex 0d68383: `project_doc_max_bytes` bounds only the project's AGENTS files,
+// codex-rs/core/src/agents_md.rs:68-92 and 142-178, while `~/.codex/AGENTS.md` is read whole outside it,
+// codex-rs/codex-home/src/instructions/mod.rs:41-78): a user-level Codex file past 32 KiB is no conflict; it is
+// written, and the install succeeds.
+#[test]
+fn a_user_level_codex_file_has_no_project_limit() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (public, private) = (d.join("pub"), d.join("priv"));
+    fs::create_dir_all(&public).unwrap();
+    fs::create_dir_all(private.join("global/rules")).unwrap();
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    fs::write(
+        private.join("stack.toml"),
+        "name = \"priv\"\nvisibility = \"private\"\n[[targets]]\nname = \"codex user\"\nadapter = \"codex\"\nkind = \"instructions\"\npath = \"~/.codex/AGENTS.md\"\n",
+    )
+    .unwrap();
+    let long = "Each line of this rule is long enough to count. ".repeat(700);
+    fs::write(
+        private.join("global/rules/big.md"),
+        format!("---\nid: rule.big\nkind: rule\ntitle: Big\naudience: [all]\nscope: global\nstatus: active\nvisibility: private\norigin:\n  type: own\n---\n{long}\n"),
+    )
+    .unwrap();
+    assert!(env.git(&private, &["init", "-q"]).status.success());
+    env.git(&private, &["add", "-A"]);
+    env.git(&private, &["commit", "-q", "-m", "start"]);
+    let o = env.lords(
+        d,
+        &[
+            "sync",
+            "--user",
+            "--apply",
+            "--public-stack",
+            public.to_str().unwrap(),
+            "--private-stack",
+            private.to_str().unwrap(),
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let written = fs::read_to_string(d.join("home/.codex/AGENTS.md")).unwrap();
+    assert!(written.len() > 32 * 1024 && written.contains("long enough"), "{}", text(&o));
+}
+
+// Spec (orchestrator, 27 Oct: `lords check --stack` is "one flag that skips the drift part", run by a stack repo's
+// pre-commit, where the hook probe can't run): it fails on a broken entry and passes once that is fixed, and
+// reports neither drift nor the hook probe, which the full check reports for the same stacks.
+#[test]
+fn check_stack_checks_the_entries_without_drift_or_the_hook_probe() {
+    let env = Env::new();
+    let (public, private) = stack_repos(&env);
+    let (pubs, privs) = (public.join("stack"), private.clone());
+    let stacks =
+        ["--public-stack", pubs.to_str().unwrap(), "--private-stack", privs.to_str().unwrap()];
+    let check = |extra: &[&str]| env.lords(&private, &[&["check"][..], extra, &stacks].concat());
+
+    fs::write(private.join("global/rules/t.md"), temporary_rule(false)).unwrap();
+    let o = check(&["--stack"]);
+    assert!(!o.status.success() && text(&o).contains("t.md"), "{}", text(&o));
+
+    fs::write(private.join("global/rules/t.md"), temporary_rule(true)).unwrap();
+    let o = check(&["--stack"]);
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(!out.contains("drift") && !out.contains("privacy-hooks"), "{out}");
+    let full = text(&check(&[]));
+    assert!(full.contains("drift") && full.contains("privacy-hooks"), "{full}");
+}
+
+// Spec (orchestrator, 27 Oct: "`lords check` as the stack repos' pre-commit hook … full-history secrets scan as
+// the private stack's pre-push hook"): in a private stack repo, `hooks install --secrets-only` refuses a commit of a
+// broken entry, even when config.txt names another private stack, and lets the fixed one through; its pre-push
+// passes a clean history and refuses one holding a secret. A repo with no stack gets neither check.
+#[test]
+fn a_private_stack_repo_checks_its_commits_and_pushes_only_a_clean_history() {
+    let env = Env::new();
+    let (public, private) = stack_repos(&env);
+    let other = env.dir.path().join("other-priv");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(other.join("stack.toml"), "name = \"other\"\nvisibility = \"private\"\n").unwrap();
+    let cfg = env.dir.path().join("home/.lords-command");
+    fs::create_dir_all(&cfg).unwrap();
+    fs::write(
+        cfg.join("config.txt"),
+        format!("public = {}\nprivate = {}\n", public.join("stack").display(), other.display()),
+    )
+    .unwrap();
+    let o = env.lords(&private, &["hooks", "install", "--secrets-only"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(private.join(".git/hooks/pre-push").is_file());
+
+    fs::write(private.join("global/rules/t.md"), temporary_rule(false)).unwrap();
+    env.git(&private, &["add", "-A"]);
+    let o = env.git(&private, &["commit", "-q", "-m", "a broken rule"]);
+    assert!(!o.status.success() && text(&o).contains("t.md"), "{}", text(&o));
+    assert_eq!(commits(&env, &private), 1);
+    fs::write(private.join("global/rules/t.md"), temporary_rule(true)).unwrap();
+    env.git(&private, &["add", "-A"]);
+    let o = env.git(&private, &["commit", "-q", "-m", "the fixed rule"]);
+    assert!(o.status.success(), "{}", text(&o));
+
+    let push = || env.git(&private, &["hook", "run", "pre-push", "--", "origin", "unused"]);
+    let o = push();
+    assert!(o.status.success(), "{}", text(&o));
+    // A commit no hook ran for (made elsewhere and fetched), holding a token built here from its parts.
+    let token = ["ghp", "_", &"a1".repeat(18)].concat();
+    fs::write(private.join("notes.md"), format!("the token {token}\n")).unwrap();
+    env.git(&private, &["add", "notes.md"]);
+    let tree =
+        String::from_utf8_lossy(&env.git(&private, &["write-tree"]).stdout).trim().to_string();
+    let planted = env.git(&private, &["commit-tree", &tree, "-p", "HEAD", "-m", "planted"]);
+    let planted = String::from_utf8_lossy(&planted.stdout).trim().to_string();
+    assert!(env.git(&private, &["update-ref", "HEAD", &planted]).status.success());
+    let o = push();
+    assert!(!o.status.success() && text(&o).contains("notes.md"), "{}", text(&o));
+
+    let plain = env.repo();
+    assert!(env.lords(&plain, &["hooks", "install"]).status.success());
+    assert!(!plain.join(".git/hooks/pre-push").exists());
+    let pre = fs::read_to_string(plain.join(".git/hooks/pre-commit")).unwrap();
+    assert!(!pre.contains("check --stack"), "{pre}");
+}
+
+// Spec (orchestrator, 27 Oct: the public stack's pre-push runs `privacy --history` and `check --public`): in a
+// public stack repo it passes a clean repo and refuses one whose tree holds a user path.
+#[test]
+fn a_public_stack_repo_pre_push_runs_the_public_check() {
+    let env = Env::new();
+    let (public, _) = stack_repos(&env);
+    let o = env.lords(&public, &["hooks", "install"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let push = || env.git(&public, &["hook", "run", "pre-push", "--", "origin", "unused"]);
+    let o = push();
+    assert!(o.status.success(), "{}", text(&o));
+    let sep = std::path::MAIN_SEPARATOR;
+    fs::write(public.join("notes.md"), format!("see C:{sep}{}{sep}alice{sep}x\n", "Users"))
+        .unwrap();
+    let o = push();
+    assert!(!o.status.success() && text(&o).contains("notes.md"), "{}", text(&o));
+}
