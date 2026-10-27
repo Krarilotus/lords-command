@@ -32,9 +32,9 @@ wasn't run; and the open risks and unknowns. Blockers, uncertainty and material 
 never cut to make it shorter. Length follows the decision, not a word count.
 
 Full evidence (findings, reasoning, reproductions, logs) goes into one durable record in the **evidence home**, a named
-place each project sets, with stable ids and an index at the top, linked from the report and opened when needed. (Open,
-for the owner: where the evidence home lives so that it survives a move across hosts.) Don't repeat an automatic
-completion notice or narrate routine activity.
+place each project sets, with stable ids and an index at the top, linked from the report and opened when needed. The
+evidence home is `Harness/notes`, a private repository that syncs itself. Don't repeat an automatic completion notice
+or narrate routine activity.
 
 Every report on code or design also gives its owner and level verdict: whether the work sits with the owner of the job
 at the right level of abstraction. Question the design where it doesn't, and raise an issue with its owner, with
