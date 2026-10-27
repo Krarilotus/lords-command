@@ -77,32 +77,48 @@ fn development_skills_install_per_checkout() {
     assert_eq!(git(&checkout, &["status", "--porcelain"]), "");
 }
 
-// Spec (above): where the repo tracks a skill of the same name, linking is a conflict (nothing is applied) and
-// `check` reports the clash.
+// Spec (above; orchestrator, 27 Oct: "the repo's tracked copy wins in its indexed skill dir and leaves a note; content
+// that differs from the stack's stays a finding"): where the repo tracks a skill of the same name in a dir it indexes,
+// its copy wins, nothing is installed over it, and `check` reports the difference; where it tracks one in a dir it
+// doesn't index, installing over it is still a conflict (nothing is applied).
 #[test]
-fn a_tracked_skill_of_the_same_name_is_a_clash() {
-    let f = Fixture::new();
-    skill(&f, "verify", "roles: [coder]\n");
-    let checkout = f.path("checkout");
-    f.write(
-        "checkout/.claude/skills/verify/SKILL.md",
-        "---\nname: verify\ndescription: the repo's own\n---\nX\n",
-    );
-    f.git_init("checkout");
-    f.write(
-        "priv/stack.toml",
-        &format!(
-            "name = \"priv\"\nvisibility = \"private\"\nroles = [\"coder\"]\n[repos.beta-core]\ncheckouts = ['{}']\nworktrees = false\nskills = ['.claude/skills']\n",
-            checkout.display()
-        ),
-    );
-    let p = plan(&f.stacks(), &f.opts()).unwrap();
-    assert!(p
-        .items
-        .iter()
-        .any(|i| i.path == checkout.join(".claude/skills/verify") && i.action == Action::Conflict));
-    assert!(apply(&p).is_err());
-    assert!(has(&f.check(), "skill-clash", "skill.verify"));
+fn a_tracked_skill_of_the_same_name_wins_where_indexed_and_conflicts_elsewhere() {
+    for indexed in [true, false] {
+        let f = Fixture::new();
+        skill(&f, "verify", "roles: [coder]\n");
+        let checkout = f.path("checkout");
+        f.write(
+            "checkout/.claude/skills/verify/SKILL.md",
+            "---\nname: verify\ndescription: the repo's own\n---\nX\n",
+        );
+        f.git_init("checkout");
+        let skills = if indexed { "skills = ['.claude/skills']\n" } else { "" };
+        f.write(
+            "priv/stack.toml",
+            &format!(
+                "name = \"priv\"\nvisibility = \"private\"\nroles = [\"coder\"]\n[repos.beta-core]\ncheckouts = ['{}']\nworktrees = false\n{skills}",
+                checkout.display()
+            ),
+        );
+        let p = plan(&f.stacks(), &f.opts()).unwrap();
+        let at = |a: Action| {
+            p.items
+                .iter()
+                .any(|i| i.path == checkout.join(".claude/skills/verify") && i.action == a)
+        };
+        if indexed {
+            assert!(!p.items.iter().any(|i| i.path == checkout.join(".claude/skills/verify")));
+            apply(&p).unwrap();
+            assert_eq!(
+                f.read("checkout/.claude/skills/verify/SKILL.md"),
+                "---\nname: verify\ndescription: the repo's own\n---\nX\n"
+            );
+            assert!(has(&f.check(), "skill-clash", "skill.verify"));
+        } else {
+            assert!(at(Action::Conflict));
+            assert!(apply(&p).is_err());
+        }
+    }
 }
 
 // Spec (above: "the four adapted skills are development skills, so their user-level junctions are dropped. The

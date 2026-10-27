@@ -1554,8 +1554,23 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
                 } else {
                     git::run(p, &["ls-files", "--", &rel])
                 };
+                // A skill the repo tracks in a dir it indexes in place is the repo's own: its tracked copy wins there,
+                // and the stack's isn't installed over it (orchestrator, 27 Oct; check reports a copy that differs).
+                let indexed = |rel: &str| {
+                    pl.stacks.entries().any(|x| {
+                        matches!(&x.meta.origin, crate::model::Origin::InRepo { repo, path, .. }
+                            if *repo == place.name && path == rel)
+                    })
+                };
                 match tracked {
                     Ok(o) if o.trim().is_empty() => {}
+                    Ok(_) if indexed(&rel) => {
+                        pl.plan.notes.push(format!(
+                            "{}: the repo tracks its own `{name}` at {rel}, indexed in place; the stack's copy isn't installed over it",
+                            place.label
+                        ));
+                        continue;
+                    }
                     Ok(_) => {
                         pl.plan.items.push(conflict(
                             &target,

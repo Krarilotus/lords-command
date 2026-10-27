@@ -456,9 +456,12 @@ pub fn temporaries(stacks: &Stacks, today: &str, out: &mut Vec<Finding>) {
     }
 }
 
-/// A development skill that sync would link into a repo where the repo already tracks a skill of that name.
+/// A development skill whose name a repo also tracks in a skills dir it indexes in place. The repo's tracked copy wins
+/// there and sync doesn't install the stack's over it (orchestrator, 27 Oct); a copy with the same files is no finding,
+/// one that differs is a warning, so the two get looked at.
 fn skill_clashes(stacks: &Stacks, out: &mut Vec<Finding>) {
     for t in stacks.entries().filter(|e| matches!(e.meta.origin, Origin::InRepo { .. })) {
+        let Origin::InRepo { sha256: tracked_sha, .. } = &t.meta.origin else { continue };
         let tracked = t.id().rsplit('.').next().unwrap_or_default();
         for s in stacks.entries().filter(|e| {
             e.active()
@@ -467,19 +470,24 @@ fn skill_clashes(stacks: &Stacks, out: &mut Vec<Finding>) {
                 && !crate::compose::user_level(e)
                 && coapply(stacks, &e.scope, &t.scope)
         }) {
-            if s.id().trim_start_matches("skill.") == tracked {
-                out.push(
-                    Finding::error(
-                        "skill-clash",
-                        format!(
-                            "the repo tracks a skill named `{tracked}` ({}); rename one",
-                            t.id()
-                        ),
-                    )
-                    .at(&s.meta_file, None)
-                    .entry(s.id()),
-                );
+            if s.id().trim_start_matches("skill.") != tracked {
+                continue;
             }
+            let stack_sha = s.meta_file.parent().map(dir_hash_or_unreadable).unwrap_or_default();
+            if stack_sha == *tracked_sha {
+                continue;
+            }
+            out.push(
+                Finding::warning(
+                    "skill-clash",
+                    format!(
+                        "the repo tracks its own `{tracked}` ({}), which differs from the stack's; the repo's copy wins there",
+                        t.id()
+                    ),
+                )
+                .at(&s.meta_file, None)
+                .entry(s.id()),
+            );
         }
     }
 }
