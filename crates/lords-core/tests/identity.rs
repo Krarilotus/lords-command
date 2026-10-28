@@ -157,10 +157,12 @@ fn a_cwd_through_a_junction_binds_as_its_target() {
     w.mkdir("work/app/src");
     let reg = alpha_with_app(&w, &app);
     let alias = w.path("alias");
+    // cmd reads a `/` in an argument as a switch, so both paths go with `\` only.
+    let backslashed = |p: &Path| p.to_string_lossy().replace('/', "\\");
     let out = std::process::Command::new("cmd")
         .args(["/c", "mklink", "/J"])
-        .arg(&alias)
-        .arg(app.join("src"))
+        .arg(backslashed(&alias))
+        .arg(backslashed(&app.join("src")))
         .output()
         .unwrap();
     assert!(out.status.success(), "mklink: {}", String::from_utf8_lossy(&out.stderr));
