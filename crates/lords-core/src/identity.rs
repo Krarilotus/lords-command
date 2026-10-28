@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 /// The registry's file in the registry home.
 pub const REGISTRY: &str = "stores.toml";
+/// The lock file every registry read and change holds, beside it.
+const LOCK: &str = "stores.lock";
 
 /// `<home>/stores.toml`: where the stores are and the bindings their owners approved, never their content.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,8 +108,18 @@ pub fn default_home() -> Option<PathBuf> {
 
 impl Registry {
     /// The registry in `home`: empty when it has no file; an error when the file can't be read or isn't a
-    /// registry. Conflicting claims load as they are: `resolve` takes them for ambiguity.
+    /// registry. Conflicting claims load as they are: `resolve` takes them for ambiguity. Read under the registry's
+    /// lock, so a registration being saved is never read half done or missing (Sol review r1, F3).
     pub fn load(home: &Path) -> Result<Registry, String> {
+        if fsguard::kind_here(home)? == fsguard::Kind::Missing {
+            return Ok(Registry::default());
+        }
+        let _held = lock(home)?;
+        Registry::load_held(home)
+    }
+
+    /// `load`, by a caller that holds the lock.
+    fn load_held(home: &Path) -> Result<Registry, String> {
         let file = home.join(REGISTRY);
         match fsguard::read_text(&file)? {
             None => Ok(Registry::default()),
@@ -134,13 +146,22 @@ impl Registry {
     }
 }
 
+/// The registry's lock: every read and every read-modify-write of `stores.toml` holds it, so concurrent
+/// registrations each see the one before and none is lost (Sol review r1, F3).
+fn lock(home: &Path) -> Result<fsguard::Lock, String> {
+    let root = Root::home(home)?;
+    root.create()?;
+    fsguard::lock(&root.join(&[Part::new(LOCK)?]))
+}
+
 /// Records the core's public stack and private overlay (both canonical).
 pub fn set_core(home: &Path, public: &Path, private: Option<&Path>) -> Result<(), String> {
     let core = Core {
         public: fsguard::canonical(public)?,
         private: private.map(fsguard::canonical).transpose()?,
     };
-    let mut reg = Registry::load(home)?;
+    let _held = lock(home)?;
+    let mut reg = Registry::load_held(home)?;
     if reg.core.as_ref() != Some(&core) {
         reg.core = Some(core);
         reg.save(home)?;
@@ -179,7 +200,8 @@ pub fn register_store(home: &Path, store_dir: &Path) -> Result<Registration, Str
             });
         }
     }
-    let old = Registry::load(home)?;
+    let _held = lock(home)?;
+    let old = Registry::load_held(home)?;
     refuse_conflicts(&old, &project, &store, &repos, &workspaces)?;
     let mut reg = old.clone();
     reg.stores.retain(|s| s.project != project);

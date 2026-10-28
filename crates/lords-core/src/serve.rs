@@ -10,7 +10,7 @@ use crate::compose::{self, Layers};
 use crate::fsguard::{self, Part, Root};
 use crate::identity::{self, Binding, Place, Registry};
 use crate::model::{Audience, Delivery, Entry, Kind, Lifecycle};
-use crate::stack::{self, Reads, Stack, Stacks};
+use crate::stack::{self, Stack, Stacks};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -124,13 +124,35 @@ fn view(reg: &Registry, binding: Binding) -> Result<View, String> {
         let stacks = Stacks::selected(&core.public, core.private.as_deref(), None)?;
         return Ok(View { binding, stacks });
     };
-    match Stacks::selected(&core.public, core.private.as_deref(), Some(store)) {
+    let loaded = Stacks::selected(&core.public, core.private.as_deref(), Some(store))
+        .and_then(|s| usable(s.project.as_ref().ok_or("no store loaded")?, project).map(|()| s));
+    match loaded {
         Ok(stacks) => Ok(View { binding, stacks }),
         Err(e) => {
             let stacks = Stacks::selected(&core.public, core.private.as_deref(), None)?;
-            let reason = format!("project {project}'s store can't be loaded: {e}");
+            let reason = format!("project {project}'s store can't be served: {e}");
             Ok(View { binding: Binding::CoreOnly { cwd: Some(cwd.clone()), reason }, stacks })
         }
+    }
+}
+
+/// Whether a loaded store may serve `project` (Sol review r1, F1, F2): it names that project, and it has no error,
+/// such as an entry that couldn't be read, a foreign layer or a misplaced entry. Otherwise the session gets the core
+/// alone, and nothing is written, rather than a partial or another project.
+fn usable(store: &Stack, project: &str) -> Result<(), String> {
+    match store.manifest.project.as_deref() {
+        Some(p) if p == project => {}
+        other => {
+            return Err(format!(
+                "{} names project {}, not {project}",
+                store.root.display(),
+                other.unwrap_or("none")
+            ))
+        }
+    }
+    match store.problems.iter().find(|p| p.severity == crate::finding::Severity::Error) {
+        Some(p) => Err(p.to_string()),
+        None => Ok(()),
     }
 }
 
@@ -247,6 +269,8 @@ pub fn brief(home: &Path, start: &Start) -> Result<Brief, String> {
             "bytes": text.len(),
         }),
     )?;
+    // A brief is usable only if its delivery can be read back (Sol review r1, F4): never report one that can't.
+    bound(home, &delivery_id)?;
     Ok(Brief { delivery_id, project, role, text, revisions })
 }
 
@@ -271,8 +295,12 @@ fn rebind(home: &Path, d: &Bound) -> Result<View, String> {
     let reg = Registry::load(home)?;
     let v = view(&reg, identity::resolve(&reg, &d.cwd, None))?;
     if project_of(&v.binding) != d.project {
+        let why = match &v.binding {
+            Binding::CoreOnly { reason, .. } => format!(" ({reason})"),
+            Binding::Project { .. } => String::new(),
+        };
         return Err(format!(
-            "delivery {} was for {}, but its dir now resolves to {}: run `lords brief` again",
+            "delivery {} was for {}, but its dir now resolves to {}{why}: run `lords brief` again",
             d.id,
             d.project.as_deref().unwrap_or("no project"),
             project_of(&v.binding).as_deref().unwrap_or("no project")
@@ -540,7 +568,8 @@ pub fn remember(
     }
     // Under the store's lock: the first free id, then the file put in place whole.
     let _held = fsguard::lock(&root.join(&[Part::new(STORE_LOCK)?]))?;
-    let fresh = Stack::load_reading(&store, Reads::ProjectStore)?;
+    let fresh = Stack::load_store(&store)?;
+    usable(&fresh, &project).map_err(|e| format!("not remembered: {e}"))?;
     for n in 1.. {
         let slug = if n == 1 { base.clone() } else { format!("{base}-{n}") };
         let id = format!("{}.{slug}", kind.name());

@@ -4,7 +4,7 @@
 
 use crate::fsguard::{self, Part, Root, Tree};
 use crate::model::Scope;
-use crate::stack::{self, Reads, Stack, MANIFEST};
+use crate::stack::{self, Stack, MANIFEST};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -193,7 +193,7 @@ pub fn migrate(source: &Path, project: &str, to: &Path) -> Result<Migration, Str
     let home = Root::home(&parent)?;
     fsguard::put_tree(&home.join(&[Part::new(&name)?]), &tree)?;
     // The copy, read back as a project store: the same ids, the same bytes.
-    let new = Stack::load_reading(&to, Reads::ProjectStore)?;
+    let new = Stack::load_store(&to)?;
     let new_ids: BTreeSet<String> = new.entries.iter().map(|e| e.id().to_string()).collect();
     for id in moved_ids.symmetric_difference(&new_ids) {
         record.problems.push(format!("`{id}` is in only one of the source and the store"));

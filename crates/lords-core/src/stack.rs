@@ -197,7 +197,11 @@ impl Stack {
                 manifest_path.display()
             ));
         }
-        for (dir, scope) in layer_dirs(root, reads)? {
+        let dirs = match reads {
+            Reads::ProjectStore => stack.store_layers(root)?,
+            _ => layer_dirs(root, reads)?,
+        };
+        for (dir, scope) in dirs {
             stack.load_layer(&dir, &scope);
         }
         if reads == Reads::ProjectStore {
@@ -234,6 +238,63 @@ impl Stack {
 
     /// A project store holds its own project alone: no global layer, and no entry scoped to another project or to
     /// a repo or workspace that the store doesn't declare for its project (v2 design §2.1).
+    /// A project store reached through no link (Sol review r1, F1): none at or above its root and none inside it,
+    /// so every file it serves is the store's own. Then `load_reading` with `Reads::ProjectStore`.
+    pub fn load_store(root: &Path) -> Result<Stack, String> {
+        fsguard::check(root)?;
+        if has_links(root)? {
+            return Err(format!(
+                "{} holds a link (junction or symlink); a project store holds none",
+                root.display()
+            ));
+        }
+        Stack::load_reading(root, Reads::ProjectStore)
+    }
+
+    /// The layer dirs a project store declares for its project: `project/<it>`, and `repo/<name>` and
+    /// `workspace/<name>` for the repos and workspaces its manifest gives that project. Any other dir there belongs to
+    /// another project: an error, and never opened (Sol review r1, F1).
+    fn store_layers(&mut self, root: &Path) -> Result<Vec<(PathBuf, Scope)>, String> {
+        let project = self.manifest.project.clone().unwrap_or_default();
+        let m = &self.manifest;
+        let ours = |kind: &str, name: &str| match kind {
+            "project" => name == project,
+            "repo" => {
+                m.repos.get(name).and_then(|r| r.project.as_deref()) == Some(project.as_str())
+            }
+            _ => {
+                m.workspaces.get(name).and_then(|w| w.project.as_deref()) == Some(project.as_str())
+            }
+        };
+        let mut out = Vec::new();
+        let mut foreign = Vec::new();
+        for kind in ["project", "repo", "workspace"] {
+            for dir in sorted_children(&root.join(kind))?.into_iter().filter(|d| d.is_dir()) {
+                let name = file_name(&dir);
+                if !ours(kind, &name) {
+                    foreign.push(dir);
+                    continue;
+                }
+                let scope = match kind {
+                    "project" => Scope::Project(name),
+                    "repo" => Scope::Repo(name),
+                    _ => Scope::Workspace(name),
+                };
+                out.push((dir, scope));
+            }
+        }
+        for dir in foreign {
+            self.problems.push(
+                Finding::error(
+                    "foreign-scope",
+                    format!("a layer that isn't project {project}'s; not read"),
+                )
+                .at(dir, None),
+            );
+        }
+        Ok(out)
+    }
+
     fn check_store_scopes(&mut self, root: &Path) {
         let project = self.manifest.project.clone().unwrap_or_default();
         if fsguard::kind_here(&root.join("global")).is_ok_and(|k| k != fsguard::Kind::Missing) {
@@ -267,6 +328,15 @@ impl Stack {
             })
             .collect();
         self.problems.extend(foreign);
+        // Only the project's own, well-placed entries are served: one with any error at its file (a foreign scope,
+        // as just recorded, or its placement or schema) is reported and left out (Sol review r1, F1).
+        let bad: Vec<PathBuf> = self
+            .problems
+            .iter()
+            .filter(|p| p.severity == crate::finding::Severity::Error)
+            .filter_map(|p| p.file.clone())
+            .collect();
+        self.entries.retain(|e| !bad.contains(&e.meta_file));
     }
 
     fn check_public_manifest(&mut self, path: &Path) {
@@ -824,7 +894,7 @@ impl Stacks {
             ));
         }
         let private = private.map(|p| Stack::load_reading(p, Reads::Global)).transpose()?;
-        let project = store.map(|s| Stack::load_reading(s, Reads::ProjectStore)).transpose()?;
+        let project = store.map(Stack::load_store).transpose()?;
         for s in private.iter().chain(project.iter()) {
             if s.visibility() != Visibility::Private {
                 return Err(format!(
