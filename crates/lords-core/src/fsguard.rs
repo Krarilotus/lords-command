@@ -428,6 +428,26 @@ fn set_attrs(path: &Path, a: &Attrs) -> Result<(), String> {
     Ok(())
 }
 
+/// The one path the filesystem has for what is at `path` (identity, v2 design §2.1, step 1): a plain read that
+/// follows every junction and symlink on purpose, as the location a working dir really is, and settles spelling
+/// (case, separators, short names). A drive path comes back without Windows' `\\?\` prefix, so it reads as git and
+/// a user write it; any other verbatim form (a share, a device) stays as it is. Missing or unreadable: an error.
+pub fn canonical(path: &Path) -> Result<PathBuf, String> {
+    let c = fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(plain_drive(c))
+}
+
+/// `\\?\C:\x` as `C:\x`; anything else unchanged.
+fn plain_drive(p: PathBuf) -> PathBuf {
+    let Some(rest) = p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) else {
+        return p;
+    };
+    match rest.as_bytes() {
+        [d, b':', b'\\', ..] if d.is_ascii_alphabetic() => PathBuf::from(rest),
+        _ => p,
+    }
+}
+
 /// Whether two paths name one file or dir, by the filesystem's identity of it (volume and file id), not by
 /// spelling (Sol review r3, R3-04). Both must exist.
 pub fn same_file(a: &Path, b: &Path) -> Result<bool, String> {

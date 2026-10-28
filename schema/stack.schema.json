@@ -62,7 +62,8 @@
           "path": { "type": "string" },
           "project": { "type": "string" },
           "adapters": { "type": "array", "items": { "type": "string" } },
-          "default_role": { "type": "string", "description": "as for a repo" }
+          "default_role": { "type": "string", "description": "as for a repo" },
+          "descendants": { "type": "array", "items": { "type": "string" }, "description": "non-git dirs below path (relative, /-separated) that belong to this workspace too; none by default" }
         },
         "additionalProperties": false
       }

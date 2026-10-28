@@ -59,6 +59,10 @@ pub struct Workspace {
     /// As for a repo: the role of a session here without a brief.
     #[serde(default)]
     pub default_role: Option<String>,
+    /// Non-git dirs below `path` (relative, `/`-separated) that belong to this workspace too (v2 design §2.1,
+    /// identity step 4); none by default.
+    #[serde(default)]
+    pub descendants: Vec<String>,
 }
 
 fn yes() -> bool {
