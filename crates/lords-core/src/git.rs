@@ -103,6 +103,17 @@ pub fn status(dir: &Path, args: &[&str]) -> Result<bool, String> {
     }
 }
 
+/// A config value as git reads it there (`config --get`): `None` when it isn't set, an error when git fails.
+pub fn config_get(dir: &Path, key: &str) -> Result<Option<String>, String> {
+    let args = ["config", "--get", key];
+    let out = git(dir, &args)?;
+    match out.status.code() {
+        Some(0) => Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_string())),
+        Some(1) => Ok(None),
+        _ => Err(failed(&args, out.status, &out.stderr, &[])),
+    }
+}
+
 pub fn toplevel(dir: &Path) -> Option<PathBuf> {
     run(dir, &["rev-parse", "--show-toplevel"]).ok().map(|s| PathBuf::from(s.trim()))
 }
