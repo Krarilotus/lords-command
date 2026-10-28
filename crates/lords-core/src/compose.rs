@@ -436,6 +436,14 @@ fn for_role(e: &Entry, ctx: &Context) -> bool {
     }
 }
 
+/// The entries no other of `live` overrides, and the ids overridden: the one place that decides which of two
+/// applicable entries holds (design: Layers; v2 design §2.1).
+pub fn without_overridden(live: Vec<&Entry>) -> (Vec<&Entry>, BTreeSet<&str>) {
+    let overridden: BTreeSet<&str> =
+        live.iter().flat_map(|e| e.meta.overrides.iter().map(String::as_str)).collect();
+    (live.into_iter().filter(|e| !overridden.contains(e.id())).collect(), overridden)
+}
+
 pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
     let mut development: Vec<String> = stacks
         .all()
@@ -447,10 +455,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
     development.dedup();
     // One day for the whole composition: what it includes and how it labels it.
     let today = crate::ops::today();
-    let all = applicable_on(stacks, ctx, &today);
-    let overridden: BTreeSet<&str> =
-        all.iter().flat_map(|e| e.meta.overrides.iter().map(String::as_str)).collect();
-    let live: Vec<&Entry> = all.into_iter().filter(|e| !overridden.contains(e.id())).collect();
+    let (live, overridden) = without_overridden(applicable_on(stacks, ctx, &today));
     // For only some of the development roles, where the reader's role is unknown.
     let partial_role = |e: &Entry| {
         ctx.roles.is_none()

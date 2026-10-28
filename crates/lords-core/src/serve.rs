@@ -115,27 +115,44 @@ fn project_of(b: &Binding) -> Option<String> {
     }
 }
 
-/// The selected stores for a binding: the core's two global layers, and the project's store where there is one.
+/// The selected stores for a binding: the core's two global layers, and the project's store where there is one. A
+/// project store that can't be loaded leaves the core alone, with why (design §2.1: "Missing selected store is a
+/// visible error with core-only fallback"); a core that can't be loaded is an error.
 fn view(reg: &Registry, binding: Binding) -> Result<View, String> {
     let core = reg.core.as_ref().ok_or("no core registered: run `lords register --core` first")?;
-    let store = match &binding {
-        Binding::Project { store, .. } => Some(store.as_path()),
-        Binding::CoreOnly { .. } => None,
+    let Binding::Project { project, store, cwd, .. } = &binding else {
+        let stacks = Stacks::selected(&core.public, core.private.as_deref(), None)?;
+        return Ok(View { binding, stacks });
     };
-    let stacks = Stacks::selected(&core.public, core.private.as_deref(), store)?;
-    Ok(View { binding, stacks })
+    match Stacks::selected(&core.public, core.private.as_deref(), Some(store)) {
+        Ok(stacks) => Ok(View { binding, stacks }),
+        Err(e) => {
+            let stacks = Stacks::selected(&core.public, core.private.as_deref(), None)?;
+            let reason = format!("project {project}'s store can't be loaded: {e}");
+            Ok(View { binding: Binding::CoreOnly { cwd: Some(cwd.clone()), reason }, stacks })
+        }
+    }
 }
 
-/// The layers a binding composes: its project and place, and every global entry (the reader has no user file
-/// that carries them). Outside any project, the global layer alone: a repo name no stack can hold selects none.
+/// The layers a binding composes: its project and place (in a repo, with the path entries above the working dir),
+/// and every global entry (the reader has no user file that carries them). Outside any project, the global layer
+/// alone: a repo name no stack can hold selects none.
 fn layers(b: &Binding) -> Layers {
     match b {
-        Binding::Project { project, place: Place::Repo { name, .. }, .. } => Layers::Repo {
-            repo: name.clone(),
-            project: Some(project.clone()),
-            sub: None,
-            global: true,
-        },
+        Binding::Project { project, place: Place::Repo { name, toplevel }, cwd, .. } => {
+            Layers::Repo {
+                repo: name.clone(),
+                project: Some(project.clone()),
+                sub: cwd.strip_prefix(toplevel).ok().and_then(|rel| {
+                    let parts: Vec<String> = rel
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect();
+                    (!parts.is_empty()).then(|| parts.join("/"))
+                }),
+                global: true,
+            }
+        }
         Binding::Project { project, place: Place::Workspace { name }, .. } => {
             Layers::Workspace { name: name.clone(), project: Some(project.clone()), global: true }
         }
@@ -252,16 +269,16 @@ fn bound(home: &Path, id: &str) -> Result<Bound, String> {
 /// The view a delivery selects, resolved again now: it must still be the delivery's project.
 fn rebind(home: &Path, d: &Bound) -> Result<View, String> {
     let reg = Registry::load(home)?;
-    let binding = identity::resolve(&reg, &d.cwd, None);
-    if project_of(&binding) != d.project {
+    let v = view(&reg, identity::resolve(&reg, &d.cwd, None))?;
+    if project_of(&v.binding) != d.project {
         return Err(format!(
             "delivery {} was for {}, but its dir now resolves to {}: run `lords brief` again",
             d.id,
             d.project.as_deref().unwrap_or("no project"),
-            project_of(&binding).as_deref().unwrap_or("no project")
+            project_of(&v.binding).as_deref().unwrap_or("no project")
         ));
     }
-    view(&reg, binding)
+    Ok(v)
 }
 
 /// An ended entry says why; a live temporary one carries the clause composed text has (temporary.rs owns it).
@@ -311,11 +328,21 @@ fn applicable<'a>(
         default_role: None,
         default_role_inline: false,
     };
-    compose::candidates(&v.stacks, &ctx)
+    let judged: Vec<(&Entry, Lifecycle)> = compose::candidates(&v.stacks, &ctx)
         .into_iter()
         .map(|e| (e, crate::temporary::lifecycle(e, &v.stacks, as_of)))
-        .filter(|(_, l)| match l {
-            Lifecycle::Active | Lifecycle::ReviewDue { .. } => true,
+        .collect();
+    let holds = |l: &Lifecycle| matches!(l, Lifecycle::Active | Lifecycle::ReviewDue { .. });
+    // Only entries that hold override others, as the composer has it.
+    let (live, _) = compose::without_overridden(
+        judged.iter().filter(|(_, l)| holds(l)).map(|(e, _)| *e).collect(),
+    );
+    judged
+        .into_iter()
+        .filter(|(e, l)| match l {
+            Lifecycle::Active | Lifecycle::ReviewDue { .. } => {
+                live.iter().any(|x| std::ptr::eq(*x, *e))
+            }
             Lifecycle::Expired { .. } | Lifecycle::Invalid { .. } => ended,
             Lifecycle::Retired => false,
         })
