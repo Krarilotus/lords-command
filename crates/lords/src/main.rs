@@ -9,6 +9,8 @@ use lords_core::process::ExitCode;
 use lords_core::{git, hooks, sync, Finding, Severity, Stack, Stacks};
 use std::path::{Path, PathBuf};
 
+mod v2;
+
 const USAGE: &str = "\
 lords: one home for how you work with agents
 
@@ -116,6 +118,10 @@ fn public_rules(public: &Path, private: Option<&Stack>) -> Result<Rules, String>
 }
 
 fn cmd_check(mut a: Args) -> Result<bool, String> {
+    if let Some(store) = a.value("--store")? {
+        let store = std::path::absolute(&store).map_err(|e| format!("{store}: {e}"))?;
+        return v2::cmd_check_store(a, &store);
+    }
     let public_only = a.flag("--public");
     let stack_only = a.flag("--stack");
     let strict = a.flag("--strict");
@@ -723,7 +729,12 @@ fn cmd_hash(mut a: Args) -> Result<bool, String> {
 fn main() -> ExitCode {
     let mut words: Vec<String> = std::env::args().skip(1).collect();
     if words.is_empty() || words.iter().any(|w| w == "--help" || w == "-h") {
-        println!("{USAGE}");
+        println!(
+            "{USAGE}
+
+{}",
+            v2::USAGE
+        );
         return ExitCode::SUCCESS;
     }
     let cmd = words.remove(0);
@@ -742,6 +753,12 @@ fn main() -> ExitCode {
         "adopt" => cmd_adopt(a),
         "set-aside" => cmd_set_aside(a),
         "sizes" => cmd_sizes(a),
+        "register" => v2::cmd_register(a),
+        "brief" => v2::cmd_brief(a),
+        "context" => v2::cmd_context(a),
+        "search" => v2::cmd_search(a),
+        "remember" => v2::cmd_remember(a),
+        "store" => v2::cmd_store(a),
         other => Err(format!("unknown command `{other}`\n\n{USAGE}")),
     };
     match result {

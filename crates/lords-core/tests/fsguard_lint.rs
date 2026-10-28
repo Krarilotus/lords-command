@@ -347,7 +347,7 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
 fn only_fsguard_changes_the_filesystem() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut files = Vec::new();
-    for krate in ["lords-core", "lords", "lords-command"] {
+    for krate in ["lords-core", "lords", "lords-command", "lords-mcp"] {
         sources(&root.join(krate).join("src"), &mut files);
     }
     assert!(files.len() > 10, "the sources were found: {files:?}");
@@ -506,7 +506,9 @@ fn r5_03_the_resolved_check_names_every_door() {
     ) {
         assert!(methods.contains(&m), "disallowed-methods lacks {m}");
     }
-    for krate in ["", "crates/lords-core/", "crates/lords/", "crates/lords-command/"] {
+    for krate in
+        ["", "crates/lords-core/", "crates/lords/", "crates/lords-command/", "crates/lords-mcp/"]
+    {
         let manifest = fs::read_to_string(workspace().join(format!("{krate}Cargo.toml"))).unwrap();
         let squeezed: String = manifest.chars().filter(|c| !c.is_whitespace()).collect();
         for loosened in ["disallowed_methods=", "disallowed_types=", "style=", "all="] {
