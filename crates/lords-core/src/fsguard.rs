@@ -251,6 +251,52 @@ fn append_line_at(path: &Path, line: &str) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// The siblings `beside(path, what)` named for `path`: `.<name>.lords-<what>-…`.
+fn siblings_at(path: &Path, what: &str) -> Result<Vec<PathBuf>, String> {
+    let dir = path.parent().ok_or_else(|| format!("{}: no parent dir", path.display()))?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let prefix = format!(".{name}.lords-{what}-");
+    Ok(list_dir(dir)?
+        .into_iter()
+        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&prefix)))
+        .collect())
+}
+
+/// Replaces a file that is the tool's alone in one step: written and synced beside it, then renamed over it, which
+/// the OS does atomically on one volume. A reader sees the old file or the new one, never neither; an interruption
+/// leaves at most a staged copy beside an intact file, and the next publish removes such copies first (Sol fix
+/// check 1, F3 and F4a).
+fn publish_at(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    check(path)?;
+    for old in siblings_at(path, "new")? {
+        delete_file_at(&old)?;
+    }
+    let staged = beside(path, "new")?;
+    create_file_at(&staged, bytes)?;
+    fs::rename(&staged, path).map_err(|e| {
+        let _ = delete_file_at(&staged);
+        format!("{}: {e}", path.display())
+    })
+}
+
+/// A file's last byte (`None`: no file, or an empty one), read without reading the rest.
+pub fn last_byte(path: &Path) -> Result<Option<u8>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    if f.metadata().map_err(|e| format!("{}: {e}", path.display()))?.len() == 0 {
+        return Ok(None);
+    }
+    let mut b = [0u8; 1];
+    f.seek(SeekFrom::End(-1))
+        .and_then(|_| f.read_exact(&mut b))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Some(b[0]))
+}
+
 /// As `append_line_at`, making the file where it isn't yet (a journal's first line).
 fn append_or_create_line_at(path: &Path, line: &str) -> Result<(), String> {
     check(path)?;
@@ -1033,6 +1079,16 @@ pub fn append_line(p: &Contained, line: &str) -> Result<(), String> {
 /// Appends one line to a file that is the tool's alone, making it where it isn't yet (v2's journal).
 pub fn append_or_create_line(p: &Contained, line: &str) -> Result<(), String> {
     append_or_create_line_at(&p.path, line)
+}
+
+/// Replaces the tool's own file at `p` in one step (see `publish_at`): the registry and the journal's recovery.
+pub fn publish(p: &Contained, bytes: &[u8]) -> Result<(), String> {
+    publish_at(&p.path, bytes)
+}
+
+/// The copies `move_aside` left beside `p` and never moved back: what an interrupted move-aside replacement leaves.
+pub fn asides(p: &Contained) -> Result<Vec<PathBuf>, String> {
+    siblings_at(&p.path, "old")
 }
 
 /// Waits for, then holds, the exclusive lock on the lock file at `p` (made where it isn't yet).

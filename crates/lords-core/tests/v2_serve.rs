@@ -170,9 +170,8 @@ fn a_link_into_another_project_dangles() {
     );
     let reg = identity::Registry::load(&w.home()).unwrap();
     let core = reg.core.unwrap();
-    let stacks =
-        Stacks::selected(&core.public, core.private.as_deref(), Some(&w.path("stores/alpha")))
-            .unwrap();
+    let store = lords_core::stack::Stack::check_store(&w.path("stores/alpha")).unwrap();
+    let stacks = Stacks::selected(&core.public, core.private.as_deref(), Some(store)).unwrap();
     let findings = check::check_stack(&stacks, &Rules::public());
     let errors: Vec<_> =
         findings.iter().filter(|f| f.severity == lords_core::Severity::Error).collect();
@@ -196,11 +195,7 @@ fn a_store_refuses_entries_of_another_scope() {
         "stores/alpha/global/facts/core-ish.md",
         &entry("fact.core-ish", "global", "private", "", "x\n"),
     );
-    let s = lords_core::stack::Stack::load_reading(
-        &w.path("stores/alpha"),
-        lords_core::stack::Reads::ProjectStore,
-    )
-    .unwrap();
+    let s = lords_core::stack::Stack::check_store(&w.path("stores/alpha")).unwrap();
     let foreign: Vec<_> = s.problems.iter().filter(|p| p.code == "foreign-scope").collect();
     assert_eq!(foreign.len(), 2, "{:#?}", s.problems);
     assert!(s.find("fact.core-ish").is_none(), "a store's global layer is never loaded");
@@ -319,11 +314,7 @@ fn concurrent_writers_each_get_their_own_entry() {
     unique.sort();
     unique.dedup();
     assert_eq!(unique.len(), 8, "{made:?}");
-    let s = lords_core::stack::Stack::load_reading(
-        &w.path("stores/alpha"),
-        lords_core::stack::Reads::ProjectStore,
-    )
-    .unwrap();
+    let s = lords_core::stack::Stack::load_store(&w.path("stores/alpha"), "alpha").unwrap();
     assert!(s.problems.is_empty(), "{:#?}", s.problems);
     for i in &made {
         let e = s.find(i).unwrap();
@@ -419,8 +410,7 @@ fn migrate_copies_one_project_with_its_manifest_and_leaves_the_source() {
     assert!(m.problems.is_empty(), "{:?}", m.problems);
     assert_eq!(m.ids, ["fact.b", "fact.c", "rule.a"]);
     assert_eq!(snapshot(&old), before, "the source is unchanged");
-    let store = lords_core::stack::Stack::load_reading(&to, lords_core::stack::Reads::ProjectStore)
-        .unwrap();
+    let store = lords_core::stack::Stack::load_store(&to, "alpha").unwrap();
     assert_eq!(store.manifest.project.as_deref(), Some("alpha"));
     assert!(
         store.manifest.repos.contains_key("app") && !store.manifest.repos.contains_key("other")
@@ -749,4 +739,33 @@ fn a_save_interrupted_at_any_byte_keeps_the_last_registry() {
             "cut {cut}: the next save keeps both"
         );
     }
+}
+
+// Spec: Sol fix check 1, F1 (witness `review_replaced_manifest_is_checked_before_bodies`): "one selected-load boundary
+// must establish the bound project and containment before opening bodies". A store whose manifest was replaced by
+// another project's is refused from its manifest alone: a body in that other project's layer, held so that any read
+// of it fails, is never opened.
+#[test]
+#[cfg(windows)]
+fn a_replaced_manifest_is_refused_before_any_body_is_read() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let w = World::new();
+    let beta = fs::read_to_string(w.path("stores/beta/stack.toml")).unwrap();
+    fs::write(w.path("stores/alpha/stack.toml"), beta).unwrap();
+    w.write(
+        "stores/alpha/project/beta/rules/foreign.md",
+        &entry("rule.foreign", "project:beta", "private", "", "FOREIGN\n"),
+    );
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(w.path("stores/alpha/project/beta/rules/foreign.md"))
+        .unwrap();
+    let err = lords_core::stack::Stack::load_store(&w.path("stores/alpha"), "alpha").unwrap_err();
+    assert!(err.contains("names project beta, not alpha"), "{err}");
+    assert!(!err.contains("os error 32") && !err.contains("foreign.md"), "no body was read: {err}");
+    // Its check names the same project from the manifest and reads the same layers.
+    let checked = lords_core::stack::Stack::check_store(&w.path("stores/alpha")).unwrap();
+    assert_eq!(checked.manifest.project.as_deref(), Some("beta"));
+    drop(held);
 }

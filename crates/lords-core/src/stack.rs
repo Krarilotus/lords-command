@@ -143,6 +143,24 @@ pub struct Manifest {
     pub privacy: PrivacyConfig,
 }
 
+impl Manifest {
+    /// Whether `scope` belongs to `project` by this manifest: its project layer, and the repos (with their paths) and
+    /// workspaces it declares for that project. The one place that decides a project's layers and entries (Sol fix
+    /// check 1: the loader, the store check and migration all ask here).
+    pub fn owns(&self, project: &str, scope: &Scope) -> bool {
+        match scope {
+            Scope::Global => false,
+            Scope::Project(p) => p == project,
+            Scope::Repo(r) | Scope::Path { repo: r, .. } => {
+                self.repos.get(r).and_then(|x| x.project.as_deref()) == Some(project)
+            }
+            Scope::Workspace(w) => {
+                self.workspaces.get(w).and_then(|x| x.project.as_deref()) == Some(project)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Stack {
     pub root: PathBuf,
@@ -159,12 +177,24 @@ impl Stack {
 
     /// Loads a stack. Fails only when `stack.toml` is missing or invalid; entry problems are collected.
     pub fn load(root: &Path) -> Result<Stack, String> {
-        Stack::load_reading(root, Reads::All)
+        Stack::load_reading(root, Reads::All, None)
     }
 
     /// Loads only the layers `reads` names: the others' dirs are never opened (v2 design §2.1, "selection
-    /// precedes reads"). A project store must name its project, and every entry in it must belong to that project.
-    pub fn load_reading(root: &Path, reads: Reads) -> Result<Stack, String> {
+    /// precedes reads"). Private: a project store is read only through `load_store` or `check_store`, which give the
+    /// project it must be, if known, and so take the one selected-load decision before any entry is opened (Sol fix
+    /// check 1, F1).
+    fn load_reading(root: &Path, reads: Reads, expected: Option<&str>) -> Result<Stack, String> {
+        if reads == Reads::ProjectStore {
+            // Containment first: no link at or above the store root, none inside it.
+            fsguard::check(root)?;
+            if has_links(root)? {
+                return Err(format!(
+                    "{} holds a link (junction or symlink); a project store holds none",
+                    root.display()
+                ));
+            }
+        }
         let manifest_path = root.join(MANIFEST);
         let text = fsguard::read_string(&manifest_path)
             .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
@@ -186,16 +216,28 @@ impl Stack {
                 w[0]
             ));
         }
+        if reads == Reads::ProjectStore {
+            // The project, from the manifest alone, before any layer is opened.
+            match (manifest.project.as_deref(), expected) {
+                (None, _) => {
+                    return Err(format!(
+                        "{}: a project store names its `project`",
+                        manifest_path.display()
+                    ))
+                }
+                (Some(p), Some(want)) if p != want => {
+                    return Err(format!(
+                        "{} names project {p}, not {want}",
+                        manifest_path.display()
+                    ))
+                }
+                _ => {}
+            }
+        }
         let mut stack =
             Stack { root: root.to_path_buf(), manifest, entries: Vec::new(), problems: Vec::new() };
         if stack.visibility() == Visibility::Public {
             stack.check_public_manifest(&manifest_path);
-        }
-        if reads == Reads::ProjectStore && stack.manifest.project.is_none() {
-            return Err(format!(
-                "{}: a project store names its `project`",
-                manifest_path.display()
-            ));
         }
         let dirs = match reads {
             Reads::ProjectStore => stack.store_layers(root)?,
@@ -236,65 +278,63 @@ impl Stack {
         }
     }
 
-    /// A project store holds its own project alone: no global layer, and no entry scoped to another project or to
-    /// a repo or workspace that the store doesn't declare for its project (v2 design §2.1).
-    /// A project store reached through no link (Sol review r1, F1): none at or above its root and none inside it,
-    /// so every file it serves is the store's own. Then `load_reading` with `Reads::ProjectStore`.
-    pub fn load_store(root: &Path) -> Result<Stack, String> {
-        fsguard::check(root)?;
-        if has_links(root)? {
-            return Err(format!(
-                "{} holds a link (junction or symlink); a project store holds none",
-                root.display()
-            ));
+    /// The project store at `root`, trusted to serve `project`, or why not (v2 design §2.1; Sol fix check 1, F1): no
+    /// link at, above or inside it; its manifest names `project`, checked before any entry is opened; only that
+    /// project's layers read; and no error at all, such as an entry that couldn't be read or a misplaced one. A store
+    /// that fails any of these serves nothing: the caller falls back to the core.
+    ///
+    /// The one way to read a store for serving; the unchecked reader isn't reachable from outside:
+    ///
+    /// ```compile_fail
+    /// let root = std::path::Path::new("store");
+    /// lords_core::stack::Stack::load_reading(root, lords_core::stack::Reads::ProjectStore, None).unwrap();
+    /// ```
+    pub fn load_store(root: &Path, project: &str) -> Result<Stack, String> {
+        let s = Stack::load_reading(root, Reads::ProjectStore, Some(project))?;
+        match s.problems.iter().find(|p| p.severity == crate::finding::Severity::Error) {
+            Some(p) => Err(p.to_string()),
+            None => Ok(s),
         }
-        Stack::load_reading(root, Reads::ProjectStore)
     }
 
-    /// The layer dirs a project store declares for its project: `project/<it>`, and `repo/<name>` and
-    /// `workspace/<name>` for the repos and workspaces its manifest gives that project. Any other dir there belongs to
+    /// The project store at `root` for its check (`lords check --store`, a migration's read-back): the same
+    /// containment and layer selection as `load_store`, the project its own manifest names, and every problem kept for
+    /// the report instead of refusing. Never a source for serving.
+    pub fn check_store(root: &Path) -> Result<Stack, String> {
+        Stack::load_reading(root, Reads::ProjectStore, None)
+    }
+
+    /// The layer dirs a project store declares for its project (`Manifest::owns`). Any other dir there belongs to
     /// another project: an error, and never opened (Sol review r1, F1).
     fn store_layers(&mut self, root: &Path) -> Result<Vec<(PathBuf, Scope)>, String> {
         let project = self.manifest.project.clone().unwrap_or_default();
-        let m = &self.manifest;
-        let ours = |kind: &str, name: &str| match kind {
-            "project" => name == project,
-            "repo" => {
-                m.repos.get(name).and_then(|r| r.project.as_deref()) == Some(project.as_str())
-            }
-            _ => {
-                m.workspaces.get(name).and_then(|w| w.project.as_deref()) == Some(project.as_str())
-            }
-        };
         let mut out = Vec::new();
-        let mut foreign = Vec::new();
         for kind in ["project", "repo", "workspace"] {
             for dir in sorted_children(&root.join(kind))?.into_iter().filter(|d| d.is_dir()) {
                 let name = file_name(&dir);
-                if !ours(kind, &name) {
-                    foreign.push(dir);
-                    continue;
-                }
                 let scope = match kind {
                     "project" => Scope::Project(name),
                     "repo" => Scope::Repo(name),
                     _ => Scope::Workspace(name),
                 };
-                out.push((dir, scope));
+                if self.manifest.owns(&project, &scope) {
+                    out.push((dir, scope));
+                } else {
+                    self.problems.push(
+                        Finding::error(
+                            "foreign-scope",
+                            format!("a layer that isn't project {project}'s; not read"),
+                        )
+                        .at(dir, None),
+                    );
+                }
             }
-        }
-        for dir in foreign {
-            self.problems.push(
-                Finding::error(
-                    "foreign-scope",
-                    format!("a layer that isn't project {project}'s; not read"),
-                )
-                .at(dir, None),
-            );
         }
         Ok(out)
     }
 
+    /// A project store holds its own project alone: no global layer, and no entry scoped outside its project
+    /// (`Manifest::owns`; v2 design §2.1).
     fn check_store_scopes(&mut self, root: &Path) {
         let project = self.manifest.project.clone().unwrap_or_default();
         if fsguard::kind_here(&root.join("global")).is_ok_and(|k| k != fsguard::Kind::Missing) {
@@ -303,21 +343,10 @@ impl Stack {
                     .at(root.join("global"), None),
             );
         }
-        let m = &self.manifest;
-        let mine = |s: &Scope| match s {
-            Scope::Global => false,
-            Scope::Project(p) => *p == project,
-            Scope::Repo(r) | Scope::Path { repo: r, .. } => {
-                m.repos.get(r).and_then(|x| x.project.as_deref()) == Some(project.as_str())
-            }
-            Scope::Workspace(w) => {
-                m.workspaces.get(w).and_then(|x| x.project.as_deref()) == Some(project.as_str())
-            }
-        };
         let foreign: Vec<Finding> = self
             .entries
             .iter()
-            .filter(|e| !mine(&e.scope))
+            .filter(|e| !self.manifest.owns(&project, &e.scope))
             .map(|e| {
                 Finding::error(
                     "foreign-scope",
@@ -328,15 +357,6 @@ impl Stack {
             })
             .collect();
         self.problems.extend(foreign);
-        // Only the project's own, well-placed entries are served: one with any error at its file (a foreign scope,
-        // as just recorded, or its placement or schema) is reported and left out (Sol review r1, F1).
-        let bad: Vec<PathBuf> = self
-            .problems
-            .iter()
-            .filter(|p| p.severity == crate::finding::Severity::Error)
-            .filter_map(|p| p.file.clone())
-            .collect();
-        self.entries.retain(|e| !bad.contains(&e.meta_file));
     }
 
     fn check_public_manifest(&mut self, path: &Path) {
@@ -769,7 +789,7 @@ fn read_yaml_file(path: &Path) -> Result<Option<Map<String, Value>>, String> {
 
 /// Which layers a load reads (v2 design §2.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Reads {
+pub(crate) enum Reads {
     /// Every layer: the v1 tools.
     All,
     /// The `global` layer alone: the core, public and private.
@@ -884,17 +904,17 @@ impl Stacks {
     pub fn selected(
         public: &Path,
         private: Option<&Path>,
-        store: Option<&Path>,
+        store: Option<Stack>,
     ) -> Result<Stacks, String> {
-        let public = Stack::load_reading(public, Reads::Global)?;
+        let public = Stack::load_reading(public, Reads::Global, None)?;
         if public.visibility() != Visibility::Public {
             return Err(format!(
                 "{}: the public stack's stack.toml says visibility = private",
                 public.root.display()
             ));
         }
-        let private = private.map(|p| Stack::load_reading(p, Reads::Global)).transpose()?;
-        let project = store.map(Stack::load_store).transpose()?;
+        let private = private.map(|p| Stack::load_reading(p, Reads::Global, None)).transpose()?;
+        let project = store;
         for s in private.iter().chain(project.iter()) {
             if s.visibility() != Visibility::Private {
                 return Err(format!(

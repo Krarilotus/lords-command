@@ -5,7 +5,7 @@
 use crate::Args;
 use lords_core::identity::{self, Registry};
 use lords_core::serve::{self, Note, Start};
-use lords_core::{check, migrate, privacy::Rules, Stacks};
+use lords_core::{check, migrate, privacy::Rules, Stack, Stacks};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -192,7 +192,8 @@ pub fn cmd_check_store(mut a: Args, store: &Path) -> Result<bool, String> {
     a.done()?;
     let reg = Registry::load(&home)?;
     let core = reg.core.as_ref().ok_or("no core registered: run `lords register --core` first")?;
-    let stacks = Stacks::selected(&core.public, core.private.as_deref(), Some(store))?;
+    let stacks =
+        Stacks::selected(&core.public, core.private.as_deref(), Some(Stack::check_store(store)?))?;
     let rules =
         Rules::public().with_allow_from(&core.public).with_private(stacks.private.as_ref())?;
     let findings = check::check_stack(&stacks, &rules);

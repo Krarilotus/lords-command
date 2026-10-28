@@ -42,18 +42,16 @@ pub struct Migration {
 /// source declares for it.
 fn layers(source: &Stack, project: &str) -> Vec<String> {
     let m = &source.manifest;
+    let owned = |s: Scope| m.owns(project, &s);
     let mut out = vec![format!("project/{project}")];
     out.extend(
-        m.repos
-            .iter()
-            .filter(|(_, r)| r.project.as_deref() == Some(project))
-            .map(|(n, _)| format!("repo/{n}")),
+        m.repos.keys().filter(|n| owned(Scope::Repo((*n).clone()))).map(|n| format!("repo/{n}")),
     );
     out.extend(
         m.workspaces
-            .iter()
-            .filter(|(_, w)| w.project.as_deref() == Some(project))
-            .map(|(n, _)| format!("workspace/{n}")),
+            .keys()
+            .filter(|n| owned(Scope::Workspace((*n).clone())))
+            .map(|n| format!("workspace/{n}")),
     );
     out
 }
@@ -140,16 +138,7 @@ pub fn migrate(source: &Path, project: &str, to: &Path) -> Result<Migration, Str
     let moved_ids: BTreeSet<String> = old
         .entries
         .iter()
-        .filter(|e| match &e.scope {
-            Scope::Project(p) => p == project,
-            Scope::Repo(r) | Scope::Path { repo: r, .. } => {
-                old.manifest.repos.get(r).and_then(|x| x.project.as_deref()) == Some(project)
-            }
-            Scope::Workspace(w) => {
-                old.manifest.workspaces.get(w).and_then(|x| x.project.as_deref()) == Some(project)
-            }
-            Scope::Global => false,
-        })
+        .filter(|e| old.manifest.owns(project, &e.scope))
         .map(|e| e.id().to_string())
         .collect();
     let id_of = |file: &str| {
@@ -193,7 +182,7 @@ pub fn migrate(source: &Path, project: &str, to: &Path) -> Result<Migration, Str
     let home = Root::home(&parent)?;
     fsguard::put_tree(&home.join(&[Part::new(&name)?]), &tree)?;
     // The copy, read back as a project store: the same ids, the same bytes.
-    let new = Stack::load_store(&to)?;
+    let new = Stack::check_store(&to)?;
     let new_ids: BTreeSet<String> = new.entries.iter().map(|e| e.id().to_string()).collect();
     for id in moved_ids.symmetric_difference(&new_ids) {
         record.problems.push(format!("`{id}` is in only one of the source and the store"));

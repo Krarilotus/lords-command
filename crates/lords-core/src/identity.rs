@@ -122,17 +122,29 @@ impl Registry {
     fn load_held(home: &Path) -> Result<Registry, String> {
         let file = home.join(REGISTRY);
         match fsguard::read_text(&file)? {
-            None => Ok(Registry::default()),
             Some(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", file.display())),
+            // No registry is first use only if no save was cut off after moving one aside (Sol fix check 1, F3): such
+            // a copy is the last acknowledged registry, and nothing builds on its absence.
+            None => match fsguard::asides(&Root::home(home)?.join(&[Part::new(REGISTRY)?]))?.first() {
+                Some(aside) => Err(format!(
+                    "{}: a registry save was interrupted; the last registry is {}: move it back to {} (one copy is \
+                     enough if there are several), then retry",
+                    file.display(),
+                    aside.display(),
+                    file.display()
+                )),
+                None => Ok(Registry::default()),
+            },
         }
     }
 
-    /// Writes the registry to `home`, replacing the file (the tool's own) whole.
+    /// Writes the registry to `home` in one step (`fsguard::publish`): a reader and an interruption see the old
+    /// registry or the new one, never none.
     fn save(&self, home: &Path) -> Result<(), String> {
         let text = toml::to_string(self).map_err(|e| format!("the registry: {e}"))?;
         let root = Root::home(home)?;
         root.create()?;
-        fsguard::replace_own_file(&root.join(&[Part::new(REGISTRY)?]), text.as_bytes())
+        fsguard::publish(&root.join(&[Part::new(REGISTRY)?]), text.as_bytes())
     }
 
     /// Its lists in one order, so the same registrations always make the same file.

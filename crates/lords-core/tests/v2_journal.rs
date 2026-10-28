@@ -52,9 +52,9 @@ fn a_cut_last_line_is_recovered_visibly() {
     let new = brief(&d);
     serve::context(&home, &new, "coder", None, "2026-10-28").unwrap();
     let events = journal::read(&home).unwrap();
-    assert!(events.iter().any(|e| e["event"] == "journal_gap"), "the gap is recorded: {events:#?}");
-    let text = fs::read_to_string(home.join("journal.jsonl")).unwrap();
-    assert!(text.contains("{\"v\":\n"), "the cut fragment itself is kept as evidence");
+    let gap = events.iter().find(|e| e["event"] == "journal_gap").expect("the gap is recorded");
+    // The cut fragment itself is kept as evidence: `{"v":` is 7b 22 76 22 3a.
+    assert_eq!(gap["cut_hex"], "7b2276223a", "{gap}");
 }
 
 // Spec: F4 "Keep interior corruption strict … never silently accept corrupt audit evidence or report a successful
@@ -138,4 +138,38 @@ fn a_reader_waits_for_a_writer_holding_the_lock() {
         let events = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
         assert_eq!(events.last().unwrap()["event"], "new");
     });
+}
+
+// Spec: Sol fix check 1, F4a "make recovery itself recoverable/idempotent at every interrupted publication prefix":
+// recovery publishes by a staged copy renamed over the journal, so its interrupted states are the journal as it was
+// (cut tail and all) with a staged copy cut after any byte. From each, two appends leave every complete event, one gap
+// and the two new events readable, and no staged copy behind.
+#[test]
+fn a_recovery_interrupted_at_any_byte_is_recovered() {
+    let start = b"{\"v\":1,\"event\":\"brief\"}\n{\"v\":".to_vec();
+    let probe = TempDir::new().unwrap();
+    fs::write(probe.path().join("journal.jsonl"), &start).unwrap();
+    journal::append(probe.path(), "probe", serde_json::json!({})).unwrap();
+    let after = fs::read(probe.path().join("journal.jsonl")).unwrap();
+    // What recovery published: everything up to the probe's own line.
+    let probe_line = after[..after.len() - 1].iter().rposition(|b| *b == b'\n').unwrap() + 1;
+    let recovered = &after[..probe_line];
+    for cut in 0..=recovered.len() {
+        let d = TempDir::new().unwrap();
+        let home = d.path();
+        fs::write(home.join("journal.jsonl"), &start).unwrap();
+        fs::write(home.join(format!(".journal.jsonl.lords-new-1-{cut}-0")), &recovered[..cut])
+            .unwrap();
+        journal::append(home, "first", serde_json::json!({})).unwrap();
+        journal::append(home, "second", serde_json::json!({})).unwrap();
+        let events = journal::read(home).unwrap_or_else(|e| panic!("cut {cut}: {e}"));
+        let kinds: Vec<&str> = events.iter().map(|e| e["event"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["brief", "journal_gap", "first", "second"], "cut {cut}");
+        let left: Vec<_> = fs::read_dir(home)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("lords-new"))
+            .collect();
+        assert!(left.is_empty(), "cut {cut}: staged copies left: {left:?}");
+    }
 }

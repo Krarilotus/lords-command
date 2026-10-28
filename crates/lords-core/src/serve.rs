@@ -124,8 +124,9 @@ fn view(reg: &Registry, binding: Binding) -> Result<View, String> {
         let stacks = Stacks::selected(&core.public, core.private.as_deref(), None)?;
         return Ok(View { binding, stacks });
     };
-    let loaded = Stacks::selected(&core.public, core.private.as_deref(), Some(store))
-        .and_then(|s| usable(s.project.as_ref().ok_or("no store loaded")?, project).map(|()| s));
+    // The loader takes the one decision whether this store may serve this project (Sol fix check 1, F1).
+    let loaded = Stack::load_store(store, project)
+        .and_then(|s| Stacks::selected(&core.public, core.private.as_deref(), Some(s)));
     match loaded {
         Ok(stacks) => Ok(View { binding, stacks }),
         Err(e) => {
@@ -133,26 +134,6 @@ fn view(reg: &Registry, binding: Binding) -> Result<View, String> {
             let reason = format!("project {project}'s store can't be served: {e}");
             Ok(View { binding: Binding::CoreOnly { cwd: Some(cwd.clone()), reason }, stacks })
         }
-    }
-}
-
-/// Whether a loaded store may serve `project` (Sol review r1, F1, F2): it names that project, and it has no error,
-/// such as an entry that couldn't be read, a foreign layer or a misplaced entry. Otherwise the session gets the core
-/// alone, and nothing is written, rather than a partial or another project.
-fn usable(store: &Stack, project: &str) -> Result<(), String> {
-    match store.manifest.project.as_deref() {
-        Some(p) if p == project => {}
-        other => {
-            return Err(format!(
-                "{} names project {}, not {project}",
-                store.root.display(),
-                other.unwrap_or("none")
-            ))
-        }
-    }
-    match store.problems.iter().find(|p| p.severity == crate::finding::Severity::Error) {
-        Some(p) => Err(p.to_string()),
-        None => Ok(()),
     }
 }
 
@@ -568,8 +549,7 @@ pub fn remember(
     }
     // Under the store's lock: the first free id, then the file put in place whole.
     let _held = fsguard::lock(&root.join(&[Part::new(STORE_LOCK)?]))?;
-    let fresh = Stack::load_store(&store)?;
-    usable(&fresh, &project).map_err(|e| format!("not remembered: {e}"))?;
+    let fresh = Stack::load_store(&store, &project).map_err(|e| format!("not remembered: {e}"))?;
     for n in 1.. {
         let slug = if n == 1 { base.clone() } else { format!("{base}-{n}") };
         let id = format!("{}.{slug}", kind.name());
