@@ -7,6 +7,11 @@
   "required": ["name", "visibility"],
   "properties": {
     "name": { "type": "string" },
+    "project": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "a project store: the one project this stack holds (v2 design §2.1); its entries are that project's alone"
+    },
     "topics": {
       "type": "array",
       "uniqueItems": true,

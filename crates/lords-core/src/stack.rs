@@ -115,6 +115,9 @@ pub struct PrivacyConfig {
 pub struct Manifest {
     pub name: String,
     pub visibility: Visibility,
+    /// A project store (v2 design §2.1): the one project it holds. `None`: a v1 stack or the core.
+    #[serde(default)]
+    pub project: Option<String>,
     /// The controlled list of topics (design: Entry metadata).
     #[serde(default)]
     pub topics: Vec<String>,
