@@ -1,56 +1,46 @@
 //! Temporary entries (owner, 25 Oct: "we don't poison the context with them forever as being temporary in the
-//! past"). An entry ends on its `until` date, when the status it watches reaches the end state, or when its review
-//! date passes unrenewed. An ended entry is never composed; `check` reports it and `sync --apply` retires it.
+//! past"). What a temporary entry's fields mean is `Entry::lifecycle`'s alone (design v2 §4); this module reads it
+//! against the loaded stacks. An expired or invalid entry is never composed; `check` reports it, and `sync --apply`
+//! retires only an expired one.
 
-use crate::model::{Entry, Kind};
+use crate::model::{Entry, Lifecycle};
 use crate::stack::Stacks;
 
-/// Why a temporary entry has ended by `today` (YYYY-MM-DD), or `None` while it holds.
-pub fn ended(e: &Entry, stacks: &Stacks, today: &str) -> Option<String> {
-    let t = e.meta.temporary.as_ref()?;
-    if let Some(until) = &t.until {
-        if today >= until.as_str() {
-            return Some(format!("until {until} reached"));
-        }
-    }
-    if let Some(w) = &t.when {
-        let reached = stacks
-            .find(&w.status)
-            .filter(|s| s.meta.kind == Kind::Status)
-            .and_then(|s| s.meta.state.as_deref())
-            .is_some_and(|state| state == w.state);
-        if reached {
-            return Some(format!("{} is {}", w.status, w.state));
-        }
-    }
-    if today > t.review_by.as_str() {
-        return Some(format!("review date {} passed unrenewed", t.review_by));
-    }
-    None
+/// Where `e` stands on `as_of` (YYYY-MM-DD), its `when` read against `stacks`.
+pub fn lifecycle(e: &Entry, stacks: &Stacks, as_of: &str) -> Lifecycle {
+    e.lifecycle(as_of, &|id| stacks.find(id))
 }
 
 /// The one short clause composed text carries for a live temporary entry.
-pub fn label(e: &Entry, stacks: &Stacks) -> Option<String> {
+pub fn label(e: &Entry, stacks: &Stacks, as_of: &str) -> Option<String> {
     let t = e.meta.temporary.as_ref()?;
     let end = match (&t.until, &t.when) {
-        (Some(until), _) => format!("until {until}"),
+        (Some(until), _) => Some(format!("until {until}")),
         (None, Some(w)) => {
             let what = stacks
                 .find(&w.status)
                 .map(|s| s.meta.title.clone())
                 .unwrap_or_else(|| w.status.clone());
-            format!("until {what}: {}", w.state)
+            Some(format!("until {what}: {}", w.state))
         }
-        (None, None) => format!("review by {}", t.review_by),
+        (None, None) => None,
     };
-    Some(format!("temporary, {end}"))
+    let review = match lifecycle(e, stacks, as_of) {
+        Lifecycle::ReviewDue { since } => Some(format!("review due since {since}")),
+        _ if end.is_none() => t.review_by.as_ref().map(|r| format!("review by {r}")),
+        _ => None,
+    };
+    let parts: Vec<String> = end.into_iter().chain(review).collect();
+    Some(format!("temporary, {}", parts.join("; ")))
 }
 
-/// Every active entry that has ended by `today`, with why.
-pub fn expired<'a>(stacks: &'a Stacks, today: &str) -> Vec<(&'a Entry, String)> {
+/// Every active entry that has expired by `as_of`, with why.
+pub fn expired<'a>(stacks: &'a Stacks, as_of: &str) -> Vec<(&'a Entry, String)> {
     stacks
         .entries()
-        .filter(|e| e.active())
-        .filter_map(|e| ended(e, stacks, today).map(|why| (e, why)))
+        .filter_map(|e| match lifecycle(e, stacks, as_of) {
+            Lifecycle::Expired { why } => Some((e, why)),
+            _ => None,
+        })
         .collect()
 }

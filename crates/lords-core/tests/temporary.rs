@@ -1,6 +1,7 @@
 //! Temporary entries (owner, 25 Oct: "on temporary rules we need to see that if we have them, that we actually
-//! don't poison the context with them forever as being temporary in the past"; orchestrator: an end condition and a
-//! review date on every one; ended ones reported, never composed, retired by sync with a commit).
+//! don't poison the context with them forever as being temporary in the past"; design v2 §4: a reason and at least
+//! one date on every one; expired ones reported, never composed, retired by sync with a commit; review-due ones
+//! reported and composed, labelled; invalid ones are errors).
 
 // Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -8,7 +9,7 @@
 mod common;
 use common::*;
 use lords_core::compose::{compose, Context, Layers};
-use lords_core::model::Audience;
+use lords_core::model::{valid_date, Audience, Lifecycle};
 use lords_core::Severity;
 
 const PAST: &str = "2000-01-01";
@@ -317,16 +318,16 @@ fn a_review_only_entry_becomes_due_and_never_expires() {
 }
 
 // Spec (design v2 §4, `when`: "An unreadable/dangling target is invalid and a check error, not silent indefinite
-// validity"; Check: "Reject … invalid end conditions"): a `when` watching no entry, or an entry that is no status,
-// is an error, and the entry is not composed.
+// validity"; Check: "Reject … invalid end conditions"): a `when` watching no entry, or a status entry with no state
+// to read, is an error, and the entry is not composed.
 #[test]
 fn a_when_with_a_missing_target_is_an_invalid_entry() {
     let f = Fixture::new();
-    for target in ["status.nowhere", "rule.other"] {
-        f.write(
-            "pub/global/rules/other.md",
-            &entry("rule.other", "global", "public", "", "Other.\n"),
-        );
+    f.write(
+        "pub/global/status/blank.md",
+        &entry("status.blank", "global", "public", "", "No state.\n"),
+    );
+    for target in ["status.nowhere", "status.blank"] {
         rule(
             &f,
             &temp(&format!(
@@ -421,4 +422,123 @@ fn only_expired_entries_are_retired_and_reads_change_nothing() {
         .map(|i| i.target.as_str())
         .collect();
     assert_eq!(listed, ["rule.gone (temporary entry)"]);
+}
+
+fn lifecycle_on(f: &Fixture, id: &str, as_of: &str) -> Lifecycle {
+    let s = f.stacks();
+    let e = s.find(id).unwrap();
+    e.lifecycle(as_of, &|x| s.find(x))
+}
+
+// Spec (design v2 §4: "`model::Entry` evaluates `lifecycle(as_of, status_lookup)` as active, review-due, expired,
+// retired or invalid"; the example's states; "reject … already-expired writes": a write whose `until` is the day
+// of writing is already expired by the same evaluator): each state through the one evaluator.
+#[test]
+fn the_entry_evaluates_its_own_lifecycle() {
+    let f = Fixture::new();
+    rule(&f, &temp("  until: 2026-10-30\n  review_by: 2026-10-28\n"));
+    assert_eq!(lifecycle_on(&f, "rule.t", "2026-10-28"), Lifecycle::Active);
+    assert_eq!(
+        lifecycle_on(&f, "rule.t", "2026-10-29"),
+        Lifecycle::ReviewDue { since: "2026-10-28".into() }
+    );
+    assert_eq!(
+        lifecycle_on(&f, "rule.t", "2026-10-30"),
+        Lifecycle::Expired { why: "until 2026-10-30 reached".into() }
+    );
+    rule(&f, &temp("  until: 2026-10-28\n"));
+    assert!(matches!(lifecycle_on(&f, "rule.t", "2026-10-28"), Lifecycle::Expired { .. }));
+    f.write("pub/global/rules/p.md", &entry("rule.p", "global", "public", "", "Plain.\n"));
+    assert_eq!(lifecycle_on(&f, "rule.p", "2999-01-01"), Lifecycle::Active, "no temporary block");
+    f.write(
+        "pub/global/rules/p.md",
+        &entry("rule.p", "global", "public", "", "Plain.\n").replace(
+            "status: active",
+            "status: retired\nretired:\n  date: 2026-01-01\n  reason: r",
+        ),
+    );
+    assert_eq!(lifecycle_on(&f, "rule.p", "2026-10-28"), Lifecycle::Retired);
+}
+
+// Spec (design v2 §4, `when`: "matching state expires it through the same model evaluator"; "Require a real status
+// target"): the watched status's state ends it; a status with no state can't be read and is invalid.
+#[test]
+fn a_when_ends_through_the_same_evaluator() {
+    let f = Fixture::new();
+    let status = |extra: &str| entry("status.s", "global", "public", extra, "S.\n");
+    rule(
+        &f,
+        &temp(&format!("  when:\n    status: status.s\n    state: done\n  review_by: {FUTURE}\n")),
+    );
+    f.write("pub/global/status/s.md", &status("state: open\n"));
+    assert_eq!(lifecycle_on(&f, "rule.t", "2026-10-28"), Lifecycle::Active);
+    f.write("pub/global/status/s.md", &status("state: done\n"));
+    assert_eq!(
+        lifecycle_on(&f, "rule.t", "2026-10-28"),
+        Lifecycle::Expired { why: "status.s is done".into() }
+    );
+    f.write("pub/global/status/s.md", &status(""));
+    assert!(matches!(lifecycle_on(&f, "rule.t", "2026-10-28"), Lifecycle::Invalid { .. }));
+}
+
+// Spec (design v2 §4: "Context returns its next validity boundary"): the next day the lifecycle changes by date:
+// the day after the review date, then the `until` day, then none; none for an entry no date changes.
+#[test]
+fn next_boundary_is_the_next_day_the_lifecycle_changes() {
+    let f = Fixture::new();
+    rule(&f, &temp("  until: 2026-10-30\n  review_by: 2026-10-28\n"));
+    let s = f.stacks();
+    let e = s.find("rule.t").unwrap();
+    assert_eq!(e.next_boundary("2026-10-27").as_deref(), Some("2026-10-29"));
+    assert_eq!(e.next_boundary("2026-10-28").as_deref(), Some("2026-10-29"));
+    assert_eq!(e.next_boundary("2026-10-29").as_deref(), Some("2026-10-30"));
+    assert_eq!(e.next_boundary("2026-10-30"), None);
+    // Each boundary is where the evaluator's answer changes, and the day before it is not.
+    for (before, at) in [("2026-10-28", "2026-10-29"), ("2026-10-29", "2026-10-30")] {
+        let on = |d: &str| e.lifecycle(d, &|x| s.find(x));
+        assert_ne!(on(before), on(at), "{at}");
+    }
+    rule(&f, &temp("  review_by: 2026-12-31\n"));
+    let s = f.stacks();
+    let e = s.find("rule.t").unwrap();
+    assert_eq!(e.next_boundary("2026-12-31").as_deref(), Some("2027-01-01"), "across a year");
+    assert_eq!(e.next_boundary("2027-01-01"), None, "due for good");
+    rule(&f, &temp("  review_by: 2028-02-28\n"));
+    assert_eq!(
+        f.stacks().find("rule.t").unwrap().next_boundary("2028-01-01").as_deref(),
+        Some("2028-02-29"),
+        "a leap day"
+    );
+    rule(&f, &temp("  until: 2026-02-30\n"));
+    assert_eq!(f.stacks().find("rule.t").unwrap().next_boundary("2026-01-01"), None, "invalid");
+    f.write("pub/global/rules/p.md", &entry("rule.p", "global", "public", "", "Plain.\n"));
+    assert_eq!(f.stacks().find("rule.p").unwrap().next_boundary("2026-01-01"), None);
+}
+
+// Spec (design v2 §4: "reject malformed/impossible dates"; the task: "`2026-02-30` is invalid"): a real calendar
+// date in YYYY-MM-DD form only.
+#[test]
+fn valid_date_accepts_only_real_calendar_dates() {
+    for d in ["2026-10-28", "2024-02-29", "2000-02-29", "2026-12-31", "2026-01-01"] {
+        assert!(valid_date(d), "{d}");
+    }
+    for d in [
+        "2026-02-30",
+        "2025-02-29",
+        "1900-02-29",
+        "2026-04-31",
+        "2026-13-01",
+        "2026-00-10",
+        "2026-10-00",
+        "2026-1-05",
+        "2026-10-5",
+        "26-10-28",
+        "2026/10/28",
+        "2026-10-28 ",
+        "+026-10-28",
+        "2026-1a-28",
+        "",
+    ] {
+        assert!(!valid_date(d), "{d:?}");
+    }
 }

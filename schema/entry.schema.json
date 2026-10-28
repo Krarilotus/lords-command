@@ -71,9 +71,9 @@
     },
     "temporary": {
       "type": "object",
-      "description": "a temporary entry: it ends on `until` (a date) or `when` a status entry reaches a state, and is reviewed by `review_by` (renew it by moving that date, or it ends); an ended entry is never composed and is retired by sync",
-      "required": ["review_by", "reason"],
-      "anyOf": [{ "required": ["until"] }, { "required": ["when"] }],
+      "description": "a temporary entry: a reason and at least one of `until` and `review_by` (real calendar dates, UTC). It expires on its `until` day (exclusive) or `when` a status entry reaches a state; an expired entry is never composed and sync retires it. After `review_by` it is review due, never expired by that alone: it stays composed, labelled \"review due since <review_by>\", until it is renewed or ends. A blank reason, an impossible date or a `when` watching no status entry makes it invalid: a check error, never composed",
+      "required": ["reason"],
+      "anyOf": [{ "required": ["until"] }, { "required": ["review_by"] }],
       "properties": {
         "until": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
         "when": {

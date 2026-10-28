@@ -172,8 +172,9 @@ pub struct EndsWhen {
     pub state: String,
 }
 
-/// A temporary entry's end (owner, 25 Oct: temporary rules must not "poison the context … forever"): a date or a
-/// status condition, and a review date by which it is renewed or it ends.
+/// A temporary entry's end (owner, 25 Oct: temporary rules must not "poison the context … forever"): a reason and
+/// at least one date. `until` ends it; `when` ends it once a status reaches a state; `review_by` only makes it due
+/// for review (design v2 §4). `Entry::lifecycle` is the one place that reads these fields' meaning.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Temporary {
@@ -181,8 +182,87 @@ pub struct Temporary {
     pub until: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<EndsWhen>,
-    pub review_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_by: Option<String>,
     pub reason: String,
+}
+
+/// Where an entry stands on a day (design v2 §4). Everything that composes, checks, retires or audits entries reads
+/// this, never the temporary fields' dates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Lifecycle {
+    Active,
+    /// Past its review date (`since` is that date) and not ended: still composed, labelled.
+    ReviewDue {
+        since: String,
+    },
+    /// Its `until` day has come or its `when` status has its state: never composed; sync retires it.
+    Expired {
+        why: String,
+    },
+    Retired,
+    /// An end that can't be evaluated (a blank reason, no date, an impossible date, a `when` watching no status):
+    /// never composed, and a check error.
+    Invalid {
+        why: String,
+    },
+}
+
+/// A real calendar date written YYYY-MM-DD (`2026-02-30` is not).
+pub fn valid_date(s: &str) -> bool {
+    parse_date(s).is_some()
+}
+
+fn parse_date(s: &str) -> Option<(u32, u32, u32)> {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| {
+        b[r.clone()].iter().all(u8::is_ascii_digit).then(|| s[r].parse::<u32>().ok()).flatten()
+    };
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    ((1..=12).contains(&m) && (1..=days_in_month(y, m)).contains(&d)).then_some((y, m, d))
+}
+
+fn days_in_month(y: u32, m: u32) -> u32 {
+    match m {
+        2 if y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400)) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// The day after a valid date.
+fn next_day(s: &str) -> Option<String> {
+    let (y, m, d) = parse_date(s)?;
+    let (y, m, d) = if d < days_in_month(y, m) {
+        (y, m, d + 1)
+    } else if m < 12 {
+        (y, m + 1, 1)
+    } else {
+        (y + 1, 1, 1)
+    };
+    Some(format!("{y:04}-{m:02}-{d:02}"))
+}
+
+impl Temporary {
+    /// What makes this block unevaluable on its own, without looking at other entries.
+    fn invalid(&self) -> Option<String> {
+        if self.reason.trim().is_empty() {
+            return Some("its reason is blank".into());
+        }
+        if self.until.is_none() && self.review_by.is_none() {
+            return Some("it has neither an until nor a review_by date".into());
+        }
+        for (field, date) in [("until", &self.until), ("review_by", &self.review_by)] {
+            if let Some(d) = date.as_deref().filter(|d| !valid_date(d)) {
+                return Some(format!("its {field} `{d}` is no calendar date"));
+            }
+        }
+        None
+    }
 }
 
 /// A case behind an entry: what happened, when, and where it is recorded. Kept beside the rule, never in the
@@ -335,5 +415,56 @@ impl Entry {
 
     pub fn rank(&self) -> u8 {
         self.scope.rank(self.stack)
+    }
+
+    /// Where this entry stands on `as_of` (UTC, YYYY-MM-DD, as `ops::today()`); `status` finds the entry a `when`
+    /// watches. `until` is exclusive (`as_of >= until` has ended it); a passed `review_by` only makes it due.
+    pub fn lifecycle<'s>(
+        &self,
+        as_of: &str,
+        status: &dyn Fn(&str) -> Option<&'s Entry>,
+    ) -> Lifecycle {
+        if !self.active() {
+            return Lifecycle::Retired;
+        }
+        let Some(t) = &self.meta.temporary else { return Lifecycle::Active };
+        if let Some(why) = t.invalid() {
+            return Lifecycle::Invalid { why };
+        }
+        let mut reached = false;
+        if let Some(w) = &t.when {
+            let Some(s) = status(&w.status).filter(|s| s.meta.kind == Kind::Status) else {
+                return Lifecycle::Invalid {
+                    why: format!("its when watches `{}`, which is no status entry", w.status),
+                };
+            };
+            let Some(state) = s.meta.state.as_deref() else {
+                return Lifecycle::Invalid {
+                    why: format!("its when watches `{}`, which has no state", w.status),
+                };
+            };
+            reached = state == w.state;
+        }
+        if let Some(until) = t.until.as_deref().filter(|u| as_of >= *u) {
+            return Lifecycle::Expired { why: format!("until {until} reached") };
+        }
+        if let (true, Some(w)) = (reached, &t.when) {
+            return Lifecycle::Expired { why: format!("{} is {}", w.status, w.state) };
+        }
+        match t.review_by.as_deref().filter(|r| as_of > *r) {
+            Some(r) => Lifecycle::ReviewDue { since: r.to_string() },
+            None => Lifecycle::Active,
+        }
+    }
+
+    /// The next day after `as_of` on which this entry's lifecycle changes by date alone, so a context built on
+    /// `as_of` is valid before it. `None`: no date changes it any more (a status a `when` watches still can).
+    pub fn next_boundary(&self, as_of: &str) -> Option<String> {
+        let t = self.meta.temporary.as_ref().filter(|_| self.active())?;
+        if t.invalid().is_some() || t.until.as_deref().is_some_and(|u| as_of >= u) {
+            return None;
+        }
+        let due = t.review_by.as_deref().filter(|r| as_of <= *r).and_then(next_day);
+        [t.until.clone(), due].into_iter().flatten().min()
     }
 }
