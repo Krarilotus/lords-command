@@ -548,3 +548,149 @@ fn search_and_context_agree_for_the_deliverys_role() {
         serve::search(&w.home(), &id, "", &["rule.reviewer-version".into()], false, "2026-10-28");
     assert!(reviewer.unwrap().is_empty(), "another role's entry is not this delivery's");
 }
+
+/// A junction at `link` to `target` (cmd reads a `/` as a switch, so both go with `\`).
+fn junction(link: &Path, target: &Path) {
+    let bs = |p: &Path| p.to_string_lossy().replace('/', "\\");
+    let out = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(bs(link))
+        .arg(bs(target))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "mklink: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// What a session at `place` gets now: its brief's project and every id of its context.
+fn served(w: &World, place: &str) -> (Option<String>, Vec<String>, String) {
+    let b = serve::brief(&w.home(), &w.start(&w.path(place), "coder")).unwrap();
+    let c = serve::context(&w.home(), &b.delivery_id, "coder", None, "2026-10-28").unwrap();
+    let note = Note { text: "x".into(), ..Note::default() };
+    assert!(
+        serve::remember(&w.home(), &b.delivery_id, &note, "2026-10-28").is_err(),
+        "no write: {}",
+        b.text
+    );
+    (b.project, all_ids(&c), b.text)
+}
+
+// Spec: design §2.1 "Selection precedes reads … one selected project"; Sol review r1 F1 (witness `linked-store`): a
+// registered store path that is now a junction to another project's store is not that project: the session falls
+// back to the core, visibly, and gets nothing of the other store.
+#[test]
+#[cfg(windows)]
+fn a_store_path_replaced_by_a_link_is_not_served() {
+    let w = World::new();
+    let before = w.brief("alpha-app", "coder");
+    fs::rename(w.path("stores/alpha"), w.path("stores/alpha-real")).unwrap();
+    junction(&w.path("stores/alpha"), &w.path("stores/beta"));
+    let (project, ids, text) = served(&w, "alpha-app");
+    assert_eq!(project, None, "{text}");
+    assert!(text.contains("core only") && text.contains("alpha"), "{text}");
+    assert!(ids.iter().all(|i| !i.contains("beta")), "{ids:?}");
+    assert!(
+        serve::context(&w.home(), &before, "coder", None, "2026-10-28").is_err(),
+        "the old delivery rebriefs"
+    );
+}
+
+// Spec: as above, F1 "store-root and descendant links": a link inside the selected store reaches no other store.
+#[test]
+#[cfg(windows)]
+fn a_link_inside_the_store_is_not_followed() {
+    let w = World::new();
+    junction(
+        &w.path("stores/alpha/project/alpha/rules/linked"),
+        &w.path("stores/beta/project/beta/rules"),
+    );
+    let (project, ids, text) = served(&w, "alpha-app");
+    assert_eq!(project, None, "{text}");
+    assert!(ids.iter().all(|i| !i.contains("beta")), "{ids:?}");
+}
+
+// Spec: F1 "validate the registered store identity and expected project": a store whose manifest now names another
+// project is not served as the bound one.
+#[test]
+fn a_store_whose_manifest_names_another_project_is_not_served() {
+    let w = World::new();
+    let beta = fs::read_to_string(w.path("stores/beta/stack.toml")).unwrap();
+    fs::write(w.path("stores/alpha/stack.toml"), beta).unwrap();
+    let (project, _, text) = served(&w, "alpha-app");
+    assert_eq!(project, None, "{text}");
+    assert!(text.contains("beta"), "the reason names what it found: {text}");
+}
+
+// Spec: F1 (witness `foreign-layer`) "select only that project's declared layers … invalid placement/foreign scope
+// must never become deliverable": an entry in another project's layer dir, scoped to one of the store's own places,
+// is never served; the store falls back to the core with the reason.
+#[test]
+fn an_entry_in_a_foreign_layer_is_never_served() {
+    let w = World::new();
+    w.write(
+        "stores/alpha/project/beta/rules/foreign.md",
+        &entry("rule.foreign", "repo:alpha-app", "private", "roles: [coder]\n", "FOREIGN_BODY\n"),
+    );
+    let (project, ids, text) = served(&w, "alpha-app");
+    assert!(!ids.contains(&"rule.foreign".to_string()), "{ids:?}");
+    assert_eq!(project, None, "{text}");
+}
+
+// Spec: Sol review r1 F2 (witness `unreadable-file`); design §2.1 "Missing selected store is a visible error with
+// core-only fallback": a required entry that can't be read (another process holds it, OS error 32) leaves no partial
+// project active or writable.
+#[test]
+#[cfg(windows)]
+fn an_unreadable_entry_leaves_no_partial_project() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let w = World::new();
+    let before = w.brief("alpha-app", "coder");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(w.path("stores/alpha/project/alpha/rules/alpha-coder.md"))
+        .unwrap();
+    let (project, ids, text) = served(&w, "alpha-app");
+    assert_eq!(project, None, "{text}");
+    assert!(!ids.contains(&"fact.alpha-fact".to_string()), "{ids:?}");
+    let err = serve::context(&w.home(), &before, "coder", None, "2026-10-28").unwrap_err();
+    assert!(err.contains("lords brief"), "an actionable rebrief: {err}");
+    drop(held);
+}
+
+// Spec: Sol review r1 F3 (witness `registration.log`): every acknowledged registration is kept when several run at
+// once, and a reader meanwhile never sees a registry with less than it held.
+#[test]
+fn concurrent_registrations_all_survive() {
+    isolate_git();
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("registry");
+    let stores: Vec<PathBuf> = (0..12)
+        .map(|n| {
+            let s = dir.path().join(format!("s{n}"));
+            fs::create_dir_all(&s).unwrap();
+            fs::write(s.join("stack.toml"), format!("name = \"s{n}\"\nvisibility = \"private\"\nproject = \"p{n}\"\n[projects.p{n}]\n")).unwrap();
+            s
+        })
+        .collect();
+    identity::set_core(&home, dir.path(), None).unwrap();
+    std::thread::scope(|sc| {
+        let reader = sc.spawn(|| {
+            for _ in 0..200 {
+                let reg = identity::Registry::load(&home).unwrap();
+                assert!(reg.core.is_some(), "a reader never sees the registry empty");
+            }
+        });
+        let writers: Vec<_> =
+            stores.iter().map(|s| sc.spawn(|| identity::register_store(&home, s))).collect();
+        for h in writers {
+            h.join().unwrap().unwrap();
+        }
+        reader.join().unwrap();
+    });
+    let reg = identity::Registry::load(&home).unwrap();
+    let mut projects: Vec<String> = reg.stores.iter().map(|s| s.project.clone()).collect();
+    projects.sort();
+    let mut want: Vec<String> = (0..12).map(|n| format!("p{n}")).collect();
+    want.sort();
+    assert_eq!(projects, want);
+}
