@@ -159,6 +159,12 @@ impl Stack {
 
     /// Loads a stack. Fails only when `stack.toml` is missing or invalid; entry problems are collected.
     pub fn load(root: &Path) -> Result<Stack, String> {
+        Stack::load_reading(root, Reads::All)
+    }
+
+    /// Loads only the layers `reads` names: the others' dirs are never opened (v2 design §2.1, "selection
+    /// precedes reads"). A project store must name its project, and every entry in it must belong to that project.
+    pub fn load_reading(root: &Path, reads: Reads) -> Result<Stack, String> {
         let manifest_path = root.join(MANIFEST);
         let text = fsguard::read_string(&manifest_path)
             .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
@@ -185,8 +191,17 @@ impl Stack {
         if stack.visibility() == Visibility::Public {
             stack.check_public_manifest(&manifest_path);
         }
-        for (dir, scope) in layer_dirs(root)? {
+        if reads == Reads::ProjectStore && stack.manifest.project.is_none() {
+            return Err(format!(
+                "{}: a project store names its `project`",
+                manifest_path.display()
+            ));
+        }
+        for (dir, scope) in layer_dirs(root, reads)? {
             stack.load_layer(&dir, &scope);
+        }
+        if reads == Reads::ProjectStore {
+            stack.check_store_scopes(root);
         }
         // A dir that couldn't be read leaves the stack incomplete: it doesn't load (R5-04's class, decision 4).
         if let Some(p) = stack.problems.iter().find(|p| p.code == UNREADABLE) {
@@ -215,6 +230,43 @@ impl Stack {
                 Vec::new()
             }
         }
+    }
+
+    /// A project store holds its own project alone: no global layer, and no entry scoped to another project or to
+    /// a repo or workspace that the store doesn't declare for its project (v2 design §2.1).
+    fn check_store_scopes(&mut self, root: &Path) {
+        let project = self.manifest.project.clone().unwrap_or_default();
+        if fsguard::kind_here(&root.join("global")).is_ok_and(|k| k != fsguard::Kind::Missing) {
+            self.problems.push(
+                Finding::error("foreign-scope", "a project store holds no global layer")
+                    .at(root.join("global"), None),
+            );
+        }
+        let m = &self.manifest;
+        let mine = |s: &Scope| match s {
+            Scope::Global => false,
+            Scope::Project(p) => *p == project,
+            Scope::Repo(r) | Scope::Path { repo: r, .. } => {
+                m.repos.get(r).and_then(|x| x.project.as_deref()) == Some(project.as_str())
+            }
+            Scope::Workspace(w) => {
+                m.workspaces.get(w).and_then(|x| x.project.as_deref()) == Some(project.as_str())
+            }
+        };
+        let foreign: Vec<Finding> = self
+            .entries
+            .iter()
+            .filter(|e| !mine(&e.scope))
+            .map(|e| {
+                Finding::error(
+                    "foreign-scope",
+                    format!("scope {} is not project {project}'s", e.scope),
+                )
+                .at(&e.meta_file, None)
+                .entry(e.id())
+            })
+            .collect();
+        self.problems.extend(foreign);
     }
 
     fn check_public_manifest(&mut self, path: &Path) {
@@ -525,6 +577,7 @@ impl Stack {
                         name: text("name").or(Some(dir_name.clone())),
                         description: text("description"),
                         metadata: None,
+                        delivery: Default::default(),
                     };
                     let files = self.files_of(&dir);
                     self.entries.push(Entry {
@@ -644,8 +697,25 @@ fn read_yaml_file(path: &Path) -> Result<Option<Map<String, Value>>, String> {
     }
 }
 
-fn layer_dirs(root: &Path) -> Result<Vec<(PathBuf, Scope)>, String> {
-    let mut out = vec![(root.join("global"), Scope::Global)];
+/// Which layers a load reads (v2 design §2.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reads {
+    /// Every layer: the v1 tools.
+    All,
+    /// The `global` layer alone: the core, public and private.
+    Global,
+    /// A project store: its project, repo and workspace layers, never a global one.
+    ProjectStore,
+}
+
+fn layer_dirs(root: &Path, reads: Reads) -> Result<Vec<(PathBuf, Scope)>, String> {
+    let mut out = Vec::new();
+    if reads != Reads::ProjectStore {
+        out.push((root.join("global"), Scope::Global));
+    }
+    if reads == Reads::Global {
+        return Ok(out);
+    }
     for p in sorted_children(&root.join("project"))? {
         if p.is_dir() {
             out.push((p.clone(), Scope::Project(file_name(&p))));
@@ -710,6 +780,9 @@ pub fn file_name(p: &Path) -> String {
 pub struct Stacks {
     pub public: Stack,
     pub private: Option<Stack>,
+    /// v2: the one project store selected for a working dir (design §2.1). With it, `public` and `private` hold
+    /// their global layers alone.
+    pub project: Option<Stack>,
 }
 
 impl Stacks {
@@ -733,11 +806,38 @@ impl Stacks {
                 ));
             }
         }
-        Ok(Stacks { public, private })
+        Ok(Stacks { public, private, project: None })
+    }
+
+    /// v2's view for one binding (design §2.1): the core's two global layers and, where the working dir belongs to
+    /// a project, that project's store. Nothing else is opened: no other layer, store, memory dir or checkout.
+    pub fn selected(
+        public: &Path,
+        private: Option<&Path>,
+        store: Option<&Path>,
+    ) -> Result<Stacks, String> {
+        let public = Stack::load_reading(public, Reads::Global)?;
+        if public.visibility() != Visibility::Public {
+            return Err(format!(
+                "{}: the public stack's stack.toml says visibility = private",
+                public.root.display()
+            ));
+        }
+        let private = private.map(|p| Stack::load_reading(p, Reads::Global)).transpose()?;
+        let project = store.map(|s| Stack::load_reading(s, Reads::ProjectStore)).transpose()?;
+        for s in private.iter().chain(project.iter()) {
+            if s.visibility() != Visibility::Private {
+                return Err(format!(
+                    "{}: its stack.toml says visibility = public",
+                    s.root.display()
+                ));
+            }
+        }
+        Ok(Stacks { public, private, project })
     }
 
     pub fn all(&self) -> impl Iterator<Item = &Stack> {
-        std::iter::once(&self.public).chain(self.private.iter())
+        std::iter::once(&self.public).chain(self.private.iter()).chain(self.project.iter())
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &Entry> {
@@ -746,6 +846,15 @@ impl Stacks {
 
     pub fn find(&self, id: &str) -> Option<&Entry> {
         self.entries().find(|e| e.id() == id)
+    }
+
+    /// The stack an entry was loaded from: the project store's own when it holds the entry's file, which declares
+    /// its own topics and roles (v2 design §2.1).
+    pub fn of(&self, e: &Entry) -> Option<&Stack> {
+        self.project
+            .as_ref()
+            .filter(|p| e.meta_file.starts_with(&p.root))
+            .or_else(|| self.stack(e.stack))
     }
 
     pub fn stack(&self, v: Visibility) -> Option<&Stack> {
@@ -758,7 +867,11 @@ impl Stacks {
     /// The project a repo belongs to, from either manifest (private wins).
     pub fn repo_project(&self, repo: &str) -> Option<String> {
         let project = |s: &Stack| s.manifest.repos.get(repo).and_then(|r| r.project.clone());
-        self.private.as_ref().and_then(project).or_else(|| project(&self.public))
+        self.project
+            .as_ref()
+            .and_then(project)
+            .or_else(|| self.private.as_ref().and_then(project))
+            .or_else(|| project(&self.public))
     }
 
     pub fn declares_project(&self, p: &str) -> bool {

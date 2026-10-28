@@ -5,7 +5,7 @@
 
 mod common;
 use common::*;
-use lords_core::Severity;
+use lords_core::{check, Severity};
 
 // Spec (Layers): a narrower layer replaces a broader entry by naming it; that is valid, and `check` lists it.
 #[test]
@@ -269,6 +269,37 @@ fn a_dangling_link_is_an_error() {
     let d = found.iter().find(|x| x.code == "dangling").unwrap();
     // 11 frontmatter lines, then "line", then the link.
     assert_eq!(d.line, Some(13), "the line in the file, frontmatter included");
+}
+
+// Spec (orchestrator, 28 Oct, decided in v2 slice 1a: "scratch evidence comes and goes"): a link to a file outside
+// the entry's own stack names another owner's evidence. Its absence is a warning (`--strict` still fails on it), never
+// an error that blocks every commit; a missing file inside the stack, and a missing entry id, stay errors.
+#[test]
+fn a_missing_file_outside_the_stack_is_a_warning_and_inside_an_error() {
+    let f = Fixture::new();
+    let outside = f.path("scratch/gone.sh").display().to_string().replace('\\', "/");
+    // In the private stack: an absolute path names the user, which the public stack's privacy check refuses.
+    f.write(
+        "priv/global/rules/a.md",
+        &entry(
+            "rule.a",
+            "global",
+            "private",
+            &format!("links: ['{outside}']\n"),
+            "See [log](../../../scratch/gone.log).\n",
+        ),
+    );
+    let found = f.check();
+    assert_eq!(errors(&found), Vec::<&str>::new(), "{found:#?}");
+    let warned: Vec<_> = found.iter().filter(|x| x.code == "evidence-missing").collect();
+    assert_eq!(warned.len(), 2, "the metadata link and the body link: {found:#?}");
+    assert!(warned.iter().all(|w| w.severity == Severity::Warning));
+    assert!(check::has_errors(&found, true), "--strict fails on it");
+    f.write(
+        "priv/global/rules/a.md",
+        &entry("rule.a", "global", "private", "links: [inside-gone.md]\n", "x\n"),
+    );
+    assert_eq!(errors(&f.check()), ["dangling"]);
 }
 
 // Spec (Privacy): the public stack gets every class; the private stack only the secret class.

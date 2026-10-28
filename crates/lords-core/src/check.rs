@@ -237,16 +237,15 @@ fn declared(stacks: &Stacks, out: &mut Vec<Finding>) {
     }
     for e in stacks.entries() {
         // Topics are a controlled list: the entry's own stack declares them (a public entry, the public stack).
+        let own = stacks.of(e).filter(|_| e.stack == Visibility::Private);
         let known = |t: &String| {
             stacks.public.manifest.topics.contains(t)
-                || (e.stack == Visibility::Private
-                    && stacks.private.as_ref().is_some_and(|p| p.manifest.topics.contains(t)))
+                || own.is_some_and(|p| p.manifest.topics.contains(t))
         };
         // Roles likewise.
         let role_known = |r: &String| {
             stacks.public.manifest.roles.contains(r)
-                || (e.stack == Visibility::Private
-                    && stacks.private.as_ref().is_some_and(|p| p.manifest.roles.contains(r)))
+                || own.is_some_and(|p| p.manifest.roles.contains(r))
         };
         for r in e.meta.roles.iter().filter(|r| !role_known(r)) {
             out.push(
@@ -381,11 +380,7 @@ fn links(stacks: &Stacks, out: &mut Vec<Finding>) {
                     Some(_) => {}
                 }
             } else if !l.contains("://") && !dir.join(l).exists() {
-                out.push(
-                    Finding::error("dangling", format!("link `{l}`: no such file"))
-                        .at(&e.meta_file, None)
-                        .entry(e.id()),
-                );
+                out.push(missing_file(stacks, e, &dir.join(l), l).at(&e.meta_file, None));
             }
         }
         for (i, line) in e.body.lines().enumerate() {
@@ -400,14 +395,47 @@ fn links(stacks: &Stacks, out: &mut Vec<Finding>) {
                 let path = target.split('#').next().unwrap_or(target);
                 if !path.is_empty() && !dir.join(path).exists() {
                     out.push(
-                        Finding::error("dangling", format!("link `{target}`: no such file"))
-                            .at(&e.body_file, Some(e.body_line + i))
-                            .entry(e.id()),
+                        missing_file(stacks, e, &dir.join(path), target)
+                            .at(&e.body_file, Some(e.body_line + i)),
                     );
                 }
             }
         }
     }
+}
+
+/// A linked file that isn't there. Inside the entry's own stack it is the stack's defect: an error. Outside, it is
+/// another owner's evidence, which comes and goes (orchestrator, 28 Oct): a warning, which `--strict` still fails on,
+/// never an error that blocks every commit.
+fn missing_file(stacks: &Stacks, e: &Entry, path: &Path, link: &str) -> Finding {
+    let inside = stacks
+        .all()
+        .find(|s| e.meta_file.starts_with(&s.root))
+        .is_some_and(|s| lexical(path).starts_with(lexical(&s.root)));
+    let f = if inside {
+        Finding::error("dangling", format!("link `{link}`: no such file"))
+    } else {
+        Finding::warning(
+            "evidence-missing",
+            format!("link `{link}`: no such file outside the stack"),
+        )
+    };
+    f.entry(e.id())
+}
+
+/// `p` with its `.` and `..` parts folded away, without reading the disk (the file may be gone).
+fn lexical(p: &Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn provenance(stacks: &Stacks, out: &mut Vec<Finding>) {
@@ -554,6 +582,9 @@ pub fn has_errors(findings: &[Finding], strict: bool) -> bool {
         f.severity == Severity::Error
             || (strict
                 && (f.severity == Severity::Candidate
-                    || matches!(f.code, "temporary-expired" | "temporary-review-due")))
+                    || matches!(
+                        f.code,
+                        "temporary-expired" | "temporary-review-due" | "evidence-missing"
+                    )))
     })
 }

@@ -133,7 +133,11 @@
     "links": { "type": "array", "items": { "type": "string" } },
     "name": { "type": "string", "description": "memory files: the agent's own slug (becomes memory.<name>)" },
     "description": { "type": "string", "description": "memory files and skills: the agent-facing one-liner" },
-    "metadata": { "type": "object", "description": "memory files: the agent's own metadata, kept verbatim" }
+    "metadata": { "type": "object", "description": "memory files: the agent's own metadata, kept verbatim" },
+    "delivery": {
+      "enum": ["always", "on-demand"],
+      "description": "v2: `always` puts the text in every matching role's context; `on-demand` (the default) only an index line to fetch it by"
+    }
   },
   "allOf": [
     { "if": { "properties": { "status": { "const": "retired" } } }, "then": { "required": ["retired"] } },

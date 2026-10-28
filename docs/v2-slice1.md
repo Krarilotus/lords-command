@@ -59,6 +59,14 @@ workspace/<name>/<kind>/…  likewise for workspaces
 A store holds no `global/` layer and no entry of another project; `check --store` reports either as an error.
 New memory from `remember` lands in `project/<id>/memory/remembered/<slug>.md` with full frontmatter.
 
+## Inputs reused for 1b and 4
+
+- The fresh-session probes at each real start location (`Harness/scratch/lords-command-eff/delivery-20261027/`:
+  `claude-replica.sh`, `real-starts.sh`, `claude-rules-agents.sh`, `codex-replica.sh`, `claude-lazy3.sh`) and the load
+  rules they measured (`Harness/notes/2026-10-27-lords-delivery-and-plan-time.md`, D1–D4): the 1b delivery matrix.
+- Codex's user-file budget: openai/codex `0d68383`, `core/src/agents_md.rs:68-92, 142-178` (the user file is read
+  whole), and the v1 size guard (`OverLimit`, `b6edcf6`): the 1b Codex staging stays under it.
+
 ## Inputs the tests attack (per invariant)
 
 - **Identity:** a cwd reached through a junction; a linked worktree outside any declared root; a nested unrelated git
@@ -72,5 +80,7 @@ New memory from `remember` lands in `project/<id>/memory/remembered/<slug>.md` w
   `when` with a missing target; malformed and impossible dates (`2026-02-30`); blank reason; already-expired write.
 - **Remember:** concurrent writers on one store; the same title twice; a title that slugs to nothing or to `..`;
   a helper or reviewer role; an unknown cwd; a kind other than memory/fact.
+- **Hook environment:** `brief` run with `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` naming another repo resolves
+  the same binding and reads the same stores (the path `eedabce` covers: `process::git` clears git's repo variables).
 - **Delivery:** a delivery id from another project or another role; an unknown or malformed id; two sessions in one
   cwd with different roles, one calling context; a failed or truncated response; MCP down, CLI fallback.

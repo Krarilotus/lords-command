@@ -395,17 +395,25 @@ fn only_agents(e: &Entry, audience: &[Audience]) -> Option<String> {
     Some(names.join(", "))
 }
 
-pub fn applicable<'a>(stacks: &'a Stacks, ctx: &Context) -> Vec<&'a Entry> {
-    applicable_on(stacks, ctx, &crate::ops::today())
-}
-
-fn applicable_on<'a>(stacks: &'a Stacks, ctx: &Context, as_of: &str) -> Vec<&'a Entry> {
+/// The active entries a context selects, before any temporary entry's end is looked at: v2's API evaluates each
+/// one's lifecycle itself, to label it or leave it out (design §4).
+pub fn candidates<'a>(stacks: &'a Stacks, ctx: &Context) -> Vec<&'a Entry> {
     stacks
         .entries()
         .filter(|e| e.active())
         .filter(|e| !ctx.public_only || e.stack == Visibility::Public)
         .filter(|e| in_layers(e, &ctx.layers) && reaches(e, &ctx.audience))
         .filter(|e| for_role(e, ctx))
+        .collect()
+}
+
+pub fn applicable<'a>(stacks: &'a Stacks, ctx: &Context) -> Vec<&'a Entry> {
+    applicable_on(stacks, ctx, &crate::ops::today())
+}
+
+fn applicable_on<'a>(stacks: &'a Stacks, ctx: &Context, as_of: &str) -> Vec<&'a Entry> {
+    candidates(stacks, ctx)
+        .into_iter()
         // An expired or invalid temporary entry is never composed; a review-due one is, labelled.
         .filter(|e| {
             !matches!(

@@ -10,13 +10,27 @@ use crate::privacy::{self, Hit, Rules};
 use crate::stack::{self, Stack, Stacks, DEFAULTS, SIDECAR};
 use std::path::{Path, PathBuf};
 
-/// Today's date (UTC) as YYYY-MM-DD.
-pub fn today() -> String {
-    let secs = std::time::SystemTime::now()
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = (secs / 86_400) as i64;
+        .unwrap_or(0)
+}
+
+/// Today's date (UTC) as YYYY-MM-DD.
+pub fn today() -> String {
+    date_of((unix_secs() / 86_400) as i64)
+}
+
+/// Now (UTC) as YYYY-MM-DDTHH:MM:SSZ: a journal's time stamps.
+pub fn now() -> String {
+    let secs = unix_secs();
+    let s = secs % 86_400;
+    format!("{}T{:02}:{:02}:{:02}Z", date_of((secs / 86_400) as i64), s / 3600, s / 60 % 60, s % 60)
+}
+
+/// The civil date `days` after 1970-01-01.
+fn date_of(days: i64) -> String {
     // Civil date from days since 1970-01-01 (H. Hinnant's algorithm).
     let z = days + 719_468;
     let era = z.div_euclid(146_097);

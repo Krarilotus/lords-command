@@ -4,7 +4,7 @@
 //! appears only where nothing was, and replacing means moving the old one aside first. Deletes follow nothing.
 //!
 //! The boundary, exactly (Sol review r3, R3-08; r4, R4-06), which tests/fsguard_lint.rs enforces: in the run-time
-//! sources of the library, the CLI and the GUI (`src/` of each crate), only this file reaches `std::fs` (and the
+//! sources of the library, the CLI, the MCP server and the GUI (`src/` of each crate), only this file reaches `std::fs` (and the
 //! platform `std::os` extensions), and only process.rs reaches `std::process`, by any spelling: no path through
 //! them, no grouped or renamed `use` of them, no renamed `std`. Every other source reads and writes through here:
 //! the checked calls for anything sync decides on, and the plain reads below (which follow links, as std does) for
@@ -249,6 +249,38 @@ fn append_line_at(path: &Path, line: &str) -> Result<(), String> {
     writeln!(f, "{line}")
         .and_then(|()| f.sync_all())
         .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// As `append_line_at`, making the file where it isn't yet (a journal's first line).
+fn append_or_create_line_at(path: &Path, line: &str) -> Result<(), String> {
+    check(path)?;
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    writeln!(f, "{line}")
+        .and_then(|()| f.sync_all())
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// An exclusive lock on a lock file that is the tool's alone, held until this is dropped (the OS releases it when
+/// the process ends, so a crash leaves no stale lock).
+#[derive(Debug)]
+pub struct Lock {
+    _file: fs::File,
+}
+
+fn lock_at(path: &Path) -> Result<Lock, String> {
+    check(path)?;
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    f.lock().map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Lock { _file: f })
 }
 
 /// Puts a file at `path`, where nothing may be: written beside it, then linked in (which fails if something
@@ -996,6 +1028,16 @@ pub fn create_file(p: &Contained, bytes: &[u8]) -> Result<(), String> {
 /// Appends one line to a file that is the tool's alone (a backup manifest).
 pub fn append_line(p: &Contained, line: &str) -> Result<(), String> {
     append_line_at(&p.path, line)
+}
+
+/// Appends one line to a file that is the tool's alone, making it where it isn't yet (v2's journal).
+pub fn append_or_create_line(p: &Contained, line: &str) -> Result<(), String> {
+    append_or_create_line_at(&p.path, line)
+}
+
+/// Waits for, then holds, the exclusive lock on the lock file at `p` (made where it isn't yet).
+pub fn lock(p: &Contained) -> Result<Lock, String> {
+    lock_at(&p.path)
 }
 
 /// Puts a file where nothing may be, absent or whole.

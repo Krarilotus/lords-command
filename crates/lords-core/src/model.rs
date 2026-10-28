@@ -319,6 +319,24 @@ pub struct Meta {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// Whether a role's context carries the text (`always`) or only an index line to fetch it by (v2 design §2.1).
+    #[serde(default, skip_serializing_if = "Delivery::is_default")]
+    pub delivery: Delivery,
+}
+
+/// How an entry reaches a session (v2 design §2.1): an old entry is on demand until it is classified.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Delivery {
+    Always,
+    #[default]
+    OnDemand,
+}
+
+impl Delivery {
+    fn is_default(&self) -> bool {
+        *self == Delivery::OnDemand
+    }
 }
 
 /// How narrow a scope is. Narrower layers may change broader ones (design: Layers).
