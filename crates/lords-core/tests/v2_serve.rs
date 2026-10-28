@@ -694,3 +694,59 @@ fn concurrent_registrations_all_survive() {
     want.sort();
     assert_eq!(projects, want);
 }
+
+// Spec: Sol fix check 1, F3 (witness `review_registry_interrupted_save`): "registry publication/recovery must preserve
+// the last acknowledged state across interruption, or refuse with an actionable recovery path instead of silently
+// treating it as first use". A save interrupted after moving the registry aside is never read as an empty registry,
+// and no later change builds on that emptiness.
+#[test]
+fn an_interrupted_registry_save_is_never_read_as_empty() {
+    use lords_core::fsguard::{self, Part, Root};
+    let w = World::new();
+    let root = Root::home(&w.home()).unwrap();
+    let held = fsguard::lock(&root.join(&[Part::new("stores.lock").unwrap()])).unwrap();
+    let aside = fsguard::move_aside(&root.join(&[Part::new("stores.toml").unwrap()])).unwrap();
+    drop(held);
+    let loaded = identity::Registry::load(&w.home());
+    assert!(
+        loaded.as_ref().is_ok_and(|r| r.stores.len() == 2 && r.core.is_some()) || loaded.is_err(),
+        "an interrupted save read as {loaded:?}"
+    );
+    if let Err(e) = &loaded {
+        assert!(
+            e.contains(&aside.path().display().to_string()),
+            "the error names what to restore: {e}"
+        );
+        assert!(
+            identity::set_core(&w.home(), &w.path("core/pub"), None).is_err(),
+            "nothing builds on it"
+        );
+    }
+}
+
+// Spec: as above, every interruption of a save that publishes by a staged copy: a partial staged copy (each prefix
+// of the new registry) beside an intact registry leaves the last acknowledged registry readable, and the next save
+// succeeds over it and keeps every registration.
+#[test]
+fn a_save_interrupted_at_any_byte_keeps_the_last_registry() {
+    let w = World::new();
+    let home = w.home();
+    let before = fs::read(home.join("stores.toml")).unwrap();
+    let next = before
+        .iter()
+        .copied()
+        .chain(b"# a save in progress\n".iter().copied())
+        .collect::<Vec<u8>>();
+    for cut in [0, 1, next.len() / 2, next.len() - 1, next.len()] {
+        let staged = home.join(format!(".stores.toml.lords-new-1-{cut}-0"));
+        fs::write(&staged, &next[..cut]).unwrap();
+        let reg = identity::Registry::load(&home).unwrap();
+        assert_eq!(reg.stores.len(), 2, "cut {cut}");
+        identity::set_core(&home, &w.path("core/pub"), None).unwrap();
+        assert_eq!(
+            identity::Registry::load(&home).unwrap().stores.len(),
+            2,
+            "cut {cut}: the next save keeps both"
+        );
+    }
+}

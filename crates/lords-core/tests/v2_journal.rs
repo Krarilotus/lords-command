@@ -72,3 +72,70 @@ fn interior_corruption_stays_an_error() {
     let start = Start { cwd: d.path().join("cwd"), role: "coder".into(), ..Start::default() };
     assert!(serve::brief(&home, &start).is_err(), "no usable brief is claimed");
 }
+
+// Spec: Sol fix check 1, F4b (witness `review_invalid_utf8_completed_middle_line`): "preserve strict decoding of
+// completed records; any tolerance for a cut final record must be confined to that record".
+#[test]
+fn invalid_utf8_in_a_completed_record_is_an_error() {
+    let d = world();
+    let home = d.path().join("registry");
+    fs::write(
+        home.join("journal.jsonl"),
+        b"{\"event\":\"old\"}\n{\"event\":\"\xff\"}\n{\"event\":\"new\"}\n",
+    )
+    .unwrap();
+    assert!(journal::read(&home).is_err());
+}
+
+// Spec: F4a "make recovery itself recoverable/idempotent at every interrupted publication prefix while preserving
+// completed events": an append cut after any byte of its line, followed by two appends, leaves every completed event
+// and the two new ones readable, the cut recorded once.
+#[test]
+fn an_append_cut_at_any_byte_is_recovered() {
+    let line =
+        b"{\"v\":1,\"at\":\"2026-10-28T00:00:00Z\",\"event\":\"cut\",\"pad\":\"\xc3\xa9\"}\n";
+    for cut in 1..line.len() {
+        let d = world();
+        let home = d.path().join("registry");
+        brief(&d);
+        let mut f = fs::OpenOptions::new().append(true).open(home.join("journal.jsonl")).unwrap();
+        f.write_all(&line[..cut]).unwrap();
+        drop(f);
+        journal::append(&home, "first", serde_json::json!({})).unwrap();
+        journal::append(&home, "second", serde_json::json!({})).unwrap();
+        let events = journal::read(&home).unwrap_or_else(|e| panic!("cut {cut}: {e}"));
+        let kinds: Vec<&str> = events.iter().map(|e| e["event"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["brief", "journal_gap", "first", "second"], "cut {cut}");
+    }
+}
+
+// Spec: F4 "serialize reads/recovery with appends" (the review's controlled witness `review_journal_reader_lock_witness`):
+// a reader that starts while a writer holds the journal's lock waits for it and sees the completed write.
+#[test]
+fn a_reader_waits_for_a_writer_holding_the_lock() {
+    use lords_core::fsguard::{self, Part, Root};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let d = world();
+    let home = d.path().join("registry");
+    brief(&d);
+    let done = fs::read(home.join("journal.jsonl")).unwrap();
+    let root = Root::home(&home).unwrap();
+    let held = fsguard::lock(&root.join(&[Part::new("journal.lock").unwrap()])).unwrap();
+    let mut partial = done.clone();
+    partial.extend_from_slice(b"{\"v\":1,\"event\":\"ne");
+    fs::write(home.join("journal.jsonl"), &partial).unwrap();
+    std::thread::scope(|s| {
+        let (tx, rx) = mpsc::channel();
+        let h = &home;
+        s.spawn(move || tx.send(journal::read(h)).unwrap());
+        let early = rx.recv_timeout(Duration::from_millis(300));
+        let mut whole = done.clone();
+        whole.extend_from_slice(b"{\"v\":1,\"event\":\"new\"}\n");
+        fs::write(home.join("journal.jsonl"), &whole).unwrap();
+        drop(held);
+        assert!(early.is_err(), "the reader returned while the writer held the lock: {early:?}");
+        let events = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        assert_eq!(events.last().unwrap()["event"], "new");
+    });
+}
