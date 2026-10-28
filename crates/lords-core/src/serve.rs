@@ -407,7 +407,7 @@ pub fn context(
     })
 }
 
-/// Entries of the delivery's binding that match `query` (in id, title, topics or text, any case) or are named in
+/// Entries of the delivery's binding, its role included as in `context`, that match `query` (in id, title, topics or text, any case) or are named in
 /// `ids`, with their text. Expired and invalid entries only with `include_expired`; retired ones never.
 pub fn search(
     home: &Path,
@@ -431,7 +431,7 @@ pub fn search(
                     || e.meta.topics.iter().any(|t| t.to_lowercase() == q)
                     || e.body.to_lowercase().contains(&q)))
     };
-    Ok(applicable(&v, &d.audience, None, as_of, include_expired)
+    Ok(applicable(&v, &d.audience, Some(vec![d.role.clone()]), as_of, include_expired)
         .into_iter()
         .filter(|(e, _)| hit(e))
         .map(|(e, l)| item(e, label(e, &l, &v.stacks, as_of), true))
