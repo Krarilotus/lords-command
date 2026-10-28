@@ -441,3 +441,84 @@ fn migrate_copies_one_project_with_its_manifest_and_leaves_the_source() {
     assert_eq!(record["ids"], serde_json::json!(["fact.b", "fact.c", "rule.a"]));
     assert!(migrate::migrate(&old, "alpha", &to).is_err(), "never over an existing store");
 }
+
+/// Every id a context returns, duties and index together.
+fn all_ids(c: &serve::Context) -> Vec<String> {
+    ids(&c.duties).into_iter().chain(ids(&c.index)).collect()
+}
+
+// Spec: design §2.1 "load the two core layers and the selected project's declared layers": a path entry of the bound
+// repo reaches a session working under that path, and only there (sol-loop r1, S1).
+#[test]
+fn a_path_entry_reaches_sessions_under_its_path() {
+    let w = World::new();
+    fs::create_dir_all(w.path("alpha-app/src/deep")).unwrap();
+    w.write(
+        "stores/alpha/repo/alpha-app/rules/src-rule.md",
+        &entry(
+            "rule.src-rule",
+            "path:alpha-app:src",
+            "private",
+            "roles: [coder]\n",
+            "Under src.\n",
+        ),
+    );
+    let deep = w.brief("alpha-app/src/deep", "coder");
+    let c = serve::context(&w.home(), &deep, "coder", None, "2026-10-28").unwrap();
+    assert!(ids(&c.duties).contains(&"rule.src-rule".to_string()), "{:?}", all_ids(&c));
+    let found = serve::search(&w.home(), &deep, "", &["rule.src-rule".into()], false, "2026-10-28");
+    assert_eq!(ids(&found.unwrap()), ["rule.src-rule"]);
+    let top = w.brief("alpha-app", "coder");
+    let c = serve::context(&w.home(), &top, "coder", None, "2026-10-28").unwrap();
+    assert!(!all_ids(&c).contains(&"rule.src-rule".to_string()), "not above its path");
+}
+
+// Spec: design §2.1 "reuse entry ids, provenance, roles, scopes, overrides and extensions": an entry another applicable
+// entry overrides is left out, as the composer leaves it out (sol-loop r1, S2).
+#[test]
+fn an_overridden_entry_is_left_out() {
+    let w = World::new();
+    w.write(
+        "stores/alpha/project/alpha/rules/replaces.md",
+        &entry(
+            "rule.alpha-replaces",
+            "project:alpha",
+            "private",
+            "overrides: [rule.core-rule]\n",
+            "The project's own version.\n",
+        ),
+    );
+    let id = w.brief("alpha-app", "coder");
+    let c = serve::context(&w.home(), &id, "coder", None, "2026-10-28").unwrap();
+    let all = all_ids(&c);
+    assert!(
+        all.contains(&"rule.alpha-replaces".to_string())
+            && !all.contains(&"rule.core-rule".to_string()),
+        "{all:?}"
+    );
+    assert!(serve::search(&w.home(), &id, "core rule text", &[], false, "2026-10-28")
+        .unwrap()
+        .is_empty());
+    // Elsewhere the core rule still holds.
+    fs::create_dir_all(w.path("elsewhere")).unwrap();
+    let out = w.brief("elsewhere", "coder");
+    let c = serve::context(&w.home(), &out, "coder", None, "2026-10-28").unwrap();
+    assert!(all_ids(&c).contains(&"rule.core-rule".to_string()));
+}
+
+// Spec: design §2.1 "Missing selected store is a visible error with core-only fallback" (sol-loop r1, S3): the brief
+// still binds the session to the core, says why, and nothing can be written.
+#[test]
+fn a_missing_store_falls_back_to_the_core_visibly() {
+    let w = World::new();
+    fs::rename(w.path("stores/alpha"), w.path("stores/alpha-moved")).unwrap();
+    let b = serve::brief(&w.home(), &w.start(&w.path("alpha-app"), "coder")).unwrap();
+    assert_eq!(b.project, None);
+    assert!(b.text.contains("alpha") && b.text.contains("core only"), "{}", b.text);
+    let c = serve::context(&w.home(), &b.delivery_id, "coder", None, "2026-10-28").unwrap();
+    let mut all = all_ids(&c);
+    all.sort();
+    assert_eq!(all, ["fact.core-fact", "rule.core-rule"]);
+    let note = Note { text: "x".into(), ..Note::default() };
+    assert!(serve::remember(&w.home(), &b.delivery_id, &note, "2026-10-28").is_err());
+}
