@@ -112,10 +112,12 @@ fn a_status_reaching_its_end_state_ends_a_temporary_entry() {
     assert!(!user_level(&f).contains("Two helpers per lead."));
 }
 
-// Spec (above: "Every temporary entry needs an end condition and a review date"): a review date that passes
-// unrenewed ends the entry, even before its end condition.
+// Spec (design v2 §4, `review_by`: "`as_of > review_by` means review due, not expiry. Include a visible 'review
+// due since DATE' label in context … until an actual end condition occurs"; it "deliberately replaces today's
+// auto-expiry after review date"): a passed review date is reported as due, never as expired, and the entry is
+// still composed, labelled.
 #[test]
-fn an_unrenewed_review_date_ends_a_temporary_entry() {
+fn a_passed_review_date_makes_an_entry_review_due_and_keeps_it_composed() {
     let f = Fixture::new();
     f.write(
         "pub/global/rules/r.md",
@@ -127,26 +129,36 @@ fn an_unrenewed_review_date_ends_a_temporary_entry() {
             "Review me.\n",
         ),
     );
-    assert!(has(&f.check(), "temporary-expired", "rule.r"));
-    assert!(!user_level(&f).contains("Review me."));
+    let found = f.check();
+    assert!(has(&found, "temporary-review-due", "rule.r"), "{found:#?}");
+    assert!(!has(&found, "temporary-expired", "rule.r"), "{found:#?}");
+    let text = user_level(&f);
+    assert!(
+        text.contains(&format!("(temporary, until {FUTURE}; review due since {PAST})\nReview me.")),
+        "{text}"
+    );
 }
 
-// Spec (schema): a temporary block needs an end condition (until or when), a review date and a reason; `state` is
-// for status entries only.
+// Spec (design v2 §4: "at least one valid calendar date (`until` or `review_by`)"; "A review-only temporary entry
+// is allowed"; schema): a temporary block needs a reason and a date, a review date alone is enough; `state` is for
+// status entries only.
 #[test]
-fn the_schema_demands_an_end_and_keeps_state_on_status_entries() {
+fn the_schema_demands_a_date_and_keeps_state_on_status_entries() {
     let f = Fixture::new();
     f.write(
         "pub/global/rules/a.md",
-        &entry(
-            "rule.a",
-            "global",
-            "public",
-            &format!("temporary:\n  review_by: {FUTURE}\n  reason: r\n"),
-            "x\n",
-        ),
+        &entry("rule.a", "global", "public", "temporary:\n  reason: r\n", "x\n"),
     );
-    assert!(errors(&f.check()).contains(&"schema"), "no end condition");
+    assert!(errors(&f.check()).contains(&"schema"), "no date");
+    let when_only = "temporary:\n  when:\n    status: status.s\n    state: done\n  reason: r\n";
+    f.write("pub/global/rules/a.md", &entry("rule.a", "global", "public", when_only, "x\n"));
+    assert!(errors(&f.check()).contains(&"schema"), "a when without a review date");
+    f.write(
+        "pub/global/rules/a.md",
+        &entry("rule.a", "global", "public", &temp(&format!("  review_by: {FUTURE}\n")), "x\n"),
+    );
+    assert_eq!(errors(&f.check()), Vec::<&str>::new(), "review-only is allowed");
+    assert!(user_level(&f).contains(&format!("(temporary, review by {FUTURE})\nx")));
     f.write("pub/global/rules/a.md", &entry("rule.a", "global", "public", "state: done\n", "x\n"));
     assert!(errors(&f.check()).contains(&"schema"), "state on a rule");
 }
@@ -229,4 +241,184 @@ fn sync_retires_an_expired_entry_and_no_file_carries_it() {
         written.iter().all(|t| !t.contains("Text of rule.gone")),
         "no file carries an expired entry"
     );
+}
+
+/// The temporary-entry findings `check` reports for the stacks on the day `as_of`.
+fn on(f: &Fixture, as_of: &str) -> Vec<lords_core::Finding> {
+    let mut out = Vec::new();
+    lords_core::check::temporaries(&f.stacks(), as_of, &mut out);
+    out
+}
+
+fn codes_on(f: &Fixture, as_of: &str) -> Vec<&'static str> {
+    on(f, as_of).iter().map(|x| x.code).collect()
+}
+
+fn rule(f: &Fixture, block: &str) {
+    f.write("pub/global/rules/t.md", &entry("rule.t", "global", "public", block, "Trial text.\n"));
+}
+
+// Spec (design v2 §4, its example: "`until=2026-10-30`, `review_by=2026-10-28` … On 29 Oct UTC, it is returned
+// review due; at 00:00 UTC on 30 Oct, it is excluded"; Check: "Report due and expired entries separately; `--strict`
+// treats them as action-required"): due on the 29th only, expired from the 30th, each failing only --strict.
+#[test]
+fn the_design_example_is_due_on_the_29th_and_expired_on_the_30th() {
+    let f = Fixture::new();
+    rule(&f, &temp("  until: 2026-10-30\n  review_by: 2026-10-28\n"));
+    assert_eq!(codes_on(&f, "2026-10-28"), Vec::<&str>::new());
+    let due = on(&f, "2026-10-29");
+    assert_eq!(due.iter().map(|x| x.code).collect::<Vec<_>>(), ["temporary-review-due"]);
+    assert_eq!(due[0].severity, Severity::Warning);
+    assert!(
+        due[0].message.contains("2026-10-28"),
+        "the due finding names the review date: {}",
+        due[0].message
+    );
+    assert!(
+        !lords_core::check::has_errors(&due, false) && lords_core::check::has_errors(&due, true)
+    );
+    let gone = on(&f, "2026-10-30");
+    assert_eq!(gone.iter().map(|x| x.code).collect::<Vec<_>>(), ["temporary-expired"]);
+    assert!(
+        !lords_core::check::has_errors(&gone, false) && lords_core::check::has_errors(&gone, true)
+    );
+}
+
+// Spec (design v2 §4, `until`: "Exclusive UTC calendar boundary: `as_of >= until` means expired"): the day before
+// holds, the day itself has ended.
+#[test]
+fn until_holds_the_day_before_and_ends_on_the_day() {
+    let f = Fixture::new();
+    rule(&f, &temp(&format!("  until: 2026-03-01\n  review_by: {FUTURE}\n")));
+    assert_eq!(codes_on(&f, "2026-02-28"), Vec::<&str>::new());
+    assert_eq!(codes_on(&f, "2026-03-01"), ["temporary-expired"]);
+}
+
+// Spec (design v2 §4, `review_by`: "`as_of > review_by` means review due, not expiry"): on the review date nothing
+// is due; the day after it is due and still not expired.
+#[test]
+fn review_by_is_due_only_the_day_after() {
+    let f = Fixture::new();
+    rule(&f, &temp(&format!("  until: {FUTURE}\n  review_by: 2026-12-31\n")));
+    assert_eq!(codes_on(&f, "2026-12-31"), Vec::<&str>::new());
+    assert_eq!(codes_on(&f, "2027-01-01"), ["temporary-review-due"]);
+}
+
+// Spec (design v2 §4: "A review-only temporary entry is allowed"; it is "review due" after its date "until an
+// actual end condition occurs"): with no end condition it never expires, however late.
+#[test]
+fn a_review_only_entry_becomes_due_and_never_expires() {
+    let f = Fixture::new();
+    rule(&f, &temp("  review_by: 2026-10-28\n"));
+    assert_eq!(errors(&f.check()), Vec::<&str>::new(), "{:#?}", f.check());
+    assert_eq!(codes_on(&f, "2026-10-28"), Vec::<&str>::new());
+    assert_eq!(codes_on(&f, "2026-10-29"), ["temporary-review-due"]);
+    assert_eq!(codes_on(&f, "2999-01-01"), ["temporary-review-due"]);
+}
+
+// Spec (design v2 §4, `when`: "An unreadable/dangling target is invalid and a check error, not silent indefinite
+// validity"; Check: "Reject … invalid end conditions"): a `when` watching no entry, or an entry that is no status,
+// is an error, and the entry is not composed.
+#[test]
+fn a_when_with_a_missing_target_is_an_invalid_entry() {
+    let f = Fixture::new();
+    for target in ["status.nowhere", "rule.other"] {
+        f.write(
+            "pub/global/rules/other.md",
+            &entry("rule.other", "global", "public", "", "Other.\n"),
+        );
+        rule(
+            &f,
+            &temp(&format!(
+                "  when:\n    status: {target}\n    state: done\n  review_by: {FUTURE}\n"
+            )),
+        );
+        let found = on(&f, "2026-10-28");
+        assert_eq!(
+            found.iter().map(|x| x.code).collect::<Vec<_>>(),
+            ["temporary-invalid"],
+            "{target}"
+        );
+        assert_eq!(found[0].severity, Severity::Error);
+        assert!(!user_level(&f).contains("Trial text."), "{target}");
+    }
+}
+
+// Spec (design v2 §4: "reject malformed/impossible dates"; Check: "Reject missing reason/date"): an impossible
+// calendar date in either field, or a blank reason, is an error and the entry is not composed; a real leap day is
+// fine.
+#[test]
+fn impossible_dates_and_a_blank_reason_are_invalid() {
+    let f = Fixture::new();
+    for block in [
+        format!("temporary:\n  until: 2026-02-30\n  review_by: {FUTURE}\n  reason: r\n"),
+        format!("temporary:\n  until: {FUTURE}\n  review_by: 2025-02-29\n  reason: r\n"),
+        "temporary:\n  review_by: 2026-13-01\n  reason: r\n".to_string(),
+        "temporary:\n  review_by: 2026-04-31\n  reason: r\n".to_string(),
+        format!("temporary:\n  until: {FUTURE}\n  review_by: {FUTURE}\n  reason: \"  \"\n"),
+    ] {
+        rule(&f, &block);
+        let found = on(&f, "2026-01-01");
+        assert_eq!(
+            found.iter().map(|x| x.code).collect::<Vec<_>>(),
+            ["temporary-invalid"],
+            "{block}"
+        );
+        assert!(lords_core::check::has_errors(&found, false), "{block}");
+        assert!(!user_level(&f).contains("Trial text."), "{block}");
+    }
+    rule(&f, &temp(&format!("  until: 2028-02-29\n  review_by: {FUTURE}\n")));
+    assert_eq!(codes_on(&f, "2026-01-01"), Vec::<&str>::new());
+    assert!(user_level(&f).contains("Trial text."));
+}
+
+// Spec (design v2 §4: "Sync retires only Expired" via the lifecycle; Check: "Do not auto-retire or auto-commit during
+// a read/check"): sync plans no retirement for a review-due or an invalid entry, and neither check nor composing
+// changes an expired entry's file.
+#[test]
+fn only_expired_entries_are_retired_and_reads_change_nothing() {
+    let f = Fixture::new();
+    f.write(
+        "priv/global/rules/due.md",
+        &entry(
+            "rule.due",
+            "global",
+            "private",
+            &temp(&format!("  until: {FUTURE}\n  review_by: {PAST}\n")),
+            "Due.\n",
+        ),
+    );
+    f.write(
+        "priv/global/rules/bad.md",
+        &entry(
+            "rule.bad",
+            "global",
+            "private",
+            &format!("temporary:\n  until: {PAST}\n  review_by: {FUTURE}\n  reason: \"\t\"\n"),
+            "Bad.\n",
+        ),
+    );
+    let gone = f.write(
+        "priv/global/rules/gone.md",
+        &entry(
+            "rule.gone",
+            "global",
+            "private",
+            &temp(&format!("  until: {PAST}\n  review_by: {FUTURE}\n")),
+            "Gone.\n",
+        ),
+    );
+    f.git_init("priv");
+    let before = std::fs::read(&gone).unwrap();
+    let _ = f.check();
+    let _ = user_level(&f);
+    assert_eq!(std::fs::read(&gone).unwrap(), before, "a read never retires");
+    let p = lords_core::sync::plan(&f.stacks(), &f.opts()).unwrap();
+    let listed: Vec<&str> = p
+        .items
+        .iter()
+        .filter(|i| i.action == lords_core::sync::Action::RetireEntry)
+        .map(|i| i.target.as_str())
+        .collect();
+    assert_eq!(listed, ["rule.gone (temporary entry)"]);
 }
