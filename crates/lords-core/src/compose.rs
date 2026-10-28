@@ -1,7 +1,7 @@
 //! Composition (design: Layers): which entries apply to some agents in one place, in what order, and where
 //! each output line comes from. Harness-neutral: adapters (adapters.rs) decide where the text goes.
 
-use crate::model::{Audience, Entry, Kind, Scope, Visibility};
+use crate::model::{Audience, Entry, Kind, Lifecycle, Scope, Visibility};
 use crate::stack::Stacks;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -396,15 +396,23 @@ fn only_agents(e: &Entry, audience: &[Audience]) -> Option<String> {
 }
 
 pub fn applicable<'a>(stacks: &'a Stacks, ctx: &Context) -> Vec<&'a Entry> {
-    let today = crate::ops::today();
+    applicable_on(stacks, ctx, &crate::ops::today())
+}
+
+fn applicable_on<'a>(stacks: &'a Stacks, ctx: &Context, as_of: &str) -> Vec<&'a Entry> {
     stacks
         .entries()
         .filter(|e| e.active())
         .filter(|e| !ctx.public_only || e.stack == Visibility::Public)
         .filter(|e| in_layers(e, &ctx.layers) && reaches(e, &ctx.audience))
         .filter(|e| for_role(e, ctx))
-        // An ended temporary entry is never composed (it is retired at the next sync).
-        .filter(|e| crate::temporary::ended(e, stacks, &today).is_none())
+        // An expired or invalid temporary entry is never composed; a review-due one is, labelled.
+        .filter(|e| {
+            !matches!(
+                crate::temporary::lifecycle(e, stacks, as_of),
+                Lifecycle::Expired { .. } | Lifecycle::Invalid { .. }
+            )
+        })
         .collect()
 }
 
@@ -429,7 +437,9 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         .collect();
     development.sort();
     development.dedup();
-    let all = applicable(stacks, ctx);
+    // One day for the whole composition: what it includes and how it labels it.
+    let today = crate::ops::today();
+    let all = applicable_on(stacks, ctx, &today);
     let overridden: BTreeSet<&str> =
         all.iter().flat_map(|e| e.meta.overrides.iter().map(String::as_str)).collect();
     let live: Vec<&Entry> = all.into_iter().filter(|e| !overridden.contains(e.id())).collect();
@@ -469,7 +479,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
     }
     let push_entry = |e: &Entry, lines: &mut Vec<String>, out: &mut Composed| {
         let who = only_for(e, ctx, &development);
-        let temp = crate::temporary::label(e, stacks);
+        let temp = crate::temporary::label(e, stacks, &today);
         // In a file every role reads under a byte limit, an entry for only some roles is a reference; the role
         // files of the roles it binds carry its text.
         let inline_here =
@@ -541,7 +551,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
                     .collect();
                 ext.sort_by_key(|x| x.id().to_string());
                 for x in std::iter::once(e).chain(ext) {
-                    let temp = crate::temporary::label(x, stacks)
+                    let temp = crate::temporary::label(x, stacks, &today)
                         .map(|t| format!(" ({t})"))
                         .unwrap_or_default();
                     items.push((x, format!("{}{temp}", x.meta.title), None));

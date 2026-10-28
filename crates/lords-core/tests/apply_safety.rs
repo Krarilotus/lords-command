@@ -484,8 +484,10 @@ fn until_date_is_an_end_boundary() {
     );
     let s = f.stacks();
     let e = s.find("rule.t").unwrap();
-    assert!(lords_core::temporary::ended(e, &s, "2026-10-25").is_some());
-    assert!(lords_core::temporary::ended(e, &s, "2026-10-24").is_none());
+    use lords_core::model::Lifecycle;
+    let on = |day: &str| lords_core::temporary::lifecycle(e, &s, day);
+    assert!(matches!(on("2026-10-25"), Lifecycle::Expired { .. }));
+    assert_eq!(on("2026-10-24"), Lifecycle::Active);
 }
 
 // Spec (finding 8's rollback, for what apply changes in owner files; design: Ownership boundary): `restore` puts a

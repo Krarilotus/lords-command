@@ -721,11 +721,11 @@ fn stack_repos(env: &Env) -> (PathBuf, PathBuf) {
     (public, private)
 }
 
-/// A temporary rule, with or without the review date its schema requires.
-fn temporary_rule(review_by: bool) -> String {
+/// A temporary rule, with or without the date its schema requires.
+fn temporary_rule(dated: bool) -> String {
     format!(
-        "---\nid: rule.t\nkind: rule\ntitle: T\naudience: [all]\nscope: global\nstatus: active\nvisibility: private\ntemporary:\n  until: 2099-01-01\n{}  reason: a test\norigin:\n  type: own\n---\nA rule for a while.\n",
-        if review_by { "  review_by: 2099-01-01\n" } else { "" }
+        "---\nid: rule.t\nkind: rule\ntitle: T\naudience: [all]\nscope: global\nstatus: active\nvisibility: private\ntemporary:\n{}  reason: a test\norigin:\n  type: own\n---\nA rule for a while.\n",
+        if dated { "  until: 2099-01-01\n  review_by: 2099-01-01\n" } else { "" }
     )
 }
 

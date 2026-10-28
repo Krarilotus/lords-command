@@ -437,34 +437,28 @@ fn provenance(stacks: &Stacks, out: &mut Vec<Finding>) {
     }
 }
 
-/// Temporary entries: each `when` watches a real status entry, and one that has ended is reported (sync retires
-/// it). The warning fails under `--strict` like any finding the owner must act on.
-pub fn temporaries(stacks: &Stacks, today: &str, out: &mut Vec<Finding>) {
-    for e in stacks.entries().filter(|e| e.active()) {
-        let Some(t) = &e.meta.temporary else { continue };
-        if let Some(w) = &t.when {
-            match stacks.find(&w.status) {
-                Some(s) if s.meta.kind == crate::model::Kind::Status => {}
-                _ => out.push(
-                    Finding::error(
-                        "dangling",
-                        format!("temporary.when watches `{}`, which is no status entry", w.status),
-                    )
-                    .at(&e.meta_file, None)
-                    .entry(e.id()),
-                ),
-            }
-        }
-        if let Some(why) = crate::temporary::ended(e, stacks, today) {
-            out.push(
-                Finding::warning(
-                    "temporary-expired",
-                    format!("ended ({why}); it is no longer composed, and sync --apply retires it"),
-                )
-                .at(&e.meta_file, None)
-                .entry(e.id()),
-            );
-        }
+/// Temporary entries, as their lifecycle stands on `as_of`: an invalid one is an error; a review-due and an expired
+/// one are separate warnings (sync retires only the expired), each failing under `--strict` like any finding the
+/// owner must act on. Nothing is retired here.
+pub fn temporaries(stacks: &Stacks, as_of: &str, out: &mut Vec<Finding>) {
+    use crate::model::Lifecycle;
+    for e in stacks.entries() {
+        let f = match crate::temporary::lifecycle(e, stacks, as_of) {
+            Lifecycle::Active | Lifecycle::Retired => continue,
+            Lifecycle::Invalid { why } => Finding::error(
+                "temporary-invalid",
+                format!("its end can't be evaluated: {why}; it is not composed"),
+            ),
+            Lifecycle::ReviewDue { since } => Finding::warning(
+                "temporary-review-due",
+                format!("review due since {since}: renew its review date, or end or retire it"),
+            ),
+            Lifecycle::Expired { why } => Finding::warning(
+                "temporary-expired",
+                format!("ended ({why}); it is no longer composed, and sync --apply retires it"),
+            ),
+        };
+        out.push(f.at(&e.meta_file, None).entry(e.id()));
     }
 }
 
@@ -558,6 +552,8 @@ pub fn public_tree(repo: &Path, rules: &Rules) -> Result<(Scan, Vec<Finding>), S
 pub fn has_errors(findings: &[Finding], strict: bool) -> bool {
     findings.iter().any(|f| {
         f.severity == Severity::Error
-            || (strict && (f.severity == Severity::Candidate || f.code == "temporary-expired"))
+            || (strict
+                && (f.severity == Severity::Candidate
+                    || matches!(f.code, "temporary-expired" | "temporary-review-due")))
     })
 }

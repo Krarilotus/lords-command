@@ -1835,7 +1835,8 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
             Err(e) => pl.plan.notes.push(format!("memory stores: {e}")),
         }
     }
-    // Ended temporary entries: never composed; listed here, retired by import_and_apply.
+    // Expired temporary entries (their lifecycle; a review-due or invalid one stays): never composed; listed here,
+    // retired by import_and_apply.
     for (e, why) in crate::temporary::expired(stacks, &crate::ops::today()) {
         let mut item = Item::new(
             &format!("{} (temporary entry)", e.id()),
@@ -2790,7 +2791,7 @@ pub fn import_and_apply(
                 }
             }
         }
-        // Ended temporary entries leave the stacks' context for good: retired, with a commit each.
+        // Expired temporary entries leave the stacks' context for good: retired, with a commit each.
         let stacks = Stacks::load(public, private)?;
         for (id, commit) in crate::ops::retire_expired(&stacks, &crate::ops::today(), true)? {
             done.push(format!(
