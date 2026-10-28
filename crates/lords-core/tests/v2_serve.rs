@@ -522,3 +522,29 @@ fn a_missing_store_falls_back_to_the_core_visibly() {
     let note = Note { text: "x".into(), ..Note::default() };
     assert!(serve::remember(&w.home(), &b.delivery_id, &note, "2026-10-28").is_err());
 }
+
+// Spec: design §2.1, search is "scoped to the same binding" as context, role included (sol-loop r2, S4): an override
+// meant for another role hides nothing from this delivery, so search returns what its context lists.
+#[test]
+fn search_and_context_agree_for_the_deliverys_role() {
+    let w = World::new();
+    w.write(
+        "stores/alpha/project/alpha/rules/reviewer-version.md",
+        &entry(
+            "rule.reviewer-version",
+            "project:alpha",
+            "private",
+            "roles: [reviewer]\noverrides: [rule.core-rule]\n",
+            "For reviewers instead.\n",
+        ),
+    );
+    let id = w.brief("alpha-app", "coder");
+    let c = serve::context(&w.home(), &id, "coder", None, "2026-10-28").unwrap();
+    assert!(all_ids(&c).contains(&"rule.core-rule".to_string()), "{:?}", all_ids(&c));
+    let found =
+        serve::search(&w.home(), &id, "", &["rule.core-rule".into()], false, "2026-10-28").unwrap();
+    assert_eq!(ids(&found), ["rule.core-rule"]);
+    let reviewer =
+        serve::search(&w.home(), &id, "", &["rule.reviewer-version".into()], false, "2026-10-28");
+    assert!(reviewer.unwrap().is_empty(), "another role's entry is not this delivery's");
+}
