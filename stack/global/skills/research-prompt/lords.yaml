@@ -1,0 +1,11 @@
+id: skill.research-prompt
+kind: skill
+title: "Research prompt: a self-standing, open deep-research prompt when broader knowledge is needed"
+audience: [all]
+roles: [orchestrator, coder, helper, reviewer]
+scope: global
+status: active
+visibility: public
+origin:
+  type: own
+topics: [research, process]
