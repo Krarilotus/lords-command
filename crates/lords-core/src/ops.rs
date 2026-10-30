@@ -247,6 +247,9 @@ pub struct Imported {
     /// In the stack but no longer in the agent's dir: kept, reported.
     pub absent_in_source: Vec<String>,
     pub commit: Option<String>,
+    /// Whether the import wrote anything into the stack (a memory file, or the store's defaults file): `sync --apply`
+    /// plans again when it did.
+    pub wrote: bool,
 }
 
 /// Whether the stack's copy still holds exactly what the agent wrote: the same body, and the same frontmatter once

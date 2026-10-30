@@ -127,6 +127,20 @@ fn import_gives_memory_history() {
     );
 }
 
+// Spec (sol-loop sync-perf r1, S1, witness: an empty memory source whose stack dir has no defaults file yet; import
+// wrote the defaults file but reported nothing, so `sync --apply` kept its first plan): import reports every write to
+// the stack, the defaults file included, and nothing when it writes nothing.
+#[test]
+fn import_reports_writing_the_defaults_file() {
+    let (f, _src) = store_fixture();
+    let load = || Stack::load(&f.priv_root()).unwrap();
+    let r = &import(&load(), None, true).unwrap()[0];
+    assert!(f.path("priv/global/memory/agent/lords.defaults.yaml").exists());
+    assert!(r.wrote, "{r:?}");
+    let r = &import(&load(), None, true).unwrap()[0];
+    assert!(!r.wrote, "{r:?}");
+}
+
 // Spec (Import and memory, retire): a retired memory stays retired when the agent later edits its copy.
 #[test]
 fn import_keeps_a_retirement_when_the_agent_edits_the_file() {

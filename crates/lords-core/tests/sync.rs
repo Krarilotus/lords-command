@@ -279,6 +279,57 @@ fn skills_install_as_copies_the_ledger_owns() {
     assert!(f.path("pub/global/skills/old/SKILL.md").exists(), "the stack keeps the skill");
 }
 
+// Spec (sol-loop sync-perf r1, S2, witness: a checkout tracking `claude.local.md`, its working copy deleted; the batched
+// tracked-file check compared names case-sensitively and planned a Create of `CLAUDE.local.md`, the same file on
+// Windows): a tracked file whose name differs only in case is the destination there, a conflict, never written.
+#[cfg(windows)]
+#[test]
+fn a_tracked_file_in_another_case_is_never_written_over() {
+    let f = Fixture::new();
+    f.write(
+        "priv/repo/beta-core/facts/h.md",
+        &entry(
+            "fact.h",
+            "repo:beta-core",
+            "private",
+            "",
+            "Hosts.
+",
+        ),
+    );
+    let main = f.path("checkout");
+    f.write(
+        "checkout/claude.local.md",
+        "Tracked.
+",
+    );
+    f.git_init("checkout");
+    std::fs::remove_file(main.join("claude.local.md")).unwrap();
+    let manifest = format!(
+        "name = \"priv\"
+visibility = \"private\"
+[projects.beta]
+[repos.beta-core]
+project = \"beta\"
+checkouts = ['{}']
+",
+        main.display()
+    );
+    f.write("priv/stack.toml", &manifest);
+    let opts = Options { repo: Some("beta-core".into()), ..f.opts() };
+    let p = plan(&f.stacks(), &opts).unwrap();
+    let item = p
+        .items
+        .iter()
+        .find(|i| {
+            i.path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("claude.local.md"))
+        })
+        .unwrap();
+    assert_eq!(item.action, Action::Conflict, "{item:?}");
+}
+
 // Spec (Sync, repo targets; docs/load-order.md): every checkout and worktree gets the untracked file each family
 // reads (CLAUDE.local.md, AGENTS.override.md), listed once in the shared git exclude; a tracked file of that name
 // is a conflict and nothing is applied; the tracked AGENTS.md is only reported, never written.
