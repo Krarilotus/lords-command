@@ -234,6 +234,15 @@ fn declared(stacks: &Stacks, out: &mut Vec<Finding>) {
                 ));
             }
         }
+        // A target's roles likewise (Codex switch-on review r1, R3: a typo selected nothing).
+        for t in &m.targets {
+            for r in t.roles.iter().filter(|r| !roles.contains(r)) {
+                out.push(Finding::error(
+                    "role-undeclared",
+                    format!("target {}: role `{r}` is in no stack's roles list", t.name),
+                ));
+            }
+        }
     }
     for e in stacks.entries() {
         // Topics are a controlled list: the entry's own stack declares them (a public entry, the public stack).

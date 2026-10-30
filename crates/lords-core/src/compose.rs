@@ -425,6 +425,29 @@ fn for_role(e: &Entry, ctx: &Context) -> bool {
     }
 }
 
+/// The memory stores marked `live`: their agents keep their own `MEMORY.md` current (orchestrator, 30 Oct, item 3).
+pub fn live_stores(stacks: &Stacks) -> impl Iterator<Item = &crate::stack::MemoryStore> {
+    stacks.private.iter().flat_map(|p| p.manifest.memory_stores.iter()).filter(|m| m.live)
+}
+
+/// A live store's index: `MEMORY.md` in its own dir.
+pub fn live_index(m: &crate::stack::MemoryStore) -> PathBuf {
+    crate::config::expand_home(&m.path).join("MEMORY.md")
+}
+
+/// Why a live store's index can't be named, if it can't: it must be a readable plain file (Codex switch-on review r1,
+/// R2).
+pub fn live_index_problem(m: &crate::stack::MemoryStore) -> Option<String> {
+    let index = live_index(m);
+    match crate::fsguard::read(&index) {
+        Ok(Some(_)) => None,
+        Ok(None) => {
+            Some(format!("memory store {}: its live index {} is missing", m.name, index.display()))
+        }
+        Err(e) => Some(format!("memory store {}: its live index can't be read ({e})", m.name)),
+    }
+}
+
 pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
     let mut development: Vec<String> = stacks
         .all()
@@ -434,7 +457,15 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         .collect();
     development.sort();
     development.dedup();
-    let all = applicable(stacks, ctx);
+    // A live store's imported copies take no part in composition (Codex switch-on review r1, R4): its own index is
+    // the one source, named in Memory below, so its lagging copies never render, not as notes, extensions or overrides.
+    let live_store = |e: &Entry| match &e.meta.origin {
+        crate::model::Origin::Imported { store, .. } => {
+            live_stores(stacks).any(|m| m.name == *store)
+        }
+        _ => false,
+    };
+    let all: Vec<&Entry> = applicable(stacks, ctx).into_iter().filter(|e| !live_store(e)).collect();
     let overridden: BTreeSet<&str> =
         all.iter().flat_map(|e| e.meta.overrides.iter().map(String::as_str)).collect();
     let live: Vec<&Entry> = all.into_iter().filter(|e| !overridden.contains(e.id())).collect();
@@ -596,20 +627,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             _ => true,
         })
         .collect();
-    // A live store's index is the file its agents write, one source (orchestrator, 30 Oct, item 3): it is named once,
-    // and its imported copies, which lag until the next import, are left out.
-    let live: Vec<&crate::stack::MemoryStore> = stacks
-        .private
-        .iter()
-        .flat_map(|p| p.manifest.memory_stores.iter())
-        .filter(|m| m.live)
-        .collect();
-    let store_of = |e: &Entry| match &e.meta.origin {
-        crate::model::Origin::Imported { store, .. } => {
-            live.iter().copied().find(|m| m.name == *store)
-        }
-        _ => None,
-    };
+    // A live store's index is the file its agents write, one source (orchestrator, 30 Oct, item 3): it is named once.
     // Named from its declaration wherever its scope and audience reach and its harness doesn't load it by itself, so
     // a store with no note imported yet is named too (sol-loop r1, S1).
     let serves = |m: &crate::stack::MemoryStore| {
@@ -622,21 +640,21 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
     // reader who is only `product` (sol-loop r2, S2, S3).
     let memory_here = !ctx.public_only
         && ctx.roles.as_ref().is_none_or(|roles| roles.iter().any(|r| r != PRODUCT_ROLE));
-    let live_here: BTreeSet<(&str, String)> = live
-        .iter()
-        .copied()
+    // Only an index that is a readable file is named (review r1, R2): a missing one is the plan's conflict and check's
+    // error (`live_index_problem`), never a dead pointer.
+    let live_here: BTreeSet<(&str, String)> = live_stores(stacks)
         .filter(|_| memory_here)
         .filter(|m| Scope::parse(&m.scope).is_some_and(|s| scope_in_layers(&s, &ctx.layers, false)))
         .filter(|m| serves(m) && !ctx.skip_stores.contains(&m.name))
+        .filter(|m| live_index_problem(m).is_none())
         .map(|m| {
-            let index = crate::config::expand_home(&m.path).join("MEMORY.md");
+            let index = live_index(m);
             (
                 m.name.as_str(),
                 index.display().to_string().replace('/', std::path::MAIN_SEPARATOR_STR),
             )
         })
         .collect();
-    notes.retain(|e| store_of(e).is_none());
     notes.sort_by(|a, b| (a.rank(), a.id()).cmp(&(b.rank(), b.id())));
     // Where the reader's role is unknown, notes for one role stay out of the index; one line says where they are.
     // The place's default role is no unknown one: its notes stay in the index.

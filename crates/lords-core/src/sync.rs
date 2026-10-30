@@ -1483,6 +1483,12 @@ fn strip_verbatim(p: &Path) -> String {
 /// and the stack no longer wants goes by its ledger record; nothing else in the dir is looked at.
 fn skills_items(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Vec<Item> {
     let dir = expand_home(&t.path);
+    // A role no stack declares selects nothing, which would make what the target installed look unwanted: a conflict,
+    // before the target's scope is covered, so nothing of it is removed (Codex switch-on review r1, R3).
+    let declared = declared_roles(pl.stacks);
+    if let Some(r) = t.roles.iter().find(|r| !declared.contains(r)) {
+        return vec![conflict(&t.name, &dir, format!("role `{r}` is in no stack's roles list"))];
+    }
     let root = match Root::target(t) {
         Ok(r) => r,
         Err(e) => return vec![conflict(&t.name, &dir, e)],
@@ -2282,6 +2288,17 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
             {
                 return Err(format!("no repo or workspace `{r}` in the private stack.toml"));
             }
+        }
+    }
+    // A live memory store whose index isn't a readable file: a conflict, so no file loses its memory index to a dead
+    // pointer or a stale copy, and nothing applies until it is there (Codex switch-on review r1, R2).
+    for m in compose::live_stores(stacks) {
+        if let Some(why) = compose::live_index_problem(m) {
+            pl.plan.items.push(conflict(
+                &format!("memory store {}", m.name),
+                &compose::live_index(m),
+                why,
+            ));
         }
     }
     // Removal only from a complete view (design-simplification-r6, rule B; Sol review r7, R7-04/R7-05): a problem of
@@ -3134,6 +3151,12 @@ pub fn drift_findings(stacks: &Stacks, home: &Path) -> Vec<crate::Finding> {
             out.extend(repo_size_findings(stacks));
             out.extend(shadow_findings(stacks));
             out.extend(verbatim_findings(stacks));
+            // A live memory store's index must be there (Codex switch-on review r1, R2).
+            for m in compose::live_stores(stacks) {
+                if let Some(why) = compose::live_index_problem(m) {
+                    out.push(Finding::error("memory-live", why).at(compose::live_index(m), None));
+                }
+            }
             out.extend(plan.notes.iter().map(|n| Finding::info("sync-note", n.clone())));
             out
         }
@@ -3310,6 +3333,9 @@ pub fn shadow_findings(stacks: &Stacks) -> Vec<crate::Finding> {
 pub struct Size {
     /// "user level", "repo <name>" or "workspace <name>".
     pub place: String,
+    /// The checkout or worktree measured, where the place has more than one: the largest file of its adapter there
+    /// (Codex switch-on review r1, R1).
+    pub at: Option<String>,
     /// The adapter whose agents read it (its id); empty for what every adapter's agents read (role files, skill
     /// copies).
     pub adapter: String,
@@ -3347,12 +3373,11 @@ impl Size {
             None => format!("{} bytes", self.bytes),
         };
         let parts: Vec<String> = self.sections.iter().map(|(s, n)| format!("{s} {n}")).collect();
-        format!(
-            "{}, {who} ({}): {against}; by section: {}",
-            self.place,
-            self.file,
-            parts.join(", ")
-        )
+        let place = match &self.at {
+            Some(at) => format!("{}, {at}", self.place),
+            None => self.place.clone(),
+        };
+        format!("{}, {who} ({}): {against}; by section: {}", place, self.file, parts.join(", "))
     }
 }
 
@@ -3386,6 +3411,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
         // The limit is on a place's project files; the user-level file is read whole (adapters.rs, `byte_limit`).
         out.push(Size {
             place: "user level".into(),
+            at: None,
             adapter: adapter.id().to_string(),
             file: adapter.id().to_string(),
             bytes: text.len(),
@@ -3404,14 +3430,35 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
     }
     for (label, name, ids) in places {
         let Some(dir) = first_path(stacks, &name) else { continue };
+        // Every checkout and worktree sync writes for, each with its own tracked preamble (Codex switch-on review r1,
+        // R1: measuring only the first let a later one past the limit pass check).
+        let paths: Vec<PathBuf> = match private.manifest.repos.get(&name) {
+            Some(repo) => checkouts(repo)
+                .map(|(roots, _, _)| roots.iter().map(|r| r.path().to_path_buf()).collect())
+                .unwrap_or_else(|_| vec![dir.clone()]),
+            None => vec![dir.clone()],
+        };
         // Every adapter is measured, also one the place doesn't get yet: the line holds before it is switched on.
         for adapter in adapters::ALL.iter().copied() {
             let enabled = ids.is_empty() || ids.iter().any(|a| a == adapter.id());
-            let (text, composed) =
-                place_text(stacks, place_layers(stacks, &name, false), adapter, &dir);
+            // The largest of the place's files decides; past one checkout, the label names it.
+            let (at, text, composed) = paths
+                .iter()
+                .map(|p| {
+                    let (text, composed) =
+                        place_text(stacks, place_layers(stacks, &name, false), adapter, p);
+                    (p, text, composed)
+                })
+                .max_by_key(|(_, text, _)| text.len())
+                .unwrap_or_else(|| {
+                    let (text, composed) =
+                        place_text(stacks, place_layers(stacks, &name, false), adapter, &dir);
+                    (&dir, text, composed)
+                });
             let rendered = adapter.render(&composed);
             out.push(Size {
                 place: label.clone(),
+                at: (paths.len() > 1).then(|| at.display().to_string()),
                 adapter: adapter.id().to_string(),
                 file: adapter.repo_file().to_string(),
                 bytes: text.len(),
@@ -3443,6 +3490,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
             parts.push((format!("in all {paths}"), each * paths));
             out.push(Size {
                 place: label.clone(),
+                at: None,
                 adapter: String::new(),
                 file: "skill copies".into(),
                 bytes: each,
@@ -3456,6 +3504,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
             let text = role_composed(stacks, place_layers(stacks, &name, true), &role).text;
             out.push(Size {
                 place: label.clone(),
+                at: None,
                 adapter: String::new(),
                 file: format!("{ROLE_DIR}/{}", role_file(&role)),
                 bytes: text.len(),
