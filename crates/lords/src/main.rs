@@ -122,16 +122,7 @@ fn public_rules(public: &Path, private: Option<&Stack>) -> Result<Rules, String>
 /// exit 0 (orchestrator, 30 Oct: Claude Code takes exit 2 from a PreToolUse hook as a refusal). `lords guard
 /// --self-test` prints `ok` when the guard refuses its witness; sync runs it before installing the copy hooks name.
 fn cmd_guard(mut a: Args) -> ExitCode {
-    // Every write may fail (a harness that closed its pipe): never a panic, the call goes on (rm-guard review r1, R8).
-    let say = |line: &str| {
-        use std::io::Write;
-        let _ =
-            writeln!(std::io::stdout().lock(), "{line}").and_then(|()| std::io::stdout().flush());
-    };
-    let note = |line: &str| {
-        use std::io::Write;
-        let _ = writeln!(std::io::stderr().lock(), "lords guard: {line}; this call is let through");
-    };
+    let note = |line: &str| say_err(&format!("lords guard: {line}; this call is let through"));
     if a.flag("--help") || a.flag("-h") {
         say("usage: lords guard rm   (Claude Code's PreToolUse hook; the event on stdin)");
         return ExitCode::SUCCESS;
@@ -177,14 +168,26 @@ fn guard_install(mut a: Args) -> ExitCode {
     match done {
         Ok((place, wrote)) => {
             let what = if wrote { "installed" } else { "already current" };
-            println!("guard {what}: {} (passes its self-test)", place.display());
+            say(&format!("guard {what}: {} (passes its self-test)", place.display()));
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("lords guard install: {e}");
+            say_err(&format!("lords guard install: {e}"));
             ExitCode::from(2)
         }
     }
+}
+
+// Every `lords guard` write may fail (a harness or caller that closed its pipe): never a panic, the exit code stands
+// (rm-guard review r1, R8; fix check r5, R10).
+fn say(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stdout().lock(), "{line}").and_then(|()| std::io::stdout().flush());
+}
+
+fn say_err(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
 }
 
 fn cmd_check(mut a: Args) -> Result<bool, String> {
