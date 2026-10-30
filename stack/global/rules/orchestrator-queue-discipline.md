@@ -14,21 +14,27 @@ basis:
 - quote: "it would both - save tokens - give compounding information because information is less likely to get stale"
   date: 2026-10-30
   by: owner
+- quote: "and it seems the rules for taking in the whole queue not one message at a time when you decide to end your turn and take the next subagent has still not managed to penetrate and actually land, make sure to add that proper"
+  date: 2026-10-30
+  by: owner
+  source: about 23:40, to another orchestrator
 evidence:
 - summary: "Two orchestrators, 30 Oct: read-then-cancel lost nothing only because no item had attachments; a turn that stayed running held six items for two hours; twice a child's final result sat only in its task status, with no notification and no queue item. Promoting a queued item into the running turn was verified the same day."
   date: 2026-10-30
 - summary: "Later that night an orchestrator promoted items in parallel and acted between promotions: each parallel call after the first was interrupted, items stayed queued, and the owner saw them handled one by one."
   date: 2026-10-30
+- summary: "Promoting every item still failed in practice: each promotion injects its one message into the running turn and interrupts the calls beside it, so items kept arriving one at a time (an orchestrator, every batch that night). Reading an item returns its full text; only an attachment needs a promotion. Twice an orchestrator said it had taken everything while an item sat queued, because nothing showed it the queue."
+  date: 2026-10-30
 origin:
   type: own
 topics: [delegation, process]
 ---
-Answer an owner message in the next turn, before anything queued. Take everything that waits for you at once: at the
-start of a turn and again before its final reply, pull every item queued in your own thread into the running turn
-(promote it; don't read and cancel, since reading returns only text and a cancel can drop an attachment), so the queue
-is empty when the turn ends. List the queue, then promote every item one after another, with no other call in parallel
-(a promotion interrupts calls still in flight) and no work in between, and act only once all are in. A task's
-automatic completion notice can't be promoted: read it whole, then cancel it. The queue isn't the only inbox: at each checkup also read the result of every child
+Answer an owner message in the next turn, before anything queued. Take everything that waits for you at once, at the
+start of a turn and again before its final reply, so the queue is empty when the turn ends: list your own thread's
+queue (`t3_queue list`), read every truncated item in full, cancel each text-only item once its text is in hand, and
+promote only an item that carries an attachment (a `t3-context://` marker), since a cancel would drop it. Promote one
+at a time with no other call beside it (a promotion interrupts calls in flight). Then answer all of them together. A
+task's automatic completion notice is read whole, then cancelled. The queue isn't the only inbox: at each checkup also read the result of every child
 that finished since the last one, comparing its latest run with the last one you acted on, since a result can sit
 there with no notification (a lead's later turns don't wake its parent); don't poll children that are still running. Handle what arrived together as one batch: one message per agent,
 and close each request with its disposition, not merely because it was read. To a busy agent, read its state first and
