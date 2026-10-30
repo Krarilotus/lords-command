@@ -23,8 +23,8 @@ topics: [owner-decisions, research]
 ---
 Before asking the owner, check the recorded intent and decisions; never re-ask a settled one. Ask only for choices
 that are the owner's and can't be derived from their intent, with the options and your recommendation. Decisions
-outside your authority go to whoever delegated to you; within it, decide, also while the owner is away. A technical
-failure is a fact to diagnose, not a question.
+outside your authority go to their owner (rule.decisions-go-to-their-owner); within it, decide, also while the owner
+is away. A technical failure is a fact to diagnose, not a question.
 
 When a design question has an established answer from the field's leaders, research how they solve it, adopt the
 leading approach adapted to the project, and present the result. Bring the owner only what is his: domain intent,
