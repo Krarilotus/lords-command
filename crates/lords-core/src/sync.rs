@@ -2456,6 +2456,29 @@ fn owner_update(item: &Item, run: &mut Run) -> Result<(), String> {
 
 /// Replaces or removes a tool-owned path: what is there moves aside and must still match its ledger record
 /// (otherwise it goes back and apply stops); the new version goes in; the old one is deleted, following nothing.
+/// Whether a tool item's destination is still as the plan saw it, read only: nothing where it creates, and its ledger
+/// record unchanged where it updates or removes. Apply runs it for every tool item before anything changes (rm-guard
+/// fix check r3, R7: validate everything first, then act); `tool_change` runs it again and checks the content when it
+/// acts, for what changes later.
+fn tool_current(item: &Item, ledger: &Ledger) -> Result<(), String> {
+    let Dest::Tool(place) = &item.dest else { return Ok(()) };
+    match item.action {
+        Action::Create | Action::Install
+            if fsguard::kind(place.path())? != fsguard::Kind::Missing =>
+        {
+            Err(stale(item, "something appeared"))
+        }
+        Action::Update | Action::Refresh | Action::Remove => {
+            let recorded = ledger.get(place.path()).map(|o| o.sha.clone());
+            if recorded.is_none() || recorded != item.have {
+                return Err(stale(item, "its ledger record changed"));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn tool_change(item: &Item, ledger: &mut Ledger) -> Result<(), String> {
     if item.action == Action::Forget {
         ledger.forget(&item.path);
@@ -2472,19 +2495,12 @@ fn tool_change(item: &Item, ledger: &mut Ledger) -> Result<(), String> {
             fsguard::Kind::Missing => String::new(),
         })
     };
+    tool_current(item, ledger)?;
     let record = ledger.get(path).cloned();
     let recorded = record.as_ref().map(|o| o.sha.clone());
     let old = match item.action {
-        Action::Create | Action::Install => {
-            if fsguard::kind(path)? != fsguard::Kind::Missing {
-                return Err(stale(item, "something appeared"));
-            }
-            None
-        }
+        Action::Create | Action::Install => None,
         Action::Update | Action::Refresh | Action::Remove => {
-            if recorded.is_none() || recorded != item.have {
-                return Err(stale(item, "its ledger record changed"));
-            }
             // What is there must be what the record says: a file where it records a dir is refused, and the other
             // way round (Sol review r4, R4-01).
             let on_disk = match fsguard::kind(path)? {
@@ -2584,6 +2600,9 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
     }
     // The ledger covers only tool-owned paths; a plan is current only if the owner files it changes and the guard copy
     // are as it saw them too (rm-guard fix check r2, R7). Checked here, under the lock, before anything changes.
+    for i in changing.iter().filter(|i| i.class == Class::Tool) {
+        tool_current(i, &ledger)?;
+    }
     for i in changing.iter().filter(|i| i.class == Class::Owner) {
         let now = fsguard::read_text(&i.path)?.map(|t| fsguard::sha(t.as_bytes()));
         if now != i.have {

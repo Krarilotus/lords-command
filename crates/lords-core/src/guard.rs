@@ -33,6 +33,9 @@ fn commands(command: &str) -> Vec<Vec<Word>> {
     let (mut out, mut words, mut word) = (Vec::new(), Vec::new(), Word::default());
     let mut started = false;
     let (mut single, mut double) = (false, false);
+    // Whether the character before this one was an active redirection operator (`>` or `<`, unquoted and unescaped):
+    // a literal one (`\>`, `">"`) is word text and starts no redirection (rm-guard fix check r3, R9).
+    let mut after_op = false;
     let mut i = 0;
     let end_word = |words: &mut Vec<Word>, word: &mut Word, started: &mut bool| {
         if *started {
@@ -42,6 +45,7 @@ fn commands(command: &str) -> Vec<Vec<Word>> {
     };
     while i < c.len() {
         let ch = c[i];
+        let op_before = std::mem::take(&mut after_op);
         if single {
             if ch == '\'' {
                 single = false;
@@ -126,11 +130,7 @@ fn commands(command: &str) -> Vec<Vec<Word>> {
             ' ' | '\t' if !double => end_word(&mut words, &mut word, &mut started),
             // `&` and `|` that are part of a trailing redirection (`2>&1`, `&>`, `>|`) don't end the command: what
             // follows is still this command's (rm-guard fix check r2, R9).
-            '&' | '|'
-                if !double
-                    && (i > 0 && matches!(c[i - 1], '>' | '<')
-                        || ch == '&' && c.get(i + 1) == Some(&'>')) =>
-            {
+            '&' | '|' if !double && (op_before || ch == '&' && c.get(i + 1) == Some(&'>')) => {
                 word.text.push(ch);
                 started = true;
             }
@@ -141,6 +141,7 @@ fn commands(command: &str) -> Vec<Vec<Word>> {
                 }
             }
             _ => {
+                after_op = !double && matches!(ch, '>' | '<');
                 word.text.push(ch);
                 started = true;
             }
