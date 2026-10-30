@@ -972,3 +972,96 @@ fn a_size_past_the_line_is_info_for_an_adapter_not_switched_on() {
     assert!(message.contains("not switched on"), "{message}");
     assert_eq!(severity("[\"codex\"]").map(|x| x.0), Some(lords_core::Severity::Warning));
 }
+
+// Spec (orchestrator, 30 Oct, item 2: "Make overflow fail `lords check`, not warn, so Codex can never cut a file
+// silently"): past an adapter's hard limit, a place's file for an adapter the place writes for is an error; for one it
+// doesn't write for, still info.
+#[test]
+fn a_size_past_the_limit_fails_check_for_an_adapter_switched_on() {
+    let severity = |adapters: &str| {
+        let f = Fixture::new();
+        std::fs::create_dir_all(f.path("work")).unwrap();
+        f.write(
+            "priv/workspace/work/rules/big.md",
+            &entry(
+                "rule.big",
+                "workspace:work",
+                "private",
+                "",
+                &format!("{}\n", "x".repeat(40_000)),
+            ),
+        );
+        with_targets(
+            &f,
+            &format!(
+                "[workspaces.work]\npath = '{}'\nadapters = {adapters}\n",
+                f.path("work").display()
+            ),
+        );
+        lords_core::sync::drift_findings(&f.stacks(), &f.home())
+            .into_iter()
+            .find(|x| x.code == "size" && x.message.contains("codex"))
+            .map(|x| x.severity)
+    };
+    assert_eq!(severity("[\"codex\"]"), Some(lords_core::Severity::Error));
+    assert_eq!(severity("[\"claude\"]"), Some(lords_core::Severity::Info));
+}
+
+// Spec (orchestrator, 30 Oct, item 3: "Make the place agents write the one source the generated section reflects, so a
+// new note shows and an archived one drops out without waiting for a sync"): a store marked `live` is indexed by one
+// line naming the index file its agents write (`MEMORY.md` in its own dir), never by Lords' imported copies; another
+// store is listed as before.
+#[test]
+fn a_live_memory_store_is_indexed_by_its_own_index_file() {
+    let f = Fixture::new();
+    memory_store(&f, "priv/global/memory/live", "global", "live", "all");
+    f.write(
+        "priv/global/memory/live/stale.md",
+        "---\nname: stale-copy\ndescription: an imported copy\n---\nB\n",
+    );
+    memory_store(&f, "priv/global/memory/old", "global", "old", "all");
+    f.write(
+        "priv/global/memory/old/kept.md",
+        "---\nname: kept-note\ndescription: an old store's note\n---\nB\n",
+    );
+    let live = f.path("agent-memory");
+    fs::create_dir_all(&live).unwrap();
+    f.write("agent-memory/MEMORY.md", "- [new](new.md) — written a minute ago\n");
+    f.write(
+        "priv/stack.toml",
+        &format!(
+            "name = \"priv\"\nvisibility = \"private\"\n[projects.beta]\n[repos.beta-core]\nproject = \"beta\"\n\
+             [[memory_stores]]\nname = \"live\"\npath = '{}'\nscope = \"global\"\nlive = true\n\
+             [[memory_stores]]\nname = \"old\"\npath = '{}'\nscope = \"global\"\n",
+            live.display(),
+            f.path("old-memory").display()
+        ),
+    );
+    let layers = Layers::Repo {
+        repo: "beta-core".into(),
+        project: Some("beta".into()),
+        sub: None,
+        global: false,
+    };
+    let text = compose(
+        &f.stacks(),
+        &Context {
+            audience: vec![Audience::Opus],
+            layers,
+            public_only: false,
+            skip_stores: vec![],
+            roles: None,
+            by_reference: false,
+            role_dir: None,
+            relative_to: None,
+            default_role: None,
+            default_role_inline: false,
+        },
+    )
+    .text;
+    let index =
+        live.join("MEMORY.md").display().to_string().replace('/', std::path::MAIN_SEPARATOR_STR);
+    assert!(text.contains(&index), "the live index is named: {text}");
+    assert!(!text.contains("stale-copy"), "no imported copy of a live store: {text}");
+    assert!(text.contains("kept-note"), "a store that isn't live is listed as before: {text}");
+}
