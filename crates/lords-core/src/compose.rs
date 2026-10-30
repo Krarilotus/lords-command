@@ -591,6 +591,32 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             _ => true,
         })
         .collect();
+    // A live store's index is the file its agents write, one source (orchestrator, 30 Oct, item 3): it is named once,
+    // and its imported copies, which lag until the next import, are left out.
+    let live: Vec<&crate::stack::MemoryStore> = stacks
+        .private
+        .iter()
+        .flat_map(|p| p.manifest.memory_stores.iter())
+        .filter(|m| m.live)
+        .collect();
+    let store_of = |e: &Entry| match &e.meta.origin {
+        crate::model::Origin::Imported { store, .. } => {
+            live.iter().copied().find(|m| m.name == *store)
+        }
+        _ => None,
+    };
+    let live_here: BTreeSet<(&str, String)> = notes
+        .iter()
+        .filter_map(|e| store_of(e))
+        .map(|m| {
+            let index = crate::config::expand_home(&m.path).join("MEMORY.md");
+            (
+                m.name.as_str(),
+                index.display().to_string().replace('/', std::path::MAIN_SEPARATOR_STR),
+            )
+        })
+        .collect();
+    notes.retain(|e| store_of(e).is_none());
     notes.sort_by(|a, b| (a.rank(), a.id()).cmp(&(b.rank(), b.id())));
     // Where the reader's role is unknown, notes for one role stay out of the index; one line says where they are.
     // The place's default role is no unknown one: its notes stay in the index.
@@ -601,7 +627,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         .into_iter()
         .partition(|e| ctx.roles.is_none() && !e.meta.roles.is_empty() && !default_note(e));
     let pointer = role_pointer(&role_notes, ctx);
-    if !notes.is_empty() || pointer.is_some() {
+    if !notes.is_empty() || pointer.is_some() || !live_here.is_empty() {
         if !lines.is_empty() {
             lines.push(String::new());
         }
@@ -609,6 +635,9 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         lines.push(String::new());
         lines.push(MEMORY_INTRO.into());
         lines.push(String::new());
+        for (name, index) in &live_here {
+            lines.push(format!("- {name}: its index is `{index}`, which its agents keep current"));
+        }
         push_index(&index_items(&notes), ctx, &mut lines, &mut out);
         if let Some(p) = pointer {
             lines.push(p);

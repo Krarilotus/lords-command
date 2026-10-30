@@ -1488,10 +1488,17 @@ fn skills_items(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Vec<Item
         Err(e) => return vec![conflict(&t.name, &dir, e)],
     };
     pl.verified(&root);
-    let ctx = context(pl.stacks, adapter, audience_of(&t.audience, adapter), Layers::Global);
+    let mut ctx = context(pl.stacks, adapter, audience_of(&t.audience, adapter), Layers::Global);
+    // A target that names roles also takes the global skills for those roles, as a file that must stand alone takes
+    // every global entry (orchestrator, 30 Oct, item 2: Codex's user-level skills); one that names none keeps only
+    // skills without roles (25 Oct).
+    if !t.roles.is_empty() {
+        ctx.roles = Some(t.roles.clone());
+        ctx.layers = Layers::Workspace { name: String::new(), project: None, global: true };
+    }
     let wanted: Vec<&Entry> = compose::applicable(pl.stacks, &ctx)
         .into_iter()
-        .filter(|e| e.meta.kind == Kind::Skill)
+        .filter(|e| e.meta.kind == Kind::Skill && matches!(e.scope, crate::model::Scope::Global))
         .filter(|e| !matches!(e.meta.origin, crate::model::Origin::InRepo { .. }))
         .collect();
     let scope = format!("target:{}", t.name);
@@ -3480,13 +3487,21 @@ fn repo_size_findings(stacks: &Stacks) -> Vec<crate::Finding> {
     });
     let copies: Vec<crate::Finding> = copies.collect();
     // An adapter the place doesn't write for yet: measured, so the line holds before it is switched on, but only
-    // info (orchestrator, 30 Oct, study P6).
+    // info (orchestrator, 30 Oct, study P6). One it writes for: past the line a warning, past the hard limit an error,
+    // since the harness would cut the file without a word (orchestrator, 30 Oct, item 2).
     let mut out: Vec<crate::Finding> = all
         .into_iter()
         .filter(|s| s.over_line())
-        .map(|s| match s.enabled {
-            true => crate::Finding::warning("size", s.describe()),
-            false => crate::Finding::info(
+        .map(|s| match (s.enabled, s.limit.is_some_and(|l| s.reads > l)) {
+            (true, true) => crate::Finding::error(
+                "size",
+                format!(
+                    "{} (past the limit: the harness would cut it, so sync doesn't write it)",
+                    s.describe()
+                ),
+            ),
+            (true, false) => crate::Finding::warning("size", s.describe()),
+            (false, _) => crate::Finding::info(
                 "size",
                 format!("{} (not switched on here; it matters once it is)", s.describe()),
             ),
