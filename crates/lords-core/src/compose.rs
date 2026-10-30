@@ -331,11 +331,16 @@ pub struct Composed {
 }
 
 fn in_layers(e: &Entry, layers: &Layers) -> bool {
-    match (layers, &e.scope) {
-        (Layers::Global, _) => user_level(e),
+    scope_in_layers(&e.scope, layers, user_level(e))
+}
+
+/// Whether something of `scope` belongs in `layers`; `user_level`: it suits every run (see `user_level`).
+fn scope_in_layers(scope: &Scope, layers: &Layers, user_level: bool) -> bool {
+    match (layers, scope) {
+        (Layers::Global, _) => user_level,
         (Layers::Workspace { project, .. }, Scope::Project(p)) => project.as_deref() == Some(p),
         (Layers::Workspace { name, .. }, Scope::Workspace(w)) => w == name,
-        (Layers::Workspace { global, .. }, Scope::Global) => *global || !user_level(e),
+        (Layers::Workspace { global, .. }, Scope::Global) => *global || !user_level,
         (Layers::Workspace { .. }, _) => false,
         (Layers::Repo { project, .. }, Scope::Project(p)) => project.as_deref() == Some(p),
         (Layers::Repo { repo, .. }, Scope::Repo(r)) => r == repo,
@@ -345,7 +350,7 @@ fn in_layers(e: &Entry, layers: &Layers) -> bool {
                     .as_deref()
                     .is_some_and(|here| here == s || here.starts_with(&format!("{s}/")))
         }
-        (Layers::Repo { global, .. }, Scope::Global) => *global || !user_level(e),
+        (Layers::Repo { global, .. }, Scope::Global) => *global || !user_level,
         (Layers::Repo { .. }, Scope::Workspace(_)) => false,
     }
 }
@@ -605,9 +610,19 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         }
         _ => None,
     };
-    let live_here: BTreeSet<(&str, String)> = notes
+    // Named from its declaration wherever its scope and audience reach and its harness doesn't load it by itself, so
+    // a store with no note imported yet is named too (sol-loop r1, S1).
+    let serves = |m: &crate::stack::MemoryStore| {
+        m.audience.is_empty()
+            || m.audience.iter().any(|a| {
+                a == "all" || ctx.audience.iter().any(|c| format!("{c:?}").eq_ignore_ascii_case(a))
+            })
+    };
+    let live_here: BTreeSet<(&str, String)> = live
         .iter()
-        .filter_map(|e| store_of(e))
+        .copied()
+        .filter(|m| Scope::parse(&m.scope).is_some_and(|s| scope_in_layers(&s, &ctx.layers, false)))
+        .filter(|m| serves(m) && !ctx.skip_stores.contains(&m.name))
         .map(|m| {
             let index = crate::config::expand_home(&m.path).join("MEMORY.md");
             (
