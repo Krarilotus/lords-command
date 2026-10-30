@@ -1126,4 +1126,33 @@ fn a_live_store_is_named_from_its_declaration_without_imported_notes() {
         !text("beta-core", "beta", vec![Audience::Opus], vec!["live".into()]).contains(&index),
         "native here"
     );
+    // Sol-loop r2, S2 and S3 (witnesses: a public tracked file, and the product role's file, got the private store's
+    // line): a live store follows the rules memory notes follow: never in a public-only composition, never for a
+    // reader who is only `product`.
+    let with = |public_only: bool, roles: Option<Vec<String>>| {
+        compose(
+            &f.stacks(),
+            &Context {
+                audience: vec![Audience::Opus],
+                layers: Layers::Repo {
+                    repo: "beta-core".into(),
+                    project: Some("beta".into()),
+                    sub: None,
+                    global: false,
+                },
+                public_only,
+                skip_stores: vec![],
+                roles,
+                by_reference: false,
+                role_dir: None,
+                relative_to: None,
+                default_role: None,
+                default_role_inline: false,
+            },
+        )
+        .text
+    };
+    assert!(!with(true, None).contains(&index), "a public-only composition");
+    assert!(!with(false, Some(vec!["product".into()])).contains(&index), "the product role");
+    assert!(with(false, Some(vec!["coder".into()])).contains(&index), "a development role");
 }
