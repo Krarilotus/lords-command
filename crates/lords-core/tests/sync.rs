@@ -1156,3 +1156,124 @@ fn a_live_store_is_named_from_its_declaration_without_imported_notes() {
     assert!(!with(false, Some(vec!["product".into()])).contains(&index), "the product role");
     assert!(with(false, Some(vec!["coder".into()])).contains(&index), "a development role");
 }
+
+/// A composition for a declared repo that must stand alone (every global entry, as a role file), Opus readers, the
+/// given roles.
+fn composed_for(f: &Fixture, roles: Option<Vec<String>>) -> String {
+    compose(
+        &f.stacks(),
+        &Context {
+            audience: vec![Audience::Opus],
+            layers: Layers::Repo {
+                repo: "beta-core".into(),
+                project: Some("beta".into()),
+                sub: None,
+                global: true,
+            },
+            public_only: false,
+            skip_stores: vec![],
+            roles,
+            by_reference: false,
+            role_dir: None,
+            relative_to: None,
+            default_role: None,
+            default_role_inline: false,
+        },
+    )
+    .text
+}
+
+// Spec (Codex switch-on review r1, R1, witness: the first of two checkouts fits, the second's tracked AGENTS.md is
+// 40,000 bytes; check measured only the first): check's size error covers every checkout sync writes for, naming the
+// one past the limit.
+#[test]
+fn a_later_checkout_past_the_limit_fails_check() {
+    let f = Fixture::new();
+    f.write(
+        "priv/repo/beta-core/facts/h.md",
+        &entry("fact.h", "repo:beta-core", "private", "", "Hosts.\n"),
+    );
+    f.write("one/AGENTS.md", "Short.\n");
+    f.git_init("one");
+    f.write("two/AGENTS.md", &format!("{}\n", "x".repeat(40_000)));
+    f.git_init("two");
+    with_targets(
+        &f,
+        &format!(
+            "adapters = [\"claude\", \"codex\"]\ncheckouts = ['{}', '{}']\nworktrees = false\n",
+            f.path("one").display(),
+            f.path("two").display()
+        ),
+    );
+    let errors: Vec<String> = lords_core::sync::drift_findings(&f.stacks(), &f.home())
+        .into_iter()
+        .filter(|x| x.code == "size" && x.severity == lords_core::Severity::Error)
+        .map(|x| x.message)
+        .collect();
+    let two = f.path("two").display().to_string();
+    assert!(errors.iter().any(|m| m.contains("codex") && m.contains(&two)), "{errors:?}");
+}
+
+// Spec (review r1, R2, witness: a live store whose dir exists without MEMORY.md got a dead pointer and lost its note
+// links): a live store's index must be a readable file. Missing, it is never pointed to and its imported copies are
+// never listed in its place; the plan holds a conflict for it, so nothing is applied, and check says so.
+#[test]
+fn a_live_store_without_its_index_is_a_conflict_not_a_dead_pointer() {
+    let f = Fixture::new();
+    memory_store(&f, "priv/global/memory/live", "global", "live", "all");
+    f.write(
+        "priv/global/memory/live/note.md",
+        "---\nname: imported-note\ndescription: a copy\n---\nB\n",
+    );
+    let live = f.path("agent-memory");
+    f.write("agent-memory/note.md", "the live note\n");
+    with_targets(
+        &f,
+        &format!(
+            "[[memory_stores]]\nname = \"live\"\npath = '{}'\nscope = \"global\"\nlive = true\n",
+            live.display()
+        ),
+    );
+    let text = composed_for(&f, None);
+    assert!(!text.contains("MEMORY.md") && !text.contains("imported-note"), "{text}");
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    assert!(
+        p.items.iter().any(|i| i.action == Action::Conflict && i.path == live.join("MEMORY.md")),
+        "{:?}",
+        p.items.iter().map(|i| (&i.action, &i.path)).collect::<Vec<_>>()
+    );
+    assert!(lords_core::sync::drift_findings(&f.stacks(), &f.home())
+        .iter()
+        .any(|x| x.severity == lords_core::Severity::Error && x.message.contains("MEMORY.md")));
+}
+
+// Spec (review r1, R4, witness: an imported note of a live store that extends a fact rendered its stale body beside
+// the fact): a live store's imported copies take no part in composition at all: not as extensions, not as overrides,
+// not in role counts.
+#[test]
+fn a_live_stores_imported_copies_never_render() {
+    let f = Fixture::new();
+    f.write(
+        "priv/global/facts/base.md",
+        &entry("fact.base", "global", "private", "", "The base fact.\n"),
+    );
+    memory_store(&f, "priv/global/memory/live", "global", "live", "all");
+    f.write(
+        "priv/global/memory/live/stale.md",
+        "---\nname: stale\ndescription: a copy\nextends: [fact.base]\n---\nSTALE_IMPORTED_BODY\n",
+    );
+    let live = f.path("agent-memory");
+    f.write("agent-memory/MEMORY.md", "- [stale](stale.md)\n");
+    with_targets(
+        &f,
+        &format!(
+            "[[memory_stores]]\nname = \"live\"\npath = '{}'\nscope = \"global\"\nlive = true\n",
+            live.display()
+        ),
+    );
+    for roles in [None, Some(vec!["reviewer".to_string()])] {
+        let text = composed_for(&f, roles.clone());
+        assert!(text.contains("The base fact."), "{roles:?}: {text}");
+        assert!(!text.contains("STALE_IMPORTED_BODY"), "{roles:?}: {text}");
+    }
+}
