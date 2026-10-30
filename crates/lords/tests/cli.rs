@@ -922,8 +922,8 @@ fn the_guard_fails_open_when_it_cant_write() {
     }
 }
 
-/// A user-level fixture for the stale-plan tests: a settings target with the rm guard, a skills target, three
-/// `lords` builds told apart by a trailing byte (A: none, B, C), and a plan for each.
+/// A user-level fixture for the guard and stale-plan tests: a settings target with the rm guard, a skills target, and
+/// three `lords` builds told apart by a trailing byte (A: none, B, C).
 struct Stale {
     dir: TempDir,
 }
@@ -965,19 +965,29 @@ impl Stale {
         );
     }
 
-    fn plan(&self, build: &str) -> lords_core::sync::Plan {
+    fn home(&self) -> PathBuf {
+        self.dir.path().join("tool")
+    }
+
+    fn install(&self, build: &str) -> Result<bool, String> {
+        lords_core::sync::install_guard(
+            &self.home(),
+            &self.dir.path().join(build).join("lords.exe"),
+        )
+    }
+
+    fn plan(&self) -> lords_core::sync::Plan {
         let r = self.dir.path();
         let stacks = lords_core::Stacks::load(&r.join("pub"), Some(&r.join("priv"))).unwrap();
         let opts = lords_core::sync::Options {
             user_only: true,
-            home: r.join("tool"),
-            guard_from: Some(r.join(build).join("lords.exe")),
+            home: self.home(),
             ..lords_core::sync::Options::default()
         };
         lords_core::sync::plan(&stacks, &opts).unwrap()
     }
 
-    /// The guard copy's last byte, the settings' bytes and the ledger's bytes: what a refused apply must leave.
+    /// The guard copy's last byte, the settings' bytes and the ledger's bytes.
     fn state(&self) -> (Option<u8>, Vec<u8>, Option<Vec<u8>>) {
         let r = self.dir.path();
         let copy =
@@ -987,110 +997,66 @@ impl Stale {
     }
 }
 
-// Spec: rm-guard fix check r2, R7 (witness: a stale plan whose only changes are the settings and the guard: the ledger
-// revision doesn't move, and the stale plan replaced the live guard): a plan is current only if the settings and the
-// guard copy are as it saw them; a stale one changes nothing.
+// Spec (orchestrator, 30 Oct, after the rm-guard fix check r4: "Take guard installation out of `sync apply`
+// altogether … Sync never writes, replaces or deletes the guard copy"): no apply, of a fresh plan or a stale one,
+// changes the guard copy's bytes; only `lords guard install` does.
 #[test]
-fn a_settings_only_stale_plan_never_replaces_the_live_guard() {
+fn no_apply_changes_the_guard_copy() {
     let s = Stale::new();
-    lords_core::sync::apply(&s.plan("a")).unwrap();
-    let stale = s.plan("a");
-    s.write("home/settings.json", b"{\"model\":\"x\"}\n");
-    lords_core::sync::apply(&s.plan("b")).unwrap();
-    let after_b = s.state();
-    assert_eq!(after_b.0, Some(b'B'));
-    let _ = lords_core::sync::apply(&stale);
-    assert_eq!(s.state(), after_b, "a stale settings plan changed something");
+    assert!(s.install("b").unwrap());
+    let plan_with_b = s.plan();
+    assert!(s.install("c").unwrap());
+    lords_core::sync::apply(&plan_with_b).unwrap();
+    assert_eq!(
+        s.state().0,
+        Some(b'C'),
+        "a plan made with B installed applied with C installed: C stays"
+    );
+    lords_core::sync::apply(&s.plan()).unwrap();
+    assert_eq!(s.state().0, Some(b'C'));
+    assert!(!s.install("c").unwrap(), "already current");
 }
 
-// Spec: R7, the guard-only case: settings in sync, only the guard copy changed by another sync since the plan.
+// Spec (as above, the stale cases; rm-guard fix checks r2, r3, R7): a stale plan is refused before it changes anything:
+// its ledger changed, a settings file changed, or a tool destination was occupied; the guard copy, the settings and
+// the ledger stay as they were.
 #[test]
-fn a_guard_only_stale_plan_never_replaces_the_live_guard() {
+fn a_stale_plan_changes_nothing() {
+    // The ledger changed.
     let s = Stale::new();
-    lords_core::sync::apply(&s.plan("b")).unwrap();
-    let stale = s.plan("a");
-    lords_core::sync::apply(&s.plan("c")).unwrap();
-    let after_c = s.state();
-    assert_eq!(after_c.0, Some(b'C'));
-    assert!(lords_core::sync::apply(&stale).is_err(), "a stale guard plan is refused");
-    assert_eq!(s.state(), after_c);
-}
-
-// Spec: rm-guard fix check r3, R7 (witness: after the plan, an unowned file appeared where it would install a skill;
-// the ledger, the settings and the guard were unchanged, and apply replaced the guard before the install found it
-// stale): apply validates every item first, then acts; a stale tool destination changes nothing.
-#[test]
-fn a_stale_tool_destination_never_replaces_the_live_guard() {
-    let s = Stale::new();
-    lords_core::sync::apply(&s.plan("b")).unwrap();
+    s.install("b").unwrap();
+    let stale = s.plan();
     s.skill("b");
-    let stale = s.plan("a");
+    lords_core::sync::apply(&s.plan()).unwrap();
+    let before = s.state();
+    assert!(lords_core::sync::apply(&stale).is_err(), "a stale ledger");
+    assert_eq!(s.state(), before);
+    // A settings file changed.
+    let s = Stale::new();
+    s.install("b").unwrap();
+    let stale = s.plan();
+    s.write("home/settings.json", b"{\"model\":\"x\"}\n");
+    let before = s.state();
+    assert!(lords_core::sync::apply(&stale).is_err(), "stale settings");
+    assert_eq!(s.state(), before);
+    // A tool destination was occupied (r3's witness).
+    let s = Stale::new();
+    s.install("b").unwrap();
+    lords_core::sync::apply(&s.plan()).unwrap();
+    s.skill("b");
+    let stale = s.plan();
     s.write("home/skills/b", b"not the tool's\n");
     let before = s.state();
-    assert_eq!(before.0, Some(b'B'));
-    assert!(lords_core::sync::apply(&stale).is_err(), "a stale destination is refused");
+    assert!(lords_core::sync::apply(&stale).is_err(), "an occupied destination");
     assert_eq!(s.state(), before);
 }
 
-// Spec: rm-guard review r1, R7 (witness: a stale plan's apply installed its guard, replacing a newer one, before the
-// ledger check refused the plan): a stale plan changes nothing, the guard copy included; the guard and the settings
-// are installed under one apply lock, after the plan is known current.
+// Spec (orchestrator, 30 Oct: "`lords guard install` installs or updates the stable copy under its own lock. It
+// copies to a staged path, self-tests it, and renames it into place atomically"; "sync with no copy installed writes no
+// hook and says why"): before an install, sync leaves the hook out and names the fix; `lords guard install` puts the
+// copy there, and sync then names it in the settings; a staged copy an interrupted install left doesn't stop the next.
 #[test]
-fn a_stale_plan_never_replaces_the_live_guard() {
-    use lords_core::sync::{apply, plan, Options};
-    let d = TempDir::new().unwrap();
-    let r = d.path();
-    let write = |rel: &str, text: &[u8]| {
-        let p = r.join(rel);
-        fs::create_dir_all(p.parent().unwrap()).unwrap();
-        fs::write(p, text).unwrap();
-    };
-    let skill = |name: &str| {
-        write(
-            &format!("pub/global/skills/{name}/SKILL.md"),
-            format!("---\nname: {name}\n---\nX\n").as_bytes(),
-        );
-        write(
-            &format!("pub/global/skills/{name}/lords.yaml"),
-            format!("id: skill.{name}\nkind: skill\ntitle: {name}\naudience: [all]\nscope: global\nstatus: active\nvisibility: public\norigin:\n  type: own\n").as_bytes(),
-        );
-    };
-    write("pub/stack.toml", b"name = \"pub\"\nvisibility = \"public\"\n");
-    skill("a");
-    write("home/settings.json", b"{}\n");
-    let targets = format!(
-        "name = \"priv\"\nvisibility = \"private\"\n[[targets]]\nname = \"settings\"\nadapter = \"claude\"\nkind = \"settings\"\npath = '{}'\nguards = [\"rm\"]\n[[targets]]\nname = \"skills\"\nadapter = \"claude\"\nkind = \"skills\"\npath = '{}'\n",
-        r.join("home/settings.json").display(),
-        r.join("home/skills").display()
-    );
-    write("priv/stack.toml", targets.as_bytes());
-    let lords = fs::read(env!("CARGO_BIN_EXE_lords")).unwrap();
-    write("a/lords.exe", &lords);
-    // B: the same program with a trailing byte, so its copy is told apart.
-    write("b/lords.exe", &[&lords[..], b"B"].concat());
-    let stacks = || lords_core::Stacks::load(&r.join("pub"), Some(&r.join("priv"))).unwrap();
-    let opts = |exe: &str| Options {
-        user_only: true,
-        home: r.join("tool"),
-        guard_from: Some(r.join(exe).join("lords.exe")),
-        ..Options::default()
-    };
-    let stale = plan(&stacks(), &opts("a")).unwrap();
-    skill("b");
-    apply(&plan(&stacks(), &opts("b")).unwrap()).unwrap();
-    let copy = r.join("tool/bin/lords-guard.exe");
-    assert_eq!(fs::read(&copy).unwrap().last(), Some(&b'B'), "the newer guard is installed");
-    let settings = fs::read(r.join("home/settings.json")).unwrap();
-    assert!(apply(&stale).is_err(), "the stale plan is refused");
-    assert_eq!(fs::read(&copy).unwrap().last(), Some(&b'B'), "the live guard stays");
-    assert_eq!(fs::read(r.join("home/settings.json")).unwrap(), settings);
-}
-
-// Spec (orchestrator, 30 Oct: "have sync install a stable copy … that the settings name. Copy it only once that exe
-// answers … a self-test"): a settings target with guards installs `<tool home>/bin/lords-guard.exe` and names it in
-// the hook; the installed copy refuses the witness; a second sync changes nothing.
-#[test]
-fn sync_installs_a_stable_guard_copy_and_names_it() {
+fn sync_names_the_guard_only_once_it_is_installed() {
     let env = Env::new();
     let d = env.dir.path();
     let (public, private) = (d.join("pub"), d.join("priv"));
@@ -1107,57 +1073,44 @@ fn sync_installs_a_stable_guard_copy_and_names_it() {
     assert!(env.git(&private, &["init", "-q"]).status.success());
     env.git(&private, &["add", "-A"]);
     env.git(&private, &["commit", "-q", "-m", "start"]);
+    let stacks =
+        ["--public-stack", public.to_str().unwrap(), "--private-stack", private.to_str().unwrap()];
     let sync = |apply: bool| {
         let mut args = vec!["sync", "--user"];
         if apply {
             args.push("--apply");
         }
-        args.extend([
-            "--public-stack",
-            public.to_str().unwrap(),
-            "--private-stack",
-            private.to_str().unwrap(),
-        ]);
-        env.lords(d, &args)
+        env.lords(d, &[&args[..], &stacks].concat())
     };
+    let settings = || fs::read_to_string(d.join("home/.claude-balanced/settings.json")).unwrap();
+    // Not installed: no hook, and the plan says why.
+    let o = sync(false);
+    assert!(text(&o).contains("guard not installed: run `lords guard install`"), "{}", text(&o));
+    assert!(sync(true).status.success());
+    assert!(!settings().contains("lords-guard"), "{}", settings());
+    // A staged copy an interrupted install left behind.
+    let copy = d.join("home/.lords-command/bin/lords-guard.exe");
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    fs::write(copy.with_file_name(".lords-guard.exe.exe"), b"cut").unwrap();
+    let o = env.lords(d, &["guard", "install"]);
+    assert!(o.status.success() && copy.is_file(), "{}", text(&o));
     let o = sync(true);
     assert!(o.status.success(), "{}", text(&o));
-    let copy = d.join("home/.lords-command/bin/lords-guard.exe");
-    assert!(copy.is_file(), "{}", text(&o));
-    let v: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(d.join("home/.claude-balanced/settings.json")).unwrap(),
-    )
-    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&settings()).unwrap();
     let h = &v["hooks"]["PreToolUse"][0]["hooks"][0];
     let named = h["command"].as_str().unwrap().replace('\\', "/").to_lowercase();
     assert_eq!(named, copy.display().to_string().replace('\\', "/").to_lowercase(), "{h}");
     let event = r#"{"tool_name":"Bash","tool_input":{"command":"rm -f $OUT/x"}}"#;
     let o = guard(&env, &copy, &["guard", "rm"], event);
     assert!(String::from_utf8_lossy(&o.stdout).contains("\"deny\""), "{}", text(&o));
-    let again = text(&sync(false));
-    assert!(!again.contains("installs the guard"), "{again}");
-    // Sol-loop r2, S13: a check of the synced settings reports no conflict for them.
-    let check = env.lords(
-        d,
-        &[
-            "check",
-            "--public-stack",
-            public.to_str().unwrap(),
-            "--private-stack",
-            private.to_str().unwrap(),
-        ],
-    );
-    let out = text(&check);
-    assert!(!out.contains("guards need") && !out.contains("settings.json"), "{out}");
-    // S12: the copy gone, a sync puts it back (the settings name it).
+    // A check of the synced settings reports no conflict for them.
+    let out = text(&env.lords(d, &[&["check"][..], &stacks].concat()));
+    assert!(!out.contains("settings.json"), "{out}");
+    // The copy gone: sync takes the hook out and says why; it never puts a copy back.
     fs::remove_file(&copy).unwrap();
     let o = sync(true);
-    assert!(o.status.success() && copy.is_file(), "{}", text(&o));
-    // S11: a staged copy an interrupted install left doesn't stop the next one.
-    fs::remove_file(&copy).unwrap();
-    fs::write(copy.with_file_name(".lords-guard.exe.exe"), b"cut").unwrap();
-    let o = sync(true);
-    assert!(o.status.success() && copy.is_file(), "{}", text(&o));
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(!settings().contains("lords-guard") && !copy.exists(), "{}", settings());
 }
 
 // Spec (orchestrator, 27 Oct: `lords check --stack` is "one flag that skips the drift part", run by a stack repo's

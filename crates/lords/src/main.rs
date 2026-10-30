@@ -33,6 +33,7 @@ usage:
   lords compose [--repo NAME [--role ROLE]] [--adapter ID] [--json]   what a harness reads there, with sources
   lords sizes [--json]   every file sync writes, by section; fails past the warning line
   lords guard rm   Claude's PreToolUse hook: refuses an `rm` whose path holds a variable not written as quoted ${VAR:?}
+  lords guard install [--home DIR]   install or update the guard copy the hooks run (sync never writes it)
 
 stacks: --public-stack DIR, --private-stack DIR, else config.txt (beside the exe, or ~/.lords-command/),
 else the public stack is <this git repo>/stack.
@@ -142,6 +143,9 @@ fn cmd_guard(mut a: Args) -> ExitCode {
         return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
     }
     let which = a.positional();
+    if which.as_deref() == Some("install") {
+        return guard_install(a);
+    }
     if which.as_deref() != Some("rm") || a.done().is_err() {
         note("usage `lords guard rm` (event on stdin)");
         return ExitCode::SUCCESS;
@@ -158,6 +162,29 @@ fn cmd_guard(mut a: Args) -> ExitCode {
         say(&out);
     }
     ExitCode::SUCCESS
+}
+
+/// `lords guard install [--home DIR]`: installs or updates the guard copy hooks run from this `lords` (sync only
+/// refers to it; orchestrator, 30 Oct). A user's command, with the usual exit codes: 0 done, 2 refused (the old copy
+/// stays).
+fn guard_install(mut a: Args) -> ExitCode {
+    let done = tool_home(&mut a).and_then(|home| {
+        a.done()?;
+        let me = std::env::current_exe().map_err(|e| e.to_string())?;
+        let wrote = lords_core::sync::install_guard(&home, &me)?;
+        Ok((lords_core::sync::guard_place(&home)?.path().to_path_buf(), wrote))
+    });
+    match done {
+        Ok((place, wrote)) => {
+            let what = if wrote { "installed" } else { "already current" };
+            println!("guard {what}: {} (passes its self-test)", place.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("lords guard install: {e}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 fn cmd_check(mut a: Args) -> Result<bool, String> {
@@ -291,17 +318,7 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         ));
     }
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
-    let guard_from = std::env::current_exe().ok();
-    let opts = sync::Options {
-        repo,
-        user_only,
-        adapter,
-        place,
-        home,
-        uninstall: false,
-        stage,
-        guard_from,
-    };
+    let opts = sync::Options { repo, user_only, adapter, place, home, uninstall: false, stage };
     let plan = sync::plan(&stacks, &opts)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_default());

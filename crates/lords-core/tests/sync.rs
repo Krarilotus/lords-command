@@ -537,57 +537,50 @@ fn a_settings_target_adds_the_exclude_and_keeps_the_rest() {
     assert_eq!(plan(&f.stacks(), &opts).unwrap().items[0].action, Action::InSync);
 }
 
-// Spec (owner, 30 Oct: the `rm` guard, installed "the way Lords installs things"; orchestrator, 30 Oct: the settings
-// name a stable copy under the tool's home, copied "only once that exe answers … a self-test"): a settings target's
-// `guards` plans one Lords `PreToolUse` hook per guard, in exec form, naming `<home>/bin/lords-guard.exe`, beside the
-// hooks already there; a copy that doesn't answer its self-test stops the apply before the settings change; a guard
-// taken out of the target takes its hook out, and only that one.
+// Spec (orchestrator, 30 Oct, after the rm-guard fix check r4: "The plan writes the Lords hook entry into settings only
+// if the copy is present and passes `guard --self-test` … If it isn't present, the plan reports … 'guard not installed:
+// run `lords guard install`' and doesn't write the hook"): with no copy, or one that can't run, the settings get no
+// Lords hook, the item says why, and an existing Lords hook is taken out, only that one, the user's own hooks kept.
 #[test]
-fn a_settings_target_installs_its_guards_beside_other_hooks() {
+fn a_settings_target_names_no_guard_that_isnt_installed() {
     let f = Fixture::new();
     let theirs = r#"{"matcher": "Write", "hooks": [{"type": "command", "command": "fmt"}]}"#;
-    let before = format!(
-        "{{\n  \"model\": \"x\",\n  \"hooks\": {{\"PreToolUse\": [{theirs}], \"Stop\": []}}\n}}\n"
+    let settings = f.write(
+        "home/.claude-balanced/settings.json",
+        &format!("{{\n  \"model\": \"x\",\n  \"hooks\": {{\"PreToolUse\": [{theirs}], \"Stop\": []}}\n}}\n"),
     );
-    let settings = f.write("home/.claude-balanced/settings.json", &before);
     with_targets(
         &f,
         &target("balanced settings", "claude", "settings", &settings, "guards = ['rm']\n"),
     );
-    // A `lords` that can't run: its copy never passes the self-test.
-    let fake = f.write("fake-lords.exe", "not a program");
-    let opts = Options { user_only: true, guard_from: Some(fake), ..f.opts() };
+    let opts = Options { user_only: true, ..f.opts() };
     let p = plan(&f.stacks(), &opts).unwrap();
-    assert_eq!(p.items[0].action, Action::Update);
-    let v: serde_json::Value =
-        serde_json::from_str(p.items[0].proposed.as_deref().unwrap()).unwrap();
-    let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
-    assert_eq!(
-        pre[0],
-        serde_json::from_str::<serde_json::Value>(theirs).unwrap(),
-        "theirs stays first"
+    assert_eq!(p.items[0].action, Action::InSync, "{:?}", p.items[0]);
+    assert!(
+        p.items[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("guard not installed: run `lords guard install`")),
+        "{:?}",
+        p.items[0].notes
     );
-    assert_eq!(pre[1]["matcher"], "Bash");
-    let h = &pre[1]["hooks"][0];
-    assert_eq!(h["args"], serde_json::json!(["guard", "rm"]), "{h}");
+    // A copy that can't run is no installed guard either.
     let copy = f.home().join("bin").join("lords-guard.exe");
-    let named = h["command"].as_str().unwrap().replace('\\', "/").to_lowercase();
-    assert_eq!(named, copy.display().to_string().replace('\\', "/").to_lowercase(), "{h}");
-    assert_eq!(v["hooks"]["Stop"], serde_json::json!([]));
-    assert_eq!(v["model"], "x");
-    let failed = apply(&p).expect_err("a guard copy that can't run");
-    assert!(failed.contains("lords-guard"), "{failed}");
-    assert_eq!(fs::read_to_string(&settings).unwrap(), before, "the settings never name it");
-    assert!(!copy.exists(), "no copy left");
-    // Taken out of the target: only Lords' hook goes.
-    // Lords' hook: the one naming its copy.
+    f.write("lords-home/bin/lords-guard.exe", "not a program");
+    assert!(copy.exists(), "the fixture's tool home is lords-home");
+    let p = plan(&f.stacks(), &opts).unwrap();
+    assert!(
+        p.items[0].notes.iter().any(|n| n.contains("guard not ready")),
+        "{:?}",
+        p.items[0].notes
+    );
+    // A Lords hook already there, its copy not ready: taken out, the user's kept.
     let named = copy.display().to_string().replace('\\', "/");
     let lords = format!(
         r#"{{"matcher": "Bash", "hooks": [{{"type": "command", "command": "{named}", "args": ["guard", "rm"]}}]}}"#
     );
     fs::write(&settings, format!("{{\"hooks\": {{\"PreToolUse\": [{theirs}, {lords}]}}}}\n"))
         .unwrap();
-    with_targets(&f, &target("balanced settings", "claude", "settings", &settings, ""));
     let p = plan(&f.stacks(), &opts).unwrap();
     assert_eq!(p.items[0].action, Action::Update);
     apply(&p).unwrap();
@@ -597,11 +590,27 @@ fn a_settings_target_installs_its_guards_beside_other_hooks() {
         v["hooks"]["PreToolUse"],
         serde_json::json!([serde_json::from_str::<serde_json::Value>(theirs).unwrap()])
     );
+    assert_eq!(fs::read_to_string(&copy).unwrap(), "not a program", "sync never touches the copy");
+}
+
+// Spec (orchestrator, 30 Oct: "`lords guard install` … copies to a staged path, self-tests it, and renames it into place
+// atomically. A failure leaves the old copy untouched"): a copy that fails its self-test is never installed; the old
+// copy stays byte for byte, and no staged copy is left.
+#[test]
+fn a_guard_install_that_fails_its_self_test_leaves_the_old_copy() {
+    let f = Fixture::new();
+    let copy = f.write("lords-home/bin/lords-guard.exe", "OLD");
+    let fake = f.write("fake-lords.exe", "not a program");
+    assert!(lords_core::sync::install_guard(&f.home(), &fake).is_err());
+    assert_eq!(fs::read_to_string(&copy).unwrap(), "OLD");
+    let left: Vec<_> =
+        fs::read_dir(copy.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left.len(), 1, "{left:?}");
 }
 
 // Spec: rm-guard review r1, R6 (witness: a user hook carrying a token beside the settings sync edits; adding the guard
-// printed it in the plan's diff and `--json`): a settings plan reports what Lords changes there ("Lords hook added")
-// and never the settings' text, in any output.
+// printed it in the plan's diff and `--json`): a settings plan reports what Lords changes there and never the settings'
+// text, in any output.
 #[test]
 fn a_settings_plan_never_shows_the_settings_text() {
     let f = Fixture::new();
@@ -609,20 +618,17 @@ fn a_settings_plan_never_shows_the_settings_text() {
         "home/.claude-balanced/settings.json",
         "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"Write\",\"hooks\":[{\"type\":\"command\",\"command\":\"audit --token SYNTHETIC_SENTINEL\"}]}]},\n\"env\":{\"EXAMPLE_SECRET\":\"SYNTHETIC_ENV_SENTINEL\"}}\n",
     );
-    with_targets(
-        &f,
-        &target("balanced settings", "claude", "settings", &settings, "guards = ['rm']\n"),
-    );
-    let fake = f.write("fake-lords.exe", "not a program");
-    let p = plan(&f.stacks(), &Options { user_only: true, guard_from: Some(fake), ..f.opts() })
-        .unwrap();
+    let excluded = f.path("home/.claude/CLAUDE.md");
+    let extra = format!("exclude = ['{}']\nguards = ['rm']\n", excluded.display());
+    with_targets(&f, &target("balanced settings", "claude", "settings", &settings, &extra));
+    let p = plan(&f.stacks(), &Options { user_only: true, ..f.opts() }).unwrap();
     let item = &p.items[0];
     assert_eq!(item.action, Action::Update);
     let json = serde_json::to_string(&p).unwrap();
     for shown in [json.as_str(), item.diff.as_str()] {
         assert!(!shown.contains("SYNTHETIC"), "{shown}");
     }
-    assert!(item.diff.contains("Lords hook added"), "{}", item.diff);
+    assert!(item.diff.contains("Lords exclude added"), "{}", item.diff);
 }
 
 // Spec: sol-loop rm guard r1, S1 and S2 (witnesses): a hook is Lords' only when it runs Lords' guard copy. A user's

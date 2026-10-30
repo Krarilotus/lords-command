@@ -102,6 +102,9 @@ pub struct Item {
     /// still uses them.
     #[serde(skip)]
     pub(crate) redacted: bool,
+    /// A settings item whose hooks will name the guard copy: apply checks it is there and answers before it writes.
+    #[serde(skip)]
+    pub(crate) names_guard: Option<Contained>,
 }
 
 /// An item as plans show it (`--json`, the app): a redacted item without its texts.
@@ -238,6 +241,7 @@ impl Item {
             units: Vec::new(),
             conflict: ConflictKind::Other,
             redacted: false,
+            names_guard: None,
         }
     }
 
@@ -279,26 +283,6 @@ pub struct Plan {
     /// before the install stage drops a blocked place's items.
     #[serde(skip)]
     pub over_limit: bool,
-    /// The guard executable a settings target's hooks run, when it must be installed or replaced (`GuardInstall`).
-    #[serde(skip)]
-    pub guard: Option<GuardInstall>,
-    /// `Options::guard_from`.
-    #[serde(skip)]
-    pub guard_from: Option<PathBuf>,
-}
-
-/// The stable copy of `lords` that harness hooks run (orchestrator, 30 Oct): `<tool home>/bin/lords-guard.exe`, never
-/// a build output that a `cargo clean`, a failed or a locked rebuild could take away. It is the syncing executable's
-/// bytes, installed only after the staged copy passes `guard --self-test`.
-#[derive(Clone, Debug)]
-pub struct GuardInstall {
-    pub place: Contained,
-    pub bytes: Vec<u8>,
-    /// The settings targets whose hooks name it: the install stays in the plan only while one of them does.
-    pub for_targets: Vec<String>,
-    /// The hash of the copy as the plan saw it, `None` when there was none: apply refuses a plan whose copy changed
-    /// since (rm-guard fix check r2, R7).
-    pub seen: Option<String>,
 }
 
 /// The guard copy's bytes, read through the path check (a link anywhere on the way is refused); `None` when there is
@@ -312,9 +296,37 @@ fn guard_bytes(place: &Contained) -> Result<Option<Vec<u8>>, String> {
     }
 }
 
-/// Where the guard copy lives in the tool's home.
-fn guard_place(home: &Path) -> Result<Contained, String> {
+/// Where the guard copy lives in the tool's home: `<tool home>/bin/lords-guard.exe`, the stable copy of `lords` that
+/// harness hooks run (orchestrator, 30 Oct), never a build output a `cargo clean` or a locked rebuild could take away.
+pub fn guard_place(home: &Path) -> Result<Contained, String> {
     Ok(Root::home(home)?.join(&[Part::new("bin")?, Part::new("lords-guard.exe")?]))
+}
+
+/// Whether the guard copy is there and answers its self-test: what a settings plan needs before it names it in a hook,
+/// checked when planning and again when applying. Read only.
+fn guard_ready(place: &Contained) -> Result<(), String> {
+    match guard_bytes(place)? {
+        None => Err("guard not installed: run `lords guard install`".into()),
+        Some(_) => crate::process::guard_self_test(place.path())
+            .map_err(|e| format!("guard not ready ({e}): run `lords guard install`")),
+    }
+}
+
+/// `lords guard install` (orchestrator, 30 Oct, after the rm-guard fix check r4: sync never touches the guard copy):
+/// installs or updates the guard copy from `from` under the apply lock: a staged copy that must pass `guard
+/// --self-test`, renamed into place; a failure leaves the old copy as it was. `true` when it wrote one, `false` when
+/// the copy was the same already (and still answers).
+pub fn install_guard(home: &Path, from: &Path) -> Result<bool, String> {
+    let bytes = fsguard::read_bytes(from).map_err(|e| format!("{}: {e}", from.display()))?;
+    let _lock = ApplyLock::take(home, 60)?;
+    let place = guard_place(home)?;
+    fsguard::create_dir_all(&Root::home(home)?.join(&[Part::new("bin")?]))?;
+    match guard_bytes(&place)? {
+        Some(have) if have == bytes => {
+            crate::process::guard_self_test(place.path()).map(|()| false)
+        }
+        _ => fsguard::install_exe(&place, &bytes, crate::process::guard_self_test).map(|()| true),
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -335,9 +347,6 @@ pub struct Options {
     pub uninstall: bool,
     /// What the apply may do: everything, or the install stage only.
     pub stage: Stage,
-    /// The `lords` executable whose copy a settings target's guard hooks run (the CLI passes itself, the app the
-    /// `lords` beside it). `None`: a settings target with guards is a conflict.
-    pub guard_from: Option<PathBuf>,
 }
 
 /// `~/.lords-command`, the tool's own dir on this machine.
@@ -1229,47 +1238,21 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
         Ok(g) => g,
         Err(e) => return conflict(&t.name, &path, e),
     };
-    // The copy the hooks name: planned for apply to install or confirm whenever a `lords` to copy is given; without
-    // one (a check of drift), it must be there already (sol-loop r2, S12, S13).
-    if !t.guards.is_empty() {
-        let have = match guard_bytes(&guard) {
-            Ok(h) => h,
-            Err(e) => return conflict(&t.name, &path, e),
-        };
-        match (&pl.plan.guard_from, &mut pl.plan.guard) {
-            (_, Some(g)) => g.for_targets.push(t.name.clone()),
-            (None, None) if have.is_none() => {
-                return conflict(
-                    &t.name,
-                    &path,
-                    format!(
-                        "the guard copy {} is missing; sync from `lords`",
-                        guard.path().display()
-                    ),
-                );
-            }
-            (None, None) => {}
-            (Some(from), None) => {
-                let bytes = match fsguard::read_bytes(from) {
-                    Ok(b) => b,
-                    Err(e) => return conflict(&t.name, &path, format!("{}: {e}", from.display())),
-                };
-                if have.as_deref() != Some(&bytes[..]) {
-                    pl.plan.notes.push(format!(
-                        "installs the guard {} (a copy of this lords)",
-                        guard.path().display()
-                    ));
-                }
-                pl.plan.guard = Some(GuardInstall {
-                    place: guard.clone(),
-                    bytes,
-                    for_targets: vec![t.name.clone()],
-                    seen: have.as_deref().map(fsguard::sha),
-                });
+    // Sync never writes the guard copy (`lords guard install` does): a hook names it only while it is there and
+    // answers; otherwise the hook is left out (or taken out) and the target says why.
+    let mut not_ready = None;
+    let guards: &[String] = if t.guards.is_empty() {
+        &[]
+    } else {
+        match guard_ready(&guard) {
+            Ok(()) => &t.guards,
+            Err(why) => {
+                not_ready = Some(why);
+                &[]
             }
         }
-    }
-    let hooks = match guard_hooks(t, adapter, &value, guard.path()) {
+    };
+    let hooks = match guard_hooks(guards, adapter, &value, guard.path()) {
         Ok(h) => h,
         Err(e) => return conflict(&t.name, &path, e),
     };
@@ -1299,6 +1282,8 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
     let mut item =
         owner_file_item(&t.name, &path, Dest::Owner(owner), proposed, &Composed::default());
     item.redacted = true;
+    item.notes.extend(not_ready);
+    item.names_guard = (!guards.is_empty()).then(|| guard.clone());
     item.diff = settings_summary(
         &added_excludes,
         hooks
@@ -1348,7 +1333,7 @@ fn settings_summary(added_excludes: &[String], guards: Option<(usize, usize)>) -
 /// install` does for git hooks. A hook entry is Lords' when its args are `guard <name>`; any other entry stays as it
 /// is.
 fn guard_hooks(
-    t: &Target,
+    guards: &[String],
     adapter: &dyn Adapter,
     settings: &serde_json::Value,
     guard: &Path,
@@ -1363,13 +1348,13 @@ fn guard_hooks(
     let lords_entry =
         |e: &serde_json::Value| e["hooks"].as_array().is_some_and(|hs| hs.iter().any(&ours));
     let has_lords = current["PreToolUse"].as_array().is_some_and(|a| a.iter().any(lords_entry));
-    if t.guards.is_empty() && !has_lords {
+    if guards.is_empty() && !has_lords {
         return Ok(None);
     }
-    if !t.guards.is_empty() && adapter.id() != "claude" {
+    if !guards.is_empty() && adapter.id() != "claude" {
         return Err(format!("guards are Claude Code hooks; adapter {} has none", adapter.id()));
     }
-    for g in &t.guards {
+    for g in guards {
         if g != "rm" {
             return Err(format!("no guard `{g}`; there is: rm"));
         }
@@ -1395,7 +1380,7 @@ fn guard_hooks(
         }
     }
     pre.retain(|e| e["hooks"].as_array().is_none_or(|hs| !hs.is_empty()));
-    for g in &t.guards {
+    for g in guards {
         pre.push(serde_json::json!({ "matcher": "Bash", "hooks": [{
             "type": "command", "command": exe, "args": ["guard", g],
         }] }));
@@ -2072,7 +2057,6 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         plan: Plan {
             home: opts.home.clone(),
             ledger_revision: ledger.revision(),
-            guard_from: opts.guard_from.clone(),
             ..Plan::default()
         },
         ledger,
@@ -2221,14 +2205,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         pl.wanted.clear();
     }
     match (opts.stage, &complete) {
-        (Stage::Install, _) => {
-            staged(&mut pl.plan);
-            // The guard copy goes only with a settings target that still names it (sol-loop r2, S15).
-            let left = |n: &String| pl.plan.items.iter().any(|i| &i.target == n);
-            if pl.plan.guard.as_ref().is_some_and(|g| !g.for_targets.iter().any(left)) {
-                pl.plan.guard = None;
-            }
-        }
+        (Stage::Install, _) => staged(&mut pl.plan),
         (Stage::Full, Some(_)) => pl.unwanted(),
         (Stage::Full, None) => pl.plan.notes.push(format!(
             "removal held: {why}, so nothing is removed or forgotten until both are none"
@@ -2566,7 +2543,7 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
     }
     let changing: Vec<&Item> =
         plan.items.iter().filter(|i| i.changes() && i.action != Action::RetireEntry).collect();
-    if changing.is_empty() && plan.guard.is_none() {
+    if changing.is_empty() {
         return Ok(Applied::default());
     }
     if plan.complete.is_none()
@@ -2588,8 +2565,8 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
             ));
         }
     }
-    // One lock over everything this apply changes, taken once the plan is known current (rm-guard review r1, R7): a
-    // stale plan changes nothing, the guard copy included.
+    // One lock over everything this apply changes; every check first, then the changes (rm-guard review r1, R7). Apply
+    // never writes the guard copy (`lords guard install` does).
     let _lock = ApplyLock::take(&plan.home, 60)?;
     let mut ledger = Ledger::load(&plan.home)?;
     if ledger.revision() != plan.ledger_revision {
@@ -2598,8 +2575,9 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
                 .into(),
         );
     }
-    // The ledger covers only tool-owned paths; a plan is current only if the owner files it changes and the guard copy
-    // are as it saw them too (rm-guard fix check r2, R7). Checked here, under the lock, before anything changes.
+    // The ledger covers only tool-owned paths; a plan is current only if its tool destinations and the owner files it
+    // changes are as it saw them too (rm-guard fix checks r2, r3, R7). Checked here, under the lock, before anything
+    // changes; and settings that will name the guard copy only while it is there and answers.
     for i in changing.iter().filter(|i| i.class == Class::Tool) {
         tool_current(i, &ledger)?;
     }
@@ -2612,24 +2590,8 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
             ));
         }
     }
-    if let Some(g) = &plan.guard {
-        let now = guard_bytes(&g.place)?;
-        if now.as_deref().map(fsguard::sha) != g.seen {
-            return Err(format!(
-                "{} changed since the plan (another sync?); plan again (nothing was changed)",
-                g.place.path().display()
-            ));
-        }
-        // The guard copy before the settings that name it: they never name a guard that doesn't answer
-        // (orchestrator, 30 Oct).
-        fsguard::create_dir_all(&Root::home(&plan.home)?.join(&[Part::new("bin")?]))?;
-        match now {
-            Some(have) if have == g.bytes => crate::process::guard_self_test(g.place.path())?,
-            _ => fsguard::install_exe(&g.place, &g.bytes, crate::process::guard_self_test)?,
-        }
-    }
-    if changing.is_empty() {
-        return Ok(Applied::default());
+    for g in changing.iter().filter_map(|i| i.names_guard.as_ref()) {
+        guard_ready(g).map_err(|e| format!("{e} (nothing was changed)"))?;
     }
     let mut run = Run::new(&plan.home)?;
     let mut applied = Applied::default();
