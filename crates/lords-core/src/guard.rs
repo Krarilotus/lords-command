@@ -188,12 +188,12 @@ pub fn unguarded_rm(command: &str) -> Option<String> {
 }
 
 /// Shell words that can stand before a command in a simple command's place.
-const KEYWORDS: [&str; 10] =
-    ["then", "do", "else", "elif", "if", "while", "until", "!", "{", "time"];
+const KEYWORDS: [&str; 9] = ["then", "do", "else", "elif", "if", "while", "until", "!", "{"];
 
-/// Commands that run the command after them (with options of their own in between).
-const WRAPPERS: [&str; 9] =
-    ["sudo", "command", "env", "builtin", "exec", "nohup", "nice", "timeout", "xargs"];
+/// Commands that run the command after them (with options of their own in between). `time` is one: it takes options
+/// of its own (`time -p`; sol-loop r4, S19).
+const WRAPPERS: [&str; 10] =
+    ["sudo", "command", "env", "builtin", "exec", "nohup", "nice", "timeout", "xargs", "time"];
 
 /// The guard hook's answer to one `PreToolUse` event (the harness's stdin JSON): a denial naming the fix, or nothing
 /// (empty: the call goes on to the harness's own checks). Only Bash calls are looked at; input that isn't such an
