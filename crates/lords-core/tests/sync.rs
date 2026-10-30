@@ -936,3 +936,39 @@ fn check_warns_before_an_adapter_cuts_text() {
     assert!(warned(25_000), "25 000 bytes of 32 768 is past 75 %");
     assert!(!warned(23_000), "23 000 bytes is under 75 %");
 }
+
+// Spec (orchestrator, 30 Oct, accepted from the sync-performance study P6: Codex size warnings are "info-only for
+// adapters not switched on"): past the line, a place's file for an adapter the place doesn't write for is an `info`
+// finding that says so; for one it writes for, a warning.
+#[test]
+fn a_size_past_the_line_is_info_for_an_adapter_not_switched_on() {
+    let severity = |adapters: &str| {
+        let f = Fixture::new();
+        std::fs::create_dir_all(f.path("work")).unwrap();
+        f.write(
+            "priv/workspace/work/rules/big.md",
+            &entry(
+                "rule.big",
+                "workspace:work",
+                "private",
+                "",
+                &format!("{}\n", "x".repeat(25_000)),
+            ),
+        );
+        with_targets(
+            &f,
+            &format!(
+                "[workspaces.work]\npath = '{}'\nadapters = {adapters}\n",
+                f.path("work").display()
+            ),
+        );
+        lords_core::sync::drift_findings(&f.stacks(), &f.home())
+            .into_iter()
+            .find(|x| x.code == "size" && x.message.contains("codex"))
+            .map(|x| (x.severity, x.message))
+    };
+    let (s, message) = severity("[\"claude\"]").expect("still measured");
+    assert_eq!(s, lords_core::Severity::Info, "{message}");
+    assert!(message.contains("not switched on"), "{message}");
+    assert_eq!(severity("[\"codex\"]").map(|x| x.0), Some(lords_core::Severity::Warning));
+}
