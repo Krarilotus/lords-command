@@ -124,6 +124,29 @@ fn keywords_and_wrapper_options_dont_hide_rm() {
     }
 }
 
+// Spec: sol-loop rm guard r5, S20–S22 (witnesses): a leading redirection, a wrapper named by its path, and an `rm`
+// inside a shell string another command runs (`trap`, `eval`, `bash -c`, `sh -c`) are all still checked.
+#[test]
+fn redirections_wrapper_paths_and_shell_strings_dont_hide_rm() {
+    for command in [
+        "OUT=; 2>/dev/null rm -rf \"$OUT/build\"",
+        ">/dev/null 2>&1 rm $X",
+        "/usr/bin/time -p rm -rf \"$OUT/build\"",
+        "/usr/bin/sudo rm $X",
+        "OUT=; trap 'rm -rf \"$OUT/build\"' EXIT",
+        "bash -c 'rm -rf \"$OUT/build\"'",
+        "sh -c \"rm -f $X\"",
+        "eval 'rm -f $X'",
+    ] {
+        assert!(denied(command).is_some(), "let through: {command}");
+    }
+    for command in
+        ["trap 'rm -rf \"${OUT:?}/build\"' EXIT", "bash -c 'echo $X'", "2>/dev/null ls $X"]
+    {
+        assert_eq!(denied(command), None, "{command}");
+    }
+}
+
 // Spec: the reasoned call (owner, 30 Oct: "a variable inside quotes without `:?` gets your reasoned call"): rejected.
 // Quoting stops word splitting, not emptiness: with OUT empty, `rm -rf "$OUT/x"` is `rm -rf /x`. Only `:?` stops that.
 #[test]
