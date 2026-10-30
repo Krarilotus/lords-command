@@ -25,6 +25,8 @@ evidence:
   date: 2026-10-30
 - summary: "Promoting every item still failed in practice: each promotion injects its one message into the running turn and interrupts the calls beside it, so items kept arriving one at a time (an orchestrator, every batch that night). Reading an item returns its full text; only an attachment needs a promotion. Twice an orchestrator said it had taken everything while an item sat queued, because nothing showed it the queue."
   date: 2026-10-30
+- summary: "Read-then-cancel reports '[cancelled] Child task ended with status cancelled' to the sender of a message the receiver read and answered; a sender first took two such messages for lost. T3 has no 'taken' state yet (an upstream proposal, with a queue listing)."
+  date: 2026-10-31
 origin:
   type: own
 topics: [delegation, process]
@@ -34,7 +36,8 @@ start of a turn and again before its final reply, so the queue is empty when the
 queue (`t3_queue list`), read every truncated item in full, cancel each text-only item once its text is in hand, and
 promote only an item that carries an attachment (a `t3-context://` marker), since a cancel would drop it. Promote one
 at a time with no other call beside it (a promotion interrupts calls in flight). Then answer all of them together. A
-task's automatic completion notice is read whole, then cancelled. The queue isn't the only inbox: at each checkup also read the result of every child
+task's automatic completion notice is read whole, then cancelled. A cancel after a read tells the item's sender
+"[cancelled]": as a sender, read that as taken, and judge delivery by the answer. The queue isn't the only inbox: at each checkup also read the result of every child
 that finished since the last one, comparing its latest run with the last one you acted on, since a result can sit
 there with no notification (a lead's later turns don't wake its parent); don't poll children that are still running. Handle what arrived together as one batch: one message per agent,
 and close each request with its disposition, not merely because it was read. To a busy agent, read its state first and
