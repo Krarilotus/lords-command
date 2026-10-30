@@ -1350,9 +1350,24 @@ fn newly_shown(checkout: &Path, current: &str, proposed: &str) -> Result<Vec<Str
 
 /// The files the repo tracks at or below `paths` in the checkout at `dir`, relative to it, from one git call.
 fn tracked_at(dir: &Path, paths: &[&str]) -> Result<Vec<String>, String> {
+    // On Windows a name that differs only in case is the same file, so git is asked case-insensitively and the answer
+    // folded (sol-loop sync-perf r1, S2): a tracked `claude.local.md` is where `CLAUDE.local.md` would be written.
+    let specs: Vec<String> = paths
+        .iter()
+        .map(|p| if cfg!(windows) { format!(":(icase){p}") } else { p.to_string() })
+        .collect();
     let mut args = vec!["ls-files", "-z", "--"];
-    args.extend_from_slice(paths);
-    Ok(git::run(dir, &args)?.split('\0').filter(|s| !s.is_empty()).map(str::to_string).collect())
+    args.extend(specs.iter().map(String::as_str));
+    Ok(git::run(dir, &args)?.split('\0').filter(|s| !s.is_empty()).map(fold).collect())
+}
+
+/// A repo-relative name as the filesystem compares it: case-folded on Windows, as is.
+fn fold(name: &str) -> String {
+    if cfg!(windows) {
+        name.to_uppercase()
+    } else {
+        name.to_string()
+    }
 }
 
 /// Every checkout and (if asked) worktree of a repo, as roots verified by `Root::checkout`, the worktrees skipped
@@ -1542,9 +1557,12 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
         match tracked_in.get(&ledger::key(p)) {
             None => Ok(false),
             Some(Err(e)) => Err(e.clone()),
-            Some(Ok(files)) => Ok(files.iter().any(|f| {
-                f == rel || f.strip_prefix(rel).is_some_and(|rest| rest.starts_with('/'))
-            })),
+            Some(Ok(files)) => {
+                let rel = fold(rel);
+                Ok(files.iter().any(|f| {
+                    *f == rel || f.strip_prefix(&rel).is_some_and(|rest| rest.starts_with('/'))
+                }))
+            }
         }
     };
     for adapter in chosen.iter().copied() {
@@ -2828,8 +2846,8 @@ pub fn import_and_apply(
         if let Some(p) = &stacks.private {
             if !p.manifest.memory_stores.is_empty() {
                 for r in crate::ops::import(p, None, true)? {
-                    stacks_changed |=
-                        r.commit.is_some() || !r.added.is_empty() || !r.changed.is_empty();
+                    // Any write, the store's defaults file included (sol-loop sync-perf r1, S1).
+                    stacks_changed |= r.wrote || r.commit.is_some();
                     if let Some(c) = r.commit {
                         done.push(format!("imported memory from {}: commit {c}", r.store));
                     }

@@ -333,6 +333,7 @@ fn import_stores(
             fsguard::create_dir_all(&dest_place)?;
         }
         let defaults = dest.join(DEFAULTS);
+        let mut wrote_defaults = false;
         if write && !defaults.exists() {
             let audience =
                 if s.audience.is_empty() { "all".to_string() } else { s.audience.join(", ") };
@@ -342,8 +343,10 @@ fn import_stores(
             );
             git_keeps(&defaults)?;
             stack_write(&private.root, &defaults, text.as_bytes())?;
+            wrote_defaults = true;
         }
-        let mut rep = Imported { store: s.name.clone(), ..Imported::default() };
+        let mut rep =
+            Imported { store: s.name.clone(), wrote: wrote_defaults, ..Imported::default() };
         let mut seen = Vec::new();
         for f in stack::sorted_children(&src)? {
             // A source entry whose kind can't be told stops the import, never is skipped (r5, R5-04's class).
@@ -400,6 +403,7 @@ fn import_stores(
             );
             rep.commit = git::commit(&private.root, &[rel(&private.root, &dest)], &msg)?;
         }
+        rep.wrote |= write && (!rep.added.is_empty() || !rep.changed.is_empty());
         reports.push(rep);
     }
     Ok(reports)
