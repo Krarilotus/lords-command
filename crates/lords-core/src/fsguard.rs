@@ -770,18 +770,22 @@ impl Root {
     /// level there is exactly this path, and its git dir is there. A dir that is none, a dir inside one, a stale
     /// worktree git still lists, and a git that fails are all errors.
     pub fn checkout(path: &Path) -> Result<Root, String> {
-        let top = crate::git::run(path, &["rev-parse", "--show-toplevel"])
+        // One git process for both answers, a line each: sync verifies every worktree of a repo this way.
+        let out = crate::git::run(path, &["rev-parse", "--show-toplevel", "--absolute-git-dir"])
             .map_err(|e| format!("{} is no git checkout ({e})", path.display()))?;
-        if crate::ledger::key(Path::new(top.trim())) != crate::ledger::key(path) {
+        let mut lines = out.lines().map(str::trim);
+        let (top, git_dir) = match (lines.next(), lines.next()) {
+            (Some(t), Some(g)) => (t, g),
+            _ => return Err(format!("{} is no git checkout (git said {out:?})", path.display())),
+        };
+        if crate::ledger::key(Path::new(top)) != crate::ledger::key(path) {
             return Err(format!(
-                "{} is no checkout's root: git's top level there is {}",
-                path.display(),
-                top.trim()
+                "{} is no checkout's root: git's top level there is {top}",
+                path.display()
             ));
         }
-        let git_dir = crate::git::run(path, &["rev-parse", "--absolute-git-dir"])?;
-        if kind(Path::new(git_dir.trim()))? != Kind::Dir {
-            return Err(format!("{}: its git dir {} is gone", path.display(), git_dir.trim()));
+        if kind(Path::new(git_dir))? != Kind::Dir {
+            return Err(format!("{}: its git dir {git_dir} is gone", path.display()));
         }
         Root::at(path.to_path_buf())
     }
