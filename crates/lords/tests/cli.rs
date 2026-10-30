@@ -907,6 +907,113 @@ fn the_guard_fails_open_when_it_cant_write() {
     let event = r#"{"tool_name":"Bash","tool_input":{"command":"rm -f $OUT/x"}}"#;
     child.stdin.take().unwrap().write_all(event.as_bytes()).unwrap();
     assert_eq!(child.wait().unwrap().code(), Some(0), "a closed response pipe");
+    // rm-guard fix check r2, R8: the guard's help, with its stdout closed.
+    for args in [&["guard", "--help"][..], &["guard", "rm", "-h"]] {
+        let mut c = env.cmd(exe, env.dir.path());
+        let mut child = c
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stdout.take());
+        assert_eq!(child.wait().unwrap().code(), Some(0), "{args:?} with a closed stdout");
+    }
+}
+
+/// A user-level fixture for the stale-plan tests: a settings target with the rm guard, a skills target, three
+/// `lords` builds told apart by a trailing byte (A: none, B, C), and a plan for each.
+struct Stale {
+    dir: TempDir,
+}
+
+impl Stale {
+    fn new() -> Stale {
+        let s = Stale { dir: TempDir::new().unwrap() };
+        s.write("pub/stack.toml", b"name = \"pub\"\nvisibility = \"public\"\n");
+        s.skill("a");
+        s.write("home/settings.json", b"{}\n");
+        let r = s.dir.path();
+        let targets = format!(
+            "name = \"priv\"\nvisibility = \"private\"\n[[targets]]\nname = \"settings\"\nadapter = \"claude\"\nkind = \"settings\"\npath = '{}'\nguards = [\"rm\"]\n[[targets]]\nname = \"skills\"\nadapter = \"claude\"\nkind = \"skills\"\npath = '{}'\n",
+            r.join("home/settings.json").display(),
+            r.join("home/skills").display()
+        );
+        s.write("priv/stack.toml", targets.as_bytes());
+        let lords = fs::read(env!("CARGO_BIN_EXE_lords")).unwrap();
+        s.write("a/lords.exe", &lords);
+        s.write("b/lords.exe", &[&lords[..], b"B"].concat());
+        s.write("c/lords.exe", &[&lords[..], b"C"].concat());
+        s
+    }
+
+    fn write(&self, rel: &str, text: &[u8]) {
+        let p = self.dir.path().join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, text).unwrap();
+    }
+
+    fn skill(&self, name: &str) {
+        self.write(
+            &format!("pub/global/skills/{name}/SKILL.md"),
+            format!("---\nname: {name}\n---\nX\n").as_bytes(),
+        );
+        self.write(
+            &format!("pub/global/skills/{name}/lords.yaml"),
+            format!("id: skill.{name}\nkind: skill\ntitle: {name}\naudience: [all]\nscope: global\nstatus: active\nvisibility: public\norigin:\n  type: own\n").as_bytes(),
+        );
+    }
+
+    fn plan(&self, build: &str) -> lords_core::sync::Plan {
+        let r = self.dir.path();
+        let stacks = lords_core::Stacks::load(&r.join("pub"), Some(&r.join("priv"))).unwrap();
+        let opts = lords_core::sync::Options {
+            user_only: true,
+            home: r.join("tool"),
+            guard_from: Some(r.join(build).join("lords.exe")),
+            ..lords_core::sync::Options::default()
+        };
+        lords_core::sync::plan(&stacks, &opts).unwrap()
+    }
+
+    /// The guard copy's last byte, the settings' bytes and the ledger's bytes: what a refused apply must leave.
+    fn state(&self) -> (Option<u8>, Vec<u8>, Option<Vec<u8>>) {
+        let r = self.dir.path();
+        let copy =
+            fs::read(r.join("tool/bin/lords-guard.exe")).ok().and_then(|b| b.last().copied());
+        let ledger = fs::read(r.join("tool/state/ledger.toml")).ok();
+        (copy, fs::read(r.join("home/settings.json")).unwrap(), ledger)
+    }
+}
+
+// Spec: rm-guard fix check r2, R7 (witness: a stale plan whose only changes are the settings and the guard: the ledger
+// revision doesn't move, and the stale plan replaced the live guard): a plan is current only if the settings and the
+// guard copy are as it saw them; a stale one changes nothing.
+#[test]
+fn a_settings_only_stale_plan_never_replaces_the_live_guard() {
+    let s = Stale::new();
+    lords_core::sync::apply(&s.plan("a")).unwrap();
+    let stale = s.plan("a");
+    s.write("home/settings.json", b"{\"model\":\"x\"}\n");
+    lords_core::sync::apply(&s.plan("b")).unwrap();
+    let after_b = s.state();
+    assert_eq!(after_b.0, Some(b'B'));
+    let _ = lords_core::sync::apply(&stale);
+    assert_eq!(s.state(), after_b, "a stale settings plan changed something");
+}
+
+// Spec: R7, the guard-only case: settings in sync, only the guard copy changed by another sync since the plan.
+#[test]
+fn a_guard_only_stale_plan_never_replaces_the_live_guard() {
+    let s = Stale::new();
+    lords_core::sync::apply(&s.plan("b")).unwrap();
+    let stale = s.plan("a");
+    lords_core::sync::apply(&s.plan("c")).unwrap();
+    let after_c = s.state();
+    assert_eq!(after_c.0, Some(b'C'));
+    assert!(lords_core::sync::apply(&stale).is_err(), "a stale guard plan is refused");
+    assert_eq!(s.state(), after_c);
 }
 
 // Spec: rm-guard review r1, R7 (witness: a stale plan's apply installed its guard, replacing a newer one, before the

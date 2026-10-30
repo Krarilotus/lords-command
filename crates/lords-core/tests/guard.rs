@@ -84,6 +84,17 @@ fn a_literal_path_and_other_commands_pass() {
     assert_eq!(rm_hook("not json"), "");
 }
 
+// Spec: rm-guard fix check r2, R9 (witnesses): a trailing redirection inside a plain `rm` command (`2>&1`, `&>`, `>|`)
+// is part of that command, so its operands are still checked; and a redirection target named `rm` is no command.
+#[test]
+fn trailing_redirections_stay_in_the_rm_command() {
+    for command in ["rm -f 2>&1 \"$OUT/x\"", "rm -f &>log \"$OUT/x\"", "rm -f >|log \"$OUT/x\""] {
+        assert!(denied(command).is_some(), "let through: {command}");
+    }
+    assert_eq!(denied("printf '%s\\n' >|rm \"$OUT\""), None);
+    assert_eq!(denied("rm -f build/out 2>&1"), None);
+}
+
 // Spec: the reasoned call (owner, 30 Oct: "a variable inside quotes without `:?` gets your reasoned call"): rejected.
 // Quoting stops word splitting, not emptiness: with OUT empty, `rm -rf "$OUT/x"` is `rm -rf /x`. Only `:?` stops that.
 // Every operand after `rm` is checked, redirection targets and options included (a false refusal costs a retry).
