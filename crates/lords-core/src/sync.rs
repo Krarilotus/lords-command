@@ -2853,16 +2853,12 @@ pub fn import_and_apply_between(
     }
     between();
     let mut done = Vec::new();
-    // Whether an import or a retirement changed a stack file, so the first plan no longer holds.
-    let mut stacks_changed = false;
     // The install stage imports and retires nothing.
     if opts.stage == Stage::Full {
         let _lock = ApplyLock::take(&opts.home, 60)?;
         if let Some(p) = &stacks.private {
             if !p.manifest.memory_stores.is_empty() {
                 for r in crate::ops::import(p, None, true)? {
-                    // Any write, the store's defaults file included (sol-loop sync-perf r1, S1).
-                    stacks_changed |= r.wrote || r.commit.is_some();
                     if let Some(c) = r.commit {
                         done.push(format!("imported memory from {}: commit {c}", r.store));
                     }
@@ -2872,16 +2868,16 @@ pub fn import_and_apply_between(
         // Ended temporary entries leave the stacks' context for good: retired, with a commit each.
         let stacks = Stacks::load(public, private)?;
         for (id, commit) in crate::ops::retire_expired(&stacks, &crate::ops::today(), true)? {
-            stacks_changed = true;
             done.push(format!(
                 "retired expired {id}{}",
                 commit.map(|c| format!(": commit {c}")).unwrap_or_default()
             ));
         }
     }
-    // A fresh plan only when the stacks changed: planning walks every checkout, and apply checks each item against
-    // the disk and the ledger's revision anyway.
-    let last = if stacks_changed { plan(&Stacks::load(public, private)?, opts)? } else { first };
+    // A fresh plan, always: what a plan read reaches beyond the stacks (a tracked `AGENTS.md`, the git index), and any
+    // of it can change while this waited for the lock; apply checks only each item's destination and the ledger
+    // (sync perf review r1, R2). Planning is about 30 s on the real stacks since this branch.
+    let last = plan(&Stacks::load(public, private)?, opts)?;
     let mut applied = apply(&last)?;
     done.append(&mut applied.done);
     applied.done = done;
