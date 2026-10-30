@@ -3449,10 +3449,18 @@ fn repo_size_findings(stacks: &Stacks) -> Vec<crate::Finding> {
         )
     });
     let copies: Vec<crate::Finding> = copies.collect();
+    // An adapter the place doesn't write for yet: measured, so the line holds before it is switched on, but only
+    // info (orchestrator, 30 Oct, study P6).
     let mut out: Vec<crate::Finding> = all
         .into_iter()
         .filter(|s| s.over_line())
-        .map(|s| crate::Finding::warning("size", s.describe()))
+        .map(|s| match s.enabled {
+            true => crate::Finding::warning("size", s.describe()),
+            false => crate::Finding::info(
+                "size",
+                format!("{} (not switched on here; it matters once it is)", s.describe()),
+            ),
+        })
         .collect();
     out.extend(copies);
     out
