@@ -2820,12 +2820,16 @@ pub fn import_and_apply(
         ));
     }
     let mut done = Vec::new();
+    // Whether an import or a retirement changed a stack file, so the first plan no longer holds.
+    let mut stacks_changed = false;
     // The install stage imports and retires nothing.
     if opts.stage == Stage::Full {
         let _lock = ApplyLock::take(&opts.home, 60)?;
         if let Some(p) = &stacks.private {
             if !p.manifest.memory_stores.is_empty() {
                 for r in crate::ops::import(p, None, true)? {
+                    stacks_changed |=
+                        r.commit.is_some() || !r.added.is_empty() || !r.changed.is_empty();
                     if let Some(c) = r.commit {
                         done.push(format!("imported memory from {}: commit {c}", r.store));
                     }
@@ -2835,14 +2839,17 @@ pub fn import_and_apply(
         // Ended temporary entries leave the stacks' context for good: retired, with a commit each.
         let stacks = Stacks::load(public, private)?;
         for (id, commit) in crate::ops::retire_expired(&stacks, &crate::ops::today(), true)? {
+            stacks_changed = true;
             done.push(format!(
                 "retired expired {id}{}",
                 commit.map(|c| format!(": commit {c}")).unwrap_or_default()
             ));
         }
     }
-    let stacks = Stacks::load(public, private)?;
-    let mut applied = apply(&plan(&stacks, opts)?)?;
+    // A fresh plan only when the stacks changed: planning walks every checkout, and apply checks each item against
+    // the disk and the ledger's revision anyway.
+    let last = if stacks_changed { plan(&Stacks::load(public, private)?, opts)? } else { first };
+    let mut applied = apply(&last)?;
     done.append(&mut applied.done);
     applied.done = done;
     Ok(applied)
