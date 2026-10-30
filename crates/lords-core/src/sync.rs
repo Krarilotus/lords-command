@@ -1095,7 +1095,8 @@ fn json_set_key(text: &str, key: &str, value: &serde_json::Value) -> Result<Stri
 }
 
 /// A settings target (an owner file): the adapter's exclude list in a JSON settings file holds every path in
-/// `exclude`. Only that one key changes; the rest of the file keeps its bytes.
+/// `exclude`, and its tool-call hooks hold one Lords guard per name in `guards` (guard.rs). Only those two keys change;
+/// the rest of the file keeps its bytes, and hooks that aren't Lords' keep theirs.
 fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
     let owner = OwnerFile::target(t);
     pl.plan.owner_files.push(owner.clone());
@@ -1133,15 +1134,93 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
         }
     }
     let list = serde_json::Value::Array(list.clone());
-    let proposed = match (&current, added) {
-        (Some(c), false) => c.clone(),
-        (Some(c), true) => match json_set_key(c, key, &list) {
-            Ok(text) => text,
-            Err(e) => return conflict(&t.name, &path, e),
-        },
-        (None, _) => serde_json::to_string_pretty(&value).expect("JSON serialises") + "\n",
+    let hooks = match guard_hooks(t, adapter, &value) {
+        Ok(h) => h,
+        Err(e) => return conflict(&t.name, &path, e),
+    };
+    if let Some(h) = &hooks {
+        value.as_object_mut().expect("an object").insert("hooks".into(), h.clone());
+    }
+    let proposed = match &current {
+        None => serde_json::to_string_pretty(&value).expect("JSON serialises") + "\n",
+        Some(c) => {
+            let mut text = c.clone();
+            if added {
+                text = match json_set_key(&text, key, &list) {
+                    Ok(t) => t,
+                    Err(e) => return conflict(&t.name, &path, e),
+                };
+            }
+            if let Some(h) = &hooks {
+                text = match json_set_key(&text, "hooks", h) {
+                    Ok(t) => t,
+                    Err(e) => return conflict(&t.name, &path, e),
+                };
+            }
+            text
+        }
     };
     owner_file_item(&t.name, &path, Dest::Owner(owner), proposed, &Composed::default())
+}
+
+/// The settings' `hooks` with one Lords guard per name in the target's `guards`, or `None` when they already hold
+/// exactly those. A guard runs the `lords` that syncs (exec form: `command` and `args`, no shell), as `lords hooks
+/// install` does for git hooks. A hook entry is Lords' when its args are `guard <name>`; any other entry stays as it
+/// is.
+fn guard_hooks(
+    t: &Target,
+    adapter: &dyn Adapter,
+    settings: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    let current = settings.get("hooks").cloned().unwrap_or(serde_json::Value::Null);
+    // Lords' entry: a hook run as `<exe> guard <name>`, whatever the exe's path (it moves with each build).
+    let lords_entry = |e: &serde_json::Value| {
+        e["hooks"].as_array().is_some_and(|hs| {
+            hs.iter().any(|h| {
+                h["args"]
+                    .as_array()
+                    .is_some_and(|a| a.len() == 2 && a[0] == "guard" && a[1] == "rm")
+            })
+        })
+    };
+    let has_lords = current["PreToolUse"].as_array().is_some_and(|a| a.iter().any(lords_entry));
+    if t.guards.is_empty() && !has_lords {
+        return Ok(None);
+    }
+    if !t.guards.is_empty() && adapter.id() != "claude" {
+        return Err(format!("guards are Claude Code hooks; adapter {} has none", adapter.id()));
+    }
+    for g in &t.guards {
+        if g != "rm" {
+            return Err(format!("no guard `{g}`; there is: rm"));
+        }
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = adapters::slashes(&exe);
+    let mut hooks = match current {
+        serde_json::Value::Null => serde_json::json!({}),
+        v @ serde_json::Value::Object(_) => v,
+        _ => return Err("`hooks` isn't an object; left alone".into()),
+    };
+    let pre = hooks
+        .as_object_mut()
+        .expect("an object")
+        .entry("PreToolUse")
+        .or_insert(serde_json::json!([]));
+    let Some(pre) = pre.as_array_mut() else {
+        return Err("`hooks.PreToolUse` isn't a list; left alone".into());
+    };
+    let before = pre.clone();
+    pre.retain(|e| !lords_entry(e));
+    for g in &t.guards {
+        pre.push(serde_json::json!({ "matcher": "Bash", "hooks": [{
+            "type": "command", "command": exe, "args": ["guard", g],
+        }] }));
+    }
+    if *pre == before {
+        return Ok(None);
+    }
+    Ok(Some(hooks))
 }
 
 /// A user file whose harness also loads another file that hides repos' own instructions, unless a settings

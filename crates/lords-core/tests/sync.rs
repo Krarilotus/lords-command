@@ -537,6 +537,55 @@ fn a_settings_target_adds_the_exclude_and_keeps_the_rest() {
     assert_eq!(plan(&f.stacks(), &opts).unwrap().items[0].action, Action::InSync);
 }
 
+// Spec (owner, 30 Oct: the `rm` guard, installed "the way Lords installs things"): a settings target's `guards` puts
+// one Lords `PreToolUse` hook per guard into the settings, in exec form, beside the hooks already there, which keep
+// their bytes; once there it is in sync; a guard taken out of the target takes its hook out, and only that one.
+#[test]
+fn a_settings_target_installs_its_guards_beside_other_hooks() {
+    let f = Fixture::new();
+    let theirs = r#"{"matcher": "Write", "hooks": [{"type": "command", "command": "fmt"}]}"#;
+    let settings = f.write(
+        "home/.claude-balanced/settings.json",
+        &format!("{{\n  \"model\": \"x\",\n  \"hooks\": {{\"PreToolUse\": [{theirs}], \"Stop\": []}}\n}}\n"),
+    );
+    with_targets(
+        &f,
+        &target("balanced settings", "claude", "settings", &settings, "guards = ['rm']\n"),
+    );
+    let opts = Options { user_only: true, ..f.opts() };
+    let p = plan(&f.stacks(), &opts).unwrap();
+    assert_eq!(p.items[0].action, Action::Update);
+    apply(&p).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+    let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(
+        pre[0],
+        serde_json::from_str::<serde_json::Value>(theirs).unwrap(),
+        "theirs stays first"
+    );
+    assert_eq!(pre[1]["matcher"], "Bash");
+    let h = &pre[1]["hooks"][0];
+    assert_eq!(h["args"], serde_json::json!(["guard", "rm"]), "{h}");
+    // Exec form: the executable that syncs (here the test binary), no shell.
+    let exe = std::env::current_exe().unwrap().display().to_string().replace('\\', "/");
+    assert_eq!(h["command"], serde_json::json!(exe), "{h}");
+    assert_eq!(v["hooks"]["Stop"], serde_json::json!([]));
+    assert_eq!(v["model"], "x");
+    assert_eq!(plan(&f.stacks(), &opts).unwrap().items[0].action, Action::InSync);
+    // Taken out of the target: only Lords' hook goes.
+    with_targets(&f, &target("balanced settings", "claude", "settings", &settings, ""));
+    let p = plan(&f.stacks(), &opts).unwrap();
+    assert_eq!(p.items[0].action, Action::Update);
+    apply(&p).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(
+        v["hooks"]["PreToolUse"],
+        serde_json::json!([serde_json::from_str::<serde_json::Value>(theirs).unwrap()])
+    );
+}
+
 // Spec (orchestrator D2, 25 Oct: "worktree_roots … skip and list" the rest; D1: "every managed repo gets
 // CLAUDE.local.md containing @AGENTS.md plus the project and repo layers"): only worktrees under a root get
 // files, the others are listed; where the checkout has an AGENTS.md, the Claude file includes it and the Codex

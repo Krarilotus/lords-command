@@ -77,7 +77,8 @@
           "roles": { "type": "array", "items": { "type": "string" }, "description": "the role whoever reads this file has; absent: unknown, so only every-role entries and a pointer to the rest" },
           "own_text": { "enum": ["keep", "replace"], "default": "keep", "description": "instructions: keep the text outside the managed block, or replace the whole file with it" },
           "via": { "type": "string", "description": "instructions: the shared file that holds the composed text; this file gets only an include line" },
-          "exclude": { "type": "array", "items": { "type": "string" }, "description": "settings: instruction files the harness must skip" }
+          "exclude": { "type": "array", "items": { "type": "string" }, "description": "settings: instruction files the harness must skip" },
+          "guards": { "type": "array", "items": { "enum": ["rm"] }, "description": "settings: tool-call guards registered as the harness's hooks (Claude only)" }
         },
         "additionalProperties": false
       }

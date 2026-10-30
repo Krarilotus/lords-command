@@ -32,6 +32,7 @@ usage:
   lords hooks install --post-checkout [--repo DIR]   a new worktree gets its place files (`sync --place`)
   lords compose [--repo NAME [--role ROLE]] [--adapter ID] [--json]   what a harness reads there, with sources
   lords sizes [--json]   every file sync writes, by section; fails past the warning line
+  lords guard rm   Claude's PreToolUse hook: refuses an `rm` whose path holds a variable not written as quoted ${VAR:?}
 
 stacks: --public-stack DIR, --private-stack DIR, else config.txt (beside the exe, or ~/.lords-command/),
 else the public stack is <this git repo>/stack.
@@ -113,6 +114,22 @@ fn print_findings(findings: &[Finding], json: bool) {
 
 fn public_rules(public: &Path, private: Option<&Stack>) -> Result<Rules, String> {
     Rules::public().with_allow_from(public).with_private(private)
+}
+
+/// `lords guard rm`: the tool-call guard Claude Code runs before a Bash call (guard.rs). Reads the event on stdin and
+/// prints a denial, or nothing; never fails the call it can't read.
+fn cmd_guard(mut a: Args) -> Result<bool, String> {
+    let which = a.positional().ok_or("guard needs what to guard: rm")?;
+    a.done()?;
+    if which != "rm" {
+        return Err(format!("no guard `{which}`; there is: rm"));
+    }
+    let input = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
+    let out = lords_core::guard::rm_hook(&input);
+    if !out.is_empty() {
+        println!("{out}");
+    }
+    Ok(true)
 }
 
 fn cmd_check(mut a: Args) -> Result<bool, String> {
@@ -742,6 +759,7 @@ fn main() -> ExitCode {
         "adopt" => cmd_adopt(a),
         "set-aside" => cmd_set_aside(a),
         "sizes" => cmd_sizes(a),
+        "guard" => cmd_guard(a),
         other => Err(format!("unknown command `{other}`\n\n{USAGE}")),
     };
     match result {

@@ -10,6 +10,7 @@ pub mod finding;
 pub mod frontmatter;
 pub mod fsguard;
 pub mod git;
+pub mod guard;
 pub mod hooks;
 pub mod ledger;
 pub mod model;
