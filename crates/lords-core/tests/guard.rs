@@ -1,4 +1,7 @@
-//! The `rm` guard (owner, 30 Oct 2026; `guard.rs`).
+//! The `rm` guard (owner, 30 Oct 2026; `guard.rs`). Its scope is the plain form only (orchestrator, 30 Oct, after the
+//! rm-guard review r1): the command word, after leading `NAME=value` assignments, is `rm` or `rm.exe`, or a path to
+//! one; then any operand holding a variable not written `"${VAR:?}"` is refused. Every other form falls back to
+//! Claude Code's own check, as before the guard; it is not covered and not tested here as a bypass.
 
 use lords_core::guard::{rm_hook, unguarded_rm};
 use serde_json::{json, Value};
@@ -15,7 +18,7 @@ fn denied(command: &str) -> Option<String> {
 }
 
 // Spec: owner, 30 Oct: "rejects, at once, an `rm` whose path contains an unquoted shell variable. The rejection message
-// names the fix: `"${VAR:?}/name"`." The witness that hung a child for 30 minutes, and its kin.
+// names the fix: `"${VAR:?}/name"`." The witness that hung a child for 30 minutes, and its kin in the plain form.
 #[test]
 fn an_unquoted_variable_path_is_rejected_with_the_fix() {
     for command in [
@@ -24,12 +27,25 @@ fn an_unquoted_variable_path_is_rejected_with_the_fix() {
         "rm -rf ${OUT:?}/build",
         "cd x && rm -r $DIR",
         "FOO=1 rm $1",
-        "sudo rm -rf $TMP/*",
         "/usr/bin/rm $X",
         "true; rm -f a $B c",
+        "rm -- $X",
+        "rm -f build/out $X # note",
+        "rm -f $'a' $B",
+        "X='f /tmp/victim'; rm -$X",
     ] {
         let why = denied(command).unwrap_or_else(|| panic!("let through: {command}"));
         assert!(why.contains("\"${VAR:?}/name\""), "{command}: {why}");
+    }
+}
+
+// Spec: rm-guard review r1, R5 (witnesses `rm.exe -rf "$OUT/build"`, `/usr/bin/rm.exe -rf "$OUT/build"`: the real GNU
+// rm on Git Bash): `rm.exe` is `rm`, bare or by path.
+#[test]
+fn rm_exe_is_rm() {
+    for command in ["rm.exe -rf \"$OUT/build\"", "/usr/bin/rm.exe -rf \"$OUT/build\"", "RM.EXE $X"]
+    {
+        assert!(denied(command).is_some(), "let through: {command}");
     }
 }
 
@@ -45,16 +61,21 @@ fn a_quoted_guarded_variable_passes() {
     }
 }
 
-// Spec: a literal path passes, and so does anything that isn't an `rm` with a variable.
+// Spec: a literal path passes, and so does anything whose command word isn't `rm`: a comment, an ANSI-C literal, and
+// (rm-guard review r1, R2's false refusal) a command that only names `rm` as data.
 #[test]
 fn a_literal_path_and_other_commands_pass() {
     for command in [
         "rm -rf build/out",
         "rm -f '$OUT/x'",
+        "rm -f build/out # $OUT is unused",
+        "rm -f $'it\\'s$OUT'",
         "echo $OUT && ls $DIR",
         "grep rm $FILE",
         "rmdir $X",
         "git rm --cached x",
+        "env printf \"%s\\n\" rm \"$OUT\"",
+        "sudo -u bob ls $X",
     ] {
         assert_eq!(denied(command), None, "{command}");
     }
@@ -63,92 +84,9 @@ fn a_literal_path_and_other_commands_pass() {
     assert_eq!(rm_hook("not json"), "");
 }
 
-// Spec: sol-loop rm guard r1, S5–S6 (witnesses): a comment and an ANSI-C quoted literal aren't deletion paths and
-// don't refuse a literal `rm`; a variable operand after them or after `--` still does.
-#[test]
-fn comments_and_ansi_c_literals_are_no_paths() {
-    for command in ["rm -f build/out # $OUT is unused", "rm -f $'it\\'s$OUT'"] {
-        assert_eq!(denied(command), None, "{command}");
-    }
-    for command in ["rm -- $X", "rm -f build/out $X # note", "rm -f $'a' $B"] {
-        assert!(denied(command).is_some(), "let through: {command}");
-    }
-}
-
-// Spec: sol-loop rm guard r2, S7–S10 (witnesses, each let through by r1's redirection and option handling): every
-// word after `rm` that holds a variable is checked, redirections and option-like words included, so no parse of
-// redirections or options can turn a deletion path into something else. Conservative by design (r1 S4 declined): a
-// false refusal costs a retry with "${VAR:?}"; a missed path costs a deletion.
-#[test]
-fn no_redirection_or_option_hides_a_variable_path() {
-    for command in [
-        "rm -f 2>&1 $OUT/x",
-        "echo ok 2>&1&& rm -f $OUT/x",
-        "rm -f &>log $OUT/x",
-        "rm -f >|log $OUT/x",
-        "X='f /tmp/victim'; rm -$X",
-        "rm -f build/out 2>\"$LOG\"",
-        "rm --interactive=\"$MODE\" -- build/out",
-    ] {
-        assert!(denied(command).is_some(), "let through: {command}");
-    }
-    for command in ["rm -f build/out 2>/dev/null", "rm -f \"${OUT:?}/x\" 2>\"${LOG:?}\""] {
-        assert_eq!(denied(command), None, "{command}");
-    }
-}
-
-// Spec: sol-loop rm guard r3, S17 and S18 (witnesses): an `rm` after a shell keyword (`then`, `do`, `else`, `!`, …) or
-// behind a wrapper's options (`command --`, `sudo -n`, `sudo -u bob`, `timeout 5`) is still an `rm`.
-#[test]
-fn keywords_and_wrapper_options_dont_hide_rm() {
-    for command in [
-        "OUT=; if true; then rm -f \"$OUT/x\"; fi",
-        "for f in a; do rm -f $f; done",
-        "if false; then :; else rm $X; fi",
-        "! rm $X",
-        "{ rm $X; }",
-        "OUT=; command -- rm -f \"$OUT/x\"",
-        "sudo -n rm -f $OUT/x",
-        "sudo -u bob rm -f $OUT/x",
-        "env -i rm $X",
-        "timeout 5 rm $X",
-        "nohup rm $X",
-        "xargs rm $X",
-        "OUT=; time -p rm -rf \"$OUT/build\"",
-        "time rm $X",
-    ] {
-        assert!(denied(command).is_some(), "let through: {command}");
-    }
-    for command in ["sudo -u bob ls $X", "if true; then echo $X; fi", "git rm $X"] {
-        assert_eq!(denied(command), None, "{command}");
-    }
-}
-
-// Spec: sol-loop rm guard r5, S20–S22 (witnesses): a leading redirection, a wrapper named by its path, and an `rm`
-// inside a shell string another command runs (`trap`, `eval`, `bash -c`, `sh -c`) are all still checked.
-#[test]
-fn redirections_wrapper_paths_and_shell_strings_dont_hide_rm() {
-    for command in [
-        "OUT=; 2>/dev/null rm -rf \"$OUT/build\"",
-        ">/dev/null 2>&1 rm $X",
-        "/usr/bin/time -p rm -rf \"$OUT/build\"",
-        "/usr/bin/sudo rm $X",
-        "OUT=; trap 'rm -rf \"$OUT/build\"' EXIT",
-        "bash -c 'rm -rf \"$OUT/build\"'",
-        "sh -c \"rm -f $X\"",
-        "eval 'rm -f $X'",
-    ] {
-        assert!(denied(command).is_some(), "let through: {command}");
-    }
-    for command in
-        ["trap 'rm -rf \"${OUT:?}/build\"' EXIT", "bash -c 'echo $X'", "2>/dev/null ls $X"]
-    {
-        assert_eq!(denied(command), None, "{command}");
-    }
-}
-
 // Spec: the reasoned call (owner, 30 Oct: "a variable inside quotes without `:?` gets your reasoned call"): rejected.
 // Quoting stops word splitting, not emptiness: with OUT empty, `rm -rf "$OUT/x"` is `rm -rf /x`. Only `:?` stops that.
+// Every operand after `rm` is checked, redirection targets and options included (a false refusal costs a retry).
 #[test]
 fn a_quoted_variable_without_the_check_is_rejected() {
     for command in [
@@ -156,6 +94,7 @@ fn a_quoted_variable_without_the_check_is_rejected() {
         "rm -rf \"${OUT}/x\"",
         "rm -f \"${OUT:?}/$id\"",
         "rm \"${OUT:-/tmp}/x\"",
+        "rm -f build/out 2>\"$LOG\"",
     ] {
         assert!(denied(command).is_some(), "let through: {command}");
     }

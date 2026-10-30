@@ -877,6 +877,92 @@ fn the_guard_fails_open_on_anything_but_a_refusal() {
     assert_eq!((o.status.code(), String::from_utf8_lossy(&o.stdout).trim()), (Some(0), "ok"));
 }
 
+// Spec: rm-guard review r1, R8 (witness: `lords guard nope` with its stderr reader closed, and `lords guard rm` with
+// its stdout reader closed, exited 101 on a print panic): the guard fails open, exit 0, when it can't write.
+#[test]
+fn the_guard_fails_open_when_it_cant_write() {
+    use std::io::Write;
+    let env = Env::new();
+    let exe = env!("CARGO_BIN_EXE_lords");
+    let mut c = env.cmd(exe, env.dir.path());
+    let mut child = c
+        .args(["guard", "nope"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stderr.take());
+    drop(child.stdin.take());
+    assert_eq!(child.wait().unwrap().code(), Some(0), "a closed diagnostic pipe");
+    let mut c = env.cmd(exe, env.dir.path());
+    let mut child = c
+        .args(["guard", "rm"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let event = r#"{"tool_name":"Bash","tool_input":{"command":"rm -f $OUT/x"}}"#;
+    child.stdin.take().unwrap().write_all(event.as_bytes()).unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(0), "a closed response pipe");
+}
+
+// Spec: rm-guard review r1, R7 (witness: a stale plan's apply installed its guard, replacing a newer one, before the
+// ledger check refused the plan): a stale plan changes nothing, the guard copy included; the guard and the settings
+// are installed under one apply lock, after the plan is known current.
+#[test]
+fn a_stale_plan_never_replaces_the_live_guard() {
+    use lords_core::sync::{apply, plan, Options};
+    let d = TempDir::new().unwrap();
+    let r = d.path();
+    let write = |rel: &str, text: &[u8]| {
+        let p = r.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, text).unwrap();
+    };
+    let skill = |name: &str| {
+        write(
+            &format!("pub/global/skills/{name}/SKILL.md"),
+            format!("---\nname: {name}\n---\nX\n").as_bytes(),
+        );
+        write(
+            &format!("pub/global/skills/{name}/lords.yaml"),
+            format!("id: skill.{name}\nkind: skill\ntitle: {name}\naudience: [all]\nscope: global\nstatus: active\nvisibility: public\norigin:\n  type: own\n").as_bytes(),
+        );
+    };
+    write("pub/stack.toml", b"name = \"pub\"\nvisibility = \"public\"\n");
+    skill("a");
+    write("home/settings.json", b"{}\n");
+    let targets = format!(
+        "name = \"priv\"\nvisibility = \"private\"\n[[targets]]\nname = \"settings\"\nadapter = \"claude\"\nkind = \"settings\"\npath = '{}'\nguards = [\"rm\"]\n[[targets]]\nname = \"skills\"\nadapter = \"claude\"\nkind = \"skills\"\npath = '{}'\n",
+        r.join("home/settings.json").display(),
+        r.join("home/skills").display()
+    );
+    write("priv/stack.toml", targets.as_bytes());
+    let lords = fs::read(env!("CARGO_BIN_EXE_lords")).unwrap();
+    write("a/lords.exe", &lords);
+    // B: the same program with a trailing byte, so its copy is told apart.
+    write("b/lords.exe", &[&lords[..], b"B"].concat());
+    let stacks = || lords_core::Stacks::load(&r.join("pub"), Some(&r.join("priv"))).unwrap();
+    let opts = |exe: &str| Options {
+        user_only: true,
+        home: r.join("tool"),
+        guard_from: Some(r.join(exe).join("lords.exe")),
+        ..Options::default()
+    };
+    let stale = plan(&stacks(), &opts("a")).unwrap();
+    skill("b");
+    apply(&plan(&stacks(), &opts("b")).unwrap()).unwrap();
+    let copy = r.join("tool/bin/lords-guard.exe");
+    assert_eq!(fs::read(&copy).unwrap().last(), Some(&b'B'), "the newer guard is installed");
+    let settings = fs::read(r.join("home/settings.json")).unwrap();
+    assert!(apply(&stale).is_err(), "the stale plan is refused");
+    assert_eq!(fs::read(&copy).unwrap().last(), Some(&b'B'), "the live guard stays");
+    assert_eq!(fs::read(r.join("home/settings.json")).unwrap(), settings);
+}
+
 // Spec (orchestrator, 30 Oct: "have sync install a stable copy … that the settings name. Copy it only once that exe
 // answers … a self-test"): a settings target with guards installs `<tool home>/bin/lords-guard.exe` and names it in
 // the hook; the installed copy refuses the witness; a second sync changes nothing.

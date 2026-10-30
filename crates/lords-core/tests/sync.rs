@@ -599,6 +599,32 @@ fn a_settings_target_installs_its_guards_beside_other_hooks() {
     );
 }
 
+// Spec: rm-guard review r1, R6 (witness: a user hook carrying a token beside the settings sync edits; adding the guard
+// printed it in the plan's diff and `--json`): a settings plan reports what Lords changes there ("Lords hook added")
+// and never the settings' text, in any output.
+#[test]
+fn a_settings_plan_never_shows_the_settings_text() {
+    let f = Fixture::new();
+    let settings = f.write(
+        "home/.claude-balanced/settings.json",
+        "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"Write\",\"hooks\":[{\"type\":\"command\",\"command\":\"audit --token SYNTHETIC_SENTINEL\"}]}]},\n\"env\":{\"EXAMPLE_SECRET\":\"SYNTHETIC_ENV_SENTINEL\"}}\n",
+    );
+    with_targets(
+        &f,
+        &target("balanced settings", "claude", "settings", &settings, "guards = ['rm']\n"),
+    );
+    let fake = f.write("fake-lords.exe", "not a program");
+    let p = plan(&f.stacks(), &Options { user_only: true, guard_from: Some(fake), ..f.opts() })
+        .unwrap();
+    let item = &p.items[0];
+    assert_eq!(item.action, Action::Update);
+    let json = serde_json::to_string(&p).unwrap();
+    for shown in [json.as_str(), item.diff.as_str()] {
+        assert!(!shown.contains("SYNTHETIC"), "{shown}");
+    }
+    assert!(item.diff.contains("Lords hook added"), "{}", item.diff);
+}
+
 // Spec: sol-loop rm guard r1, S1 and S2 (witnesses): a hook is Lords' only when it runs Lords' guard copy. A user's
 // own hook with the same args stays, with or without guards in the target; and taking Lords' hook out keeps the other
 // hooks in its entry, and the entry.
