@@ -10,6 +10,7 @@ use lords_core::sync::Size;
 fn the_size_guard_names_the_adapter_and_the_sections() {
     let s = Size {
         place: "repo fleet-scheduler".into(),
+        at: None,
         adapter: "codex".into(),
         file: "AGENTS.override.md".into(),
         bytes: 20_000,

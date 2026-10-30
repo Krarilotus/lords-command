@@ -94,7 +94,8 @@
           "path": { "type": "string" },
           "scope": { "type": "string" },
           "audience": { "type": "array", "items": { "enum": ["opus", "sol", "astra", "all"] }, "description": "who may read its notes (default all)" },
-          "native": { "type": "array", "items": { "type": "string" }, "description": "adapters whose harness loads this store by itself" }
+          "native": { "type": "array", "items": { "type": "string" }, "description": "adapters whose harness loads this store by itself" },
+          "live": { "type": "boolean", "description": "agents write this store's MEMORY.md: memory indexes name that file instead of listing the imported copies" }
         },
         "additionalProperties": false
       }

@@ -77,6 +77,71 @@ fn development_skills_install_per_checkout() {
     assert_eq!(git(&checkout, &["status", "--porcelain"]), "");
 }
 
+// Spec (orchestrator, 30 Oct, item 2: "Bring `~/.codex/skills` under Lords: doubt-review, scope-discipline,
+// stop-the-line, spec-tests and frontend-design are hand copies"; an opt-in per target, the 25 Oct default kept): a
+// user-level skills target that names roles installs the skills for those roles; one that names none keeps only
+// skills without roles.
+#[test]
+fn a_skills_target_with_roles_installs_their_skills() {
+    let installs = |roles: &str| {
+        let f = Fixture::new();
+        skill(&f, "spec-tests", "roles: [orchestrator, coder, helper, reviewer]\n");
+        skill(&f, "any-run", "");
+        let dir = f.path("home/codex-skills");
+        f.write(
+            "priv/stack.toml",
+            &format!(
+                "name = \"priv\"\nvisibility = \"private\"\nroles = [\"orchestrator\", \"coder\", \"helper\", \"reviewer\"]\n[[targets]]\nname = \"codex skills\"\nadapter = \"codex\"\nkind = \"skills\"\npath = '{}'\n{roles}",
+                dir.display()
+            ),
+        );
+        let p = plan(&f.stacks(), &Options { user_only: true, ..f.opts() }).unwrap();
+        let at = |name: &str| {
+            p.items.iter().find(|i| i.path == dir.join(name)).map(|i| i.action.clone())
+        };
+        (at("spec-tests"), at("any-run"))
+    };
+    assert_eq!(
+        installs("roles = [\"coder\", \"reviewer\"]\n"),
+        (Some(Action::Install), Some(Action::Install))
+    );
+    assert_eq!(installs(""), (None, Some(Action::Install)));
+}
+
+// Spec (Codex switch-on review r1, R3, witness: the target's roles changed from `coder` to the typo `codeer` selected no
+// role skill, and the full plan removed the installed `spec-tests`): a target role that no stack declares is a check
+// error and a conflict for that target; nothing it installed is removed.
+#[test]
+fn an_undeclared_target_role_is_a_conflict_and_removes_nothing() {
+    let f = Fixture::new();
+    skill(&f, "spec-tests", "roles: [coder]\n");
+    let dir = f.path("home/codex-skills");
+    let manifest = |roles: &str| {
+        format!(
+            "name = \"priv\"\nvisibility = \"private\"\nroles = [\"coder\"]\n[[targets]]\nname = \"codex skills\"\nadapter = \"codex\"\nkind = \"skills\"\npath = '{}'\nroles = [\"{roles}\"]\n",
+            dir.display()
+        )
+    };
+    f.write("priv/stack.toml", &manifest("coder"));
+    apply(&plan(&f.stacks(), &f.opts()).unwrap()).unwrap();
+    assert!(dir.join("spec-tests/SKILL.md").is_file());
+    f.write("priv/stack.toml", &manifest("codeer"));
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    assert!(
+        p.items.iter().any(|i| i.action == Action::Conflict && i.target == "codex skills"),
+        "{:?}",
+        p.items
+    );
+    assert!(
+        !p.items.iter().any(|i| matches!(i.action, Action::Remove | Action::Forget)),
+        "{:?}",
+        p.items
+    );
+    assert!(apply(&p).is_err());
+    assert!(dir.join("spec-tests/SKILL.md").is_file(), "still there");
+    assert!(f.check().iter().any(|x| x.code == "role-undeclared" && x.message.contains("codeer")));
+}
+
 // Spec (above; orchestrator, 27 Oct: "the repo's tracked copy wins in its indexed skill dir and leaves a note; content
 // that differs from the stack's stays a finding"): where the repo tracks a skill of the same name in a dir it indexes,
 // its copy wins, nothing is installed over it, and `check` reports the difference; where it tracks one in a dir it

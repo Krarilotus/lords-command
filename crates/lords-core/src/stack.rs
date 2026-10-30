@@ -104,6 +104,10 @@ pub struct MemoryStore {
     /// Adapters whose harness already loads this store by itself: left out of their memory index.
     #[serde(default)]
     pub native: Vec<String>,
+    /// Agents write this store's own `MEMORY.md` (orchestrator, 30 Oct, item 3): memory indexes name that file, the
+    /// one source, instead of listing the imported copies, which lag until the next import.
+    #[serde(default)]
+    pub live: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
