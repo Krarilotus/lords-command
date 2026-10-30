@@ -97,6 +97,31 @@ fn no_redirection_or_option_hides_a_variable_path() {
     }
 }
 
+// Spec: sol-loop rm guard r3, S17 and S18 (witnesses): an `rm` after a shell keyword (`then`, `do`, `else`, `!`, …) or
+// behind a wrapper's options (`command --`, `sudo -n`, `sudo -u bob`, `timeout 5`) is still an `rm`.
+#[test]
+fn keywords_and_wrapper_options_dont_hide_rm() {
+    for command in [
+        "OUT=; if true; then rm -f \"$OUT/x\"; fi",
+        "for f in a; do rm -f $f; done",
+        "if false; then :; else rm $X; fi",
+        "! rm $X",
+        "{ rm $X; }",
+        "OUT=; command -- rm -f \"$OUT/x\"",
+        "sudo -n rm -f $OUT/x",
+        "sudo -u bob rm -f $OUT/x",
+        "env -i rm $X",
+        "timeout 5 rm $X",
+        "nohup rm $X",
+        "xargs rm $X",
+    ] {
+        assert!(denied(command).is_some(), "let through: {command}");
+    }
+    for command in ["sudo -u bob ls $X", "if true; then echo $X; fi", "git rm $X"] {
+        assert_eq!(denied(command), None, "{command}");
+    }
+}
+
 // Spec: the reasoned call (owner, 30 Oct: "a variable inside quotes without `:?` gets your reasoned call"): rejected.
 // Quoting stops word splitting, not emptiness: with OUT empty, `rm -rf "$OUT/x"` is `rm -rf /x`. Only `:?` stops that.
 #[test]
