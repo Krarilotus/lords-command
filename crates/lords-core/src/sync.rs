@@ -389,6 +389,9 @@ struct Planner<'a> {
     trees: BTreeMap<String, Result<std::sync::Arc<Tree>, String>>,
     /// Each scope's roots and the slots in them, worked out once per plan.
     places: BTreeMap<String, Result<Places, String>>,
+    /// Each repo's checkouts and worktrees, verified once per plan: the ledger check and the repo's own items
+    /// (its two scopes and itself) all ask, and each answer costs a git call per worktree.
+    checkouts: BTreeMap<String, Result<Checkouts, String>>,
 }
 
 /// Every place sync puts a tool-owned path (design: Ownership boundary), as one grammar: a scope names roots (a
@@ -486,6 +489,12 @@ impl Planner<'_> {
     /// none is an error. Target names are unique (R5-06), so `target:<name>` is one target.
     fn places_of(&mut self, scope: &str) -> Result<Places, String> {
         let stacks = self.stacks;
+        let fresh = !self.places.contains_key(scope);
+        let repo_name = scope.split('/').next().and_then(|b| b.strip_prefix("repo:"));
+        let repo_roots = match repo_name {
+            Some(name) if fresh => self.checkouts_of(name),
+            _ => None,
+        };
         let found = self
             .places
             .entry(scope.to_string())
@@ -520,12 +529,11 @@ impl Planner<'_> {
                         }
                         _ => none,
                     },
-                    ("repo", _) => match m.repos.get(name) {
-                        Some(r) => place(
-                            checkouts(r).map_err(|e| format!("repo {name}: {e}"))?.0,
-                            &r.adapters,
-                        ),
-                        None => none,
+                    ("repo", _) => match (m.repos.get(name), repo_roots) {
+                        (Some(r), Some(found)) => {
+                            place(found.map_err(|e| format!("repo {name}: {e}"))?.0, &r.adapters)
+                        }
+                        _ => none,
                     },
                     ("workspace", _) => match m.workspaces.get(name) {
                         Some(w) => place(vec![Root::workspace(w)?], &w.adapters),
@@ -535,12 +543,21 @@ impl Planner<'_> {
                 }
             })
             .clone();
-        if let Ok((roots, _)) = &found {
+        // Kept once, when the scope is first worked out: the ledger check asks again for each of its records, and
+        // keeping every root again per record made the check quadratic in the worktrees.
+        if let (true, Ok((roots, _))) = (fresh, &found) {
             for r in roots {
                 self.verified(r);
             }
         }
         found
+    }
+
+    /// A declared repo's checkouts and worktrees (`checkouts`), worked out once per plan; `None` for a repo the
+    /// stack doesn't declare.
+    fn checkouts_of(&mut self, name: &str) -> Option<Result<Checkouts, String>> {
+        let repo = self.stacks.private.as_ref()?.manifest.repos.get(name)?;
+        Some(self.checkouts.entry(name.to_string()).or_insert_with(|| checkouts(repo)).clone())
     }
 
     /// A record's place, when a slot of its scope, of its kind, produces exactly its root and parts (Sol review r3,
@@ -1331,6 +1348,13 @@ fn newly_shown(checkout: &Path, current: &str, proposed: &str) -> Result<Vec<Str
     Ok(shown)
 }
 
+/// The files the repo tracks at or below `paths` in the checkout at `dir`, relative to it, from one git call.
+fn tracked_at(dir: &Path, paths: &[&str]) -> Result<Vec<String>, String> {
+    let mut args = vec!["ls-files", "-z", "--"];
+    args.extend_from_slice(paths);
+    Ok(git::run(dir, &args)?.split('\0').filter(|s| !s.is_empty()).map(str::to_string).collect())
+}
+
 /// Every checkout and (if asked) worktree of a repo, as roots verified by `Root::checkout`, the worktrees skipped
 /// for lying outside `worktree_roots`, and one note per worktree git lists that is no checkout (stale).
 /// Configured and discovered roots get the same check (design-simplification-r6, rule A; Sol review r6, R6-02). A
@@ -1496,6 +1520,33 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
         }
         Ok(())
     };
+    let skills = place_skills(pl.stacks, place.layers(false));
+    // What the repo tracks at the paths sync writes in each checkout (its adapters' files and skills dirs), from one
+    // git call per checkout; a git that fails is the error of every item there.
+    let mut asked: Vec<&str> = chosen.iter().map(|a| a.repo_file()).collect();
+    if !skills.is_empty() {
+        asked.extend(chosen.iter().filter_map(|a| a.repo_skills_dir()));
+    }
+    let tracked_in: BTreeMap<String, Result<Vec<String>, String>> = if place.workspace {
+        BTreeMap::new()
+    } else {
+        place
+            .paths
+            .iter()
+            .filter(|r| r.path().is_dir())
+            .map(|r| (ledger::key(r.path()), tracked_at(r.path(), &asked)))
+            .collect()
+    };
+    // Whether the repo tracks `rel` (a file, or anything below it) in the checkout at `p`.
+    let tracked = |p: &Path, rel: &str| -> Result<bool, String> {
+        match tracked_in.get(&ledger::key(p)) {
+            None => Ok(false),
+            Some(Err(e)) => Err(e.clone()),
+            Some(Ok(files)) => Ok(files.iter().any(|f| {
+                f == rel || f.strip_prefix(rel).is_some_and(|rest| rest.starts_with('/'))
+            })),
+        }
+    };
     for adapter in chosen.iter().copied() {
         let file = adapter.repo_file();
         let scope = place_scope(place, Some(adapter));
@@ -1509,12 +1560,7 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
                 pl.plan.items.push(conflict(&target, &path, "checkout not found"));
                 continue;
             }
-            let tracked = if place.workspace {
-                Ok(false)
-            } else {
-                git::status(p, &["ls-files", "--error-unmatch", "--", file])
-            };
-            match tracked {
+            match tracked(p, file) {
                 Ok(false) => {}
                 Ok(true) => {
                     pl.plan.items.push(conflict(
@@ -1553,7 +1599,6 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
         }
     }
     // Development skills, copied into each checkout for harnesses that read a skills dir there.
-    let skills = place_skills(pl.stacks, place.layers(false));
     let skill_dirs: Vec<(&'static dyn Adapter, &str)> =
         chosen.iter().copied().filter_map(|a| a.repo_skills_dir().map(|d| (a, d))).collect();
     for (adapter, dir) in skill_dirs {
@@ -1572,11 +1617,6 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
                     ));
                     continue;
                 };
-                let tracked = if place.workspace {
-                    Ok(String::new())
-                } else {
-                    git::run(p, &["ls-files", "--", &rel])
-                };
                 // A skill the repo tracks in a dir it indexes in place is the repo's own: its tracked copy wins there,
                 // and the stack's isn't installed over it (orchestrator, 27 Oct; check reports a copy that differs).
                 let indexed = |rel: &str| {
@@ -1585,16 +1625,16 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
                             if *repo == place.name && path == rel)
                     })
                 };
-                match tracked {
-                    Ok(o) if o.trim().is_empty() => {}
-                    Ok(_) if indexed(&rel) => {
+                match tracked(p, &rel) {
+                    Ok(false) => {}
+                    Ok(true) if indexed(&rel) => {
                         pl.plan.notes.push(format!(
                             "{}: the repo tracks its own `{name}` at {rel}, indexed in place; the stack's copy isn't installed over it",
                             place.label
                         ));
                         continue;
                     }
-                    Ok(_) => {
+                    Ok(true) => {
                         pl.plan.items.push(conflict(
                             &target,
                             dest.path(),
@@ -1732,7 +1772,8 @@ fn repo_items(
     only: Option<&str>,
     only_path: Option<&Path>,
 ) {
-    let (mut paths, skipped, stale) = match checkouts(repo) {
+    let (mut paths, skipped, stale) = match pl.checkouts_of(name).unwrap_or_else(|| checkouts(repo))
+    {
         Ok(c) => c,
         Err(e) => {
             // The place refuses whole (Sol review r5, R5-01): nothing is planned in any of its checkouts.
@@ -1817,6 +1858,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         covered: Vec::new(),
         trees: BTreeMap::new(),
         places: BTreeMap::new(),
+        checkouts: BTreeMap::new(),
     };
     pl.check_ledger()?;
     // The memory index points at the stack's copies: say what an import would bring first.

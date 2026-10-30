@@ -121,6 +121,32 @@ fn a_tracked_skill_of_the_same_name_wins_where_indexed_and_conflicts_elsewhere()
     }
 }
 
+// Spec (above: only a tracked skill "of the same name" wins or conflicts): a skill the repo tracks under another
+// name that starts with the stack skill's (`verify-old` beside `verify`) is no clash, and the stack's copy installs.
+#[test]
+fn a_tracked_skill_whose_name_only_starts_alike_is_no_clash() {
+    let f = Fixture::new();
+    skill(&f, "verify", "roles: [coder]\n");
+    let checkout = f.path("checkout");
+    f.write(
+        "checkout/.claude/skills/verify-old/SKILL.md",
+        "---\nname: verify-old\ndescription: the repo's own\n---\nX\n",
+    );
+    f.git_init("checkout");
+    f.write(
+        "priv/stack.toml",
+        &format!(
+            "name = \"priv\"\nvisibility = \"private\"\nroles = [\"coder\"]\n[repos.beta-core]\ncheckouts = ['{}']\nworktrees = false\n",
+            checkout.display()
+        ),
+    );
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    let verify = p.items.iter().find(|i| i.path == checkout.join(".claude/skills/verify"));
+    assert_eq!(verify.map(|i| i.action.clone()), Some(Action::Install), "{:#?}", p.items);
+    apply(&p).unwrap();
+    assert!(f.path("checkout/.claude/skills/verify/SKILL.md").is_file());
+}
+
 // Spec (above: "the four adapted skills are development skills, so their user-level junctions are dropped. The
 // non-OWL skills … aren't ours to manage; leave them untouched"; design: Ownership boundary, the changeover: "an
 // old copy is moved to the backup only on the owner's confirmation"): sync leaves every dir in a user-level skills
