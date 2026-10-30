@@ -618,9 +618,14 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
                 a == "all" || ctx.audience.iter().any(|c| format!("{c:?}").eq_ignore_ascii_case(a))
             })
     };
+    // And by the rules memory notes follow: memory is private, so never in a public-only composition, and never for a
+    // reader who is only `product` (sol-loop r2, S2, S3).
+    let memory_here = !ctx.public_only
+        && ctx.roles.as_ref().is_none_or(|roles| roles.iter().any(|r| r != PRODUCT_ROLE));
     let live_here: BTreeSet<(&str, String)> = live
         .iter()
         .copied()
+        .filter(|_| memory_here)
         .filter(|m| Scope::parse(&m.scope).is_some_and(|s| scope_in_layers(&s, &ctx.layers, false)))
         .filter(|m| serves(m) && !ctx.skip_stores.contains(&m.name))
         .map(|m| {
