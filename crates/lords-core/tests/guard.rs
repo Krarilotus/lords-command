@@ -63,22 +63,37 @@ fn a_literal_path_and_other_commands_pass() {
     assert_eq!(rm_hook("not json"), "");
 }
 
-// Spec: sol-loop rm guard r1, S4–S6 (witnesses): only the paths `rm` deletes are checked. A redirection target, an
-// option's value, a comment and an ANSI-C quoted literal are not deletion paths and don't refuse a literal `rm`; a
-// variable operand after `--` still does.
+// Spec: sol-loop rm guard r1, S5–S6 (witnesses): a comment and an ANSI-C quoted literal aren't deletion paths and
+// don't refuse a literal `rm`; a variable operand after them or after `--` still does.
 #[test]
-fn only_the_paths_rm_deletes_are_checked() {
-    for command in [
-        "rm -f build/out 2>\"$LOG\"",
-        "rm -f build/out > $LOG 2>&1",
-        "rm --interactive=\"$MODE\" -- build/out",
-        "rm -f build/out # $OUT is unused",
-        "rm -f $'it\\'s$OUT'",
-    ] {
+fn comments_and_ansi_c_literals_are_no_paths() {
+    for command in ["rm -f build/out # $OUT is unused", "rm -f $'it\\'s$OUT'"] {
         assert_eq!(denied(command), None, "{command}");
     }
     for command in ["rm -- $X", "rm -f build/out $X # note", "rm -f $'a' $B"] {
         assert!(denied(command).is_some(), "let through: {command}");
+    }
+}
+
+// Spec: sol-loop rm guard r2, S7–S10 (witnesses, each let through by r1's redirection and option handling): every
+// word after `rm` that holds a variable is checked, redirections and option-like words included, so no parse of
+// redirections or options can turn a deletion path into something else. Conservative by design (r1 S4 declined): a
+// false refusal costs a retry with "${VAR:?}"; a missed path costs a deletion.
+#[test]
+fn no_redirection_or_option_hides_a_variable_path() {
+    for command in [
+        "rm -f 2>&1 $OUT/x",
+        "echo ok 2>&1&& rm -f $OUT/x",
+        "rm -f &>log $OUT/x",
+        "rm -f >|log $OUT/x",
+        "X='f /tmp/victim'; rm -$X",
+        "rm -f build/out 2>\"$LOG\"",
+        "rm --interactive=\"$MODE\" -- build/out",
+    ] {
+        assert!(denied(command).is_some(), "let through: {command}");
+    }
+    for command in ["rm -f build/out 2>/dev/null", "rm -f \"${OUT:?}/x\" 2>\"${LOG:?}\""] {
+        assert_eq!(denied(command), None, "{command}");
     }
 }
 

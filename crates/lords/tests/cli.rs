@@ -927,6 +927,28 @@ fn sync_installs_a_stable_guard_copy_and_names_it() {
     assert!(String::from_utf8_lossy(&o.stdout).contains("\"deny\""), "{}", text(&o));
     let again = text(&sync(false));
     assert!(!again.contains("installs the guard"), "{again}");
+    // Sol-loop r2, S13: a check of the synced settings reports no conflict for them.
+    let check = env.lords(
+        d,
+        &[
+            "check",
+            "--public-stack",
+            public.to_str().unwrap(),
+            "--private-stack",
+            private.to_str().unwrap(),
+        ],
+    );
+    let out = text(&check);
+    assert!(!out.contains("guards need") && !out.contains("settings.json"), "{out}");
+    // S12: the copy gone, a sync puts it back (the settings name it).
+    fs::remove_file(&copy).unwrap();
+    let o = sync(true);
+    assert!(o.status.success() && copy.is_file(), "{}", text(&o));
+    // S11: a staged copy an interrupted install left doesn't stop the next one.
+    fs::remove_file(&copy).unwrap();
+    fs::write(copy.with_file_name(".lords-guard.exe.exe"), b"cut").unwrap();
+    let o = sync(true);
+    assert!(o.status.success() && copy.is_file(), "{}", text(&o));
 }
 
 // Spec (orchestrator, 27 Oct: `lords check --stack` is "one flag that skips the drift part", run by a stack repo's
