@@ -170,6 +170,13 @@ fn layer_key(e: &Entry) -> String {
     }
 }
 
+/// The `lords` CLI beside this app, whose copy guard hooks run (sync checks it runs before installing it).
+fn lords_beside() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .map(|e| e.with_file_name(format!("lords{}", std::env::consts::EXE_SUFFIX)))
+}
+
 impl App {
     fn new(ctx: &egui::Context) -> App {
         let cfg = Config::discover();
@@ -820,6 +827,7 @@ impl App {
             home: sync::default_home().unwrap_or_default(),
             uninstall: false,
             stage: sync::Stage::Full,
+            guard_from: lords_beside(),
         };
         let (pu, pr) = (paths.public.clone(), paths.private.clone());
         self.planning = Some(Task::start(ctx, move || {
@@ -885,6 +893,7 @@ impl App {
                             home: sync::default_home().unwrap_or_default(),
                             uninstall: false,
                             stage: sync::Stage::Full,
+                            guard_from: lords_beside(),
                         };
                         let (pu, pr) = (public.clone(), private.clone());
                         self.applying = Some(Task::start(ctx, move || {

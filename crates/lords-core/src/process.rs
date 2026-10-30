@@ -1,7 +1,8 @@
 //! The one door to child processes (Sol review r4, R4-06), as `fsguard.rs` is to the filesystem: no other runtime
-//! source reaches `std::process`, by any spelling (tests/fsguard_lint.rs). Two programs start here: `git` (git.rs
-//! calls it; its writing commands change only the stack repo an operation names) and the file manager, which the
-//! GUI asks to show a path or open a link, and which writes nothing itself.
+//! source reaches `std::process`, by any spelling (tests/fsguard_lint.rs). Three programs start here: `git` (git.rs
+//! calls it; its writing commands change only the stack repo an operation names), the file manager, which the
+//! GUI asks to show a path or open a link, and which writes nothing itself, and a staged copy of the `rm` guard,
+//! run once for its self-test before sync installs it.
 
 // The door: the one place the resolved boundary lints allow (clippy.toml).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -76,6 +77,40 @@ pub(crate) fn git_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result
         c.env(k, v);
     }
     c.output().map_err(|e| format!("git {}: {e}", args.join(" ")))
+}
+
+/// Runs `<exe> guard --self-test` and requires it to print `ok` and exit 0 within 20 s: the copy a harness hook will
+/// run answers before sync names it (orchestrator, 30 Oct). A child past the deadline is killed.
+pub(crate) fn guard_self_test(guard_copy: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let mut child = Command::new(guard_copy)
+        .args(["guard", "--self-test"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{}: {e}", guard_copy.display()))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(s) => break s,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{}: guard self-test took over 20 s", guard_copy.display()));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+    let mut out = String::new();
+    if let Some(mut o) = child.stdout.take() {
+        let _ = o.read_to_string(&mut out);
+    }
+    if status.success() && out.trim() == "ok" {
+        Ok(())
+    } else {
+        Err(format!("{}: guard self-test failed ({status}): {}", guard_copy.display(), out.trim()))
+    }
 }
 
 /// Shows a path in the file manager, or opens a link in the browser; doesn't wait.

@@ -537,27 +537,30 @@ fn a_settings_target_adds_the_exclude_and_keeps_the_rest() {
     assert_eq!(plan(&f.stacks(), &opts).unwrap().items[0].action, Action::InSync);
 }
 
-// Spec (owner, 30 Oct: the `rm` guard, installed "the way Lords installs things"): a settings target's `guards` puts
-// one Lords `PreToolUse` hook per guard into the settings, in exec form, beside the hooks already there, which keep
-// their bytes; once there it is in sync; a guard taken out of the target takes its hook out, and only that one.
+// Spec (owner, 30 Oct: the `rm` guard, installed "the way Lords installs things"; orchestrator, 30 Oct: the settings
+// name a stable copy under the tool's home, copied "only once that exe answers … a self-test"): a settings target's
+// `guards` plans one Lords `PreToolUse` hook per guard, in exec form, naming `<home>/bin/lords-guard.exe`, beside the
+// hooks already there; a copy that doesn't answer its self-test stops the apply before the settings change; a guard
+// taken out of the target takes its hook out, and only that one.
 #[test]
 fn a_settings_target_installs_its_guards_beside_other_hooks() {
     let f = Fixture::new();
     let theirs = r#"{"matcher": "Write", "hooks": [{"type": "command", "command": "fmt"}]}"#;
-    let settings = f.write(
-        "home/.claude-balanced/settings.json",
-        &format!("{{\n  \"model\": \"x\",\n  \"hooks\": {{\"PreToolUse\": [{theirs}], \"Stop\": []}}\n}}\n"),
+    let before = format!(
+        "{{\n  \"model\": \"x\",\n  \"hooks\": {{\"PreToolUse\": [{theirs}], \"Stop\": []}}\n}}\n"
     );
+    let settings = f.write("home/.claude-balanced/settings.json", &before);
     with_targets(
         &f,
         &target("balanced settings", "claude", "settings", &settings, "guards = ['rm']\n"),
     );
-    let opts = Options { user_only: true, ..f.opts() };
+    // A `lords` that can't run: its copy never passes the self-test.
+    let fake = f.write("fake-lords.exe", "not a program");
+    let opts = Options { user_only: true, guard_from: Some(fake), ..f.opts() };
     let p = plan(&f.stacks(), &opts).unwrap();
     assert_eq!(p.items[0].action, Action::Update);
-    apply(&p).unwrap();
     let v: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        serde_json::from_str(p.items[0].proposed.as_deref().unwrap()).unwrap();
     let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
     assert_eq!(
         pre[0],
@@ -567,13 +570,19 @@ fn a_settings_target_installs_its_guards_beside_other_hooks() {
     assert_eq!(pre[1]["matcher"], "Bash");
     let h = &pre[1]["hooks"][0];
     assert_eq!(h["args"], serde_json::json!(["guard", "rm"]), "{h}");
-    // Exec form: the executable that syncs (here the test binary), no shell.
-    let exe = std::env::current_exe().unwrap().display().to_string().replace('\\', "/");
-    assert_eq!(h["command"], serde_json::json!(exe), "{h}");
+    let copy = f.home().join("bin").join("lords-guard.exe");
+    let named = h["command"].as_str().unwrap().replace('\\', "/").to_lowercase();
+    assert_eq!(named, copy.display().to_string().replace('\\', "/").to_lowercase(), "{h}");
     assert_eq!(v["hooks"]["Stop"], serde_json::json!([]));
     assert_eq!(v["model"], "x");
-    assert_eq!(plan(&f.stacks(), &opts).unwrap().items[0].action, Action::InSync);
+    let failed = apply(&p).expect_err("a guard copy that can't run");
+    assert!(failed.contains("lords-guard"), "{failed}");
+    assert_eq!(fs::read_to_string(&settings).unwrap(), before, "the settings never name it");
+    assert!(!copy.exists(), "no copy left");
     // Taken out of the target: only Lords' hook goes.
+    let lords = r#"{"matcher": "Bash", "hooks": [{"type": "command", "command": "x/lords-guard.exe", "args": ["guard", "rm"]}]}"#;
+    fs::write(&settings, format!("{{\"hooks\": {{\"PreToolUse\": [{theirs}, {lords}]}}}}\n"))
+        .unwrap();
     with_targets(&f, &target("balanced settings", "claude", "settings", &settings, ""));
     let p = plan(&f.stacks(), &opts).unwrap();
     assert_eq!(p.items[0].action, Action::Update);

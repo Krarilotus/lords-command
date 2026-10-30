@@ -82,10 +82,11 @@ fn modules_allowed(d: Door) -> &'static [&'static str] {
     }
 }
 
-/// The child processes a source may start: `git` and the file manager, both in process.rs.
+/// The child processes a source may start: `git`, the file manager and the staged guard copy's self-test
+/// (`guard_copy`), all in process.rs.
 fn programs_allowed(d: Door) -> &'static [&'static str] {
     match d {
-        Door::Process => &["\"git\"", "\"explorer\"", "\"xdg-open\""],
+        Door::Process => &["\"git\"", "\"explorer\"", "\"xdg-open\"", "guard_copy"],
         _ => &[],
     }
 }

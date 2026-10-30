@@ -1011,6 +1011,27 @@ pub fn move_to(from: &impl Place, to: &Contained) -> Result<(), String> {
     move_to_at(from.place(), &to.path)
 }
 
+/// Puts an executable at `p` that is the tool's alone: written and synced as a staged `.exe` beside it, run there by
+/// `verify`, then renamed over `p`. A copy that fails `verify` is removed and `p` keeps what it had.
+pub fn install_exe(
+    p: &impl Place,
+    bytes: &[u8],
+    verify: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let path = p.place();
+    check(path)?;
+    let staged = beside(path, "new")?.with_extension("exe");
+    create_file_at(&staged, bytes)?;
+    if let Err(e) = verify(&staged) {
+        let _ = delete_file_at(&staged);
+        return Err(e);
+    }
+    fs::rename(&staged, path).map_err(|e| {
+        let _ = delete_file_at(&staged);
+        format!("{}: {e} (a session running it holds it; sync again)", path.display())
+    })
+}
+
 /// Replaces a file that is the tool's alone, keeping its attributes or refusing.
 pub fn replace_own_file(p: &impl Place, bytes: &[u8]) -> Result<(), String> {
     replace_own_file_at(p.place(), bytes)

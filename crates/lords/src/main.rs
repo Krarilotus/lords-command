@@ -117,19 +117,27 @@ fn public_rules(public: &Path, private: Option<&Stack>) -> Result<Rules, String>
 }
 
 /// `lords guard rm`: the tool-call guard Claude Code runs before a Bash call (guard.rs). Reads the event on stdin and
-/// prints a denial, or nothing; never fails the call it can't read.
-fn cmd_guard(mut a: Args) -> Result<bool, String> {
-    let which = a.positional().ok_or("guard needs what to guard: rm")?;
-    a.done()?;
-    if which != "rm" {
-        return Err(format!("no guard `{which}`; there is: rm"));
+/// prints a denial, or nothing. It never fails the call: a usage error or input it can't read is a note on stderr and
+/// exit 0 (orchestrator, 30 Oct: Claude Code takes exit 2 from a PreToolUse hook as a refusal). `lords guard
+/// --self-test` prints `ok` when the guard refuses its witness; sync runs it before installing the copy hooks name.
+fn cmd_guard(mut a: Args) -> ExitCode {
+    if a.flag("--self-test") {
+        let witness = r#"{"tool_name":"Bash","tool_input":{"command":"rm -f $OUT/x"}}"#;
+        let ok = lords_core::guard::rm_hook(witness).contains("\"deny\"");
+        println!("{}", if ok { "ok" } else { "the guard let its witness through" });
+        return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
+    }
+    let which = a.positional();
+    if which.as_deref() != Some("rm") || a.done().is_err() {
+        eprintln!("lords guard: usage `lords guard rm` (event on stdin); this call is let through");
+        return ExitCode::SUCCESS;
     }
     let input = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
     let out = lords_core::guard::rm_hook(&input);
     if !out.is_empty() {
         println!("{out}");
     }
-    Ok(true)
+    ExitCode::SUCCESS
 }
 
 fn cmd_check(mut a: Args) -> Result<bool, String> {
@@ -263,7 +271,17 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         ));
     }
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
-    let opts = sync::Options { repo, user_only, adapter, place, home, uninstall: false, stage };
+    let guard_from = std::env::current_exe().ok();
+    let opts = sync::Options {
+        repo,
+        user_only,
+        adapter,
+        place,
+        home,
+        uninstall: false,
+        stage,
+        guard_from,
+    };
     let plan = sync::plan(&stacks, &opts)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_default());
@@ -745,6 +763,10 @@ fn main() -> ExitCode {
     }
     let cmd = words.remove(0);
     let a = Args { words };
+    // The guard answers a harness, so it has its own exit codes (cmd_guard).
+    if cmd == "guard" {
+        return cmd_guard(a);
+    }
     let result = match cmd.as_str() {
         "check" => cmd_check(a),
         "import" => cmd_import(a),
@@ -759,7 +781,6 @@ fn main() -> ExitCode {
         "adopt" => cmd_adopt(a),
         "set-aside" => cmd_set_aside(a),
         "sizes" => cmd_sizes(a),
-        "guard" => cmd_guard(a),
         other => Err(format!("unknown command `{other}`\n\n{USAGE}")),
     };
     match result {

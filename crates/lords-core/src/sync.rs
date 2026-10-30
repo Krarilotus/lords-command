@@ -230,6 +230,26 @@ pub struct Plan {
     /// before the install stage drops a blocked place's items.
     #[serde(skip)]
     pub over_limit: bool,
+    /// The guard executable a settings target's hooks run, when it must be installed or replaced (`GuardInstall`).
+    #[serde(skip)]
+    pub guard: Option<GuardInstall>,
+    /// `Options::guard_from`.
+    #[serde(skip)]
+    pub guard_from: Option<PathBuf>,
+}
+
+/// The stable copy of `lords` that harness hooks run (orchestrator, 30 Oct): `<tool home>/bin/lords-guard.exe`, never
+/// a build output that a `cargo clean`, a failed or a locked rebuild could take away. It is the syncing executable's
+/// bytes, installed only after the staged copy passes `guard --self-test`.
+#[derive(Clone, Debug)]
+pub struct GuardInstall {
+    pub place: Contained,
+    pub bytes: Vec<u8>,
+}
+
+/// Where the guard copy lives in the tool's home.
+fn guard_place(home: &Path) -> Result<Contained, String> {
+    Ok(Root::home(home)?.join(&[Part::new("bin")?, Part::new("lords-guard.exe")?]))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -250,6 +270,9 @@ pub struct Options {
     pub uninstall: bool,
     /// What the apply may do: everything, or the install stage only.
     pub stage: Stage,
+    /// The `lords` executable whose copy a settings target's guard hooks run (the CLI passes itself, the app the
+    /// `lords` beside it). `None`: a settings target with guards is a conflict.
+    pub guard_from: Option<PathBuf>,
 }
 
 /// `~/.lords-command`, the tool's own dir on this machine.
@@ -1134,7 +1157,32 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
         }
     }
     let list = serde_json::Value::Array(list.clone());
-    let hooks = match guard_hooks(t, adapter, &value) {
+    let guard = match guard_place(&pl.plan.home) {
+        Ok(g) => g,
+        Err(e) => return conflict(&t.name, &path, e),
+    };
+    if !t.guards.is_empty() && pl.plan.guard.is_none() {
+        let mine = pl
+            .plan
+            .guard_from
+            .clone()
+            .ok_or_else(|| {
+                "guards need the `lords` executable to copy; sync from `lords`".to_string()
+            })
+            .and_then(|e| fsguard::read_bytes(&e).map_err(|err| format!("{}: {err}", e.display())));
+        let bytes = match mine {
+            Ok(b) => b,
+            Err(e) => return conflict(&t.name, &path, e),
+        };
+        if fsguard::read_bytes(guard.path()).ok().as_deref() != Some(&bytes[..]) {
+            pl.plan.notes.push(format!(
+                "installs the guard {} (a copy of this lords)",
+                guard.path().display()
+            ));
+            pl.plan.guard = Some(GuardInstall { place: guard.clone(), bytes });
+        }
+    }
+    let hooks = match guard_hooks(t, adapter, &value, guard.path()) {
         Ok(h) => h,
         Err(e) => return conflict(&t.name, &path, e),
     };
@@ -1171,6 +1219,7 @@ fn guard_hooks(
     t: &Target,
     adapter: &dyn Adapter,
     settings: &serde_json::Value,
+    guard: &Path,
 ) -> Result<Option<serde_json::Value>, String> {
     let current = settings.get("hooks").cloned().unwrap_or(serde_json::Value::Null);
     // Lords' entry: a hook run as `<exe> guard <name>`, whatever the exe's path (it moves with each build).
@@ -1195,8 +1244,7 @@ fn guard_hooks(
             return Err(format!("no guard `{g}`; there is: rm"));
         }
     }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let exe = adapters::slashes(&exe);
+    let exe = adapters::slashes(guard);
     let mut hooks = match current {
         serde_json::Value::Null => serde_json::json!({}),
         v @ serde_json::Value::Object(_) => v,
@@ -1889,6 +1937,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         plan: Plan {
             home: opts.home.clone(),
             ledger_revision: ledger.revision(),
+            guard_from: opts.guard_from.clone(),
             ..Plan::default()
         },
         ledger,
@@ -2356,6 +2405,11 @@ fn tool_change(item: &Item, ledger: &mut Ledger) -> Result<(), String> {
 pub fn apply(plan: &Plan) -> Result<Applied, String> {
     if plan.items.iter().any(|i| i.action == Action::Conflict) {
         return Err("the plan has conflicts; resolve them first (nothing was changed)".into());
+    }
+    // The guard copy first: settings never name a guard that doesn't answer (orchestrator, 30 Oct).
+    if let Some(g) = &plan.guard {
+        fsguard::create_dir_all(&Root::home(&plan.home)?.join(&[Part::new("bin")?]))?;
+        fsguard::install_exe(&g.place, &g.bytes, crate::process::guard_self_test)?;
     }
     let changing: Vec<&Item> =
         plan.items.iter().filter(|i| i.changes() && i.action != Action::RetireEntry).collect();

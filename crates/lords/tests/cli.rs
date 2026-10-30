@@ -836,6 +836,99 @@ fn a_user_level_codex_file_has_no_project_limit() {
     assert!(written.len() > 32 * 1024 && written.contains("long enough"), "{}", text(&o));
 }
 
+/// `lords guard` as Claude Code runs it: the event on stdin; its output and exit code.
+fn guard(env: &Env, exe: &Path, args: &[&str], stdin: &str) -> Output {
+    use std::io::Write;
+    let mut c = env
+        .cmd(exe.to_str().unwrap(), env.dir.path())
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    c.wait_with_output().unwrap()
+}
+
+// Spec (orchestrator, 30 Oct): "The guard should exit 2 only on a deliberate refusal: any internal error or
+// unreadable input fails open with exit 0 and a stderr note" (Claude Code takes exit 2 from a PreToolUse hook as a
+// block of the call). Usage errors and unreadable input: exit 0, nothing on stdout; the refusal: exit 0 with the
+// denial; the self-test: `ok`.
+#[test]
+fn the_guard_fails_open_on_anything_but_a_refusal() {
+    let env = Env::new();
+    let exe = Path::new(env!("CARGO_BIN_EXE_lords"));
+    let event = r#"{"tool_name":"Bash","tool_input":{"command":"rm -f $OUT/x"}}"#;
+    for args in [&["guard"][..], &["guard", "nope"], &["guard", "rm", "extra"], &["guard", "--x"]] {
+        let o = guard(&env, exe, args, event);
+        assert_eq!(o.status.code(), Some(0), "{args:?}: {}", text(&o));
+        assert!(o.stdout.is_empty() && !o.stderr.is_empty(), "{args:?}: {}", text(&o));
+    }
+    for input in ["", "not json", "{\"tool_name\": 5}"] {
+        let o = guard(&env, exe, &["guard", "rm"], input);
+        assert_eq!(o.status.code(), Some(0), "{input}: {}", text(&o));
+        assert!(o.stdout.is_empty(), "{input}: {}", text(&o));
+    }
+    let o = guard(&env, exe, &["guard", "rm"], event);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("\"deny\""), "{}", text(&o));
+    let o = guard(&env, exe, &["guard", "--self-test"], "");
+    assert_eq!((o.status.code(), String::from_utf8_lossy(&o.stdout).trim()), (Some(0), "ok"));
+}
+
+// Spec (orchestrator, 30 Oct: "have sync install a stable copy … that the settings name. Copy it only once that exe
+// answers … a self-test"): a settings target with guards installs `<tool home>/bin/lords-guard.exe` and names it in
+// the hook; the installed copy refuses the witness; a second sync changes nothing.
+#[test]
+fn sync_installs_a_stable_guard_copy_and_names_it() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (public, private) = (d.join("pub"), d.join("priv"));
+    fs::create_dir_all(&public).unwrap();
+    fs::create_dir_all(&private).unwrap();
+    fs::create_dir_all(d.join("home/.claude-balanced")).unwrap();
+    fs::write(d.join("home/.claude-balanced/settings.json"), "{\n  \"model\": \"x\"\n}\n").unwrap();
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    fs::write(
+        private.join("stack.toml"),
+        "name = \"priv\"\nvisibility = \"private\"\n[[targets]]\nname = \"balanced settings\"\nadapter = \"claude\"\nkind = \"settings\"\npath = \"~/.claude-balanced/settings.json\"\nguards = [\"rm\"]\n",
+    )
+    .unwrap();
+    assert!(env.git(&private, &["init", "-q"]).status.success());
+    env.git(&private, &["add", "-A"]);
+    env.git(&private, &["commit", "-q", "-m", "start"]);
+    let sync = |apply: bool| {
+        let mut args = vec!["sync", "--user"];
+        if apply {
+            args.push("--apply");
+        }
+        args.extend([
+            "--public-stack",
+            public.to_str().unwrap(),
+            "--private-stack",
+            private.to_str().unwrap(),
+        ]);
+        env.lords(d, &args)
+    };
+    let o = sync(true);
+    assert!(o.status.success(), "{}", text(&o));
+    let copy = d.join("home/.lords-command/bin/lords-guard.exe");
+    assert!(copy.is_file(), "{}", text(&o));
+    let v: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(d.join("home/.claude-balanced/settings.json")).unwrap(),
+    )
+    .unwrap();
+    let h = &v["hooks"]["PreToolUse"][0]["hooks"][0];
+    let named = h["command"].as_str().unwrap().replace('\\', "/").to_lowercase();
+    assert_eq!(named, copy.display().to_string().replace('\\', "/").to_lowercase(), "{h}");
+    let event = r#"{"tool_name":"Bash","tool_input":{"command":"rm -f $OUT/x"}}"#;
+    let o = guard(&env, &copy, &["guard", "rm"], event);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("\"deny\""), "{}", text(&o));
+    let again = text(&sync(false));
+    assert!(!again.contains("installs the guard"), "{again}");
+}
+
 // Spec (orchestrator, 27 Oct: `lords check --stack` is "one flag that skips the drift part", run by a stack repo's
 // pre-commit, where the hook probe can't run): it fails on a broken entry and passes once that is fixed, and
 // reports neither drift nor the hook probe, which the full check reports for the same stacks.
