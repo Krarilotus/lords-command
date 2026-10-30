@@ -1361,10 +1361,12 @@ fn tracked_at(dir: &Path, paths: &[&str]) -> Result<Vec<String>, String> {
     Ok(git::run(dir, &args)?.split('\0').filter(|s| !s.is_empty()).map(fold).collect())
 }
 
-/// A repo-relative name as the filesystem compares it: case-folded on Windows, as is.
+/// A repo-relative name as the tracked-file check compares it: on Windows its ASCII letters case-folded, as git's
+/// `:(icase)` matches them; other letters as they are, so names only Unicode case rules merge (`straße`, `strasse`;
+/// `fıx`, `fix`) stay apart, as NTFS keeps them (sol-loop sync-perf r2, S3). Elsewhere, as is.
 fn fold(name: &str) -> String {
     if cfg!(windows) {
-        name.to_uppercase()
+        name.to_ascii_uppercase()
     } else {
         name.to_string()
     }
