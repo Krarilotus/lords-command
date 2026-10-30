@@ -595,6 +595,37 @@ fn a_settings_target_installs_its_guards_beside_other_hooks() {
     );
 }
 
+// Spec: sol-loop rm guard r1, S1 and S2 (witnesses): a hook is Lords' only when it runs Lords' guard copy. A user's
+// own hook with the same args stays, with or without guards in the target; and taking Lords' hook out keeps the other
+// hooks in its entry, and the entry.
+#[test]
+fn only_lords_own_guard_hook_is_ever_taken_out() {
+    let f = Fixture::new();
+    let copy =
+        f.home().join("bin").join("lords-guard.exe").display().to_string().replace('\\', "/");
+    let mine = r#"{"matcher":"Bash","hooks":[{"type":"command","command":"my-tool","args":["guard","rm"]}]}"#;
+    let shared = format!(
+        r#"{{"matcher":"Bash","hooks":[{{"type":"command","command":"{copy}","args":["guard","rm"]}},{{"type":"command","command":"audit"}}]}}"#
+    );
+    let settings = f.write(
+        "home/.claude-balanced/settings.json",
+        &format!("{{\"hooks\":{{\"PreToolUse\":[{mine},{shared}]}}}}\n"),
+    );
+    with_targets(&f, &target("balanced settings", "claude", "settings", &settings, ""));
+    let opts = Options { user_only: true, ..f.opts() };
+    let p = plan(&f.stacks(), &opts).unwrap();
+    apply(&p).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(
+        v["hooks"]["PreToolUse"],
+        serde_json::json!([
+            serde_json::from_str::<serde_json::Value>(mine).unwrap(),
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "audit"}]}
+        ])
+    );
+}
+
 // Spec (orchestrator D2, 25 Oct: "worktree_roots … skip and list" the rest; D1: "every managed repo gets
 // CLAUDE.local.md containing @AGENTS.md plus the project and repo layers"): only worktrees under a root get
 // files, the others are listed; where the checkout has an AGENTS.md, the Claude file includes it and the Codex

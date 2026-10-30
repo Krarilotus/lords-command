@@ -63,6 +63,25 @@ fn a_literal_path_and_other_commands_pass() {
     assert_eq!(rm_hook("not json"), "");
 }
 
+// Spec: sol-loop rm guard r1, S4–S6 (witnesses): only the paths `rm` deletes are checked. A redirection target, an
+// option's value, a comment and an ANSI-C quoted literal are not deletion paths and don't refuse a literal `rm`; a
+// variable operand after `--` still does.
+#[test]
+fn only_the_paths_rm_deletes_are_checked() {
+    for command in [
+        "rm -f build/out 2>\"$LOG\"",
+        "rm -f build/out > $LOG 2>&1",
+        "rm --interactive=\"$MODE\" -- build/out",
+        "rm -f build/out # $OUT is unused",
+        "rm -f $'it\\'s$OUT'",
+    ] {
+        assert_eq!(denied(command), None, "{command}");
+    }
+    for command in ["rm -- $X", "rm -f build/out $X # note", "rm -f $'a' $B"] {
+        assert!(denied(command).is_some(), "let through: {command}");
+    }
+}
+
 // Spec: the reasoned call (owner, 30 Oct: "a variable inside quotes without `:?` gets your reasoned call"): rejected.
 // Quoting stops word splitting, not emptiness: with OUT empty, `rm -rf "$OUT/x"` is `rm -rf /x`. Only `:?` stops that.
 #[test]
