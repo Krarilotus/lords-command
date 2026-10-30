@@ -156,6 +156,46 @@ fn a_plan_with_a_conflict_has_no_complete_view() {
     assert!(p.complete.is_none());
 }
 
+// Spec (orchestrator, 30 Oct: a dry run says "applies: yes/no (why), what it releases", from the refusal rule apply
+// itself uses; rule B unchanged, any conflict holds every removal): with a conflict in workspace `a`, the plan doesn't
+// apply, says why and where, and apply refuses it. With `a` back, it applies and releases b's obsolete copy (a remove)
+// and a's record whose copy went with its folder (a forget).
+#[test]
+fn a_plan_says_whether_it_applies_and_what_it_releases() {
+    let f = Fixture::new();
+    rule(&f);
+    // A development skill (with roles): copied into each place.
+    f.write("pub/global/skills/demo/SKILL.md", "---\nname: demo\ndescription: demo\n---\nSteps.\n");
+    f.write(
+        "pub/global/skills/demo/lords.yaml",
+        "id: skill.demo\nkind: skill\ntitle: demo\naudience: [all]\nroles: [coder]\nscope: global\nstatus: active\nvisibility: public\norigin:\n  type: own\n",
+    );
+    fs::create_dir_all(f.path("a")).unwrap();
+    fs::create_dir_all(f.path("b")).unwrap();
+    declare(
+        &f,
+        &format!(
+            "roles = ['coder']\n[workspaces.a]\npath = '{}'\nadapters = ['claude']\n[workspaces.b]\npath = '{}'\nadapters = ['claude']\n",
+            f.path("a").display(),
+            f.path("b").display()
+        ),
+    );
+    sync::apply(&sync::plan(&f.stacks(), &f.opts()).unwrap()).unwrap();
+    assert!(f.path("b/.claude/skills/demo/SKILL.md").is_file(), "the skill is in b");
+    fs::remove_dir_all(f.path("pub/global/skills/demo")).unwrap();
+    fs::remove_dir_all(f.path("a")).unwrap();
+    let p = sync::plan(&f.stacks(), &f.opts()).unwrap();
+    let why = p.applies().unwrap_err();
+    assert!(why.contains("1 conflict(s) in workspace a"), "{why}");
+    assert!(sync::apply(&p).is_err(), "apply refuses what applies() refuses");
+    fs::create_dir_all(f.path("a")).unwrap();
+    let p = sync::plan(&f.stacks(), &f.opts()).unwrap();
+    let r = p.applies().unwrap();
+    assert_eq!((r.removes, r.forgets), (1, 1), "b's copy, a's gone copy");
+    sync::apply(&p).unwrap();
+    assert!(!f.path("b/.claude/skills/demo").exists(), "released");
+}
+
 // Spec (R7-05, rule B): a problem of any level in the stacks (here a skill that is a file, a warning) holds
 // removal: an installed skill whose source didn't load isn't retired.
 #[test]

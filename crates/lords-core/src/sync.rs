@@ -285,6 +285,21 @@ pub struct Plan {
     pub over_limit: bool,
 }
 
+/// What applying a plan releases besides its installs and updates: paths it removes, and ledger records it forgets
+/// (a forget drops the record only; a copy the owner changed stays where it is).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Releases {
+    pub removes: usize,
+    pub forgets: usize,
+}
+
+impl Plan {
+    /// Whether `apply` takes this plan, by its own refusal rules, and what it releases; or why not.
+    pub fn applies(&self) -> Result<Releases, String> {
+        Ok(Releases::default())
+    }
+}
+
 /// The guard copy's bytes, read through the path check (a link anywhere on the way is refused); `None` when there is
 /// none.
 fn guard_bytes(place: &Contained) -> Result<Option<Vec<u8>>, String> {

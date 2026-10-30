@@ -1143,6 +1143,64 @@ fn sync_names_the_guard_only_once_it_is_installed() {
     assert!(!settings().contains("lords-guard") && !copy.exists(), "{}", settings());
 }
 
+// Spec (orchestrator, 30 Oct: "a one-line 'applies: yes/no (why)' in the `lords sync` dry-run output itself", with
+// what it releases; fix check r2, R2-03: a forget drops a record, and an owner-edited copy it leaves is still there):
+// the dry run says whether its plan applies, and why not, in one line; what it forgets is counted as records, never
+// called gone.
+#[test]
+fn a_sync_dry_run_says_whether_it_applies() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (public, private) = (d.join("pub"), d.join("priv"));
+    fs::create_dir_all(&public).unwrap();
+    fs::create_dir_all(&private).unwrap();
+    fs::create_dir_all(d.join("home/out")).unwrap();
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    let skill = |name: &str| {
+        fs::create_dir_all(public.join(format!("global/skills/{name}"))).unwrap();
+        fs::write(
+            public.join(format!("global/skills/{name}/SKILL.md")),
+            format!("---\nname: {name}\n---\nX\n"),
+        )
+        .unwrap();
+        fs::write(
+            public.join(format!("global/skills/{name}/lords.yaml")),
+            format!("id: skill.{name}\nkind: skill\ntitle: {name}\naudience: [all]\nscope: global\nstatus: active\nvisibility: public\norigin:\n  type: own\n"),
+        )
+        .unwrap();
+    };
+    skill("a");
+    fs::write(
+        private.join("stack.toml"),
+        "name = \"priv\"\nvisibility = \"private\"\n[[targets]]\nname = \"skills\"\nadapter = \"claude\"\nkind = \"skills\"\npath = \"~/out/skills\"\n",
+    )
+    .unwrap();
+    let stacks =
+        ["--public-stack", public.to_str().unwrap(), "--private-stack", private.to_str().unwrap()];
+    let sync =
+        |more: &[&str]| text(&env.lords(d, &[&["sync", "--user"][..], more, &stacks].concat()));
+    let line = |out: &str| {
+        out.lines().find(|l| l.starts_with("applies: ")).unwrap_or_default().to_string()
+    };
+    let out = sync(&[]);
+    assert!(line(&out).starts_with("applies: yes"), "{out}");
+    // An owner-edited copy that is no longer wanted: its record is forgotten, the copy stays.
+    sync(&["--apply"]);
+    fs::write(d.join("home/out/skills/a/SKILL.md"), "OWNER EDIT\n").unwrap();
+    fs::remove_dir_all(public.join("global/skills/a")).unwrap();
+    let out = sync(&[]);
+    let l = line(&out);
+    assert!(l.contains("forgets 1 record(s)") && !l.contains("gone"), "{out}");
+    // A skill copy that isn't the tool's (no ledger record) where one installs: a conflict there, and the plan doesn't
+    // apply.
+    skill("b");
+    fs::create_dir_all(d.join("home/out/skills/b")).unwrap();
+    fs::write(d.join("home/out/skills/b/SKILL.md"), "mine\n").unwrap();
+    let out = sync(&[]);
+    let l = line(&out);
+    assert!(l.starts_with("applies: no") && l.contains("target skills"), "{out}");
+}
+
 // Spec (Sync perf review r1, R1, witness: `GIT_LITERAL_PATHSPECS=1` inherited made git read Lords' `:(icase)` pathspec
 // as a literal name, so a tracked destination looked untracked): a destination git tracks is a conflict whatever
 // pathspec mode Lords inherits. Both witnesses: a tracked file deleted from the working tree, and a ledger-owned
