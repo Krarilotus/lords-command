@@ -1065,3 +1065,65 @@ fn a_live_memory_store_is_indexed_by_its_own_index_file() {
     assert!(!text.contains("stale-copy"), "no imported copy of a live store: {text}");
     assert!(text.contains("kept-note"), "a store that isn't live is listed as before: {text}");
 }
+
+// Spec (sol-loop r1 on the Codex switch-on, S1, witness: a live store with only its MEMORY.md, no note imported yet,
+// got no Memory section, so its first note stayed invisible until an import): a live store is named wherever its
+// declared scope and audience reach and its harness doesn't load it by itself, whether or not any note was imported;
+// not where its scope doesn't reach, nor for an audience it doesn't serve, nor where it is native.
+#[test]
+fn a_live_store_is_named_from_its_declaration_without_imported_notes() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.path("priv/project/beta/memory/live")).unwrap();
+    let live = f.path("agent-memory");
+    f.write("agent-memory/MEMORY.md", "- [first](first.md) — written a minute ago\n");
+    f.write(
+        "priv/stack.toml",
+        &format!(
+            "name = \"priv\"\nvisibility = \"private\"\n[projects.beta]\n[projects.gamma]\n[repos.beta-core]\nproject = \"beta\"\n[repos.gamma-core]\nproject = \"gamma\"\n\
+             [[memory_stores]]\nname = \"live\"\npath = '{}'\nscope = \"project:beta\"\naudience = [\"opus\"]\nlive = true\n",
+            live.display()
+        ),
+    );
+    let text = |repo: &str, project: &str, audience: Vec<Audience>, skip: Vec<String>| {
+        let layers = Layers::Repo {
+            repo: repo.into(),
+            project: Some(project.into()),
+            sub: None,
+            global: false,
+        };
+        compose(
+            &f.stacks(),
+            &Context {
+                audience,
+                layers,
+                public_only: false,
+                skip_stores: skip,
+                roles: None,
+                by_reference: false,
+                role_dir: None,
+                relative_to: None,
+                default_role: None,
+                default_role_inline: false,
+            },
+        )
+        .text
+    };
+    let index =
+        live.join("MEMORY.md").display().to_string().replace('/', std::path::MAIN_SEPARATOR_STR);
+    assert!(
+        text("beta-core", "beta", vec![Audience::Opus], vec![]).contains(&index),
+        "its scope and audience"
+    );
+    assert!(
+        !text("gamma-core", "gamma", vec![Audience::Opus], vec![]).contains(&index),
+        "another project"
+    );
+    assert!(
+        !text("beta-core", "beta", vec![Audience::Sol], vec![]).contains(&index),
+        "an audience it doesn't serve"
+    );
+    assert!(
+        !text("beta-core", "beta", vec![Audience::Opus], vec!["live".into()]).contains(&index),
+        "native here"
+    );
+}
