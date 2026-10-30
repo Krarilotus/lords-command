@@ -148,33 +148,52 @@ fn commands(command: &str) -> Vec<Vec<Word>> {
 }
 
 /// The first word of an `rm` command holding a variable not written `"${VAR:?}"`, if any. Leading assignments (`X=y`)
-/// and the wrappers `sudo`, `command`, `env` and `builtin` are looked through. Every word after `rm` is checked,
+/// leading shell keywords and the wrappers in `WRAPPERS` (with their options) are looked through. Every word after `rm` is checked,
 /// redirections and option-like words too: an unquoted variable can split into paths anywhere (`rm -$X`), and no
 /// parse of them can turn a deletion path into something else. Conservative by design (sol-loop r1 S4, declined; r2
 /// S7–S10): a false refusal costs a retry with `"${VAR:?}"`, a missed path a deletion.
 pub fn unguarded_rm(command: &str) -> Option<String> {
+    let is_rm = |w: &Word| w.text == "rm" || w.text.ends_with("/rm");
+    let assignment = |t: &str| {
+        t.contains('=')
+            && !t.starts_with('=')
+            && t.split('=')
+                .next()
+                .is_some_and(|n| n.chars().all(|x| x == '_' || x.is_ascii_alphanumeric()))
+    };
     for words in commands(command) {
-        let mut rest = words.iter().skip_while(|w| {
-            let t = &w.text;
-            (t.contains('=')
-                && !t.starts_with('=')
-                && t.split('=')
-                    .next()
-                    .is_some_and(|n| n.chars().all(|x| x == '_' || x.is_ascii_alphanumeric())))
-                || ["sudo", "command", "env", "builtin"].contains(&t.as_str())
-        });
-        let Some(cmd) = rest.next() else { continue };
-        if cmd.text != "rm" && !cmd.text.ends_with("/rm") {
+        // Shell keywords before a command and leading assignments (sol-loop r3, S17).
+        let mut rest =
+            words.iter().skip_while(|w| KEYWORDS.contains(&w.text.as_str()) || assignment(&w.text));
+        let Some(first) = rest.next() else { continue };
+        let args: Vec<&Word> = if is_rm(first) {
+            rest.collect()
+        } else if WRAPPERS.contains(&first.text.as_str()) {
+            // A wrapper runs the command after its own options and their values, which a guard can't parse for every
+            // wrapper: the first `rm` word after it is taken as the command (sol-loop r3, S18).
+            match rest.position(&is_rm) {
+                Some(_) => rest.collect(),
+                None => continue,
+            }
+        } else {
             continue;
-        }
+        };
         if let Some(w) =
-            rest.find(|w| w.vars.iter().any(|(quoted, guarded)| !(*quoted && *guarded)))
+            args.iter().find(|w| w.vars.iter().any(|(quoted, guarded)| !(*quoted && *guarded)))
         {
             return Some(w.text.clone());
         }
     }
     None
 }
+
+/// Shell words that can stand before a command in a simple command's place.
+const KEYWORDS: [&str; 10] =
+    ["then", "do", "else", "elif", "if", "while", "until", "!", "{", "time"];
+
+/// Commands that run the command after them (with options of their own in between).
+const WRAPPERS: [&str; 9] =
+    ["sudo", "command", "env", "builtin", "exec", "nohup", "nice", "timeout", "xargs"];
 
 /// The guard hook's answer to one `PreToolUse` event (the harness's stdin JSON): a denial naming the fix, or nothing
 /// (empty: the call goes on to the harness's own checks). Only Bash calls are looked at; input that isn't such an
