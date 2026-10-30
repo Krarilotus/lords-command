@@ -1143,6 +1143,70 @@ fn sync_names_the_guard_only_once_it_is_installed() {
     assert!(!settings().contains("lords-guard") && !copy.exists(), "{}", settings());
 }
 
+// Spec (Sync perf review r1, R1, witness: `GIT_LITERAL_PATHSPECS=1` inherited made git read Lords' `:(icase)` pathspec
+// as a literal name, so a tracked destination looked untracked): a destination git tracks is a conflict whatever
+// pathspec mode Lords inherits. Both witnesses: a tracked file deleted from the working tree, and a ledger-owned
+// generated file force-added to the index.
+#[test]
+fn an_inherited_pathspec_mode_never_hides_a_tracked_destination() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (public, private, checkout) = (d.join("pub"), d.join("priv"), d.join("checkout"));
+    for dir in [&public, &private.join("repo/beta-core/facts"), &checkout] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    let fact = |body: &str| {
+        format!("---\nid: fact.h\nkind: fact\ntitle: h\naudience: [all]\nscope: repo:beta-core\nstatus: active\nvisibility: private\norigin:\n  type: own\n---\n{body}\n")
+    };
+    fs::write(private.join("repo/beta-core/facts/h.md"), fact("Hosts.")).unwrap();
+    fs::write(
+        private.join("stack.toml"),
+        format!(
+            "name = \"priv\"\nvisibility = \"private\"\n[projects.beta]\n[repos.beta-core]\nproject = \"beta\"\ncheckouts = ['{}']\nworktrees = false\n",
+            checkout.display()
+        ),
+    )
+    .unwrap();
+    for (dir, files) in [(&private, "-A"), (&checkout, "-A")] {
+        if dir == &checkout {
+            fs::write(checkout.join("README.md"), "x\n").unwrap();
+        }
+        assert!(env.git(dir, &["init", "-q"]).status.success());
+        env.git(dir, &["add", files]);
+        env.git(dir, &["commit", "-q", "-m", "start"]);
+    }
+    let stacks =
+        ["--public-stack", public.to_str().unwrap(), "--private-stack", private.to_str().unwrap()];
+    let literal = |args: &[&str]| {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_lords"), d);
+        c.env("GIT_LITERAL_PATHSPECS", "1").args(args).args(stacks).output().unwrap()
+    };
+    let action_of = |o: &Output, name: &str| -> String {
+        let v: serde_json::Value =
+            serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", text(o)));
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["path"].as_str().is_some_and(|p| p.ends_with(name)))
+            .map(|i| i["action"].as_str().unwrap().to_string())
+            .unwrap_or_default()
+    };
+    // A ledger-owned generated file, then force-added to the index, then its composition changed.
+    let o = env.lords(d, &[&["sync", "--repo", "beta-core", "--apply"][..], &stacks].concat());
+    assert!(o.status.success(), "{}", text(&o));
+    env.git(&checkout, &["add", "-f", "CLAUDE.local.md"]);
+    fs::write(private.join("repo/beta-core/facts/h.md"), fact("Hosts, changed.")).unwrap();
+    env.git(&private, &["commit", "-qam", "changed"]);
+    let o = literal(&["sync", "--repo", "beta-core", "--json"]);
+    assert_eq!(action_of(&o, "CLAUDE.local.md"), "conflict", "{}", text(&o));
+    // A tracked file deleted from the working tree.
+    fs::remove_file(checkout.join("CLAUDE.local.md")).unwrap();
+    let o = literal(&["sync", "--repo", "beta-core", "--json"]);
+    assert_eq!(action_of(&o, "CLAUDE.local.md"), "conflict", "{}", text(&o));
+}
+
 // Spec (orchestrator, 27 Oct: `lords check --stack` is "one flag that skips the drift part", run by a stack repo's
 // pre-commit, where the hook probe can't run): it fails on a broken entry and passes once that is fixed, and
 // reports neither drift nor the hook probe, which the full check reports for the same stacks.

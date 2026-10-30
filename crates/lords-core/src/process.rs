@@ -42,13 +42,19 @@ const LOCAL_VARS: [&str; 15] = [
     "GIT_COMMON_DIR",
 ];
 
+/// The variables that set how git reads every pathspec. Lords writes its own pathspecs (`:(icase)…` among them), so
+/// they mean what Lords wrote only in git's default mode (sync perf review r1, R1: with `GIT_LITERAL_PATHSPECS=1`
+/// inherited, `:(icase)CLAUDE.local.md` was a literal name, matched nothing, and a tracked file looked untracked).
+const PATHSPEC_VARS: [&str; 4] =
+    ["GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"];
+
 /// `git -C <dir> <args>` for the repo at `dir` alone: none of the variables that tie git to the repo this process
 /// was started from reach it (finding F1, 27 Oct: a hook's `GIT_INDEX_FILE` made another repo's `ls-files` read
-/// the commit's index).
+/// the commit's index), and no inherited pathspec mode (`PATHSPEC_VARS`).
 fn command(dir: &Path, args: &[&str]) -> Command {
     let mut c = Command::new("git");
     c.arg("-C").arg(dir).args(args);
-    for v in LOCAL_VARS {
+    for v in LOCAL_VARS.iter().chain(&PATHSPEC_VARS) {
         c.env_remove(v);
     }
     c
@@ -62,12 +68,12 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<Output, String> {
 /// Runs `git -C <dir> <args>` with the git variables this process got, and waits for it: only for reading the
 /// index of the commit a hook checks, which `git commit <paths>` names in `GIT_INDEX_FILE`.
 pub(crate) fn git_inherited(dir: &Path, args: &[&str]) -> Result<Output, String> {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .map_err(|e| format!("git {}: {e}", args.join(" ")))
+    let mut c = Command::new("git");
+    c.arg("-C").arg(dir).args(args);
+    for v in PATHSPEC_VARS {
+        c.env_remove(v);
+    }
+    c.output().map_err(|e| format!("git {}: {e}", args.join(" ")))
 }
 
 /// Runs `git -C <dir> <args>` with these environment variables set, and waits for it (the hook probe).
