@@ -922,6 +922,36 @@ fn the_guard_fails_open_when_it_cant_write() {
     }
 }
 
+// Spec: rm-guard fix check r5, R10 (witness: `lords guard install --r5-invalid-option` with its stderr reader closed
+// exited 101 on a print panic): `guard install` keeps its exit codes when it can't write, 2 for a refusal and 0 for an
+// install, never a panic.
+#[test]
+fn guard_install_keeps_its_exit_code_when_it_cant_write() {
+    let env = Env::new();
+    let exe = env!("CARGO_BIN_EXE_lords");
+    let home = env.dir.path().join("tool-home");
+    let home = home.to_str().unwrap();
+    for (args, closed_stdout, code) in [
+        (&["guard", "install", "--r5-invalid-option"][..], false, 2),
+        (&["guard", "install", "--home", home][..], true, 0),
+    ] {
+        let mut c = env.cmd(exe, env.dir.path());
+        let mut child = c
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        if closed_stdout {
+            drop(child.stdout.take());
+        } else {
+            drop(child.stderr.take());
+        }
+        assert_eq!(child.wait().unwrap().code(), Some(code), "{args:?}");
+    }
+}
+
 /// A user-level fixture for the guard and stale-plan tests: a settings target with the rm guard, a skills target, and
 /// three `lords` builds told apart by a trailing byte (A: none, B, C).
 struct Stale {
