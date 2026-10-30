@@ -296,7 +296,26 @@ pub struct Releases {
 impl Plan {
     /// Whether `apply` takes this plan, by its own refusal rules, and what it releases; or why not.
     pub fn applies(&self) -> Result<Releases, String> {
-        Ok(Releases::default())
+        let count = |a: Action| self.items.iter().filter(|i| i.action == a).count();
+        let r = Releases { removes: count(Action::Remove), forgets: count(Action::Forget) };
+        let conflicts: Vec<&Item> =
+            self.items.iter().filter(|i| i.action == Action::Conflict).collect();
+        if !conflicts.is_empty() {
+            let mut places: BTreeSet<String> =
+                conflicts.iter().flat_map(|i| i.units.iter().map(|u| u.to_string())).collect();
+            if conflicts.iter().any(|i| i.units.is_empty()) {
+                places.insert("no place".into());
+            }
+            return Err(format!(
+                "{} conflict(s) in {}, and apply takes no plan with conflicts; resolve them first. While one is left, removal is held, so the plan lists no removal or forget",
+                conflicts.len(),
+                places.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if self.complete.is_none() && r.removes + r.forgets > 0 {
+            return Err("the plan removes or forgets a path but has no proof the stacks loaded whole; plan again".into());
+        }
+        Ok(r)
     }
 }
 
@@ -2615,18 +2634,12 @@ fn tool_change(item: &Item, ledger: &mut Ledger) -> Result<(), String> {
 /// planned, and nothing is removed or forgotten without the plan's proof of a complete view (rule B). Nothing to
 /// change touches nothing, not even a lock (Sol review r2, R2-21).
 pub fn apply(plan: &Plan) -> Result<Applied, String> {
-    if plan.items.iter().any(|i| i.action == Action::Conflict) {
-        return Err("the plan has conflicts; resolve them first (nothing was changed)".into());
-    }
+    // The refusal rules a dry run reports too (`Plan::applies`).
+    plan.applies().map_err(|e| format!("{e} (nothing was changed)"))?;
     let changing: Vec<&Item> =
         plan.items.iter().filter(|i| i.changes() && i.action != Action::RetireEntry).collect();
     if changing.is_empty() {
         return Ok(Applied::default());
-    }
-    if plan.complete.is_none()
-        && changing.iter().any(|i| matches!(i.action, Action::Remove | Action::Forget))
-    {
-        return Err("the plan removes or forgets a path but has no proof the stacks loaded whole; plan again (nothing was changed)".into());
     }
     // The place an item acts on is the one the plan built for its path: an item altered since doesn't apply.
     for i in &changing {

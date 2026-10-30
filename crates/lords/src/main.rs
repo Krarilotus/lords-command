@@ -332,6 +332,13 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     let whole = !plan.over_limit;
     if !apply {
         if !json {
+            match plan.applies() {
+                Ok(r) => println!(
+                    "applies: yes; it removes {} path(s) and forgets {} record(s) (a forget leaves the path as it is)",
+                    r.removes, r.forgets
+                ),
+                Err(why) => println!("applies: no: {why}"),
+            }
             println!(
                 "dry run: nothing written (`--apply` writes; owner files are backed up first)"
             );
