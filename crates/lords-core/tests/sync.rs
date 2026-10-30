@@ -767,6 +767,42 @@ fn only_lords_own_guard_hook_is_ever_taken_out() {
     );
 }
 
+// Spec (as above, for the queue guard; brief, 30 Oct: "`queue` becomes a `Stop` entry. Foreign hook entries stay";
+// "SubagentStop … must not be registered"): with no copy installed, Lords' `Stop` hooks are taken out, the user's own
+// `Stop` hooks stay in their order (a shared entry keeps the user's hook), and `SubagentStop` is never touched.
+#[test]
+fn a_lords_stop_hook_goes_and_the_users_stay() {
+    let f = Fixture::new();
+    let copy =
+        f.home().join("bin").join("lords-guard.exe").display().to_string().replace('\\', "/");
+    let ours = format!(r#"{{"type":"command","command":"{copy}","args":["guard","queue"]}}"#);
+    let theirs = r#"{"hooks":[{"type":"command","command":"notify"}]}"#;
+    let shared = format!(r#"{{"hooks":[{ours},{{"type":"command","command":"log"}}]}}"#);
+    let sub = r#"[{"hooks":[{"type":"command","command":"sub"}]}]"#;
+    let settings = f.write(
+        "home/.claude-balanced/settings.json",
+        &format!(
+            "{{\"hooks\":{{\"Stop\":[{theirs},{shared},{{\"hooks\":[{ours}]}}],\"SubagentStop\":{sub}}}}}\n"
+        ),
+    );
+    with_targets(
+        &f,
+        &target("balanced settings", "claude", "settings", &settings, "guards = ['queue']\n"),
+    );
+    let p = plan(&f.stacks(), &Options { user_only: true, ..f.opts() }).unwrap();
+    apply(&p).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(
+        v["hooks"]["Stop"],
+        serde_json::json!([
+            serde_json::from_str::<serde_json::Value>(theirs).unwrap(),
+            {"hooks": [{"type": "command", "command": "log"}]}
+        ])
+    );
+    assert_eq!(v["hooks"]["SubagentStop"], serde_json::from_str::<serde_json::Value>(sub).unwrap());
+}
+
 // Spec (orchestrator D2, 25 Oct: "worktree_roots … skip and list" the rest; D1: "every managed repo gets
 // CLAUDE.local.md containing @AGENTS.md plus the project and repo layers"): only worktrees under a root get
 // files, the others are listed; where the checkout has an AGENTS.md, the Claude file includes it and the Codex

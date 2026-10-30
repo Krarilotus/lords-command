@@ -209,3 +209,48 @@ pub fn rm_hook(input: &str) -> String {
         .to_string(),
     }
 }
+
+// The queue guard: tests first; the stubs below answer nothing yet.
+
+pub const QUEUE_REASON: &str = "";
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Runs {
+    pub latest: String,
+    pub active: String,
+}
+
+pub fn thread_runs(_show: &str) -> Result<Option<Runs>, String> {
+    Err("not built".into())
+}
+
+pub struct Transcript;
+
+impl Transcript {
+    pub fn new(_thread: &str, _runs: &Runs) -> Transcript {
+        Transcript
+    }
+
+    pub fn line(&mut self, _line: &[u8]) {}
+
+    pub fn may_wait(&self) -> bool {
+        false
+    }
+}
+
+pub struct QueueEnv {
+    pub thread: Option<String>,
+    pub cli: Option<std::path::PathBuf>,
+    pub home: std::path::PathBuf,
+    pub deadline: std::time::Duration,
+}
+
+#[derive(Debug)]
+pub struct Answer {
+    pub stdout: String,
+    pub note: Option<String>,
+}
+
+pub fn queue_hook(_input: &str, _env: &QueueEnv) -> Answer {
+    Answer { stdout: String::new(), note: None }
+}
