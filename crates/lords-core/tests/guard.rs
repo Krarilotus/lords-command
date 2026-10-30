@@ -95,6 +95,19 @@ fn trailing_redirections_stay_in_the_rm_command() {
     assert_eq!(denied("rm -f build/out 2>&1"), None);
 }
 
+// Spec: rm-guard fix check r3, R9 (witnesses): an escaped `\>` or `\<` is a literal character, no redirection, so the
+// `|` or `&` after it separates commands as Bash has it: the `rm` after it is checked, and a variable after it belongs
+// to the next command, not to `rm`.
+#[test]
+fn an_escaped_angle_bracket_is_no_redirection() {
+    for command in
+        ["printf \\>|rm \"$OUT\"", "printf \\>&rm \"$OUT\"", "printf \\<|rm.exe \"$OUT\""]
+    {
+        assert!(denied(command).is_some(), "let through: {command}");
+    }
+    assert_eq!(denied("rm literal\\>&printf \"%s\" \"$OUT\""), None);
+}
+
 // Spec: the reasoned call (owner, 30 Oct: "a variable inside quotes without `:?` gets your reasoned call"): rejected.
 // Quoting stops word splitting, not emptiness: with OUT empty, `rm -rf "$OUT/x"` is `rm -rf /x`. Only `:?` stops that.
 // Every operand after `rm` is checked, redirection targets and options included (a false refusal costs a retry).

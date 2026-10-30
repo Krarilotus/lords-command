@@ -1016,6 +1016,22 @@ fn a_guard_only_stale_plan_never_replaces_the_live_guard() {
     assert_eq!(s.state(), after_c);
 }
 
+// Spec: rm-guard fix check r3, R7 (witness: after the plan, an unowned file appeared where it would install a skill;
+// the ledger, the settings and the guard were unchanged, and apply replaced the guard before the install found it
+// stale): apply validates every item first, then acts; a stale tool destination changes nothing.
+#[test]
+fn a_stale_tool_destination_never_replaces_the_live_guard() {
+    let s = Stale::new();
+    lords_core::sync::apply(&s.plan("b")).unwrap();
+    s.skill("b");
+    let stale = s.plan("a");
+    s.write("home/skills/b", b"not the tool's\n");
+    let before = s.state();
+    assert_eq!(before.0, Some(b'B'));
+    assert!(lords_core::sync::apply(&stale).is_err(), "a stale destination is refused");
+    assert_eq!(s.state(), before);
+}
+
 // Spec: rm-guard review r1, R7 (witness: a stale plan's apply installed its guard, replacing a newer one, before the
 // ledger check refused the plan): a stale plan changes nothing, the guard copy included; the guard and the settings
 // are installed under one apply lock, after the plan is known current.
