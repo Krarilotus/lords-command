@@ -53,6 +53,7 @@ pub enum Class {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(into = "ItemOut")]
 pub struct Item {
     pub target: String,
     pub path: PathBuf,
@@ -96,6 +97,53 @@ pub struct Item {
     /// Why an item is a conflict, by type (r7 fix check, FC-01): only `ModifiedCopy` leaves the view complete.
     #[serde(skip)]
     pub(crate) conflict: ConflictKind,
+    /// The file's text is the owner's and may hold credentials (a settings file: hook commands, env): its current and
+    /// proposed text and a text diff are never shown, only what Lords changes there (rm-guard review r1, R6). Apply
+    /// still uses them.
+    #[serde(skip)]
+    pub(crate) redacted: bool,
+}
+
+/// An item as plans show it (`--json`, the app): a redacted item without its texts.
+#[derive(Serialize)]
+struct ItemOut {
+    target: String,
+    path: PathBuf,
+    action: Action,
+    class: Class,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proposed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    have: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    want: Option<String>,
+    adoptable: bool,
+    diff: String,
+    notes: Vec<String>,
+}
+
+impl From<Item> for ItemOut {
+    fn from(i: Item) -> ItemOut {
+        let shown = !i.redacted;
+        ItemOut {
+            target: i.target,
+            path: i.path,
+            action: i.action,
+            class: i.class,
+            scope: i.scope,
+            current: i.current.filter(|_| shown),
+            proposed: i.proposed.filter(|_| shown),
+            have: i.have,
+            want: i.want,
+            adoptable: i.adoptable,
+            diff: i.diff,
+            notes: i.notes,
+        }
+    }
 }
 
 /// The kind of a conflict, set where it is made: anything but a copy the owner changed may hide what is wanted.
@@ -189,6 +237,7 @@ impl Item {
             sources: Vec::new(),
             units: Vec::new(),
             conflict: ConflictKind::Other,
+            redacted: false,
         }
     }
 
@@ -1163,9 +1212,11 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
     // One path, however its separators and case are spelt (Sol review r2, R2-20).
     let same = |a: &str, b: &str| ledger::key(Path::new(a)) == ledger::key(Path::new(b));
     let mut added = false;
+    let mut added_excludes = Vec::new();
     for e in &t.exclude {
         let want = adapters::slashes(&expand_home(e));
         if !list.iter().any(|v| v.as_str().is_some_and(|s| same(s, &want))) {
+            added_excludes.push(want.clone());
             list.push(serde_json::Value::String(want));
             added = true;
         }
@@ -1218,6 +1269,7 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
         Ok(h) => h,
         Err(e) => return conflict(&t.name, &path, e),
     };
+    let before_hooks = value.get("hooks").cloned().unwrap_or(serde_json::Value::Null);
     if let Some(h) = &hooks {
         value.as_object_mut().expect("an object").insert("hooks".into(), h.clone());
     }
@@ -1240,7 +1292,51 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
             text
         }
     };
-    owner_file_item(&t.name, &path, Dest::Owner(owner), proposed, &Composed::default())
+    let mut item =
+        owner_file_item(&t.name, &path, Dest::Owner(owner), proposed, &Composed::default());
+    item.redacted = true;
+    item.diff = settings_summary(
+        &added_excludes,
+        hooks
+            .as_ref()
+            .map(|h| (guard_count(&before_hooks, guard.path()), guard_count(h, guard.path()))),
+    );
+    item
+}
+
+/// How many of Lords' guard hooks (`guard <name>` run from `guard`) a settings `hooks` value holds.
+fn guard_count(hooks: &serde_json::Value, guard: &Path) -> usize {
+    let exe = adapters::slashes(guard);
+    hooks["PreToolUse"].as_array().map_or(0, |a| {
+        a.iter()
+            .filter_map(|e| e["hooks"].as_array())
+            .flatten()
+            .filter(|h| {
+                h["command"]
+                    .as_str()
+                    .is_some_and(|c| c.replace('\\', "/").eq_ignore_ascii_case(&exe))
+            })
+            .count()
+    })
+}
+
+/// What a settings plan shows: what Lords changes there, never the settings' text (rm-guard review r1, R6).
+fn settings_summary(added_excludes: &[String], guards: Option<(usize, usize)>) -> String {
+    let mut out = String::new();
+    for e in added_excludes {
+        out.push_str(&format!("Lords exclude added: {e}\n"));
+    }
+    match guards {
+        Some((before, after)) if after > before => {
+            out.push_str("Lords hook added: the rm guard (PreToolUse, Bash)\n")
+        }
+        Some((before, after)) if after < before => {
+            out.push_str("Lords hook removed: the rm guard\n")
+        }
+        Some(_) => out.push_str("Lords hook updated: the rm guard\n"),
+        None => {}
+    }
+    out
 }
 
 /// The settings' `hooks` with one Lords guard per name in the target's `guards`, or `None` when they already hold
@@ -2448,20 +2544,9 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
     if plan.items.iter().any(|i| i.action == Action::Conflict) {
         return Err("the plan has conflicts; resolve them first (nothing was changed)".into());
     }
-    // The guard copy first: settings never name a guard that doesn't answer (orchestrator, 30 Oct).
-    // Under the apply lock, so two syncs never install at once; checked again here, so a copy removed or changed
-    // since the plan is put right before the settings name it (sol-loop r2, S11, S12).
-    if let Some(g) = &plan.guard {
-        let _lock = ApplyLock::take(&plan.home, 60)?;
-        fsguard::create_dir_all(&Root::home(&plan.home)?.join(&[Part::new("bin")?]))?;
-        match guard_bytes(&g.place)? {
-            Some(have) if have == g.bytes => crate::process::guard_self_test(g.place.path())?,
-            _ => fsguard::install_exe(&g.place, &g.bytes, crate::process::guard_self_test)?,
-        }
-    }
     let changing: Vec<&Item> =
         plan.items.iter().filter(|i| i.changes() && i.action != Action::RetireEntry).collect();
-    if changing.is_empty() {
+    if changing.is_empty() && plan.guard.is_none() {
         return Ok(Applied::default());
     }
     if plan.complete.is_none()
@@ -2483,6 +2568,8 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
             ));
         }
     }
+    // One lock over everything this apply changes, taken once the plan is known current (rm-guard review r1, R7): a
+    // stale plan changes nothing, the guard copy included.
     let _lock = ApplyLock::take(&plan.home, 60)?;
     let mut ledger = Ledger::load(&plan.home)?;
     if ledger.revision() != plan.ledger_revision {
@@ -2490,6 +2577,18 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
             "the ledger changed since the plan (another sync?); plan again (nothing was changed)"
                 .into(),
         );
+    }
+    // The guard copy before the settings that name it: they never name a guard that doesn't answer (orchestrator,
+    // 30 Oct); checked again here, so a copy removed or changed since the plan is put right (sol-loop r2, S12).
+    if let Some(g) = &plan.guard {
+        fsguard::create_dir_all(&Root::home(&plan.home)?.join(&[Part::new("bin")?]))?;
+        match guard_bytes(&g.place)? {
+            Some(have) if have == g.bytes => crate::process::guard_self_test(g.place.path())?,
+            _ => fsguard::install_exe(&g.place, &g.bytes, crate::process::guard_self_test)?,
+        }
+    }
+    if changing.is_empty() {
+        return Ok(Applied::default());
     }
     let mut run = Run::new(&plan.home)?;
     let mut applied = Applied::default();

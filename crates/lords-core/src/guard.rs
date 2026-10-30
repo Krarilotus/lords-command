@@ -6,6 +6,13 @@
 //! `rm`: a path that holds a shell variable deletes the wrong place when the variable is empty (`rm -rf "$OUT/"` is
 //! `rm -rf /`). The only form let through is `"${VAR:?}"`, quoted, which stops the command when `VAR` is empty or
 //! unset. Quoting alone (`"$OUT/x"`) doesn't: an empty `OUT` still makes it `/x`, so it is refused too.
+//!
+//! Scope: the plain form only (orchestrator, 30 Oct, after the rm-guard review r1: a guard on the deletion path must
+//! stay simple enough to finish reviewing). A simple command whose word after leading `NAME=value` assignments is
+//! `rm` or `rm.exe`, or a path to one; every operand after it is checked. Not covered, by design: `rm` behind
+//! keywords, wrappers or their options (`then rm`, `sudo -u x rm`, `time -p rm`), leading redirections, `rm` inside a
+//! string another command runs (`trap`, `eval`, `sh -c`), other spellings of its name (`$'\x72m'`), `find -delete`,
+//! `xargs rm` and `rm $(…)`. A miss is no regression: the call goes on to Claude Code's own check, as before the guard.
 
 use serde_json::{json, Value};
 
@@ -117,16 +124,6 @@ fn commands(command: &str) -> Vec<Vec<Word>> {
                 continue;
             }
             ' ' | '\t' if !double => end_word(&mut words, &mut word, &mut started),
-            // `&` and `|` that are part of a redirection operator (`2>&1`, `&>`, `>|`) don't end the command: the
-            // words after it are still this command's (sol-loop r2, S7–S9).
-            '&' | '|'
-                if !double
-                    && (i > 0 && matches!(c[i - 1], '>' | '<')
-                        || ch == '&' && c.get(i + 1) == Some(&'>')) =>
-            {
-                word.text.push(ch);
-                started = true;
-            }
             ';' | '&' | '|' | '(' | ')' | '\n' if !double => {
                 end_word(&mut words, &mut word, &mut started);
                 if !words.is_empty() {
@@ -147,32 +144,9 @@ fn commands(command: &str) -> Vec<Vec<Word>> {
     out
 }
 
-/// The first word of an `rm` command holding a variable not written `"${VAR:?}"`, if any. Leading assignments (`X=y`)
-/// leading shell keywords and the wrappers in `WRAPPERS` (with their options) are looked through. Every word after `rm` is checked,
-/// redirections and option-like words too: an unquoted variable can split into paths anywhere (`rm -$X`), and no
-/// parse of them can turn a deletion path into something else. Conservative by design (sol-loop r1 S4, declined; r2
-/// S7–S10): a false refusal costs a retry with `"${VAR:?}"`, a missed path a deletion.
+/// The first operand of a plain `rm` command holding a variable not written `"${VAR:?}"`, if any (the module's
+/// scope). Every operand is checked, redirection targets and options included: a false refusal costs a retry.
 pub fn unguarded_rm(command: &str) -> Option<String> {
-    unguarded_rm_in(command, 0)
-}
-
-/// A command word's program name, its path dropped (`/usr/bin/time`: `time`; sol-loop r5, S22).
-fn program(w: &Word) -> &str {
-    w.text.rsplit(['/', '\\']).next().unwrap_or(&w.text)
-}
-
-/// A redirection word (`2>/dev/null`, `>&2`, `<in`), and whether its target is the next word (a lone `>`).
-fn redirection(t: &str) -> Option<bool> {
-    let op = t.trim_start_matches(|x: char| x.is_ascii_digit() || x == '&');
-    if !op.starts_with(['>', '<']) {
-        return None;
-    }
-    Some(op.trim_start_matches(['>', '<', '&', '|']).is_empty())
-}
-
-/// `unguarded_rm`, `depth` shell strings deep (a `trap`, `eval` or `sh -c` body is a command too; sol-loop r5, S21).
-fn unguarded_rm_in(command: &str, depth: usize) -> Option<String> {
-    let is_rm = |w: &Word| program(w) == "rm";
     let assignment = |t: &str| {
         t.contains('=')
             && !t.starts_with('=')
@@ -181,60 +155,13 @@ fn unguarded_rm_in(command: &str, depth: usize) -> Option<String> {
                 .is_some_and(|n| n.chars().all(|x| x == '_' || x.is_ascii_alphanumeric()))
     };
     for words in commands(command) {
-        // Shell keywords, assignments and redirections before a command (sol-loop r3, S17; r5, S20).
-        let mut lead = words.iter().peekable();
-        let mut target_next = false;
-        while let Some(w) = lead.peek() {
-            let t = w.text.as_str();
-            if target_next {
-                target_next = false;
-            } else if let Some(lone) = redirection(t) {
-                target_next = lone;
-            } else if !(KEYWORDS.contains(&t) || assignment(t)) {
-                break;
-            }
-            lead.next();
-        }
-        let mut rest = lead;
+        let mut rest = words.iter().skip_while(|w| assignment(&w.text));
         let Some(first) = rest.next() else { continue };
-        let name = program(first);
-        // A shell string another command runs is checked as a command of its own.
-        if depth < 4 {
-            let mut probe = rest.clone();
-            let body: Option<String> = match name {
-                "trap" => probe.next().map(|w| w.text.clone()),
-                "eval" => Some(probe.map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")),
-                "bash" | "sh" | "zsh" | "dash" | "ksh" => {
-                    let mut it = probe;
-                    it.find(|w| {
-                        w.text.starts_with('-') && !w.text.starts_with("--") && w.text.contains('c')
-                    })
-                    .and_then(|_| it.next())
-                    .map(|w| w.text.clone())
-                }
-                _ => None,
-            };
-            if let Some(b) = body {
-                if let Some(found) = unguarded_rm_in(&b, depth + 1) {
-                    return Some(found);
-                }
-                continue;
-            }
-        }
-        let args: Vec<&Word> = if is_rm(first) {
-            rest.collect()
-        } else if WRAPPERS.contains(&name) {
-            // A wrapper runs the command after its own options and their values, which a guard can't parse for every
-            // wrapper: the first `rm` word after it is taken as the command (sol-loop r3, S18).
-            match rest.position(&is_rm) {
-                Some(_) => rest.collect(),
-                None => continue,
-            }
-        } else {
+        if !is_rm(&first.text) {
             continue;
-        };
+        }
         if let Some(w) =
-            args.iter().find(|w| w.vars.iter().any(|(quoted, guarded)| !(*quoted && *guarded)))
+            rest.find(|w| w.vars.iter().any(|(quoted, guarded)| !(*quoted && *guarded)))
         {
             return Some(w.text.clone());
         }
@@ -242,13 +169,12 @@ fn unguarded_rm_in(command: &str, depth: usize) -> Option<String> {
     None
 }
 
-/// Shell words that can stand before a command in a simple command's place.
-const KEYWORDS: [&str; 9] = ["then", "do", "else", "elif", "if", "while", "until", "!", "{"];
-
-/// Commands that run the command after them (with options of their own in between). `time` is one: it takes options
-/// of its own (`time -p`; sol-loop r4, S19).
-const WRAPPERS: [&str; 10] =
-    ["sudo", "command", "env", "builtin", "exec", "nohup", "nice", "timeout", "xargs", "time"];
+/// Whether a command word names `rm`: `rm` or `rm.exe` (any case), bare or as a path's last part (rm-guard review r1,
+/// R5: `rm.exe` is the same GNU rm on Git Bash).
+fn is_rm(word: &str) -> bool {
+    let name = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    name.eq_ignore_ascii_case("rm") || name.eq_ignore_ascii_case("rm.exe")
+}
 
 /// The guard hook's answer to one `PreToolUse` event (the harness's stdin JSON): a denial naming the fix, or nothing
 /// (empty: the call goes on to the harness's own checks). Only Bash calls are looked at; input that isn't such an

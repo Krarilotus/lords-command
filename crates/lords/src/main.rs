@@ -121,27 +121,37 @@ fn public_rules(public: &Path, private: Option<&Stack>) -> Result<Rules, String>
 /// exit 0 (orchestrator, 30 Oct: Claude Code takes exit 2 from a PreToolUse hook as a refusal). `lords guard
 /// --self-test` prints `ok` when the guard refuses its witness; sync runs it before installing the copy hooks name.
 fn cmd_guard(mut a: Args) -> ExitCode {
+    // Every write may fail (a harness that closed its pipe): never a panic, the call goes on (rm-guard review r1, R8).
+    let say = |line: &str| {
+        use std::io::Write;
+        let _ =
+            writeln!(std::io::stdout().lock(), "{line}").and_then(|()| std::io::stdout().flush());
+    };
+    let note = |line: &str| {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr().lock(), "lords guard: {line}; this call is let through");
+    };
     if a.flag("--self-test") {
         let witness = r#"{"tool_name":"Bash","tool_input":{"command":"rm -f $OUT/x"}}"#;
         let ok = lords_core::guard::rm_hook(witness).contains("\"deny\"");
-        println!("{}", if ok { "ok" } else { "the guard let its witness through" });
+        say(if ok { "ok" } else { "the guard let its witness through" });
         return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
     }
     let which = a.positional();
     if which.as_deref() != Some("rm") || a.done().is_err() {
-        eprintln!("lords guard: usage `lords guard rm` (event on stdin); this call is let through");
+        note("usage `lords guard rm` (event on stdin)");
         return ExitCode::SUCCESS;
     }
     let input = match std::io::read_to_string(std::io::stdin()) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("lords guard: the event can't be read ({e}); this call is let through");
+            note(&format!("the event can't be read ({e})"));
             return ExitCode::SUCCESS;
         }
     };
     let out = lords_core::guard::rm_hook(&input);
     if !out.is_empty() {
-        println!("{out}");
+        say(&out);
     }
     ExitCode::SUCCESS
 }
