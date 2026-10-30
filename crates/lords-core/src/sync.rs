@@ -2830,6 +2830,18 @@ pub fn import_and_apply(
     private: Option<&Path>,
     opts: &Options,
 ) -> Result<Applied, String> {
+    import_and_apply_between(public, private, opts, || {})
+}
+
+/// `import_and_apply`, with `between` run after the first plan and before the rest: the point where another process
+/// can change what a plan read (the lock wait), for tests that must reach it without timing.
+#[doc(hidden)]
+pub fn import_and_apply_between(
+    public: &Path,
+    private: Option<&Path>,
+    opts: &Options,
+    between: impl FnOnce(),
+) -> Result<Applied, String> {
     let stacks = Stacks::load(public, private)?;
     let first = plan(&stacks, opts)?;
     if let Some(c) = first.items.iter().find(|i| i.action == Action::Conflict) {
@@ -2839,6 +2851,7 @@ pub fn import_and_apply(
             c.notes.join("; ")
         ));
     }
+    between();
     let mut done = Vec::new();
     // Whether an import or a retirement changed a stack file, so the first plan no longer holds.
     let mut stacks_changed = false;

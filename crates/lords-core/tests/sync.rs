@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use lords_core::compose::{compose, Context, Layers, BEGIN, END};
 use lords_core::model::Audience;
-use lords_core::sync::{apply, plan, Action, Options};
+use lords_core::sync::{apply, import_and_apply_between, plan, Action, Options};
 use std::fs;
 
 fn global(audience: Vec<Audience>) -> Context {
@@ -328,6 +328,60 @@ checkouts = ['{}']
         })
         .unwrap();
     assert_eq!(item.action, Action::Conflict, "{item:?}");
+}
+
+/// A repo target `beta-core` at the git checkout `checkout` with a tracked `AGENTS.md`, one fact, synced once.
+fn synced_checkout(f: &Fixture) -> std::path::PathBuf {
+    f.write(
+        "priv/repo/beta-core/facts/h.md",
+        &entry("fact.h", "repo:beta-core", "private", "", "Hosts.\n"),
+    );
+    let main = f.path("checkout");
+    f.write("checkout/AGENTS.md", "Line A.\n");
+    f.git_init("checkout");
+    let manifest = format!(
+        "name = \"priv\"\nvisibility = \"private\"\n[projects.beta]\n[repos.beta-core]\nproject = \"beta\"\ncheckouts = ['{}']\nworktrees = false\n",
+        main.display()
+    );
+    f.write("priv/stack.toml", &manifest);
+    apply(&plan(&f.stacks(), &Options { repo: Some("beta-core".into()), ..f.opts() }).unwrap())
+        .unwrap();
+    main
+}
+
+// Spec (Sync perf review r1, R2, witness: `AGENTS.md` changed after `sync --apply`'s first plan, during its lock wait;
+// nothing imported or retired, so the first plan was applied and the change never reached Codex's override): what
+// apply writes is planned after the import phase, from what the disk and git hold then.
+#[test]
+fn a_change_during_the_import_phase_reaches_the_override() {
+    let f = Fixture::new();
+    let main = synced_checkout(&f);
+    let opts = Options { repo: Some("beta-core".into()), ..f.opts() };
+    import_and_apply_between(&f.pub_root(), Some(&f.priv_root()), &opts, || {
+        fs::write(main.join("AGENTS.md"), "Line A.\nLine L.\n").unwrap();
+    })
+    .unwrap();
+    let ov = fs::read_to_string(main.join("AGENTS.override.md")).unwrap();
+    assert!(ov.contains("Line L."), "{ov}");
+}
+
+// Spec (R2, second witness: a destination force-added to git after the first plan held an Update for it; the branch
+// overwrote the now-tracked file): a destination git tracks by the time apply plans is never written over.
+#[test]
+fn a_destination_tracked_during_the_import_phase_is_never_written_over() {
+    let f = Fixture::new();
+    let main = synced_checkout(&f);
+    f.write(
+        "priv/repo/beta-core/facts/h.md",
+        &entry("fact.h", "repo:beta-core", "private", "", "Hosts, changed.\n"),
+    );
+    let before = fs::read_to_string(main.join("CLAUDE.local.md")).unwrap();
+    let opts = Options { repo: Some("beta-core".into()), ..f.opts() };
+    let r = import_and_apply_between(&f.pub_root(), Some(&f.priv_root()), &opts, || {
+        git(&main, &["add", "-f", "CLAUDE.local.md"]);
+    });
+    assert!(r.is_err(), "applied over a tracked file: {r:?}");
+    assert_eq!(fs::read_to_string(main.join("CLAUDE.local.md")).unwrap(), before);
 }
 
 // Spec (Sync, repo targets; docs/load-order.md): every checkout and worktree gets the untracked file each family
