@@ -114,6 +114,8 @@ fn keywords_and_wrapper_options_dont_hide_rm() {
         "timeout 5 rm $X",
         "nohup rm $X",
         "xargs rm $X",
+        "OUT=; time -p rm -rf \"$OUT/build\"",
+        "time rm $X",
     ] {
         assert!(denied(command).is_some(), "let through: {command}");
     }
