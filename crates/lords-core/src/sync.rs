@@ -1341,50 +1341,75 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
         &added_excludes,
         hooks
             .as_ref()
-            .map(|h| (guard_count(&before_hooks, guard.path()), guard_count(h, guard.path()))),
+            .map(|h| (guard_names(&before_hooks, guard.path()), guard_names(h, guard.path()))),
     );
     item
 }
 
-/// How many of Lords' guard hooks (`guard <name>` run from `guard`) a settings `hooks` value holds.
-fn guard_count(hooks: &serde_json::Value, guard: &Path) -> usize {
+/// The hook event each guard runs on, and its matcher: `rm` before a Bash call, `queue` when a turn would end (never
+/// on a native subagent's `SubagentStop`).
+fn guard_event(name: &str) -> Option<(&'static str, Option<&'static str>)> {
+    match name {
+        "rm" => Some(("PreToolUse", Some("Bash"))),
+        "queue" => Some(("Stop", None)),
+        _ => None,
+    }
+}
+
+/// The hook events Lords' guards are written to.
+const GUARD_EVENTS: [&str; 2] = ["PreToolUse", "Stop"];
+
+/// The names of Lords' guard hooks (`guard <name>` run from `guard`) a settings `hooks` value holds.
+fn guard_names(hooks: &serde_json::Value, guard: &Path) -> Vec<String> {
     let exe = adapters::slashes(guard);
-    hooks["PreToolUse"].as_array().map_or(0, |a| {
-        a.iter()
-            .filter_map(|e| e["hooks"].as_array())
-            .flatten()
-            .filter(|h| {
-                h["command"]
-                    .as_str()
-                    .is_some_and(|c| c.replace('\\', "/").eq_ignore_ascii_case(&exe))
-            })
-            .count()
-    })
+    GUARD_EVENTS
+        .iter()
+        .filter_map(|ev| hooks[*ev].as_array())
+        .flatten()
+        .filter_map(|e| e["hooks"].as_array())
+        .flatten()
+        .filter(|h| {
+            h["command"].as_str().is_some_and(|c| c.replace('\\', "/").eq_ignore_ascii_case(&exe))
+        })
+        .map(|h| h["args"][1].as_str().unwrap_or("").to_string())
+        .collect()
 }
 
 /// What a settings plan shows: what Lords changes there, never the settings' text (rm-guard review r1, R6).
-fn settings_summary(added_excludes: &[String], guards: Option<(usize, usize)>) -> String {
+fn settings_summary(
+    added_excludes: &[String],
+    guards: Option<(Vec<String>, Vec<String>)>,
+) -> String {
     let mut out = String::new();
     for e in added_excludes {
         out.push_str(&format!("Lords exclude added: {e}\n"));
     }
-    match guards {
-        Some((before, after)) if after > before => {
-            out.push_str("Lords hook added: the rm guard (PreToolUse, Bash)\n")
+    let Some((before, after)) = guards else { return out };
+    let added: Vec<&String> = after.iter().filter(|g| !before.contains(g)).collect();
+    let removed: Vec<&String> = before.iter().filter(|g| !after.contains(g)).collect();
+    for g in &added {
+        let at = match guard_event(g) {
+            Some((event, Some(matcher))) => format!(" ({event}, {matcher})"),
+            Some((event, None)) => format!(" ({event})"),
+            None => String::new(),
+        };
+        out.push_str(&format!("Lords hook added: the {g} guard{at}\n"));
+    }
+    for g in &removed {
+        out.push_str(&format!("Lords hook removed: the {g} guard\n"));
+    }
+    if added.is_empty() && removed.is_empty() {
+        for g in &after {
+            out.push_str(&format!("Lords hook updated: the {g} guard\n"));
         }
-        Some((before, after)) if after < before => {
-            out.push_str("Lords hook removed: the rm guard\n")
-        }
-        Some(_) => out.push_str("Lords hook updated: the rm guard\n"),
-        None => {}
     }
     out
 }
 
-/// The settings' `hooks` with one Lords guard per name in the target's `guards`, or `None` when they already hold
-/// exactly those. A guard runs the `lords` that syncs (exec form: `command` and `args`, no shell), as `lords hooks
-/// install` does for git hooks. A hook entry is Lords' when its args are `guard <name>`; any other entry stays as it
-/// is.
+/// The settings' `hooks` with one Lords guard per name in the target's `guards`, each on its event (`guard_event`), or
+/// `None` when they already hold exactly those. A guard runs the `lords` that syncs (exec form: `command` and `args`,
+/// no shell), as `lords hooks install` does for git hooks. A hook entry is Lords' when its args are `guard <name>`;
+/// any other entry stays as it is, and so does every event Lords writes no guard to.
 fn guard_hooks(
     guards: &[String],
     adapter: &dyn Adapter,
@@ -1400,45 +1425,54 @@ fn guard_hooks(
     };
     let lords_entry =
         |e: &serde_json::Value| e["hooks"].as_array().is_some_and(|hs| hs.iter().any(&ours));
-    let has_lords = current["PreToolUse"].as_array().is_some_and(|a| a.iter().any(lords_entry));
+    let has_lords = GUARD_EVENTS
+        .iter()
+        .any(|ev| current[*ev].as_array().is_some_and(|a| a.iter().any(lords_entry)));
     if guards.is_empty() && !has_lords {
         return Ok(None);
     }
     if !guards.is_empty() && adapter.id() != "claude" {
         return Err(format!("guards are Claude Code hooks; adapter {} has none", adapter.id()));
     }
+    let mut wanted = Vec::new();
     for g in guards {
-        if g != "rm" {
-            return Err(format!("no guard `{g}`; there is: rm"));
-        }
+        let (event, matcher) =
+            guard_event(g).ok_or_else(|| format!("no guard `{g}`; there are: rm, queue"))?;
+        wanted.push((g, event, matcher));
     }
     let mut hooks = match current {
         serde_json::Value::Null => serde_json::json!({}),
         v @ serde_json::Value::Object(_) => v,
         _ => return Err("`hooks` isn't an object; left alone".into()),
     };
-    let pre = hooks
-        .as_object_mut()
-        .expect("an object")
-        .entry("PreToolUse")
-        .or_insert(serde_json::json!([]));
-    let Some(pre) = pre.as_array_mut() else {
-        return Err("`hooks.PreToolUse` isn't a list; left alone".into());
-    };
-    let before = pre.clone();
+    let before = hooks.clone();
+    let events = hooks.as_object_mut().expect("an object");
     // Only Lords' own hooks go; their entry stays while it holds others (sol-loop r1, S2).
-    for e in pre.iter_mut() {
-        if let Some(hs) = e["hooks"].as_array_mut() {
-            hs.retain(|h| !ours(h));
+    for ev in GUARD_EVENTS {
+        let Some(list) = events.get_mut(ev) else { continue };
+        let Some(list) = list.as_array_mut() else {
+            if wanted.iter().any(|(_, e, _)| *e == ev) {
+                return Err(format!("`hooks.{ev}` isn't a list; left alone"));
+            }
+            continue;
+        };
+        for e in list.iter_mut() {
+            if let Some(hs) = e["hooks"].as_array_mut() {
+                hs.retain(|h| !ours(h));
+            }
         }
+        list.retain(|e| e["hooks"].as_array().is_none_or(|hs| !hs.is_empty()));
     }
-    pre.retain(|e| e["hooks"].as_array().is_none_or(|hs| !hs.is_empty()));
-    for g in guards {
-        pre.push(serde_json::json!({ "matcher": "Bash", "hooks": [{
-            "type": "command", "command": exe, "args": ["guard", g],
-        }] }));
+    for (g, event, matcher) in wanted {
+        let hook = serde_json::json!({ "type": "command", "command": exe, "args": ["guard", g] });
+        let entry = match matcher {
+            Some(m) => serde_json::json!({ "matcher": m, "hooks": [hook] }),
+            None => serde_json::json!({ "hooks": [hook] }),
+        };
+        let list = events.entry(event).or_insert(serde_json::json!([]));
+        list.as_array_mut().expect("a list, checked above").push(entry);
     }
-    if *pre == before {
+    if hooks == before {
         return Ok(None);
     }
     Ok(Some(hooks))

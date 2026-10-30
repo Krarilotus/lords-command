@@ -1,5 +1,5 @@
-//! Tool-call guards (owner, 30 Oct 2026): checks a harness runs before an agent's tool call, answering at once instead
-//! of leaving the call to stop on an approval prompt nobody sees. A Claude child in full-access mode sat about 30
+//! Guards a harness runs as hooks (owner, 30 Oct 2026): `rm` before an agent's tool call, answering at once instead
+//! of leaving the call to stop on an approval prompt nobody sees; `queue` when an agent's turn would end (below). A Claude child in full-access mode sat about 30
 //! minutes on Claude Code's "dangerous rm on a possibly-empty variable path" prompt for `rm -f $OUT/$id.json`; its
 //! parent saw only "running".
 //!
@@ -14,7 +14,10 @@
 //! string another command runs (`trap`, `eval`, `sh -c`), other spellings of its name (`$'\x72m'`), `find -delete`,
 //! `xargs rm` and `rm $(…)`. A miss is no regression: the call goes on to Claude Code's own check, as before the guard.
 
+use crate::fsguard::{Contained, Part, Root};
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// What the agent is told to write instead.
 pub const RM_FIX: &str = "\"${VAR:?}/name\"";
@@ -210,47 +213,317 @@ pub fn rm_hook(input: &str) -> String {
     }
 }
 
-// The queue guard: tests first; the stubs below answer nothing yet.
+// ---------------------------------------------------------------- queue
+//
+// `queue` (owner, 30 Oct about 23:40): agents said they had taken their whole T3 queue while items still sat in it.
+// A Claude Code `Stop` hook keeps a turn from ending while something may wait in the session's own T3 queue. T3's
+// CLI can't count the queue: `t3 thread show --json` gives the thread's latest and active run and drops the runs'
+// states, and a cancelled or promoted item stays the latest run (design note E1, Harness/notes/2026-10-31-lords-
+// queue-guard.md). So the guard reads both runs, and the session's transcript for what it listed and took (Lords
+// owner, 31 Oct, rules a and b). It fails open: a stop it can't judge goes through with a note. It never traps: at
+// most two blocks in a row.
 
-pub const QUEUE_REASON: &str = "";
+/// What the agent is told when its stop is held: the rule's steps (rule.orchestrator-queue-discipline). "May": the
+/// latest run can be one someone else cancelled (design note D1).
+pub const QUEUE_REASON: &str = "Lords: item(s) may be queued for this thread: list them, read the truncated ones in \
+    full, cancel the text-only ones, promote those with an attachment, then answer together. If the list is empty, \
+    nothing waits: end the turn.";
 
+/// How long the T3 CLI may take: measured 0.8 to 8.3 s on T3 v0.1.5 on threads of 96 and 424 items (design note E2).
+pub const QUEUE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Blocks in a row before a stop goes through anyway (brief, 30 Oct: "Block at most twice in a row").
+const MAX_BLOCKS: u32 = 2;
+
+/// A thread's latest and active run as T3's CLI shows them: run ids, compared only for equality (an id's `ordinal:`
+/// suffix needn't be the run's ordinal; design note E1-c).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Runs {
     pub latest: String,
     pub active: String,
 }
 
-pub fn thread_runs(_show: &str) -> Result<Option<Runs>, String> {
-    Err("not built".into())
+/// The runs in the answer of `t3 thread show <id> --json --messages 0`: `None` when either is `null` (no run yet,
+/// or none active: nothing to compare); an error for anything that isn't such an answer.
+pub fn thread_runs(show: &str) -> Result<Option<Runs>, String> {
+    let v: Value =
+        serde_json::from_str(show).map_err(|e| format!("its answer isn't JSON ({e})"))?;
+    let id = |key: &str| match v["thread"].get(key) {
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(Value::Null) => Ok(None),
+        _ => Err(format!("its answer has no `thread.{key}`")),
+    };
+    Ok(match (id("latestRunId")?, id("activeRunId")?) {
+        (Some(latest), Some(active)) => Some(Runs { latest, active }),
+        _ => None,
+    })
 }
 
-pub struct Transcript;
+/// One page a `t3_queue list` call of this thread showed: the line of its result, whether the call started a
+/// listing (no cursor, or cursor 0), the queued runs it showed and whether more followed (a next cursor).
+struct Page {
+    line: usize,
+    fresh: bool,
+    shown: Vec<String>,
+    more: bool,
+}
+
+/// What a session's transcript shows of its own thread's queue, fed line by line (Claude Code's JSONL, one entry a
+/// line). Only the session's own `user` and `assistant` entries count, never the copies of requests it also keeps
+/// (`api-request-blob`), and only `t3_queue` calls on this thread: no `threadId`, or this one, and no
+/// `environmentId`. A `cancel` or `promote_to_steer` takes the run it names, whatever its result.
+pub struct Transcript {
+    thread: String,
+    latest: String,
+    active: String,
+    /// The lines worth parsing: those naming the latest run, `t3_queue` or `nextCursor` (one pass, not three: a
+    /// transcript can be hundreds of MB).
+    wanted: regex::bytes::Regex,
+    line: usize,
+    /// The `list` calls not answered yet, by tool-use id: whether each starts a listing.
+    lists: std::collections::HashMap<String, bool>,
+    pages: Vec<Page>,
+    /// Each run taken, with the line of the call.
+    taken: Vec<(usize, String)>,
+    /// The first line of the session's own entries that names the latest run.
+    latest_seen: Option<usize>,
+}
 
 impl Transcript {
-    pub fn new(_thread: &str, _runs: &Runs) -> Transcript {
-        Transcript
+    pub fn new(thread: &str, runs: &Runs) -> Transcript {
+        let wanted = format!("{}|t3_queue|nextCursor", regex::escape(&runs.latest));
+        Transcript {
+            thread: thread.into(),
+            latest: runs.latest.clone(),
+            active: runs.active.clone(),
+            wanted: regex::bytes::Regex::new(&wanted).expect("escaped literals make a regex"),
+            line: 0,
+            lists: Default::default(),
+            pages: Vec::new(),
+            taken: Vec::new(),
+            latest_seen: None,
+        }
     }
 
-    pub fn line(&mut self, _line: &[u8]) {}
+    pub fn line(&mut self, line: &[u8]) {
+        let n = self.line;
+        self.line += 1;
+        // Most lines are none of these: they aren't parsed.
+        if !self.wanted.is_match(line) {
+            return;
+        }
+        let names_latest =
+            self.wanted.find_iter(line).any(|m| m.as_bytes() == self.latest.as_bytes());
+        let Ok(entry) = serde_json::from_slice::<Value>(line) else { return };
+        if !matches!(entry["type"].as_str(), Some("user" | "assistant")) {
+            return;
+        }
+        if names_latest && self.latest_seen.is_none() {
+            self.latest_seen = Some(n);
+        }
+        for c in entry["message"]["content"].as_array().into_iter().flatten() {
+            match c["type"].as_str() {
+                Some("tool_use") if self.own_queue_call(c) => {
+                    let input = &c["input"];
+                    match input["action"].as_str() {
+                        Some("list") => {
+                            let fresh = input.get("cursor").is_none_or(|v| v.is_null() || v == 0);
+                            if let Some(id) = c["id"].as_str() {
+                                self.lists.insert(id.into(), fresh);
+                            }
+                        }
+                        Some("cancel" | "promote_to_steer") => {
+                            if let Some(run) = input["queuedRunId"].as_str() {
+                                self.taken.push((n, run.into()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some("tool_result") => {
+                    let Some(&fresh) = c["tool_use_id"].as_str().and_then(|id| self.lists.get(id))
+                    else {
+                        continue;
+                    };
+                    let Ok(out) = serde_json::from_str::<Value>(&result_text(&c["content"])) else {
+                        continue;
+                    };
+                    let Some(items) = out["items"].as_array() else { continue };
+                    let shown =
+                        items.iter().filter_map(|i| i["queuedRunId"].as_str().map(String::from));
+                    let more = !out["nextCursor"].is_null();
+                    self.pages.push(Page { line: n, fresh, shown: shown.collect(), more });
+                }
+                _ => {}
+            }
+        }
+    }
 
+    /// Whether something may wait that the session hasn't taken. Only while a run later than the active one exists
+    /// (design note E1); then (a) no listing came at or after the latest run first appeared, or (b) the session's
+    /// latest listing (its last page with no cursor, and the pages after it) stopped at a limit, or showed a run no
+    /// `cancel` or `promote_to_steer` named after it was shown (Lords owner, 31 Oct). Without a later run, items of an
+    /// old listing were delivered as turns since, and nothing waits.
     pub fn may_wait(&self) -> bool {
-        false
+        if self.latest == self.active {
+            return false;
+        }
+        let listed_since = self.latest_seen.is_some_and(|f| self.pages.iter().any(|p| p.line >= f));
+        if !listed_since {
+            return true;
+        }
+        let start = self.pages.iter().rposition(|p| p.fresh).unwrap_or(0);
+        let listing = &self.pages[start..];
+        listing.last().is_some_and(|p| p.more)
+            || listing.iter().any(|p| {
+                p.shown.iter().any(|r| !self.taken.iter().any(|(n, t)| *n > p.line && t == r))
+            })
+    }
+
+    fn own_queue_call(&self, c: &Value) -> bool {
+        let name = c["name"].as_str().unwrap_or("");
+        let input = &c["input"];
+        (name == "t3_queue" || name.ends_with("__t3_queue"))
+            && input.get("environmentId").is_none_or(Value::is_null)
+            && input.get("threadId").is_none_or(|t| t.is_null() || *t == *self.thread)
     }
 }
 
+/// A tool result's text: the content itself, or its text blocks joined.
+fn result_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks.iter().filter_map(|b| b["text"].as_str()).collect(),
+        _ => String::new(),
+    }
+}
+
+/// Where the queue guard looks: the session's T3 thread and CLI (`T3CODE_THREAD_ID` and `T3CODE_CLI_PATH`, which T3
+/// sets for the sessions it starts), the tool's home (for the count of blocks in a row) and the CLI's deadline.
 pub struct QueueEnv {
     pub thread: Option<String>,
-    pub cli: Option<std::path::PathBuf>,
-    pub home: std::path::PathBuf,
-    pub deadline: std::time::Duration,
+    pub cli: Option<PathBuf>,
+    pub home: PathBuf,
+    pub deadline: Duration,
 }
 
+/// The queue guard's answer: what Claude Code reads on stdout (a block, or nothing) and a note for stderr.
 #[derive(Debug)]
 pub struct Answer {
     pub stdout: String,
     pub note: Option<String>,
 }
 
-pub fn queue_hook(_input: &str, _env: &QueueEnv) -> Answer {
-    Answer { stdout: String::new(), note: None }
+/// The queue guard's answer to one Claude Code event (its stdin JSON). Only a `Stop` is looked at; a subagent's
+/// (`SubagentStop`) or any other goes through without a word. A stop goes through with a note whenever the guard
+/// can't judge it: no thread or CLI, a CLI that fails, is late or answers something else, or a transcript it can't
+/// read. It is held, with `QUEUE_REASON`, when something may wait (`Transcript::may_wait`), at most twice in a row.
+pub fn queue_hook(input: &str, env: &QueueEnv) -> Answer {
+    let quiet = || Answer { stdout: String::new(), note: None };
+    let through = |why: String| Answer { stdout: String::new(), note: Some(why) };
+    let Ok(ev) = serde_json::from_str::<Value>(input) else {
+        return through("the event can't be read".into());
+    };
+    if ev["hook_event_name"] != "Stop" {
+        return quiet();
+    }
+    let Some(thread) = env.thread.as_deref().filter(|t| !t.is_empty()) else {
+        return through("no T3CODE_THREAD_ID: a session T3 didn't start".into());
+    };
+    let Some(cli) = env.cli.as_deref() else {
+        return through("no T3CODE_CLI_PATH".into());
+    };
+    let streak = Streak::of(&env.home, ev["session_id"].as_str());
+    let blocks = if ev["stop_hook_active"] == true { streak.blocks() } else { 0 };
+    let verdict = if blocks >= MAX_BLOCKS {
+        Err("held twice in a row already".into())
+    } else {
+        waits(&ev, thread, cli, env.deadline)
+    };
+    match verdict {
+        Ok(true) => match streak.set(blocks + 1) {
+            Ok(()) => Answer {
+                stdout: json!({"decision": "block", "reason": QUEUE_REASON}).to_string(),
+                note: None,
+            },
+            Err(e) => {
+                streak.clear();
+                through(format!("can't count the stops held in a row ({e})"))
+            }
+        },
+        Ok(false) => {
+            streak.clear();
+            quiet()
+        }
+        Err(why) => {
+            streak.clear();
+            through(why)
+        }
+    }
+}
+
+/// Whether something may wait in `thread`'s queue: the CLI's two runs, then the session's transcript.
+fn waits(ev: &Value, thread: &str, cli: &Path, deadline: Duration) -> Result<bool, String> {
+    let args = ["thread", "show", thread, "--json", "--messages", "0"];
+    let show =
+        crate::process::t3_cli(cli, &args, deadline).map_err(|e| format!("T3's CLI: {e}"))?;
+    let Some(runs) = thread_runs(&show).map_err(|e| format!("T3's CLI: {e}"))? else {
+        return Ok(false);
+    };
+    if runs.latest == runs.active {
+        return Ok(false);
+    }
+    let path = ev["transcript_path"].as_str().ok_or("the event names no transcript")?;
+    let mut t = Transcript::new(thread, &runs);
+    crate::fsguard::read_lines(path, |l| t.line(l))
+        .map_err(|e| format!("the transcript can't be read ({path}: {e})"))?;
+    Ok(t.may_wait())
+}
+
+/// The stops held in a row for one session: `<tool home>/guard/queue/<session id>`, a file that is there only while
+/// they are being held. A session id that can't be a file name has no place: nothing could count its held stops, so
+/// none is held.
+struct Streak {
+    place: Option<Contained>,
+}
+
+impl Streak {
+    fn of(home: &Path, session: Option<&str>) -> Streak {
+        let place = (|| {
+            let root = Root::home(home).ok()?;
+            let parts =
+                [Part::new("guard").ok()?, Part::new("queue").ok()?, Part::new(session?).ok()?];
+            Some(root.join(&parts))
+        })();
+        Streak { place }
+    }
+
+    /// Unknown counts as the most: a count it can't read never holds a stop again.
+    fn blocks(&self) -> u32 {
+        let Some(p) = &self.place else { return MAX_BLOCKS };
+        match crate::fsguard::read_text(p.path()) {
+            Ok(None) => 0,
+            Ok(Some(t)) => t.trim().parse().unwrap_or(MAX_BLOCKS),
+            Err(_) => MAX_BLOCKS,
+        }
+    }
+
+    fn set(&self, n: u32) -> Result<(), String> {
+        let p = self.place.as_ref().ok_or("the session id is no file name")?;
+        let dir = p.root().join(&p.parts()[..p.parts().len() - 1]);
+        crate::fsguard::create_dir_all(&dir)?;
+        let text = format!("{n}\n");
+        match crate::fsguard::kind(p.path())? {
+            crate::fsguard::Kind::Missing => crate::fsguard::create_file(p, text.as_bytes()),
+            _ => crate::fsguard::replace_own_file(p, text.as_bytes()),
+        }
+    }
+
+    fn clear(&self) {
+        if let Some(p) = &self.place {
+            if !matches!(crate::fsguard::kind(p.path()), Ok(crate::fsguard::Kind::Missing)) {
+                let _ = crate::fsguard::delete_file(p);
+            }
+        }
+    }
 }
