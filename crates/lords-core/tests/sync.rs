@@ -580,7 +580,11 @@ fn a_settings_target_installs_its_guards_beside_other_hooks() {
     assert_eq!(fs::read_to_string(&settings).unwrap(), before, "the settings never name it");
     assert!(!copy.exists(), "no copy left");
     // Taken out of the target: only Lords' hook goes.
-    let lords = r#"{"matcher": "Bash", "hooks": [{"type": "command", "command": "x/lords-guard.exe", "args": ["guard", "rm"]}]}"#;
+    // Lords' hook: the one naming its copy.
+    let named = copy.display().to_string().replace('\\', "/");
+    let lords = format!(
+        r#"{{"matcher": "Bash", "hooks": [{{"type": "command", "command": "{named}", "args": ["guard", "rm"]}}]}}"#
+    );
     fs::write(&settings, format!("{{\"hooks\": {{\"PreToolUse\": [{theirs}, {lords}]}}}}\n"))
         .unwrap();
     with_targets(&f, &target("balanced settings", "claude", "settings", &settings, ""));

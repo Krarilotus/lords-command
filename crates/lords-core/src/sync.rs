@@ -1119,7 +1119,8 @@ fn json_set_key(text: &str, key: &str, value: &serde_json::Value) -> Result<Stri
 
 /// A settings target (an owner file): the adapter's exclude list in a JSON settings file holds every path in
 /// `exclude`, and its tool-call hooks hold one Lords guard per name in `guards` (guard.rs). Only those two keys change;
-/// the rest of the file keeps its bytes, and hooks that aren't Lords' keep theirs.
+/// the rest of the file keeps its bytes. Hooks that aren't Lords' keep their content and order; the `hooks` value
+/// is written whole, so their spacing may change (sol-loop r1, S3, declined as a nit: no behaviour changes).
 fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
     let owner = OwnerFile::target(t);
     pl.plan.owner_files.push(owner.clone());
@@ -1222,16 +1223,14 @@ fn guard_hooks(
     guard: &Path,
 ) -> Result<Option<serde_json::Value>, String> {
     let current = settings.get("hooks").cloned().unwrap_or(serde_json::Value::Null);
-    // Lords' entry: a hook run as `<exe> guard <name>`, whatever the exe's path (it moves with each build).
-    let lords_entry = |e: &serde_json::Value| {
-        e["hooks"].as_array().is_some_and(|hs| {
-            hs.iter().any(|h| {
-                h["args"]
-                    .as_array()
-                    .is_some_and(|a| a.len() == 2 && a[0] == "guard" && a[1] == "rm")
-            })
-        })
+    // Lords' hook: one that runs Lords' guard copy, the only command Lords writes (sol-loop r1, S1). A user's own hook,
+    // whatever its args, is never Lords'.
+    let exe = adapters::slashes(guard);
+    let ours = |h: &serde_json::Value| {
+        h["command"].as_str().is_some_and(|c| c.replace('\\', "/").eq_ignore_ascii_case(&exe))
     };
+    let lords_entry =
+        |e: &serde_json::Value| e["hooks"].as_array().is_some_and(|hs| hs.iter().any(&ours));
     let has_lords = current["PreToolUse"].as_array().is_some_and(|a| a.iter().any(lords_entry));
     if t.guards.is_empty() && !has_lords {
         return Ok(None);
@@ -1244,7 +1243,6 @@ fn guard_hooks(
             return Err(format!("no guard `{g}`; there is: rm"));
         }
     }
-    let exe = adapters::slashes(guard);
     let mut hooks = match current {
         serde_json::Value::Null => serde_json::json!({}),
         v @ serde_json::Value::Object(_) => v,
@@ -1259,7 +1257,13 @@ fn guard_hooks(
         return Err("`hooks.PreToolUse` isn't a list; left alone".into());
     };
     let before = pre.clone();
-    pre.retain(|e| !lords_entry(e));
+    // Only Lords' own hooks go; their entry stays while it holds others (sol-loop r1, S2).
+    for e in pre.iter_mut() {
+        if let Some(hs) = e["hooks"].as_array_mut() {
+            hs.retain(|h| !ours(h));
+        }
+    }
+    pre.retain(|e| e["hooks"].as_array().is_none_or(|hs| !hs.is_empty()));
     for g in &t.guards {
         pre.push(serde_json::json!({ "matcher": "Bash", "hooks": [{
             "type": "command", "command": exe, "args": ["guard", g],

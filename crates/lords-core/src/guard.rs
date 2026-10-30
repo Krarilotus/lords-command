@@ -18,6 +18,8 @@ struct Word {
     text: String,
     /// Each `$` expansion in the word: whether it was inside double quotes, and whether it is `${NAME:?…}`.
     vars: Vec<(bool, bool)>,
+    /// A redirection (`2>"$LOG"`, or the target after a lone `>`): not an argument of the command (sol-loop r1, S4).
+    redirect: bool,
 }
 
 /// The simple commands of `command`, each as its words (split at `;`, `&`, `|`, `(`, `)` and newlines outside quotes).
@@ -26,13 +28,28 @@ fn commands(command: &str) -> Vec<Vec<Word>> {
     let (mut out, mut words, mut word) = (Vec::new(), Vec::new(), Word::default());
     let mut started = false;
     let (mut single, mut double) = (false, false);
+    // The word after a lone redirection operator is its target.
+    let mut target_next = false;
     let mut i = 0;
-    let end_word = |words: &mut Vec<Word>, word: &mut Word, started: &mut bool| {
-        if *started {
-            words.push(std::mem::take(word));
-            *started = false;
-        }
-    };
+    let end_word =
+        |words: &mut Vec<Word>, word: &mut Word, started: &mut bool, target_next: &mut bool| {
+            if *started {
+                let mut w = std::mem::take(word);
+                if *target_next {
+                    w.redirect = true;
+                    *target_next = false;
+                } else if w.redirect
+                    && w.text
+                        .trim_start_matches(|x: char| x.is_ascii_digit() || "<>&".contains(x))
+                        .is_empty()
+                {
+                    // A lone operator (`>`, `2>`): its target is the next word.
+                    *target_next = true;
+                }
+                words.push(w);
+                *started = false;
+            }
+        };
     while i < c.len() {
         let ch = c[i];
         if single {
@@ -55,6 +72,37 @@ fn commands(command: &str) -> Vec<Vec<Word>> {
             }
             '\'' if !double => {
                 single = true;
+                started = true;
+            }
+            // `$'…'`: ANSI-C quoting, a literal with backslash escapes (sol-loop r1, S6).
+            '$' if !double && i + 1 < c.len() && c[i + 1] == '\'' => {
+                started = true;
+                let mut j = i + 2;
+                while j < c.len() && c[j] != '\'' {
+                    if c[j] == '\\' && j + 1 < c.len() {
+                        word.text.push(c[j + 1]);
+                        j += 2;
+                    } else {
+                        word.text.push(c[j]);
+                        j += 1;
+                    }
+                }
+                i = j + 1;
+                continue;
+            }
+            // A comment: from an unquoted `#` at a word's start to the line's end (sol-loop r1, S5).
+            '#' if !double && !started => {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            '>' | '<' if !double => {
+                // A redirection: its operator and target are this word (`2>"$LOG"`) or this and the next.
+                if word.text.chars().all(|x| x.is_ascii_digit()) {
+                    word.redirect = true;
+                }
+                word.text.push(ch);
                 started = true;
             }
             '"' => {
@@ -93,9 +141,16 @@ fn commands(command: &str) -> Vec<Vec<Word>> {
                 }
                 continue;
             }
-            ' ' | '\t' if !double => end_word(&mut words, &mut word, &mut started),
+            ' ' | '\t' if !double => {
+                end_word(&mut words, &mut word, &mut started, &mut target_next)
+            }
+            // `>&` in `2>&1` belongs to the redirection.
+            '&' if !double && word.redirect => {
+                word.text.push(ch);
+            }
             ';' | '&' | '|' | '(' | ')' | '\n' if !double => {
-                end_word(&mut words, &mut word, &mut started);
+                end_word(&mut words, &mut word, &mut started, &mut target_next);
+                target_next = false;
                 if !words.is_empty() {
                     out.push(std::mem::take(&mut words));
                 }
@@ -107,15 +162,16 @@ fn commands(command: &str) -> Vec<Vec<Word>> {
         }
         i += 1;
     }
-    end_word(&mut words, &mut word, &mut started);
+    end_word(&mut words, &mut word, &mut started, &mut target_next);
     if !words.is_empty() {
         out.push(words);
     }
     out
 }
 
-/// The first word of an `rm` command whose variable isn't `"${VAR:?}"`, if any. Leading assignments (`X=y`) and the
-/// wrappers `sudo`, `command`, `env` and `builtin` are looked through.
+/// The first path an `rm` command deletes whose variable isn't `"${VAR:?}"`, if any. Leading assignments (`X=y`) and
+/// the wrappers `sudo`, `command`, `env` and `builtin` are looked through. Only operands are paths: not redirections,
+/// and not options (words starting with `-`) before a `--` (sol-loop r1, S4).
 pub fn unguarded_rm(command: &str) -> Option<String> {
     for words in commands(command) {
         let mut rest = words.iter().skip_while(|w| {
@@ -131,10 +187,18 @@ pub fn unguarded_rm(command: &str) -> Option<String> {
         if cmd.text != "rm" && !cmd.text.ends_with("/rm") {
             continue;
         }
-        if let Some(w) =
-            rest.find(|w| w.vars.iter().any(|(quoted, guarded)| !(*quoted && *guarded)))
-        {
-            return Some(w.text.clone());
+        let mut options = true;
+        for w in rest.filter(|w| !w.redirect) {
+            if options && w.text == "--" {
+                options = false;
+                continue;
+            }
+            if options && w.text.starts_with('-') {
+                continue;
+            }
+            if w.vars.iter().any(|(quoted, guarded)| !(*quoted && *guarded)) {
+                return Some(w.text.clone());
+            }
         }
     }
     None
