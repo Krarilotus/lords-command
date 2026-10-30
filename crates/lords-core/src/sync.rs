@@ -307,9 +307,11 @@ impl Plan {
                 places.insert("no place".into());
             }
             return Err(format!(
-                "{} conflict(s) in {}, and apply takes no plan with conflicts; resolve them first. While one is left, removal is held, so the plan lists no removal or forget",
+                "{} conflict(s) in {}, and apply takes no plan with conflicts; resolve them first. It also lists {} removal(s) and {} forget(s), held until then",
                 conflicts.len(),
-                places.into_iter().collect::<Vec<_>>().join(", ")
+                places.into_iter().collect::<Vec<_>>().join(", "),
+                r.removes,
+                r.forgets
             ));
         }
         if self.complete.is_none() && r.removes + r.forgets > 0 {
