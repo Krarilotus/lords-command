@@ -42,6 +42,10 @@ basis:
   date: 2026-10-26
   by: owner
   source: "principle 3, \"Don't micromanage\""
+- quote: "the unified base for all agents regardless which provider, and only agent specific behavior things that only work for specific models and are necessary to get their behavior adjusted there in codex or claude specific storage"
+  date: 2026-10-30
+  by: owner
+  source: "principle 4, on Codex Desktop importing Claude skills into .agents/"
 evidence:
 - summary: Disk overflow from leaked per-process test stores and caches "came up multiple times"; resource lifecycle by mechanism was asked for instead of sweeps
   date: 2026-10-25
@@ -61,7 +65,8 @@ These goals rank above any single release.
    judgement; concrete cases are evidence, not rule text. Don't micromanage: pass findings as facts and let agents
    judge. What the owner's intent can't settle goes to the owner; obvious bad apples are cleaned up.
 4. **No vendor lock-in.** Our own design: memory and rules work for every agent family, and other harnesses are
-   evidence, not templates.
+   evidence, not templates. Lords Command is the unified base for all agents, whatever the provider; only behaviour
+   that is specific to one model and needed to adjust it there lives in that provider's own storage.
 5. **Own the codebase.** Intuitive navigation with clear ownership and abstraction levels, so the owner can take control
    and change things quickly. Meta-schemas for organisation live inside the codebase and are enforced. Fast, direct
    paths between layers, without artificial barriers. Standards are defined, visible, readable and adaptable.
