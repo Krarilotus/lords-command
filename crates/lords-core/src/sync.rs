@@ -296,6 +296,9 @@ pub struct GuardInstall {
     pub bytes: Vec<u8>,
     /// The settings targets whose hooks name it: the install stays in the plan only while one of them does.
     pub for_targets: Vec<String>,
+    /// The hash of the copy as the plan saw it, `None` when there was none: apply refuses a plan whose copy changed
+    /// since (rm-guard fix check r2, R7).
+    pub seen: Option<String>,
 }
 
 /// The guard copy's bytes, read through the path check (a link anywhere on the way is refused); `None` when there is
@@ -1261,6 +1264,7 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
                     place: guard.clone(),
                     bytes,
                     for_targets: vec![t.name.clone()],
+                    seen: have.as_deref().map(fsguard::sha),
                 });
             }
         }
@@ -2578,11 +2582,29 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
                 .into(),
         );
     }
-    // The guard copy before the settings that name it: they never name a guard that doesn't answer (orchestrator,
-    // 30 Oct); checked again here, so a copy removed or changed since the plan is put right (sol-loop r2, S12).
+    // The ledger covers only tool-owned paths; a plan is current only if the owner files it changes and the guard copy
+    // are as it saw them too (rm-guard fix check r2, R7). Checked here, under the lock, before anything changes.
+    for i in changing.iter().filter(|i| i.class == Class::Owner) {
+        let now = fsguard::read_text(&i.path)?.map(|t| fsguard::sha(t.as_bytes()));
+        if now != i.have {
+            return Err(format!(
+                "{} changed since the plan (another sync?); plan again (nothing was changed)",
+                i.path.display()
+            ));
+        }
+    }
     if let Some(g) = &plan.guard {
+        let now = guard_bytes(&g.place)?;
+        if now.as_deref().map(fsguard::sha) != g.seen {
+            return Err(format!(
+                "{} changed since the plan (another sync?); plan again (nothing was changed)",
+                g.place.path().display()
+            ));
+        }
+        // The guard copy before the settings that name it: they never name a guard that doesn't answer
+        // (orchestrator, 30 Oct).
         fsguard::create_dir_all(&Root::home(&plan.home)?.join(&[Part::new("bin")?]))?;
-        match guard_bytes(&g.place)? {
+        match now {
             Some(have) if have == g.bytes => crate::process::guard_self_test(g.place.path())?,
             _ => fsguard::install_exe(&g.place, &g.bytes, crate::process::guard_self_test)?,
         }

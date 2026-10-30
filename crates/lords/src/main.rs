@@ -131,6 +131,10 @@ fn cmd_guard(mut a: Args) -> ExitCode {
         use std::io::Write;
         let _ = writeln!(std::io::stderr().lock(), "lords guard: {line}; this call is let through");
     };
+    if a.flag("--help") || a.flag("-h") {
+        say("usage: lords guard rm   (Claude Code's PreToolUse hook; the event on stdin)");
+        return ExitCode::SUCCESS;
+    }
     if a.flag("--self-test") {
         let witness = r#"{"tool_name":"Bash","tool_input":{"command":"rm -f $OUT/x"}}"#;
         let ok = lords_core::guard::rm_hook(witness).contains("\"deny\"");
@@ -773,16 +777,18 @@ fn cmd_hash(mut a: Args) -> Result<bool, String> {
 
 fn main() -> ExitCode {
     let mut words: Vec<String> = std::env::args().skip(1).collect();
+    // The guard answers a harness, so it has its own exit codes and help, before anything else (cmd_guard; rm-guard
+    // fix check r2, R8).
+    if words.first().is_some_and(|w| w == "guard") {
+        words.remove(0);
+        return cmd_guard(Args { words });
+    }
     if words.is_empty() || words.iter().any(|w| w == "--help" || w == "-h") {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
     let cmd = words.remove(0);
     let a = Args { words };
-    // The guard answers a harness, so it has its own exit codes (cmd_guard).
-    if cmd == "guard" {
-        return cmd_guard(a);
-    }
     let result = match cmd.as_str() {
         "check" => cmd_check(a),
         "import" => cmd_import(a),

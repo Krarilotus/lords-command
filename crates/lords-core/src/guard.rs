@@ -124,6 +124,16 @@ fn commands(command: &str) -> Vec<Vec<Word>> {
                 continue;
             }
             ' ' | '\t' if !double => end_word(&mut words, &mut word, &mut started),
+            // `&` and `|` that are part of a trailing redirection (`2>&1`, `&>`, `>|`) don't end the command: what
+            // follows is still this command's (rm-guard fix check r2, R9).
+            '&' | '|'
+                if !double
+                    && (i > 0 && matches!(c[i - 1], '>' | '<')
+                        || ch == '&' && c.get(i + 1) == Some(&'>')) =>
+            {
+                word.text.push(ch);
+                started = true;
+            }
             ';' | '&' | '|' | '(' | ')' | '\n' if !double => {
                 end_word(&mut words, &mut word, &mut started);
                 if !words.is_empty() {
