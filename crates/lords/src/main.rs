@@ -132,7 +132,13 @@ fn cmd_guard(mut a: Args) -> ExitCode {
         eprintln!("lords guard: usage `lords guard rm` (event on stdin); this call is let through");
         return ExitCode::SUCCESS;
     }
-    let input = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
+    let input = match std::io::read_to_string(std::io::stdin()) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("lords guard: the event can't be read ({e}); this call is let through");
+            return ExitCode::SUCCESS;
+        }
+    };
     let out = lords_core::guard::rm_hook(&input);
     if !out.is_empty() {
         println!("{out}");

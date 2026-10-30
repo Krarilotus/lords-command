@@ -91,6 +91,17 @@ pub(crate) fn guard_self_test(guard_copy: &Path) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("{}: {e}", guard_copy.display()))?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    // Its output is read beside it, so a child that keeps the pipe open can't hold the sync past the deadline
+    // (sol-loop r2, S14).
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut stdout = child.stdout.take();
+    std::thread::spawn(move || {
+        let mut out = String::new();
+        if let Some(o) = stdout.as_mut() {
+            let _ = o.read_to_string(&mut out);
+        }
+        let _ = tx.send(out);
+    });
     let status = loop {
         match child.try_wait().map_err(|e| e.to_string())? {
             Some(s) => break s,
@@ -102,10 +113,10 @@ pub(crate) fn guard_self_test(guard_copy: &Path) -> Result<(), String> {
             None => std::thread::sleep(std::time::Duration::from_millis(20)),
         }
     };
-    let mut out = String::new();
-    if let Some(mut o) = child.stdout.take() {
-        let _ = o.read_to_string(&mut out);
-    }
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    let out = rx.recv_timeout(left).map_err(|_| {
+        format!("{}: guard self-test's output not closed within 20 s", guard_copy.display())
+    })?;
     if status.success() && out.trim() == "ok" {
         Ok(())
     } else {

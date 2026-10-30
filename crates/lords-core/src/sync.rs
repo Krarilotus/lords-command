@@ -245,6 +245,19 @@ pub struct Plan {
 pub struct GuardInstall {
     pub place: Contained,
     pub bytes: Vec<u8>,
+    /// The settings targets whose hooks name it: the install stays in the plan only while one of them does.
+    pub for_targets: Vec<String>,
+}
+
+/// The guard copy's bytes, read through the path check (a link anywhere on the way is refused); `None` when there is
+/// none.
+fn guard_bytes(place: &Contained) -> Result<Option<Vec<u8>>, String> {
+    fsguard::check(place.path())?;
+    match fsguard::read_bytes(place.path()) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", place.path().display())),
+    }
 }
 
 /// Where the guard copy lives in the tool's home.
@@ -1162,25 +1175,43 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
         Ok(g) => g,
         Err(e) => return conflict(&t.name, &path, e),
     };
-    if !t.guards.is_empty() && pl.plan.guard.is_none() {
-        let mine = pl
-            .plan
-            .guard_from
-            .clone()
-            .ok_or_else(|| {
-                "guards need the `lords` executable to copy; sync from `lords`".to_string()
-            })
-            .and_then(|e| fsguard::read_bytes(&e).map_err(|err| format!("{}: {err}", e.display())));
-        let bytes = match mine {
-            Ok(b) => b,
+    // The copy the hooks name: planned for apply to install or confirm whenever a `lords` to copy is given; without
+    // one (a check of drift), it must be there already (sol-loop r2, S12, S13).
+    if !t.guards.is_empty() {
+        let have = match guard_bytes(&guard) {
+            Ok(h) => h,
             Err(e) => return conflict(&t.name, &path, e),
         };
-        if fsguard::read_bytes(guard.path()).ok().as_deref() != Some(&bytes[..]) {
-            pl.plan.notes.push(format!(
-                "installs the guard {} (a copy of this lords)",
-                guard.path().display()
-            ));
-            pl.plan.guard = Some(GuardInstall { place: guard.clone(), bytes });
+        match (&pl.plan.guard_from, &mut pl.plan.guard) {
+            (_, Some(g)) => g.for_targets.push(t.name.clone()),
+            (None, None) if have.is_none() => {
+                return conflict(
+                    &t.name,
+                    &path,
+                    format!(
+                        "the guard copy {} is missing; sync from `lords`",
+                        guard.path().display()
+                    ),
+                );
+            }
+            (None, None) => {}
+            (Some(from), None) => {
+                let bytes = match fsguard::read_bytes(from) {
+                    Ok(b) => b,
+                    Err(e) => return conflict(&t.name, &path, format!("{}: {e}", from.display())),
+                };
+                if have.as_deref() != Some(&bytes[..]) {
+                    pl.plan.notes.push(format!(
+                        "installs the guard {} (a copy of this lords)",
+                        guard.path().display()
+                    ));
+                }
+                pl.plan.guard = Some(GuardInstall {
+                    place: guard.clone(),
+                    bytes,
+                    for_targets: vec![t.name.clone()],
+                });
+            }
         }
     }
     let hooks = match guard_hooks(t, adapter, &value, guard.path()) {
@@ -2090,7 +2121,14 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         pl.wanted.clear();
     }
     match (opts.stage, &complete) {
-        (Stage::Install, _) => staged(&mut pl.plan),
+        (Stage::Install, _) => {
+            staged(&mut pl.plan);
+            // The guard copy goes only with a settings target that still names it (sol-loop r2, S15).
+            let left = |n: &String| pl.plan.items.iter().any(|i| &i.target == n);
+            if pl.plan.guard.as_ref().is_some_and(|g| !g.for_targets.iter().any(left)) {
+                pl.plan.guard = None;
+            }
+        }
         (Stage::Full, Some(_)) => pl.unwanted(),
         (Stage::Full, None) => pl.plan.notes.push(format!(
             "removal held: {why}, so nothing is removed or forgotten until both are none"
@@ -2411,9 +2449,15 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
         return Err("the plan has conflicts; resolve them first (nothing was changed)".into());
     }
     // The guard copy first: settings never name a guard that doesn't answer (orchestrator, 30 Oct).
+    // Under the apply lock, so two syncs never install at once; checked again here, so a copy removed or changed
+    // since the plan is put right before the settings name it (sol-loop r2, S11, S12).
     if let Some(g) = &plan.guard {
+        let _lock = ApplyLock::take(&plan.home, 60)?;
         fsguard::create_dir_all(&Root::home(&plan.home)?.join(&[Part::new("bin")?]))?;
-        fsguard::install_exe(&g.place, &g.bytes, crate::process::guard_self_test)?;
+        match guard_bytes(&g.place)? {
+            Some(have) if have == g.bytes => crate::process::guard_self_test(g.place.path())?,
+            _ => fsguard::install_exe(&g.place, &g.bytes, crate::process::guard_self_test)?,
+        }
     }
     let changing: Vec<&Item> =
         plan.items.iter().filter(|i| i.changes() && i.action != Action::RetireEntry).collect();

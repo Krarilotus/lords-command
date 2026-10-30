@@ -1020,8 +1020,12 @@ pub fn install_exe(
 ) -> Result<(), String> {
     let path = p.place();
     check(path)?;
-    let staged = beside(path, "new")?.with_extension("exe");
-    create_file_at(&staged, bytes)?;
+    // `.exe` appended, keeping the staged name unique (sol-loop r2, S11).
+    let staged = PathBuf::from(format!("{}.exe", beside(path, "new")?.display()));
+    if let Err(e) = create_file_at(&staged, bytes) {
+        let _ = delete_file_at(&staged);
+        return Err(e);
+    }
     if let Err(e) = verify(&staged) {
         let _ = delete_file_at(&staged);
         return Err(e);
