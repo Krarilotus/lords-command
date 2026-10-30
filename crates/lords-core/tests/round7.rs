@@ -196,6 +196,39 @@ fn a_plan_says_whether_it_applies_and_what_it_releases() {
     assert!(!f.path("b/.claude/skills/demo").exists(), "released");
 }
 
+// Spec (applies-line review r1, R1-01, witness: an owner-modified copy is a conflict that leaves the view complete, so
+// the plan lists a removal beside it; the "no" line said the plan lists none): the refusal states what the plan
+// actually lists, and both `applies` and `apply` refuse it, the obsolete copy still there.
+#[test]
+fn the_refusal_states_the_removals_the_plan_lists() {
+    let f = Fixture::new();
+    for name in ["a", "b"] {
+        f.write(
+            &format!("pub/global/skills/{name}/SKILL.md"),
+            &format!("---\nname: {name}\ndescription: x\n---\nSteps.\n"),
+        );
+        f.write(
+            &format!("pub/global/skills/{name}/lords.yaml"),
+            &format!("id: skill.{name}\nkind: skill\ntitle: {name}\naudience: [all]\nscope: global\nstatus: active\nvisibility: public\norigin:\n  type: own\n"),
+        );
+    }
+    skills_target(&f, "");
+    sync::apply(&sync::plan(&f.stacks(), &f.opts()).unwrap()).unwrap();
+    f.write("out/a/SKILL.md", "OWNER EDIT\n");
+    fs::remove_dir_all(f.path("pub/global/skills/b")).unwrap();
+    let p = sync::plan(&f.stacks(), &f.opts()).unwrap();
+    assert!(p
+        .items
+        .iter()
+        .any(|i| i.action == sync::Action::Conflict && i.path == f.path("out/a")));
+    assert!(p.items.iter().any(|i| i.action == sync::Action::Remove && i.path == f.path("out/b")));
+    let why = p.applies().unwrap_err();
+    assert!(why.contains("lists 1 removal(s) and 0 forget(s)"), "{why}");
+    assert!(!why.contains("no removal"), "{why}");
+    assert!(sync::apply(&p).is_err());
+    assert!(f.path("out/b/SKILL.md").is_file(), "nothing removed");
+}
+
 // Spec (R7-05, rule B): a problem of any level in the stacks (here a skill that is a file, a warning) holds
 // removal: an installed skill whose source didn't load isn't retired.
 #[test]
