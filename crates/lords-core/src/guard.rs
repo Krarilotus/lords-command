@@ -153,7 +153,26 @@ fn commands(command: &str) -> Vec<Vec<Word>> {
 /// parse of them can turn a deletion path into something else. Conservative by design (sol-loop r1 S4, declined; r2
 /// S7–S10): a false refusal costs a retry with `"${VAR:?}"`, a missed path a deletion.
 pub fn unguarded_rm(command: &str) -> Option<String> {
-    let is_rm = |w: &Word| w.text == "rm" || w.text.ends_with("/rm");
+    unguarded_rm_in(command, 0)
+}
+
+/// A command word's program name, its path dropped (`/usr/bin/time`: `time`; sol-loop r5, S22).
+fn program(w: &Word) -> &str {
+    w.text.rsplit(['/', '\\']).next().unwrap_or(&w.text)
+}
+
+/// A redirection word (`2>/dev/null`, `>&2`, `<in`), and whether its target is the next word (a lone `>`).
+fn redirection(t: &str) -> Option<bool> {
+    let op = t.trim_start_matches(|x: char| x.is_ascii_digit() || x == '&');
+    if !op.starts_with(['>', '<']) {
+        return None;
+    }
+    Some(op.trim_start_matches(['>', '<', '&', '|']).is_empty())
+}
+
+/// `unguarded_rm`, `depth` shell strings deep (a `trap`, `eval` or `sh -c` body is a command too; sol-loop r5, S21).
+fn unguarded_rm_in(command: &str, depth: usize) -> Option<String> {
+    let is_rm = |w: &Word| program(w) == "rm";
     let assignment = |t: &str| {
         t.contains('=')
             && !t.starts_with('=')
@@ -162,13 +181,49 @@ pub fn unguarded_rm(command: &str) -> Option<String> {
                 .is_some_and(|n| n.chars().all(|x| x == '_' || x.is_ascii_alphanumeric()))
     };
     for words in commands(command) {
-        // Shell keywords before a command and leading assignments (sol-loop r3, S17).
-        let mut rest =
-            words.iter().skip_while(|w| KEYWORDS.contains(&w.text.as_str()) || assignment(&w.text));
+        // Shell keywords, assignments and redirections before a command (sol-loop r3, S17; r5, S20).
+        let mut lead = words.iter().peekable();
+        let mut target_next = false;
+        while let Some(w) = lead.peek() {
+            let t = w.text.as_str();
+            if target_next {
+                target_next = false;
+            } else if let Some(lone) = redirection(t) {
+                target_next = lone;
+            } else if !(KEYWORDS.contains(&t) || assignment(t)) {
+                break;
+            }
+            lead.next();
+        }
+        let mut rest = lead;
         let Some(first) = rest.next() else { continue };
+        let name = program(first);
+        // A shell string another command runs is checked as a command of its own.
+        if depth < 4 {
+            let mut probe = rest.clone();
+            let body: Option<String> = match name {
+                "trap" => probe.next().map(|w| w.text.clone()),
+                "eval" => Some(probe.map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")),
+                "bash" | "sh" | "zsh" | "dash" | "ksh" => {
+                    let mut it = probe;
+                    it.find(|w| {
+                        w.text.starts_with('-') && !w.text.starts_with("--") && w.text.contains('c')
+                    })
+                    .and_then(|_| it.next())
+                    .map(|w| w.text.clone())
+                }
+                _ => None,
+            };
+            if let Some(b) = body {
+                if let Some(found) = unguarded_rm_in(&b, depth + 1) {
+                    return Some(found);
+                }
+                continue;
+            }
+        }
         let args: Vec<&Word> = if is_rm(first) {
             rest.collect()
-        } else if WRAPPERS.contains(&first.text.as_str()) {
+        } else if WRAPPERS.contains(&name) {
             // A wrapper runs the command after its own options and their values, which a guard can't parse for every
             // wrapper: the first `rm` word after it is taken as the command (sol-loop r3, S18).
             match rest.position(&is_rm) {
