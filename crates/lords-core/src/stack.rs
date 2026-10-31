@@ -267,7 +267,7 @@ impl Stack {
 
     fn load_kind_dir(&mut self, dir: &Path, kind: Kind, scope: &Scope) {
         let defaults = match read_yaml_file(&dir.join(DEFAULTS)) {
-            Ok(v) => v,
+            Ok(v) => v.map(|(m, _)| m),
             Err(e) => {
                 self.problems.push(Finding::error("schema", e).at(dir.join(DEFAULTS), None));
                 return;
@@ -338,12 +338,13 @@ impl Stack {
             body,
             parts.body_line,
             vec![file.to_path_buf()],
+            crate::model::version(&[text.as_bytes()]),
         );
     }
 
     fn load_skill(&mut self, dir: &Path, scope: &Scope) {
         let sidecar = dir.join(SIDECAR);
-        let meta = match read_yaml_file(&sidecar) {
+        let (meta, meta_text) = match read_yaml_file(&sidecar) {
             Ok(Some(m)) => m,
             Ok(None) => {
                 self.problems.push(
@@ -374,7 +375,8 @@ impl Stack {
             );
         }
         let files = self.files_of(dir);
-        self.push_entry(meta, Kind::Skill, scope, &sidecar, &skill_file, body, 1, files);
+        let version = crate::model::version(&[meta_text.as_bytes(), body.as_bytes()]);
+        self.push_entry(meta, Kind::Skill, scope, &sidecar, &skill_file, body, 1, files, version);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -388,6 +390,7 @@ impl Stack {
         body: String,
         body_line: usize,
         files: Vec<PathBuf>,
+        version: String,
     ) {
         let value = Value::Object(value);
         let errs = schema::entry_errors(&value);
@@ -442,6 +445,7 @@ impl Stack {
             body,
             body_line,
             files,
+            version,
         });
     }
 
@@ -533,6 +537,7 @@ impl Stack {
                         stack: self.visibility(),
                         meta_file: file.clone(),
                         body_file: file,
+                        version: crate::model::version(&[body.as_bytes()]),
                         body,
                         body_line: 1,
                         files,
@@ -636,9 +641,14 @@ fn parse_yaml(text: &str) -> Result<Map<String, Value>, String> {
     }
 }
 
-fn read_yaml_file(path: &Path) -> Result<Option<Map<String, Value>>, String> {
+/// A YAML file's mapping, and the text it was read from.
+type YamlFile = (Map<String, Value>, String);
+
+fn read_yaml_file(path: &Path) -> Result<Option<YamlFile>, String> {
     match fsguard::read_string(path) {
-        Ok(t) => parse_yaml(&t).map(Some).map_err(|e| format!("{}: {e}", path.display())),
+        Ok(t) => {
+            parse_yaml(&t).map(|m| Some((m, t))).map_err(|e| format!("{}: {e}", path.display()))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }

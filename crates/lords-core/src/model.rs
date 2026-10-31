@@ -322,6 +322,21 @@ pub struct Entry {
     pub body_line: usize,
     /// For a skill: every file in its directory, sorted. Otherwise the entry's one file.
     pub files: Vec<PathBuf>,
+    /// `version` of the bytes its metadata and text were read from, in that order: an edit or retirement made from
+    /// what was read carries it, and is refused if the files hold anything else by then.
+    pub version: String,
+}
+
+/// The version of an entry's files: a hash over their bytes, each part's length first, so no two splits of the same
+/// bytes share one. The metadata file, then the text file where it is another.
+pub fn version(parts: &[&[u8]]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update((p.len() as u64).to_le_bytes());
+        h.update(p);
+    }
+    format!("{:x}", h.finalize())
 }
 
 impl Entry {

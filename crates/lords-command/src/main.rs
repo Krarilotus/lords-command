@@ -626,6 +626,7 @@ impl App {
                     topics: (d.now.topics != d.loaded.topics).then(|| d.now.topics.clone()),
                     roles: (d.now.roles != d.loaded.roles).then(|| d.now.roles.clone()),
                     body: (d.now.body != d.loaded.body).then(|| d.now.body.clone()),
+                    base: None,
                 };
                 act = Some(Act::Save(e.id().to_string(), edit));
             }
@@ -754,6 +755,7 @@ impl App {
                     superseded_by: successor.as_deref(),
                     date: ops::today(),
                     commit: true,
+                    base: None,
                 };
                 self.notice = Some(ops::retire(stacks, &r).map(|r| {
                     format!(

@@ -586,7 +586,14 @@ fn cmd_retire(mut a: Args) -> Result<bool, String> {
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
     let r = ops::retire(
         &stacks,
-        &Retire { id: &id, reason: &reason, superseded_by: superseded_by.as_deref(), date, commit },
+        &Retire {
+            id: &id,
+            reason: &reason,
+            superseded_by: superseded_by.as_deref(),
+            date,
+            commit,
+            base: None,
+        },
     )?;
     println!(
         "retired {id} in {}{}",

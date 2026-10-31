@@ -259,6 +259,7 @@ fn r5_05_retire_keeps_a_files_attributes() {
         superseded_by: None,
         date: "2026-10-25".into(),
         commit: true,
+        base: None,
     };
     let result = lords_core::ops::retire(&f.stacks(), &r).map(|r| r.file);
     assert!(result.is_ok(), "{result:?}");

@@ -134,6 +134,38 @@ pub struct Retire<'a> {
     pub superseded_by: Option<&'a str>,
     pub date: String,
     pub commit: bool,
+    /// The entry's `version` as the caller read it, if it read one: refused if its files hold anything else now.
+    pub base: Option<&'a str>,
+}
+
+/// Refuses when `base` is given and the entry's files, read just now as `now`, are no longer that version: the caller
+/// read an older one, and this change would land over the newer one.
+fn still(e: &Entry, base: Option<&str>, now: &[Vec<u8>]) -> Result<(), String> {
+    let parts: Vec<&[u8]> = now.iter().map(Vec::as_slice).collect();
+    match base {
+        Some(b) if b != crate::model::version(&parts) => Err(format!(
+            "`{}` changed since it was read (version {} now); nothing changed",
+            e.id(),
+            &crate::model::version(&parts)[..12]
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The files an entry's version covers: its metadata file, then its text file where that is another.
+fn version_files(e: &Entry) -> Vec<PathBuf> {
+    if e.meta_file == e.body_file {
+        vec![e.meta_file.clone()]
+    } else {
+        vec![e.meta_file.clone(), e.body_file.clone()]
+    }
+}
+
+fn read_all(files: &[PathBuf]) -> Result<Vec<Vec<u8>>, String> {
+    files
+        .iter()
+        .map(|f| fsguard::read_bytes(f).map_err(|e| format!("{}: {e}", f.display())))
+        .collect()
 }
 
 #[derive(Debug)]
@@ -162,13 +194,15 @@ pub fn retire(stacks: &Stacks, r: &Retire) -> Result<Retired, String> {
             return Err(format!("a public entry can't name the private `{s}` as its successor"));
         }
     }
-    let before = fsguard::read_bytes(&e.meta_file).map_err(|e| e.to_string())?;
     let keys = [
         ("status", Some("retired".to_string())),
         ("superseded_by", r.superseded_by.map(str::to_string)),
         ("retired", Some(format!("date: {}\nreason: {}", r.date, quote(r.reason)))),
     ];
     git_keeps(&e.meta_file)?;
+    let now = read_all(&version_files(e))?;
+    still(e, r.base, &now)?;
+    let before = now.into_iter().next().expect("the metadata file comes first");
     let root = stacks.stack(e.stack).expect("the entry's stack is loaded").root.clone();
     set_meta_keys(&root, &e.meta_file, &keys)?;
     // The stack must still load the entry, now retired; otherwise put the file back.
@@ -211,6 +245,7 @@ pub fn retire_expired(
                 superseded_by: None,
                 date: today.to_string(),
                 commit,
+                base: None,
             },
         )?;
         done.push((id, r.commit));
@@ -697,13 +732,16 @@ fn split_part(e: &Entry, lines: &str) -> (String, String) {
 // ---------------------------------------------------------------- edit
 
 /// What an edit changes; `None` leaves a field as it is.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Edit {
     pub title: Option<String>,
     pub audience: Option<Vec<String>>,
     pub topics: Option<Vec<String>>,
     pub roles: Option<Vec<String>>,
     pub body: Option<String>,
+    /// The entry's `version` the change was made against, if any: refused if its files hold anything else now.
+    #[serde(default)]
+    pub base: Option<String>,
 }
 
 fn yaml_list(items: &[String]) -> String {
@@ -766,18 +804,12 @@ pub fn edit(
     if let Some(r) = &change.roles {
         keys.push(("roles", (!r.is_empty()).then(|| yaml_list(r))));
     }
-    let files: Vec<PathBuf> = if e.meta_file == e.body_file {
-        vec![e.meta_file.clone()]
-    } else {
-        vec![e.meta_file.clone(), e.body_file.clone()]
-    };
+    let files = version_files(e);
     for f in &files {
         git_keeps(f)?;
     }
-    let before: Vec<Vec<u8>> = files
-        .iter()
-        .map(|f| fsguard::read_bytes(f).map_err(|e| format!("{}: {e}", f.display())))
-        .collect::<Result<_, _>>()?;
+    let before = read_all(&files)?;
+    still(e, change.base.as_deref(), &before)?;
     // Puts the files back as they were; what can't go back is said (git still holds it: R3-10).
     let restore = || -> String {
         let failed: Vec<String> = files
