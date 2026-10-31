@@ -141,6 +141,29 @@ fn the_runs_staging_dir_is_owner_only_from_its_creation_and_a_wider_one_gets_not
     assert!(!dir.join("panel-token").exists(), "nothing written");
 }
 
+// Spec (fix check r1 R2, the Lords owner: the token keeps its owner-only list in the app dir only if its move there is
+// a rename on one volume; across volumes a move copies, and the copy takes the app dir's list): a staging dir reached
+// through a link (a junction, a mount point: the one way it can lie on another volume than the app dir it sits in) is
+// refused before anything is made behind it.
+#[test]
+fn a_staging_dir_behind_a_link_is_refused_before_anything_is_made() {
+    let home = tempfile::TempDir::new().unwrap();
+    let app = home.path().join("Programs").join("lords-command");
+    let elsewhere = home.path().join("elsewhere");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let link = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(app.join("staging"))
+        .arg(&elsewhere)
+        .output()
+        .unwrap();
+    assert!(link.status.success(), "{}", String::from_utf8_lossy(&link.stdout));
+    let (ok, said, _) = run(STAGE, 30, "staging", home.path(), b"");
+    assert!(!ok && said.contains("a link"), "{said}");
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0, "nothing made behind it");
+}
+
 // Spec (review r1 R6: a step's arguments are data, never code): a run's id or a file's name that isn't a plain word
 // never reaches a command line.
 #[test]
