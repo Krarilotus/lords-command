@@ -145,6 +145,28 @@ fn a_child_with_no_place_file_gets_the_whole_start_in_parts() {
     );
     let second = run(&home, &cwd, &["guard", "child", "--part", "2"], &event(&cwd));
     assert!(second.stdout.is_empty(), "nothing past the delta's one part");
+    // Repair sol-loop r1, R3: one line longer than a part is cut too, so no part passes the cap.
+    let long = format!("- rule.long: {}", "y".repeat(25_000));
+    fs::write(cwd.join(".lords/child-whole.md"), format!("{BEGIN}\n{long}\n{END}\n")).unwrap();
+    let parts: Vec<String> = (1..=4)
+        .filter_map(|n| {
+            context(&run(
+                &home,
+                &cwd,
+                &["guard", "child", "--part", &n.to_string()],
+                &with("Explore"),
+            ))
+        })
+        .collect();
+    let sizes: Vec<usize> = parts.iter().map(|p| p.chars().count()).collect();
+    assert!(sizes.iter().all(|n| *n < 10_000), "{sizes:?}");
+    let joined: String =
+        parts.iter().map(|p| p.split_once(":\n").map_or(p.as_str(), |(_, t)| t)).collect();
+    assert_eq!(joined, long, "the line whole, in order");
+    // Repair sol-loop r1, R4: an Explore child never takes the delta for its whole start.
+    fs::remove_file(cwd.join(".lords/child-whole.md")).unwrap();
+    let o = run(&home, &cwd, &["guard", "child", "--part", "1"], &with("Explore"));
+    assert!(o.stdout.is_empty(), "no whole start, no delta in its place: {o:?}");
 }
 
 // Spec (the brief, slice 4: "through each provider's subagent-start hook"; the Codex probe, design note: Codex's child

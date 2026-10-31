@@ -805,7 +805,8 @@ pub fn child_context(text: &str) -> String {
 }
 
 /// A child's start in parts, cut at line ends, each with its "part N of M" line at most `CHILD_PART_CHARS`
-/// characters; one part, unlabelled, when it fits in one. A line longer than a part is a part of its own.
+/// characters; one part, unlabelled, when it fits in one. A line longer than a part is cut too, at a character, so no
+/// part passes the cap (repair sol-loop r1, R3).
 pub fn child_parts(context: &str) -> Vec<String> {
     let max = crate::sync::CHILD_PART_CHARS;
     if context.chars().count() <= max {
@@ -815,14 +816,27 @@ pub fn child_parts(context: &str) -> Vec<String> {
     let room = max - 32;
     let mut parts: Vec<String> = Vec::new();
     let mut part = String::new();
-    for line in context.lines() {
-        if !part.is_empty() && part.chars().count() + 1 + line.chars().count() > room {
+    let pieces = context.lines().flat_map(|line| {
+        let chars: Vec<char> = line.chars().collect();
+        let chunks: Vec<String> = if chars.is_empty() {
+            vec![String::new()]
+        } else {
+            chars.chunks(room).map(|c| c.iter().collect()).collect()
+        };
+        let n = chunks.len();
+        // A cut line's pieces join without a line break between them.
+        chunks.into_iter().enumerate().map(move |(i, c)| (c, i + 1 < n))
+    });
+    let mut glued = false;
+    for (piece, continues) in pieces {
+        let sep = usize::from(!part.is_empty() && !glued);
+        if !part.is_empty() && part.chars().count() + sep + piece.chars().count() > room {
             parts.push(std::mem::take(&mut part));
-        }
-        if !part.is_empty() {
+        } else if sep == 1 {
             part.push('\n');
         }
-        part.push_str(line);
+        part.push_str(&piece);
+        glued = continues;
     }
     parts.push(part);
     let n = parts.len();
@@ -845,34 +859,37 @@ pub fn child_hook(input: &str, part: Option<usize>) -> Answer {
         return quiet();
     }
     let Some(cwd) = ev["cwd"].as_str() else { return noted("the event names no cwd") };
+    // Never the part beyond the place's file in place of a whole start (repair sol-loop r1, R4).
     let whole = ev["agent_type"].as_str().is_some_and(|t| NO_PLACE_FILE_AGENTS.contains(&t));
-    let names: &[&str] = if whole {
-        &[crate::sync::CHILD_WHOLE_FILE, crate::sync::CHILD_FILE]
-    } else {
-        &[crate::sync::CHILD_FILE]
-    };
+    let name = if whole { crate::sync::CHILD_WHOLE_FILE } else { crate::sync::CHILD_FILE };
+    // The nearest role dir is the child's place: its file, or nothing, never an enclosing place's (a repo's checkout
+    // can lie inside a workspace that is a place too).
     for d in Path::new(cwd).ancestors() {
-        for name in names {
-            let file = d.join(crate::sync::ROLE_DIR).join(name);
-            let text = match crate::fsguard::read_text(&file) {
-                Ok(Some(t)) if t.contains(crate::compose::BEGIN) => t,
-                Ok(_) => continue,
-                Err(e) => return noted(format!("{}: {e}", file.display())),
-            };
-            let context = child_context(&text);
-            let context = match part {
-                None => context,
-                Some(n) => match child_parts(&context).into_iter().nth(n.wrapping_sub(1)) {
-                    Some(p) => p,
-                    None => return quiet(),
-                },
-            };
-            let out = json!({"hookSpecificOutput": {
-                "hookEventName": "SubagentStart",
-                "additionalContext": context,
-            }});
-            return Answer { stdout: out.to_string(), note: None };
+        let dir = d.join(crate::sync::ROLE_DIR);
+        match crate::fsguard::kind(&dir) {
+            Ok(crate::fsguard::Kind::Dir) => {}
+            Ok(_) => continue,
+            Err(e) => return noted(format!("{}: {e}", dir.display())),
         }
+        let file = dir.join(name);
+        let text = match crate::fsguard::read_text(&file) {
+            Ok(Some(t)) if t.contains(crate::compose::BEGIN) => t,
+            Ok(_) => return quiet(),
+            Err(e) => return noted(format!("{}: {e}", file.display())),
+        };
+        let context = child_context(&text);
+        let context = match part {
+            None => context,
+            Some(n) => match child_parts(&context).into_iter().nth(n.wrapping_sub(1)) {
+                Some(p) => p,
+                None => return quiet(),
+            },
+        };
+        let out = json!({"hookSpecificOutput": {
+            "hookEventName": "SubagentStart",
+            "additionalContext": context,
+        }});
+        return Answer { stdout: out.to_string(), note: None };
     }
     quiet()
 }

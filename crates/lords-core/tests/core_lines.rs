@@ -561,6 +561,108 @@ fn a_stack_can_leave_the_default_roles_lines_out_of_codex_place_files() {
     );
 }
 
+/// A repo `beta-core` whose default role is the orchestrator, with roles orchestrator, coder, helper and product,
+/// `extra` added to its stack.toml, and no entries.
+fn bare_place(extra: &str) -> (Fixture, PathBuf) {
+    let f = Fixture::new();
+    let checkout = f.path("checkout");
+    f.write("checkout/README.md", "a repo\n");
+    f.git_init("checkout");
+    f.write(
+        "priv/stack.toml",
+        &format!(
+            "name = \"priv\"\nvisibility = \"private\"\nroles = [\"orchestrator\", \"coder\", \"helper\", \"product\"]\n{extra}[projects.beta]\n[repos.beta-core]\nproject = \"beta\"\ncheckouts = ['{}']\nworktrees = false\ndefault_role = \"orchestrator\"\n",
+            checkout.display()
+        ),
+    );
+    (f, checkout)
+}
+
+// Spec (repair sol-loop r1, R1, its witness; design: the role-files line counts what each role's file carries): a
+// skill line a place's file leaves to the role file (it shows the skill's hook) is counted for that role, so the
+// role file is named even when it is the only such line.
+#[test]
+fn a_skill_line_left_to_a_role_file_is_counted_there() {
+    let (f, checkout) = bare_place("");
+    let manifest = f.read("priv/stack.toml");
+    f.write(
+        "priv/stack.toml",
+        &format!("{manifest}[place_files.codex]\ndefault_role_lines = false\n"),
+    );
+    skill(&f, "tool", "roles: [orchestrator]\nstart: core\ncore: The lead's skill line.\n");
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    let codex = proposed(&p, &checkout.join("AGENTS.override.md"));
+    assert!(!codex.contains("The lead's skill line."), "{codex}");
+    let pointer = codex.lines().find(|l| l.contains("has them in full:")).unwrap_or_default();
+    assert!(
+        pointer.contains("role-orchestrator.md` (1"),
+        "the lead's file, its one entry: {codex}"
+    );
+}
+
+// Spec (repair sol-loop r1, R2, its witness; the invariant: nothing that binds a child is dropped): a child's whole
+// start that needs more parts than Claude Code's child hooks deliver is refused like a file past its harness's limit:
+// the role files aren't written, and the plan says why.
+#[test]
+fn a_child_start_past_the_parts_delivered_is_refused() {
+    let (f, checkout) = bare_place("child_role = \"helper\"\n");
+    let lines: Vec<String> =
+        (0..80).map(|i| format!("- line: \"{i:02} {}\"", "x".repeat(400))).collect();
+    f.write(
+        "priv/project/beta/rules/long.md",
+        &entry(
+            "rule.long",
+            "project:beta",
+            "private",
+            &format!("start: core\ncore:\n{}\n", lines.join("\n")),
+            "Long.\n",
+        ),
+    );
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    let item =
+        p.items.iter().find(|i| i.path == checkout.join(".lords")).expect("the role files' item");
+    assert_eq!(item.action, lords_core::sync::Action::Conflict, "{:?}", item.notes);
+    assert!(item.notes.iter().any(|n| n.contains("parts")), "{:?}", item.notes);
+    assert!(p.over_limit, "the plan fails like an over-limit file");
+}
+
+// Spec (repair sol-loop r1, R5, its witness; the Lords owner: "the limit itself stays a refusal"): a stack budget
+// above the adapter's limit doesn't hide `check`'s error for a file past the limit.
+#[test]
+fn a_budget_above_the_limit_keeps_the_limits_error() {
+    let (f, _) = bare_place("[place_files.codex]\nwarn_bytes = 100000\n");
+    let body = "Each line of this rule is long enough to count. ".repeat(900);
+    f.write(
+        "priv/project/beta/rules/big.md",
+        &entry("rule.big", "project:beta", "private", "", &format!("{body}\n")),
+    );
+    let errors: Vec<String> = lords_core::sync::drift_findings(&f.stacks(), &f.home())
+        .into_iter()
+        .filter(|x| x.code == "size" && x.severity == lords_core::Severity::Error)
+        .map(|x| x.message)
+        .collect();
+    assert!(errors.iter().any(|m| m.contains("AGENTS.override.md")), "{errors:?}");
+}
+
+// Spec (repair sol-loop r1, R6, its witness): an intent whose class is `detail` extending one shown by its whole text
+// keeps its title in the intent index; neither its body nor the parent's is lost or doubled.
+#[test]
+fn a_detail_intent_extending_a_whole_intent_keeps_its_title() {
+    let (f, checkout) = bare_place("");
+    let put = |slug: &str, yaml: &str, body: &str| {
+        f.write(
+            &format!("priv/project/beta/intent/{slug}.md"),
+            &entry(&format!("intent.{slug}"), "project:beta", "private", yaml, body),
+        );
+    };
+    put("base", "", "BASE-BODY\n");
+    put("extra", "start: detail\nextends: [intent.base]\n", "EXTRA-BODY\n");
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    let helper = planned_in(&p, &checkout.join(".lords"), "role-helper.md");
+    assert!(helper.contains("BASE-BODY") && helper.contains("intent.extra"), "{helper}");
+    assert!(!helper.contains("EXTRA-BODY"), "{helper}");
+}
+
 // Spec (the invariant: "nothing private reaches a public file"; design: Privacy): a composition of public entries
 // only (what sync reports for a tracked AGENTS.md) carries no private entry's line and names its opener without a
 // user path, so the privacy scan a public repo runs finds nothing in it.

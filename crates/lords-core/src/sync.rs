@@ -2108,7 +2108,9 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
             tree.insert(role_file(role), c.text.clone().into_bytes());
         }
     }
-    // A native child's start files, for the `child` guard (plan L6, an orchestrator's condition 3; review r1, F1).
+    // A native child's start files, for the `child` guard (plan L6, an orchestrator's condition 3; review r1, F1). One
+    // a child's hooks can't deliver whole is refused like a file past its harness's limit (repair sol-loop r1, R2).
+    let mut undeliverable = Vec::new();
     if let Some(role) = child_role(pl.stacks) {
         for (file, start) in [
             (CHILD_FILE, compose::ChildStart::Beyond),
@@ -2118,9 +2120,8 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
                 child_composed(pl.stacks, place.layers(true), role, &pl.plan.home, start).text;
             let parts = crate::guard::child_parts(&crate::guard::child_context(&text)).len();
             if parts > CHILD_PARTS {
-                pl.plan.notes.push(format!(
-                    "{}: {file} takes {parts} parts of {CHILD_PART_CHARS} characters, past the {CHILD_PARTS} Claude Code's child hooks deliver; a child starts without the rest",
-                    place.label
+                undeliverable.push(format!(
+                    "{file} takes {parts} parts of {CHILD_PART_CHARS} characters, past the {CHILD_PARTS} Claude Code's child hooks deliver: not written, the old files stay"
                 ));
             }
             tree.insert(file.into(), text.into_bytes());
@@ -2130,12 +2131,20 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
     let tree = std::sync::Arc::new(tree);
     let scope = place_scope(place, None);
     for root in place.paths.iter().filter(|r| r.path().is_dir()) {
-        let item = pl.tool_dir(
+        let mut item = pl.tool_dir(
             &format!("{} (role files)", place.label),
             &scope,
             &Slot::RoleDir.place(root, "").expect("a slot without a name"),
             tree.clone(),
         );
+        if !undeliverable.is_empty() {
+            // A conflict it has already keeps its kind (what may be removed depends on it).
+            if item.action != Action::Conflict {
+                item.action = Action::Conflict;
+                item.conflict = ConflictKind::OverLimit;
+            }
+            item.notes.splice(0..0, undeliverable.iter().cloned());
+        }
         pl.plan.items.push(item);
     }
     for (ex, checkout, files) in excludes {
@@ -3704,9 +3713,11 @@ fn repo_size_findings(stacks: &Stacks) -> Vec<crate::Finding> {
     // An adapter the place doesn't write for yet: measured, so the line holds before it is switched on, but only
     // info (orchestrator, 30 Oct, study P6). One it writes for: past the line a warning, past the hard limit an error,
     // since the harness would cut the file without a word (orchestrator, 30 Oct, item 2).
+    // Past the warning line or the limit: a stack's budget above the limit never hides the limit (repair sol-loop
+    // r1, R5).
     let mut out: Vec<crate::Finding> = all
         .into_iter()
-        .filter(|s| s.over_line())
+        .filter(|s| s.over_line() || s.limit.is_some_and(|l| s.reads > l))
         .map(|s| match (s.enabled, s.limit.is_some_and(|l| s.reads > l)) {
             (true, true) => crate::Finding::error(
                 "size",

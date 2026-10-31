@@ -629,11 +629,12 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         for p in
             parts(e, ctx, &declared).into_iter().filter(|p| !(beyond && every_development(&p.of)))
         {
-            // A skill is listed wherever it applies; a line not for this file's readers leaves its own hook there.
-            match (stays(&p), e.meta.kind == Kind::Skill) {
-                (true, true) => {}
-                (true, false) => pointed_parts.push(p),
-                (false, _) => shown_parts.entry(e.id()).or_default().push(p),
+            // A skill is listed wherever it applies; a line not for this file's readers leaves its own hook there, and
+            // is counted for the role file that has it (repair sol-loop r1, R1).
+            if stays(&p) {
+                pointed_parts.push(p);
+            } else {
+                shown_parts.entry(e.id()).or_default().push(p);
             }
         }
     }
@@ -664,8 +665,8 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
     };
     // An extension follows its parent where the parent's own form there carries it; otherwise it stands in its own
     // place (sol-loop r1, S1: one whose parent is only in the index was dropped; r2, T1: one whose parent is a skill).
-    // An intent shown as a title carries only intents, as titles: anything else would lose its line or text there
-    // (review r1, F2).
+    // An intent shown as a title carries only intents shown as titles, and a parent shown by its text carries none:
+    // anything else would lose its line or text there (review r1, F2), or show a title's text (repair r1, R6).
     let ids: BTreeSet<&str> = live.iter().filter(|e| in_section(e)).map(|e| e.id()).collect();
     let titled: BTreeSet<&str> = live
         .iter()
@@ -680,7 +681,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             .extends
             .first()
             .filter(|t| ids.contains(t.as_str()))
-            .filter(|t| e.meta.kind == Kind::Intent || !titled.contains(t.as_str()))
+            .filter(|t| titled.contains(t.as_str()) == titled.contains(e.id()))
             .cloned()
     };
 
