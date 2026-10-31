@@ -68,7 +68,8 @@ const HERE: Duration = Duration::from_secs(20);
 /// One remote step's PowerShell (review r1 R6): its block runs beside a watchdog, a process of its own that ends the
 /// step's whole process tree at the step's deadline however the step is stuck; at its end the step ends the watchdog.
 /// A step whose watchdog can't start stops before it does anything, with an error. `$staging` is this run's own dir
-/// there (review r1 R7). Static: the literals are joined at compile time, and what changes per run (the deadline, the
+/// there (review r1 R7); `$me` is the account the step runs as, and `Only-Mine` refuses a dir that grants anyone else
+/// (fix check r1 R2). Static: the literals are joined at compile time, and what changes per run (the deadline, the
 /// run's id, a file's name) comes in as arguments, each checked to be a plain word. No double quote and no `%` in any
 /// of it: cmd.exe, ssh's shell there, would read them.
 macro_rules! step {
@@ -78,6 +79,11 @@ macro_rules! step {
             "$watch = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', ",
             "'-NonInteractive', '-Command', ('Start-Sleep -Seconds {0}; taskkill /T /F /PID {1}' -f $deadline, $PID); ",
             "try { $staging = Join-Path $env:LOCALAPPDATA ('Programs\\lords-command\\staging\\' + $run); ",
+            "$me = [Security.Principal.WindowsIdentity]::GetCurrent().User; ",
+            "function Only-Mine($d) { $others = @((Get-Acl -LiteralPath $d).GetAccessRules($true, $true, ",
+            "[Security.Principal.SecurityIdentifier]) | Where-Object { $_.AccessControlType -eq 'Allow' -and ",
+            "$_.IdentityReference -ne $me }); if ($others.Count) { throw ('this run''s staging dir grants others ",
+            "than this account: ' + $d) } }; ",
             $body,
             " } finally { taskkill /T /F /PID $watch.Id 2>&1 | Out-Null } }"
         )
@@ -86,10 +92,14 @@ macro_rules! step {
 
 /// The probe: it reads, writes nothing, and reads no private key (only `.pub` files).
 const PROBE: &str = step!("$h = $env:USERPROFILE; $s = Join-Path $h '.ssh'; $a = Join-Path $env:LOCALAPPDATA 'Programs\\lords-command'; $c = Join-Path $s 'config'; $t = Join-Path $a 'config.txt'; [ordered]@{ home = $h; local_app_data = $env:LOCALAPPDATA; app_data = $env:APPDATA; ssh = [bool](Get-Command ssh.exe -ErrorAction SilentlyContinue); keygen = [bool](Get-Command ssh-keygen.exe -ErrorAction SilentlyContinue); ssh_config = $(if (Test-Path -LiteralPath $c) { [IO.File]::ReadAllText($c) } else { $null }); keys = @(Get-ChildItem -LiteralPath $s -Filter 'lords_panel_*.pub' -ErrorAction SilentlyContinue | ForEach-Object { [ordered]@{ name = $_.Name; text = [IO.File]::ReadAllText($_.FullName) } }); app = (Test-Path -LiteralPath (Join-Path $a 'lords-command.exe')); config_txt = $(if (Test-Path -LiteralPath $t) { [IO.File]::ReadAllText($t) } else { $null }); running = @(Get-Process lords-command -ErrorAction SilentlyContinue | Where-Object { $_.Path -like ($a + '\\*') }).Count; listening = @(Get-NetTCPConnection -State Listen -LocalPort 17879 -ErrorAction SilentlyContinue).Count } | ConvertTo-Json -Compress -Depth 4");
-/// This run's staging dir, made only where nothing is (a dir an earlier run left is never taken over).
-const STAGE: &str = step!("if (Test-Path -LiteralPath $staging) { throw ('this run''s staging dir is there already: ' + $staging) }; New-Item -ItemType Directory -Path $staging | Out-Null; 'staged'");
-/// One file, from stdin, into this run's staging dir, only where nothing is.
-const RECEIVE: &str = step!("$out = [IO.File]::Open((Join-Path $staging $name), 'CreateNew', 'Write'); try { [Console]::OpenStandardInput().CopyTo($out) } finally { $out.Close() }; 'received'");
+/// This run's staging dir, made only where nothing is (a dir an earlier run left is never taken over), owner-only from
+/// its creation (fix check r1 R2): its list protected, one entry, this account, for the dir and what it will hold, set
+/// by the call that makes it. Its parents are made as any dir is. One that appeared meanwhile and grants others is
+/// refused.
+const STAGE: &str = step!("if (Test-Path -LiteralPath $staging) { throw ('this run''s staging dir is there already: ' + $staging) }; New-Item -ItemType Directory -Force -Path (Split-Path -Parent $staging) | Out-Null; $sec = New-Object System.Security.AccessControl.DirectorySecurity; $sec.SetAccessRuleProtection($true, $false); $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))); [void][IO.Directory]::CreateDirectory($staging, $sec); Only-Mine $staging; 'staged'");
+/// One file, from stdin, into this run's staging dir, only where nothing is, and only while that dir grants no one but
+/// this account (fix check r1 R2: the token's bytes arrive only there, owner-only from their first byte).
+const RECEIVE: &str = step!("Only-Mine $staging; $out = [IO.File]::Open((Join-Path $staging $name), 'CreateNew', 'Write'); try { [Console]::OpenStandardInput().CopyTo($out) } finally { $out.Close() }; 'received'");
 const INSTALL_STEP: &str = step!("& (Join-Path $staging 'install.ps1')");
 const CHECK_STEP: &str = step!("& (Join-Path $staging 'check.ps1')");
 /// This run's staging dir, which this run made (STAGE refuses one that is there): only what this run created goes.

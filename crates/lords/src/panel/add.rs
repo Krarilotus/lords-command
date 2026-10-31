@@ -352,13 +352,11 @@ impl Plan {
             ),
             None => format!("  = {ssh}\\config: Host {} is there", self.alias),
         });
-        if remote.app {
-            out.push(format!(
-                "  ~ {app}\\: lords-command.exe, README.md, LICENSE, each backed up first into {app}\\backup-{run}\\"
-            ));
-        } else {
-            out.push(format!("  + {app}\\: lords-command.exe, README.md, LICENSE"));
-        }
+        // Every run names the backup dir: without the exe, a README or LICENSE may still be there (fix check r1 R7).
+        out.push(format!(
+            "  {} {app}\\: lords-command.exe, README.md, LICENSE; each one there backed up first into {app}\\backup-{run}\\ (made only then)",
+            if remote.app { "~" } else { "+" }
+        ));
         out.push(format!(
             "  + {app}\\panel-token: a copy of this PC's, owner-only (replaced, never backed up: a secret keeps no copies)"
         ));
@@ -498,6 +496,11 @@ mod tests {
                 && said.contains("dropped: none"),
             "{said}"
         );
+        // Fix check r1 R7: without the exe a README or LICENSE may still be there, and is backed up before it is
+        // replaced, so the run's backup dir is named on every run.
+        let backup =
+            "X:\\fixture-home\\AppData\\Local\\Programs\\lords-command\\backup-20261031-0900-1\\";
+        assert!(said.contains(backup), "{backup} in {said}");
     }
 
     // Spec (P4: "The same command updates the exe later and keeps config.txt"): run again on a PC that has it all,

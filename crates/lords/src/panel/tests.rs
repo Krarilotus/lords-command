@@ -40,6 +40,24 @@ fn alive(pid: u32) -> bool {
     lords_core::process::running().unwrap().iter().any(|r| r.pid == pid)
 }
 
+/// `path`'s access list as icacls prints it, lower case, one `account:(rights)` per entry; an inherited entry carries
+/// `(i)`. Account names are the OS's language, so they are compared with `whoami`'s.
+fn entries(path: &Path) -> Vec<String> {
+    let out = Command::new("icacls").arg(path).output().unwrap();
+    let shown = path.to_string_lossy().to_lowercase();
+    String::from_utf8_lossy(&out.stdout)
+        .to_lowercase()
+        .lines()
+        .filter(|l| l.contains(":("))
+        .map(|l| l.trim().trim_start_matches(shown.as_str()).trim().to_string())
+        .collect()
+}
+
+fn me() -> String {
+    let out = Command::new("whoami").output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_lowercase()
+}
+
 /// A step that starts a child (`ping`, a minute long), writes its pid into `$name`, and waits a minute.
 const STUCK: &str = step!("$c = Start-Process ping -ArgumentList '-n','60','127.0.0.1' -WindowStyle Hidden -PassThru; [IO.File]::WriteAllText((Join-Path $env:LOCALAPPDATA $name), [string]$c.Id); Start-Sleep -Seconds 60");
 /// A step that ends at once, saying its watchdog's pid.
@@ -95,6 +113,32 @@ fn files_reach_the_runs_own_staging_dir_byte_for_byte_and_only_it_is_removed() {
     assert!(run(CLEAN, 30, "staging", home.path(), b"").0);
     assert!(!staged.exists());
     assert!(programs.join("beside.txt").exists(), "nothing beside it");
+}
+
+// Spec (fix check r1 R2, the Lords owner: the run's staging dir is owner-only from its creation, its protected list set
+// while it is empty, before any secret byte arrives; a destination that grants anyone but its owner is refused; the
+// token is written only inside it): the run's dir has one entry, this account's, for itself and what it holds, nothing
+// from its parent; a file received there has only that entry; a staging dir that grants others (one made as any dir
+// is, inheriting its parent's list) gets nothing written into it.
+#[test]
+fn the_runs_staging_dir_is_owner_only_from_its_creation_and_a_wider_one_gets_nothing() {
+    let home = tempfile::TempDir::new().unwrap();
+    let (ok, said, _) = run(STAGE, 30, "staging", home.path(), b"");
+    assert!(ok, "{said}");
+    let staged = home.path().join("Programs").join("lords-command").join("staging").join("run-1");
+    let me = me();
+    assert_eq!(entries(&staged), [format!("{me}:(oi)(ci)(f)")], "protected, this account only");
+    let (ok, said, _) = run(RECEIVE, 30, "panel-token", home.path(), b"0123456789abcdef");
+    assert!(ok, "{said}");
+    assert_eq!(entries(&staged.join("panel-token")), [format!("{me}:(i)(f)")]);
+
+    let wide = tempfile::TempDir::new().unwrap();
+    let dir = wide.path().join("Programs").join("lords-command").join("staging").join("run-1");
+    std::fs::create_dir_all(&dir).unwrap();
+    assert!(entries(&dir).len() > 1, "the fixture's dir grants others: {:?}", entries(&dir));
+    let (ok, said, _) = run(RECEIVE, 30, "panel-token", wide.path(), b"0123456789abcdef");
+    assert!(!ok && said.contains("grants others"), "{said}");
+    assert!(!dir.join("panel-token").exists(), "nothing written");
 }
 
 // Spec (review r1 R6: a step's arguments are data, never code): a run's id or a file's name that isn't a plain word

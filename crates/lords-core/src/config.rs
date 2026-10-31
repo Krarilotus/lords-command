@@ -32,8 +32,8 @@ pub fn expand_home(path: &str) -> PathBuf {
     }
 }
 
-/// `api` takes only a loopback address: the panel's server has no authentication of its own, so it is reached from
-/// its own PC or through an SSH forward (overseer's rule).
+/// `api` takes only a loopback address: the panel's server listens on loopback alone, so it is reached from its own PC
+/// or through an SSH forward (overseer's rule), and every request carries its token (`http::TOKEN_HEADER`).
 pub fn check_api(api: &str) -> Result<(), String> {
     crate::http::api_port(api).map(|_| ())
 }

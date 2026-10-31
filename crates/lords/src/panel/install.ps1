@@ -62,7 +62,8 @@ if ($p.config_txt -and -not (Test-Path -LiteralPath $conf)) {
     $done += "wrote $conf"
 }
 
-# The token: owner-only before it takes its place (a protected list, one entry: this account, full control).
+# The token: owner-only since its first byte (the staging dir's list), and given its own protected list (one entry:
+# this account, full control) before it takes its place, so it keeps that list beside config.txt.
 $staged = Join-Path $staging 'panel-token'
 $acl = New-Object System.Security.AccessControl.FileSecurity
 $acl.SetAccessRuleProtection($true, $false)

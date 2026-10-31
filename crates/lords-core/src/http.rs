@@ -71,10 +71,11 @@ impl Token {
         &self.0
     }
 
-    /// Whether `other` is this token, in a time that doesn't depend on where they differ.
+    /// Whether `other` is this token, by `subtle`'s constant-time comparison: its time doesn't depend on where they
+    /// differ, only on their lengths (fix check r1).
     fn is(&self, other: &str) -> bool {
-        let (a, b) = (self.0.as_bytes(), other.as_bytes());
-        a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+        use subtle::ConstantTimeEq;
+        bool::from(self.0.as_bytes().ct_eq(other.as_bytes()))
     }
 }
 /// Headers only a browser sends.
