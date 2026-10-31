@@ -330,12 +330,13 @@ fn a_hook_never_blocks() {
     assert!(a.note.is_some(), "{a:?}");
 }
 
-// Spec (sol-loop r1, S1, witness: a pre-install session resumed after its role rules changed heard only the clock): a
-// `resume` or `compact` with no record from before can't know what the agent read itself, so it leaves the session
-// unrecorded, and the next prompt is told, once, that the rules may have changed.
+// Spec (sol-loop r1, S1, witness: a pre-install session resumed after its role rules changed heard only the clock;
+// review r1, R1, witness: a fork inherits its parent's conversation, its role-file reads included, under a new
+// session id): a `resume`, `compact` or `fork` with no record from before can't know what the agent read itself, so
+// it leaves the session unrecorded, and the next prompt is told, once, that the rules may have changed.
 #[test]
 fn a_resume_without_a_record_is_still_told_once() {
-    for source in ["resume", "compact"] {
+    for source in ["resume", "compact", "fork"] {
         let p = Place::new();
         p.start("old", source);
         let lines = p.turn("old");
@@ -347,6 +348,51 @@ fn a_resume_without_a_record_is_still_told_once() {
         );
         assert_eq!(p.turn("old"), [CLOCK], "{source}");
     }
+}
+
+// Spec (review r1, R4, witness: with the record readable but not writable, a known change was dropped and only the
+// clock went out; the Lords owner: "return the known changed paths even when saving the record fails, together with
+// the persistence note, and keep the old baseline so the change is named again next time"): a change is named, with
+// a note, while the record can't be saved, and again once it can; a session with no record whose record can't be
+// made still gets its first notice. On Windows a reader that shares only reading keeps the record from being moved
+// aside; a file where the record dir would be keeps it from being made.
+#[cfg(windows)]
+#[test]
+fn a_change_is_named_even_when_the_record_cannot_be_saved() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const SHARE_READ: u32 = 1;
+    let p = Place::new();
+    p.start("s1", "startup");
+    p.lords("root/.lords/role-coder.md", "coder rules, new");
+    let record = p.home().join("guard").join("session").join("s1");
+    let held = fs::File::options().read(true).share_mode(SHARE_READ).open(&record).unwrap();
+    let ev = json!({"hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": p.cwd(), "prompt": "go"});
+    let a = turn_hook(&ev.to_string(), &p.env(), at(NOW), Some(&berlin()));
+    assert_eq!(
+        rereads(&context(&a.stdout)).unwrap(),
+        [p.named("root/.lords/role-coder.md")],
+        "{a:?}"
+    );
+    assert!(a.note.is_some(), "{a:?}");
+    drop(held);
+    assert_eq!(
+        rereads(&p.turn("s1")).unwrap(),
+        [p.named("root/.lords/role-coder.md")],
+        "named again"
+    );
+    assert_eq!(p.turn("s1"), [CLOCK]);
+    let q = Place::new();
+    q.write("home/guard/session", "not a dir");
+    let ev = json!({"hook_event_name": "UserPromptSubmit", "session_id": "old", "cwd": q.cwd(), "prompt": "go"});
+    let a = turn_hook(&ev.to_string(), &q.env(), at(NOW), Some(&berlin()));
+    let lines = context(&a.stdout);
+    assert!(
+        lines.get(1).is_some_and(
+            |l| l.starts_with("Lords rules may have changed since this session started")
+        ),
+        "{a:?}"
+    );
+    assert!(a.note.is_some(), "{a:?}");
 }
 
 // Spec (sol-loop r1, S2, witness: an unchanged recorded file that briefly couldn't be read was named as removed, then
