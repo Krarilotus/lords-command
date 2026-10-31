@@ -17,12 +17,16 @@ fi
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     echo "fleet-test: uncommitted changes aren't tested; the job tests $short" >&2
 fi
-job=$(git rev-parse --git-path "lords-fleet-test-$short.toml")
+# Each run its own job id and file (commit, seconds, this shell's pid), so two runs never share either.
+stamp="$(date +%s)-$$"
+job=$(git rev-parse --git-path "lords-fleet-test-$short-$stamp.toml")
+# The path as a TOML basic string: a quote or backslash in it can't end the string.
+top_toml=$(printf '%s' "$top" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
 # One step: each check's log and exit code go to the job's results; the job fails if any of them fails.
 # The target dir is in the job's own directory, so concurrent jobs never share one, and beside the checkout, not in
 # it: `check --public` reads every file git doesn't ignore, and a target dir inside would be 4 GB of it.
 cat > "$job" <<EOF
-id = "lords-test-$short-$(date +%s)"
+id = "lords-test-$short-$stamp"
 group = "lords"
 kind = "lords.test"
 priority = 650
@@ -36,6 +40,7 @@ cores = 4
 ram_gb = 4
 [[inputs]]
 name = "checkout"
-source = { git = '$top', rev = "$rev" }
+source = { git = "$top_toml", rev = "$rev" }
 EOF
 FLEET_OWNER=$owner "$fleet" submit "$job"
+rm -f -- "$job"

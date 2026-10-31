@@ -50,7 +50,7 @@ colours, the words in the hover; `?` has the legend).
 ## > hack
 
 ```sh
-cargo test -j 2 -p lords-core --test <one>   # locally: only the test you're changing
+cargo test -j 2 -p lords-core --test sync    # locally: only the test you're changing (here, sync)
 sh tools/fleet-test.sh                       # rustfmt, clippy -D warnings and every test, as one fleet job
 ```
 
