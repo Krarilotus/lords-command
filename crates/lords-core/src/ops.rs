@@ -223,7 +223,7 @@ pub fn retire(stacks: &Stacks, r: &Retire) -> Result<Retired, String> {
     let commit = if r.commit && is_repo(&root) {
         // Committed over the version it was made from, every file that version covers included: a skill's text is
         // covered though only its sidecar is written (review r1 R3). One the hooks refuse leaves nothing behind; one
-        // that is published, or reverted for a conflict, stays as git has it.
+        // that is published, or committed over a newer version (a conflict), stays as git has it.
         let covered: Vec<git::Covered> = files
             .iter()
             .zip(&now)
@@ -909,8 +909,8 @@ pub fn edit(
                 wrote: written.contains(&i).then_some(after[i].as_slice()),
             })
             .collect();
-        // Refused: nothing was published, so the files are put back. A conflict (reverted) or a published commit that
-        // isn't this edit: git has it as it is, and the window reloads.
+        // Refused: nothing was published, so the files are put back. A conflict (committed over a newer version) or a
+        // published commit that isn't this edit: git has it as it is, and the window reloads.
         return git::commit_entry(&stack.root, &covered, &format!("Edit {id}")).map_err(|err| {
             if !matches!(err, git::Uncommitted::Refused(_)) {
                 return err.to_string();

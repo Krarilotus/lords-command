@@ -115,10 +115,13 @@ fn covered<'a>(path: &'a str, was: &'a [u8], wrote: Option<&'a [u8]>) -> Covered
 // - when the stack repo's hooks refuse it, leaves HEAD, the index and the file as they were (Refused);
 // - when it carries another writer's bytes for a file it wrote (a write between the edit's own and git's staging), is
 //   reported for what it is, never as this edit's success;
-// - when a file the version covers, written or not, changed in the commit's parent since it was read, is reverted by a
-//   new commit and reported as a conflict, so the window reloads;
+// - when a file the version covers, written or not, changed in the commit's parent since it was read, is reported as a
+//   conflict naming the edit's commit and the newer one, and nothing further changes: no revert, history keeps both,
+//   the window reloads and the owner decides (the Lords owner, fix check r1 N1, N2);
 // - when an agent's `git commit -a` already took the file the edit wrote, so nothing is left to commit, is reported as
-//   that commit.
+//   that commit, if that one commit holds the version as the edit's own would: its parent holds every covered file as
+//   read, and it changes none the edit didn't write; otherwise the same conflict, and the agent's commit stays (fix
+//   check r1 R3, the review's sidecar and body witness).
 #[test]
 fn an_entrys_commit_holds_its_version_over_every_covered_file() {
     use lords_core::git::{commit_entry, Uncommitted};
@@ -164,37 +167,77 @@ fn an_entrys_commit_holds_its_version_over_every_covered_file() {
         matches!(&theirs, Err(Uncommitted::Published { problem, .. }) if problem.contains("another writer's bytes")),
         "{theirs:?}"
     );
-    let at = head();
+    let short = || git(&root, &["rev-parse", "--short", "HEAD"]).trim().to_string();
 
-    // The covered text changed in HEAD since the version was read: reverted by a new commit, a conflict.
+    // The covered text changed in HEAD since the version was read: a conflict naming both commits; nothing reverted.
     f.write(&format!("priv/{body}"), "body 2\n");
     git(&root, &["commit", "-q", "-am", "an agent's text"]);
-    let read_before = git(&root, &["rev-parse", "HEAD"]);
+    let newer = short();
     f.write(&format!("priv/{meta}"), "meta 4\n");
     let stale = commit_entry(
         &root,
         &[covered(meta, b"an agent's\n", Some(b"meta 4\n")), covered(body, b"body 1\n", None)],
         "Edit skill.s",
     );
-    assert!(matches!(&stale, Err(Uncommitted::Conflict(m)) if m.contains(body)), "{stale:?}");
-    let subjects = git(&root, &["log", "-2", "--format=%s"]);
-    assert!(subjects.starts_with("Revert \"Edit skill.s\"\nEdit skill.s"), "{subjects}");
-    assert_eq!(
-        git(&root, &["rev-parse", "HEAD^{tree}"]),
-        git(&root, &["rev-parse", &format!("{}^{{tree}}", read_before.trim())])
+    let mine = short();
+    assert!(
+        matches!(&stale, Err(Uncommitted::Conflict(m)) if m.contains(body) && m.contains(&mine) && m.contains(&newer)),
+        "{stale:?}"
     );
-    assert_ne!(at, head());
+    assert_eq!(
+        git(&root, &["log", "-2", "--format=%s"]),
+        "Edit skill.s\nan agent's text\n",
+        "no revert"
+    );
+    assert_eq!(git(&root, &["show", &format!("HEAD:{meta}")]), "meta 4\n");
+    assert_eq!(git(&root, &["show", &format!("HEAD:{body}")]), "body 2\n");
+    assert_eq!(git(&root, &["status", "--porcelain"]), "");
 
-    // An agent's `commit -a` already took the edit's bytes: that commit is the edit's.
+    // An agent's `commit -a` already took the edit's bytes, and nothing else the version covers: the edit's commit.
     f.write(&format!("priv/{meta}"), "meta 5\n");
     git(&root, &["commit", "-q", "-am", "an agent's commit -a"]);
-    let theirs_commit = git(&root, &["rev-parse", "--short", "HEAD"]);
+    let theirs = short();
     let taken = commit_entry(
         &root,
-        &[covered(meta, b"an agent's\n", Some(b"meta 5\n")), covered(body, b"body 2\n", None)],
+        &[covered(meta, b"meta 4\n", Some(b"meta 5\n")), covered(body, b"body 2\n", None)],
         "Edit skill.s",
     );
-    assert_eq!(taken, Ok(Some(theirs_commit.trim().to_string())));
+    assert_eq!(taken, Ok(Some(theirs)));
+}
+
+// Spec (fix check r1 R3, the review's witness; the Lords owner: check every covered file on that one identified
+// commit, never revert the agent's): the panel writes a skill's sidecar (a retirement), then an agent saves the skill's
+// text and `git commit -a`s both. That commit holds the change's bytes and a text the change never read: a conflict
+// naming it, and nothing further changes.
+#[test]
+fn an_agents_commit_that_holds_the_change_and_a_text_it_never_read_is_a_conflict() {
+    use lords_core::git::{commit_entry, Uncommitted};
+    let f = Fixture::new();
+    f.write("priv/global/skills/s/lords.yaml", "meta 1\n");
+    f.write("priv/global/skills/s/SKILL.md", "body 1\n");
+    f.git_init("priv");
+    let root = f.priv_root();
+    let (meta, body) = ("global/skills/s/lords.yaml", "global/skills/s/SKILL.md");
+    f.write(&format!("priv/{meta}"), "retired\n");
+    f.write(&format!("priv/{body}"), "the agent's\n");
+    git(&root, &["commit", "-q", "-am", "an agent's commit -a"]);
+    let (theirs, before) =
+        (git(&root, &["rev-parse", "--short", "HEAD"]), git(&root, &["rev-parse", "HEAD"]));
+    let mixed = commit_entry(
+        &root,
+        &[covered(meta, b"meta 1\n", Some(b"retired\n")), covered(body, b"body 1\n", None)],
+        "Retire skill.s",
+    );
+    assert!(
+        matches!(&mixed, Err(Uncommitted::Conflict(m)) if m.contains(body) && m.contains(theirs.trim())),
+        "{mixed:?}"
+    );
+    assert_eq!(
+        git(&root, &["rev-parse", "HEAD"]),
+        before,
+        "the agent's commit stays, nothing on top"
+    );
+    assert_eq!(git(&root, &["status", "--porcelain"]), "");
 }
 
 // Spec (sol-loop r4, S5 and S6; review r1 R1 witness A): an agent's plain commit from the repo's own index that lands

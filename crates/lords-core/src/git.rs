@@ -130,11 +130,12 @@ pub enum Uncommitted {
     /// Nothing was published: HEAD and the index are as they were (the hooks refused, git failed). The caller puts its
     /// own writes back.
     Refused(String),
-    /// Published and then reverted by a new commit, or found committed by someone else with other bytes: the entry
-    /// changed under the edit. Nothing of the caller's is left to put back; it reloads.
+    /// The entry changed under the change: it is committed over a newer version of a file its version covers (the
+    /// message names both commits; nothing is reverted, history keeps both, the owner decides), or someone else
+    /// committed the file with other bytes. Nothing of the caller's is left to put back; it reloads.
     Conflict(String),
-    /// The commit is in HEAD and isn't this change as made (it carries another writer's bytes, or a revert it needs
-    /// failed): what it says is for its owner to settle by hand.
+    /// The commit is in HEAD and isn't this change as made (it carries another writer's bytes, or git couldn't be
+    /// asked about it): what it says is for its owner to settle by hand.
     Published { commit: String, problem: String },
 }
 
@@ -160,15 +161,18 @@ pub struct Covered<'a> {
 
 /// Commits the files a change wrote, as one of an entry's versions (review r1 R1 and R3, the Lords owner's direction):
 /// - with git's own `git commit --only -- <paths>` in the repo's own index. Git holds the index lock for the whole
-///   commit, hooks included, so ordinary committers wait rather than race; it moves HEAD only from the parent it read,
-///   and updates the index for these paths before it lets go. The repo's normal hooks run unchanged.
-/// - The version must hold in that parent for every file it covers, written or not: one that differs there means the
-///   entry changed under the change, so the commit is undone by a new `git revert` commit (never a reset or rewrite)
-///   and the outcome is a conflict.
+///   commit, hooks included, so another committer meanwhile can't race it: git refuses that commit on the lock, and
+///   it can be made again after; it moves HEAD only from the parent it read, and updates the index for these paths
+///   before it lets go. The repo's normal hooks run unchanged.
+/// - The commit holds the version as read: its parent holds every file the version covers, written or not, as read,
+///   and it changes none the change didn't write. One that differs means the entry changed under the change: the
+///   outcome is a conflict naming the change's commit and the newer one, and nothing further changes (no revert: the
+///   Lords owner, fix check r1 N1, N2).
 /// - The commit must hold the bytes the change wrote; a write by someone else between the change's own and git's
 ///   staging is committed under the change's message and said, never reported as its success.
 /// - When nothing is left to commit because someone's commit (an agent's `git commit -a`) already holds exactly these
-///   bytes, that commit is the change's.
+///   bytes, the last commit to touch them is the change's, if it holds the version as above (fix check r1 R3);
+///   otherwise the same conflict, and that commit stays.
 ///
 /// `None`: the change wrote nothing.
 pub fn commit_entry(
@@ -208,6 +212,29 @@ pub fn commit_entry(
         return Ok(None);
     }
     let written: Vec<&str> = wrote.iter().map(|(p, _)| *p).collect();
+    // The first covered file `commit` doesn't hold as the version read it (its parent must hold each as read, and it
+    // must change none the change didn't write), with the commit that changed it there.
+    let newer = |commit: &str| -> Result<Option<(String, String)>, String> {
+        let parent = format!("{commit}^");
+        for ((c, path), base) in files.iter().zip(&paths).zip(&bases) {
+            let since = if at(&parent, path).as_deref() != Some(base.as_str()) {
+                parent.as_str()
+            } else if c.wrote.is_none() && at(commit, path).as_deref() != Some(base.as_str()) {
+                commit
+            } else {
+                continue;
+            };
+            let by = run(&top, &["log", "-1", "--format=%h", since, "--", path])?;
+            return Ok(Some((path.clone(), by.trim().to_string())));
+        }
+        Ok(None)
+    };
+    let conflict = |(path, by): (String, String), commit: &str| {
+        Conflict(format!(
+            "{path} changed in {by} after it was read; this change is committed as {commit}, over it: both stay in \
+             history, nothing is reverted"
+        ))
+    };
     // Nothing left to commit: the files hold what HEAD holds.
     let mut same = vec!["diff", "--quiet", "HEAD", "--"];
     same.extend(&written);
@@ -219,7 +246,12 @@ pub fn commit_entry(
         }
         let mut last = vec!["log", "-1", "--format=%h", "--"];
         last.extend(&written);
-        return Ok(Some(run(&top, &last).map_err(Refused)?.trim().to_string()));
+        let theirs = run(&top, &last).map_err(Refused)?.trim().to_string();
+        return match newer(&theirs) {
+            Ok(None) => Ok(Some(theirs)),
+            Ok(Some(changed)) => Err(conflict(changed, &theirs)),
+            Err(problem) => Err(Published { commit: theirs, problem }),
+        };
     }
     // Not quiet: git's summary line names the commit it made (sol-loop r4, S5).
     let mut commit = vec!["commit", "--only", "-m", message, "--"];
@@ -238,33 +270,9 @@ pub fn commit_entry(
         .map_err(published)?
         .trim()
         .to_string();
-    let parent = run(&top, &["rev-parse", "--verify", &format!("{made}^")])
-        .map_err(published)?
-        .trim()
-        .to_string();
-    // The version over every covered file, in the parent git committed on.
-    if let Some(path) = paths
-        .iter()
-        .zip(&bases)
-        .find(|(p, b)| at(&parent, p).as_deref() != Some(b.as_str()))
-        .map(|(p, _)| p)
-    {
-        return match run(&top, &["revert", "--no-edit", &made]) {
-            Ok(_) => {
-                let reverted = run(&top, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
-                Err(Conflict(format!(
-                    "{path} changed in HEAD after it was read; this edit, committed as {short}, is reverted as {}",
-                    reverted.trim()
-                )))
-            }
-            Err(e) => {
-                // A revert git stopped half way is taken back to where it started; the commit stays, said.
-                let _ = run(&top, &["revert", "--abort"]);
-                Err(published(format!(
-                    "it lands over a newer {path}, and reverting it failed ({e}); revert it by hand"
-                )))
-            }
-        };
+    // The version over every covered file, around the commit git made on the parent it read.
+    if let Some(changed) = newer(&made).map_err(published)? {
+        return Err(conflict(changed, &short));
     }
     if let Some((path, _)) = wrote.iter().find(|(p, b)| at(&made, p).as_deref() != Some(b.as_str()))
     {
