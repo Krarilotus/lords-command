@@ -13,5 +13,8 @@ eframe = { version = "0.31", default-features = false, features = ["accesskit", 
 lords-core = { path = "../lords-core" }
 serde_json = "1"
 
+[dev-dependencies]
+tempfile = "3"
+
 [build-dependencies]
 winresource = { version = "0.1", default-features = false }

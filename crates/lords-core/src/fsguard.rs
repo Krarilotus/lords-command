@@ -5,7 +5,8 @@
 //!
 //! The boundary, exactly (Sol review r3, R3-08; r4, R4-06), which tests/fsguard_lint.rs enforces: in the run-time
 //! sources of the library, the CLI and the GUI (`src/` of each crate), only this file reaches `std::fs` (and the
-//! platform `std::os` extensions), and only process.rs reaches `std::process`, by any spelling: no path through
+//! platform `std::os` extensions), and only process.rs reaches `std::process` (and its two platform process
+//! extensions, a child's handle and its creation flags), by any spelling: no path through
 //! them, no grouped or renamed `use` of them, no renamed `std`. Every other source reads and writes through here:
 //! the checked calls for anything sync decides on, and the plain reads below (which follow links, as std does) for
 //! the stacks, configs and files only shown or scanned. Build scripts (Cargo's `OUT_DIR`) and tests (their own temp
@@ -253,6 +254,107 @@ fn create_file_at(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    f.write_all(bytes).and_then(|()| f.sync_all()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// `n` random bytes from the OS.
+#[cfg(windows)]
+fn random(n: usize) -> Result<Vec<u8>, String> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
+    let mut buf = vec![0u8; n];
+    // SAFETY: a buffer of `n` bytes that lives across the call; no algorithm handle, as the system-preferred flag asks.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            n as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status == 0 {
+        Ok(buf)
+    } else {
+        Err(format!("no random bytes from the OS (status {status:#x})"))
+    }
+}
+
+#[cfg(not(windows))]
+fn random(n: usize) -> Result<Vec<u8>, String> {
+    let mut buf = vec![0u8; n];
+    std::io::Read::read_exact(
+        &mut fs::File::open("/dev/urandom").map_err(|e| e.to_string())?,
+        &mut buf,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(buf)
+}
+
+/// Creates a new file only its owner can open, from its first moment: its access list is set as it is made (a
+/// protected list with one entry, the file's owner), never loosened after. Refused when anything is there.
+#[cfg(windows)]
+fn create_owner_only_at(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{LocalFree, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL};
+    check(path)?;
+    let failed =
+        |what: &str| format!("{}: {what}: {}", path.display(), std::io::Error::last_os_error());
+    // A protected DACL ("P", no inherited entries) with one entry: full access for the owner ("OW").
+    let sddl: Vec<u16> = "D:P(A;;FA;;;OW)".encode_utf16().chain([0]).collect();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: NUL-terminated wide strings that live across the calls; the descriptor the first call allocates is
+    // freed once, after CreateFileW has copied it; the handle CreateFileW returns is owned by the `File` made from it.
+    unsafe {
+        let mut sd = std::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return Err(failed("no owner-only security descriptor"));
+        }
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd,
+            bInheritHandle: 0,
+        };
+        let h = CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            &sa,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        );
+        let made = if h == INVALID_HANDLE_VALUE { Err(failed("can't be made")) } else { Ok(h) };
+        LocalFree(sd);
+        let mut f = fs::File::from_raw_handle(made? as _);
+        f.write_all(bytes)
+            .and_then(|()| f.sync_all())
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+}
+
+#[cfg(not(windows))]
+fn create_owner_only_at(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    check(path)?;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
         .open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     f.write_all(bytes).and_then(|()| f.sync_all()).map_err(|e| format!("{}: {e}", path.display()))
@@ -601,14 +703,29 @@ fn move_to_at(from: &Path, to: &Path) -> Result<(), String> {
 
 /// Replaces the file at `path` (or puts it where nothing is): the old one moves aside, the new one goes in, and the
 /// old one is deleted. For files that are the tool's alone: its ledger, a backup manifest.
-fn replace_own_file_at(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn replace_own_file_at(path: &Path, was: Option<&[u8]>, bytes: &[u8]) -> Result<(), String> {
+    let changed =
+        || format!("{} changed while it was being replaced; nothing changed", path.display());
     // The new file keeps the old one's attributes (Sol review r5, R5-05: a stack edit kept them nowhere).
     let (old, like) = match kind(path)? {
+        Kind::Missing if was.is_some() => return Err(changed()),
         Kind::Missing => (None, None),
         Kind::File => {
             // Kept exactly, or refused before anything moves (rule C).
             let like = attrs(path)?.keep().map_err(|e| format!("{}: {e}", path.display()))?;
-            (Some(move_aside_at(path)?), Some(like))
+            let aside = move_aside_at(path)?;
+            // What was moved aside is what the file held at the move, which no later write can change: unless it is
+            // what the caller read, it goes back and nothing changes.
+            if let Some(was) = was {
+                let held = fs::read(&aside).map_err(|e| format!("{}: {e}", aside.display()));
+                if held.as_deref().ok() != Some(was) {
+                    return Err(match move_back_at(&aside, path) {
+                        Ok(()) => held.err().unwrap_or_else(changed),
+                        Err(back) => format!("{}; and it couldn't go back ({back})", changed()),
+                    });
+                }
+            }
+            (Some(aside), Some(like))
         }
         Kind::Dir => return Err(format!("{} is a dir", path.display())),
     };
@@ -763,6 +880,15 @@ impl Root {
     /// The tool's own dir (its ledger, backups and lock).
     pub fn home(dir: &Path) -> Result<Root, String> {
         Root::at(dir.to_path_buf())
+    }
+
+    /// An SSH bridge's dir, which `lords panel add` changes: it holds the bridge's `sshd_config`.
+    pub fn bridge(dir: &Path) -> Result<Root, String> {
+        let root = Root::at(dir.to_path_buf())?;
+        if kind(&root.path.join("sshd_config"))? != Kind::File {
+            return Err(format!("{}: no sshd_config, so no SSH bridge", dir.display()));
+        }
+        Ok(root)
     }
 
     /// A target's dir: a skills target's own, or the dir of an instructions target's shared (`via`) file.
@@ -996,6 +1122,14 @@ pub fn create_file(p: &Contained, bytes: &[u8]) -> Result<(), String> {
     create_file_at(&p.path, bytes)
 }
 
+/// Makes a new secret where nothing is: `len` random bytes from the OS, as hex, in a file only its owner can open
+/// from its first moment (the panel's token, review r1 R2). Gives the hex; refused when anything is there.
+pub fn create_secret(p: &Contained, len: usize) -> Result<String, String> {
+    let hex: String = random(len)?.iter().map(|b| format!("{b:02x}")).collect();
+    create_owner_only_at(&p.path, hex.as_bytes())?;
+    Ok(hex)
+}
+
 /// Appends one line to a file that is the tool's alone (a backup manifest).
 pub fn append_line(p: &Contained, line: &str) -> Result<(), String> {
     append_line_at(&p.path, line)
@@ -1061,7 +1195,14 @@ pub fn install_exe(
 
 /// Replaces a file that is the tool's alone, keeping its attributes or refusing.
 pub fn replace_own_file(p: &impl Place, bytes: &[u8]) -> Result<(), String> {
-    replace_own_file_at(p.place(), bytes)
+    replace_own_file_at(p.place(), None, bytes)
+}
+
+/// Replaces a file only if it holds exactly `was` at the moment it is moved aside (a compare-and-swap): a write that
+/// lands after the caller read `was` is put back untouched, and this one refused. A stack edit made from what was read
+/// never replaces a newer file.
+pub fn replace_file_if(p: &impl Place, was: &[u8], bytes: &[u8]) -> Result<(), String> {
+    replace_own_file_at(p.place(), Some(was), bytes)
 }
 
 pub fn delete_file(p: &impl Place) -> Result<(), String> {

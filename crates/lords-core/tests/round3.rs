@@ -234,6 +234,7 @@ fn r3_10_a_stack_edit_without_a_commit_needs_git_to_hold_the_old_bytes() {
         superseded_by: None,
         date: "2026-10-25".into(),
         commit: false,
+        base: None,
     };
     let result = lords_core::ops::retire(&f.stacks(), &r).map(|r| r.file);
     assert!(result.is_err(), "{result:?}");

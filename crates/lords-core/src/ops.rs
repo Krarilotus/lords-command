@@ -110,20 +110,23 @@ fn layer_parts(scope: &Scope) -> Result<Vec<fsguard::Part>, String> {
     }
 }
 
-/// Writes keys into an entry's metadata file: frontmatter for Markdown, the whole file for a sidecar.
-fn set_meta_keys(
-    root: &Path,
-    meta_file: &Path,
-    keys: &[(&str, Option<String>)],
-) -> Result<(), String> {
-    let text =
-        fsguard::read_string(meta_file).map_err(|e| format!("{}: {e}", meta_file.display()))?;
-    let new = if stack::file_name(meta_file) == SIDECAR {
-        frontmatter::set_keys(&text, keys)
+/// An entry's metadata file's text with these keys set: in the frontmatter for Markdown, in the whole file for a
+/// sidecar.
+fn with_keys(meta_file: &Path, text: &str, keys: &[(&str, Option<String>)]) -> String {
+    if stack::file_name(meta_file) == SIDECAR {
+        frontmatter::set_keys(text, keys)
     } else {
-        frontmatter::rewrite(&text, keys)
-    };
-    stack_write(root, meta_file, new.as_bytes())
+        frontmatter::rewrite(text, keys)
+    }
+}
+
+fn text_of<'a>(file: &Path, bytes: &'a [u8]) -> Result<&'a str, String> {
+    std::str::from_utf8(bytes).map_err(|e| format!("{}: {e}", file.display()))
+}
+
+/// Replaces a stack file below its stack's root, only while it holds exactly `was` (fsguard's compare-and-swap).
+fn stack_replace(root: &Path, path: &Path, was: &[u8], bytes: &[u8]) -> Result<(), String> {
+    fsguard::replace_file_if(&stack_place(root, path)?, was, bytes)
 }
 
 // ---------------------------------------------------------------- retire
@@ -134,6 +137,38 @@ pub struct Retire<'a> {
     pub superseded_by: Option<&'a str>,
     pub date: String,
     pub commit: bool,
+    /// The entry's `version` as the caller read it, if it read one: refused if its files hold anything else now.
+    pub base: Option<&'a str>,
+}
+
+/// Refuses when `base` is given and the entry's files, read just now as `now`, are no longer that version: the caller
+/// read an older one, and this change would land over the newer one.
+fn still(e: &Entry, base: Option<&str>, now: &[Vec<u8>]) -> Result<(), String> {
+    let parts: Vec<&[u8]> = now.iter().map(Vec::as_slice).collect();
+    match base {
+        Some(b) if b != crate::model::version(&parts) => Err(format!(
+            "`{}` changed since it was read (version {} now); nothing changed",
+            e.id(),
+            &crate::model::version(&parts)[..12]
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The files an entry's version covers: its metadata file, then its text file where that is another.
+fn version_files(e: &Entry) -> Vec<PathBuf> {
+    if e.meta_file == e.body_file {
+        vec![e.meta_file.clone()]
+    } else {
+        vec![e.meta_file.clone(), e.body_file.clone()]
+    }
+}
+
+fn read_all(files: &[PathBuf]) -> Result<Vec<Vec<u8>>, String> {
+    files
+        .iter()
+        .map(|f| fsguard::read_bytes(f).map_err(|e| format!("{}: {e}", f.display())))
+        .collect()
 }
 
 #[derive(Debug)]
@@ -162,24 +197,56 @@ pub fn retire(stacks: &Stacks, r: &Retire) -> Result<Retired, String> {
             return Err(format!("a public entry can't name the private `{s}` as its successor"));
         }
     }
-    let before = fsguard::read_bytes(&e.meta_file).map_err(|e| e.to_string())?;
     let keys = [
         ("status", Some("retired".to_string())),
         ("superseded_by", r.superseded_by.map(str::to_string)),
         ("retired", Some(format!("date: {}\nreason: {}", r.date, quote(r.reason)))),
     ];
-    git_keeps(&e.meta_file)?;
+    let files = version_files(e);
+    for f in &files {
+        git_keeps(f)?;
+    }
+    let now = read_all(&files)?;
+    still(e, r.base, &now)?;
+    // The new text comes from the bytes just checked, and replaces only them.
+    let before = &now[0];
+    let new = with_keys(&e.meta_file, text_of(&e.meta_file, before)?, &keys);
     let root = stacks.stack(e.stack).expect("the entry's stack is loaded").root.clone();
-    set_meta_keys(&root, &e.meta_file, &keys)?;
-    // The stack must still load the entry, now retired; otherwise put the file back.
+    stack_replace(&root, &e.meta_file, before, new.as_bytes())?;
+    // The stack must still load the entry, now retired; otherwise put the file back, if it still holds this write.
     let ok =
         Stack::load(&root).ok().and_then(|s| s.find(r.id).map(|x| !x.active())).unwrap_or(false);
     if !ok {
-        fsguard::replace_own_file(&stack_place(&root, &e.meta_file)?, &before)?;
+        stack_replace(&root, &e.meta_file, new.as_bytes(), before)?;
         return Err(format!("retiring `{}` would leave invalid metadata; nothing changed", r.id));
     }
     let commit = if r.commit && is_repo(&root) {
-        git::commit(&root, &[rel(&root, &e.meta_file)], &format!("Retire {}: {}", r.id, r.reason))?
+        // Committed over the version it was made from, every file that version covers included: a skill's text is
+        // covered though only its sidecar is written (review r1 R3). One the hooks refuse leaves nothing behind; one
+        // that is published, or committed over a newer version (a conflict), stays as git has it.
+        let covered: Vec<git::Covered> = files
+            .iter()
+            .zip(&now)
+            .enumerate()
+            .map(|(i, (f, was))| git::Covered {
+                path: rel(&root, f),
+                was,
+                wrote: (i == 0).then_some(new.as_bytes()),
+            })
+            .collect();
+        git::commit_entry(&root, &covered, &format!("Retire {}: {}", r.id, r.reason)).map_err(
+            |err| match err {
+                git::Uncommitted::Refused(_) => {
+                    match stack_replace(&root, &e.meta_file, new.as_bytes(), before) {
+                        Ok(()) => format!("{err}; nothing changed"),
+                        Err(back) => format!(
+                            "{err}; and putting it back failed: {back} (git holds the file)"
+                        ),
+                    }
+                }
+                _ => err.to_string(),
+            },
+        )?
     } else {
         None
     };
@@ -211,6 +278,7 @@ pub fn retire_expired(
                 superseded_by: None,
                 date: today.to_string(),
                 commit,
+                base: None,
             },
         )?;
         done.push((id, r.commit));
@@ -697,13 +765,16 @@ fn split_part(e: &Entry, lines: &str) -> (String, String) {
 // ---------------------------------------------------------------- edit
 
 /// What an edit changes; `None` leaves a field as it is.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Edit {
     pub title: Option<String>,
     pub audience: Option<Vec<String>>,
     pub topics: Option<Vec<String>>,
     pub roles: Option<Vec<String>>,
     pub body: Option<String>,
+    /// The entry's `version` the change was made against, if any: refused if its files hold anything else now.
+    #[serde(default)]
+    pub base: Option<String>,
 }
 
 fn yaml_list(items: &[String]) -> String {
@@ -766,26 +837,36 @@ pub fn edit(
     if let Some(r) = &change.roles {
         keys.push(("roles", (!r.is_empty()).then(|| yaml_list(r))));
     }
-    let files: Vec<PathBuf> = if e.meta_file == e.body_file {
-        vec![e.meta_file.clone()]
-    } else {
-        vec![e.meta_file.clone(), e.body_file.clone()]
-    };
+    let files = version_files(e);
     for f in &files {
         git_keeps(f)?;
     }
-    let before: Vec<Vec<u8>> = files
-        .iter()
-        .map(|f| fsguard::read_bytes(f).map_err(|e| format!("{}: {e}", f.display())))
-        .collect::<Result<_, _>>()?;
-    // Puts the files back as they were; what can't go back is said (git still holds it: R3-10).
-    let restore = || -> String {
-        let failed: Vec<String> = files
+    let before = read_all(&files)?;
+    still(e, change.base.as_deref(), &before)?;
+    // Each file's new bytes come from the bytes just checked: the keys into the metadata file, then the text into
+    // the text file (the last one: the same file for Markdown).
+    let mut after = before.clone();
+    if !keys.is_empty() {
+        after[0] = with_keys(&e.meta_file, text_of(&e.meta_file, &before[0])?, &keys).into_bytes();
+    }
+    if let Some(body) = &change.body {
+        let last = files.len() - 1;
+        let new = if last == 0 {
+            let text = text_of(&files[0], &after[0])?;
+            let parts = frontmatter::split(text);
+            let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+            format!("---{nl}{}---{nl}{body}", parts.yaml.unwrap_or(""))
+        } else {
+            body.clone()
+        };
+        after[last] = new.into_bytes();
+    }
+    // Puts back what this edit wrote, each file only while it holds that write; what can't go back is said (git
+    // still holds it: R3-10).
+    let restore = |written: &[usize]| -> String {
+        let failed: Vec<String> = written
             .iter()
-            .zip(&before)
-            .filter_map(|(f, b)| {
-                stack_place(&stack.root, f).and_then(|at| fsguard::replace_own_file(&at, b)).err()
-            })
+            .filter_map(|&i| stack_replace(&stack.root, &files[i], &after[i], &before[i]).err())
             .collect();
         if failed.is_empty() {
             String::new()
@@ -793,19 +874,13 @@ pub fn edit(
             format!("; and putting the files back failed: {} (git holds them)", failed.join("; "))
         }
     };
-    if !keys.is_empty() {
-        set_meta_keys(&stack.root, &e.meta_file, &keys)?;
-    }
-    if let Some(body) = &change.body {
-        let text = fsguard::read_string(&e.body_file).map_err(|err| err.to_string())?;
-        let new = if e.body_file == e.meta_file {
-            let parts = frontmatter::split(&text);
-            let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
-            format!("---{nl}{}---{nl}{body}", parts.yaml.unwrap_or(""))
-        } else {
-            body.clone()
-        };
-        stack_write(&stack.root, &e.body_file, new.as_bytes())?;
+    // Each file is replaced only while it holds the bytes checked above, so a write landing since is never lost.
+    let mut written = Vec::new();
+    for i in (0..files.len()).filter(|&i| after[i] != before[i]) {
+        if let Err(err) = stack_replace(&stack.root, &files[i], &before[i], &after[i]) {
+            return Err(format!("{err}{}", restore(&written)));
+        }
+        written.push(i);
     }
     // The entry must still load, with no new problem in its files; otherwise put them back.
     let reloaded = Stack::load(&stack.root);
@@ -819,14 +894,32 @@ pub fn edit(
             .map(|p| p.message.clone()),
     };
     if let Some(why) = broken {
-        let undo = restore();
+        let undo = restore(&written);
         let changed =
             if undo.is_empty() { "nothing changed" } else { "it was undone where it could be" };
         return Err(format!("that edit would break `{id}` ({why}); {changed}{undo}"));
     }
     if commit && is_repo(&stack.root) {
-        let rels: Vec<&Path> = files.iter().map(|f| rel(&stack.root, f)).collect();
-        return git::commit(&stack.root, &rels, &format!("Edit {id}"));
+        // Only what this edit wrote is committed, over the version it was made from, every file that version covers
+        // included, written or not (sol-loop r1 S2, review r1 R1, R3).
+        let covered: Vec<git::Covered> = (0..files.len())
+            .map(|i| git::Covered {
+                path: rel(&stack.root, &files[i]),
+                was: &before[i],
+                wrote: written.contains(&i).then_some(after[i].as_slice()),
+            })
+            .collect();
+        // Refused: nothing was published, so the files are put back. A conflict (committed over a newer version) or a
+        // published commit that isn't this edit: git has it as it is, and the window reloads.
+        return git::commit_entry(&stack.root, &covered, &format!("Edit {id}")).map_err(|err| {
+            if !matches!(err, git::Uncommitted::Refused(_)) {
+                return err.to_string();
+            }
+            let undo = restore(&written);
+            let changed =
+                if undo.is_empty() { "nothing changed" } else { "it was undone where it could be" };
+            format!("{err}; {changed}{undo}")
+        });
     }
     Ok(None)
 }

@@ -10,7 +10,7 @@ use lords_core::privacy::Rules;
 use lords_core::Stack;
 
 fn retire_args<'a>(id: &'a str, reason: &'a str, by: Option<&'a str>) -> Retire<'a> {
-    Retire { id, reason, superseded_by: by, date: "2026-10-25".into(), commit: true }
+    Retire { id, reason, superseded_by: by, date: "2026-10-25".into(), commit: true, base: None }
 }
 
 // Spec (Entry metadata; brief: "move an entry to retired, with superseded_by. Nothing is silently deleted"):

@@ -1,5 +1,7 @@
 //! `lords`: the Lords Command CLI. Small on purpose: the pre-commit hook runs it.
 
+mod panel;
+
 use lords_core::check;
 use lords_core::config::Config;
 use lords_core::model::Visibility;
@@ -37,6 +39,9 @@ usage:
   lords guard session   Claude's SessionStart hook: records the Lords files the session reads
   lords guard turn   Claude's UserPromptSubmit hook: the clock, and the Lords files changed since the session started
   lords guard install [--home DIR]   install or update the guard copy the hooks run (sync never writes it)
+  lords panel serve [--port N]   the window on another PC reads and edits these stacks through it (127.0.0.1:7879)
+  lords panel add ALIAS --bridge DIR [--apply]   set a PC this one reaches as ALIAS up for the panel; prints the
+    exact targets on both PCs, and with --apply carries them out (backups first, the route checked last)
 
 stacks: --public-stack DIR, --private-stack DIR, else config.txt (beside the exe, or ~/.lords-command/),
 else the public stack is <this git repo>/stack.
@@ -635,7 +640,14 @@ fn cmd_retire(mut a: Args) -> Result<bool, String> {
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
     let r = ops::retire(
         &stacks,
-        &Retire { id: &id, reason: &reason, superseded_by: superseded_by.as_deref(), date, commit },
+        &Retire {
+            id: &id,
+            reason: &reason,
+            superseded_by: superseded_by.as_deref(),
+            date,
+            commit,
+            base: None,
+        },
     )?;
     println!(
         "retired {id} in {}{}",
@@ -936,6 +948,7 @@ fn main() -> ExitCode {
         "adopt" => cmd_adopt(a),
         "set-aside" => cmd_set_aside(a),
         "sizes" => cmd_sizes(a),
+        "panel" => panel::cmd(a),
         other => Err(format!("unknown command `{other}`\n\n{USAGE}")),
     };
     match result {
