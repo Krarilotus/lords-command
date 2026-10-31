@@ -1038,7 +1038,7 @@ fn over_size(adapter: &dyn Adapter, bytes: usize) -> Option<usize> {
 fn size_note(item: &mut Item, adapter: &dyn Adapter, text: &str, composed: &Composed) {
     if let Some(limit) = adapter.byte_limit().filter(|limit| text.len() > *limit) {
         let mut largest = sections(text, &adapter.render(composed));
-        largest.sort_by(|a, b| b.1.cmp(&a.1));
+        largest.sort_by_key(|a| std::cmp::Reverse(a.1));
         let largest: Vec<String> =
             largest.iter().take(3).map(|(s, n)| format!("{s} {n}")).collect();
         item.action = Action::Conflict;

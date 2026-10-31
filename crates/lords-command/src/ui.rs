@@ -193,7 +193,7 @@ pub fn draw(
     }
     if let Some(frame) = frame {
         let points = outline(edge, radius);
-        let stroke = Stroke::new(1.0, EDGE);
+        let stroke = Stroke::new(1.0_f32, EDGE);
         if frame.dashed {
             painter.extend(Shape::dashed_line(&points, stroke, 4.0, 3.0));
         } else {
