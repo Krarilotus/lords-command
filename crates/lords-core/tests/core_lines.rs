@@ -348,8 +348,10 @@ fn a_native_child_starts_with_its_own_roles_lines_beyond_the_place_file() {
         );
         put("lead", "roles: [orchestrator]\nstart: core\ncore: The lead's line.\n", "LEAD-BODY\n");
         put("whole", "roles: [helper]\n", "HELPER-BODY\n");
-        // Sol-loop r1, S2: a skill's line for the child's role only, which the place's file leaves to its hook.
+        // Sol-loop r1, S2: a skill's line for the child's role only, which the place's file leaves to its hook; r2, T1:
+        // and a rule extending that skill, which the skills index doesn't carry.
         skill(&f, "tool", "roles: [helper]\nstart: core\ncore: The helper's skill line.\n");
+        put("extra", "roles: [helper]\nextends: [skill.tool]\n", "EXTRA-BODY\n");
         let p = plan(&f.stacks(), &f.opts()).unwrap();
         let file = planned_in(&p, &checkout.join(".lords"), "child.md");
         let Some(role) = child_role else {
@@ -363,6 +365,7 @@ fn a_native_child_starts_with_its_own_roles_lines_beyond_the_place_file() {
             "HELPER-BODY",
             "role-helper.md",
             "- tool: The helper's skill line.",
+            "EXTRA-BODY",
             &opener(&f),
         ] {
             assert!(file.contains(want), "{want} in:\n{file}");

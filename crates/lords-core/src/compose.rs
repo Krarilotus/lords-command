@@ -625,17 +625,19 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             .collect(),
         ..Composed::default()
     };
-    // Whether an entry shows in its section: by its whole text, or by a line (an index entry shows in the index). A
-    // template shows only once it has a class.
+    // Whether an entry shows in its section (`SECTIONS`): by its whole text, or by a line (an index entry shows in the
+    // index; skills and notes in their own indexes). A template shows only once it has a class.
     let in_section = |e: &Entry| {
-        if by_parts(e) {
+        if !SECTIONS.iter().any(|(k, _)| *k == e.meta.kind) {
+            false
+        } else if by_parts(e) {
             has_line(e)
         } else {
             e.meta.kind != Kind::Template
         }
     };
     // An extension follows its parent where the parent shows in its section; otherwise it stands in its own place
-    // (sol-loop r1, S1: one whose parent is only in the index was dropped).
+    // (sol-loop r1, S1: one whose parent is only in the index was dropped; r2, T1: one whose parent is a skill).
     let ids: BTreeSet<&str> = live.iter().filter(|e| in_section(e)).map(|e| e.id()).collect();
     fn extension_of<'e>(e: &'e Entry, ids: &BTreeSet<&str>) -> Option<&'e str> {
         e.meta.extends.first().map(String::as_str).filter(|t| ids.contains(t))
