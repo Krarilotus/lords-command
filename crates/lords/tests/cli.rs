@@ -1630,3 +1630,151 @@ fn sync_registers_the_queue_guard_as_a_stop_hook() {
         serde_json::json!([{"matcher": "Bash", "hooks": [lords("rm")]}])
     );
 }
+
+/// `lords guard <args>` with this event on stdin, Claude's config dir set to the test's own (never the real one the
+/// session running these tests may carry).
+fn rules_guard(env: &Env, args: &[&str], event: &str) -> Output {
+    use std::io::Write;
+    let mut c = env
+        .cmd(env!("CARGO_BIN_EXE_lords"), env.dir.path())
+        .args(args)
+        .env("CLAUDE_CONFIG_DIR", env.dir.path().join("home/.claude"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(event.as_bytes()).unwrap();
+    c.wait_with_output().unwrap()
+}
+
+// Spec (the brief: "`lords guard session`, a `SessionStart` hook … `lords guard turn`, a `UserPromptSubmit` hook. It
+// adds `additionalContext` of one short line, `Berlin 07:41 Sat 31 Oct`, from the system clock"; the guards' common
+// rule: never fail a harness's event): through the binary, `session` answers nothing and `turn` answers context whose
+// one line is a clock line (a zone or UTC label, `HH:MM`, weekday, day, month), both exit 0; a usage error or
+// unreadable input is exit 0, nothing on stdout and a note naming the guard.
+#[test]
+fn the_session_and_turn_guards_answer_through_the_binary() {
+    let env = Env::new();
+    let cwd = env.dir.path().join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    let ev = |name: &str| {
+        serde_json::json!({"hook_event_name": name, "session_id": "s1", "source": "startup", "cwd": cwd, "prompt": "go"})
+            .to_string()
+    };
+    let o = rules_guard(&env, &["guard", "session"], &ev("SessionStart"));
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    assert!(o.stdout.is_empty(), "{}", text(&o));
+    let o = rules_guard(&env, &["guard", "turn"], &ev("UserPromptSubmit"));
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(v.get("decision").is_none(), "{v}");
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit");
+    let line = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(!line.contains('\n'), "one line: {line}");
+    let words: Vec<&str> = line.trim_end_matches(" (local zone unknown)").split(' ').collect();
+    let n = words.len();
+    assert!(n >= 5, "{line}");
+    let hhmm = words[n - 4].as_bytes();
+    let clock =
+        hhmm.len() == 5 && hhmm[2] == b':' && words[n - 4].replace(':', "").parse::<u32>().is_ok();
+    let days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let months =
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    assert!(clock && days.contains(&words[n - 3]), "{line}");
+    assert!(words[n - 2].parse::<u8>().is_ok_and(|d| (1..=31).contains(&d)), "{line}");
+    assert!(months.contains(&words[n - 1]), "{line}");
+    for (args, input) in [
+        (&["guard", "turn", "extra"][..], ev("UserPromptSubmit")),
+        (&["guard", "session", "extra"], ev("SessionStart")),
+        (&["guard", "turn"], "not json".to_string()),
+    ] {
+        let o = rules_guard(&env, args, &input);
+        assert_eq!(o.status.code(), Some(0), "{args:?}: {}", text(&o));
+        assert!(o.stdout.is_empty(), "{args:?}: {}", text(&o));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(err.contains(&format!("guard {}", args[1])), "{args:?}: {err}");
+    }
+}
+
+// Spec (the brief: "in `guards`, `session` maps to SessionStart and `turn` to UserPromptSubmit, as you did for `queue`
+// (never SubagentStart)"): with `guards = ["session", "turn"]` and the copy installed, sync names the copy in a
+// `SessionStart` entry (`guard session`) and a `UserPromptSubmit` entry (`guard turn`), neither with a matcher, after
+// the user's own hooks of those events; writes no `SubagentStart`; the plan says what it adds; `lords check` accepts
+// the target; taking `turn` out takes out only Lords' `UserPromptSubmit` hook.
+#[test]
+fn sync_registers_the_session_and_turn_guards() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (public, private) = (d.join("pub"), d.join("priv"));
+    fs::create_dir_all(&public).unwrap();
+    fs::create_dir_all(&private).unwrap();
+    fs::create_dir_all(d.join("home/.claude-balanced")).unwrap();
+    let theirs = r#"{"hooks": [{"type": "command", "command": "notify"}]}"#;
+    fs::write(
+        d.join("home/.claude-balanced/settings.json"),
+        format!("{{\n  \"hooks\": {{\"SessionStart\": [{theirs}], \"UserPromptSubmit\": [{theirs}]}}\n}}\n"),
+    )
+    .unwrap();
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    let manifest = |guards: &str| {
+        format!("name = \"priv\"\nvisibility = \"private\"\n[[targets]]\nname = \"balanced settings\"\nadapter = \"claude\"\nkind = \"settings\"\npath = \"~/.claude-balanced/settings.json\"\nguards = {guards}\n")
+    };
+    fs::write(private.join("stack.toml"), manifest(r#"["session", "turn"]"#)).unwrap();
+    assert!(env.git(&private, &["init", "-q"]).status.success());
+    env.git(&private, &["add", "-A"]);
+    env.git(&private, &["commit", "-q", "-m", "start"]);
+    let stacks =
+        ["--public-stack", public.to_str().unwrap(), "--private-stack", private.to_str().unwrap()];
+    let sync = |apply: bool| {
+        let mut args = vec!["sync", "--user"];
+        if apply {
+            args.push("--apply");
+        }
+        env.lords(d, &[&args[..], &stacks].concat())
+    };
+    let settings = || -> serde_json::Value {
+        serde_json::from_str(
+            &fs::read_to_string(d.join("home/.claude-balanced/settings.json")).unwrap(),
+        )
+        .unwrap()
+    };
+    let o = env.lords(d, &["guard", "install"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let copy = d.join("home/.lords-command/bin/lords-guard.exe");
+    let named = copy.display().to_string().replace('\\', "/");
+    let lords =
+        |g: &str| serde_json::json!({"type": "command", "command": named, "args": ["guard", g]});
+    let o = sync(false);
+    for added in [
+        "Lords hook added: the session guard (SessionStart)",
+        "Lords hook added: the turn guard (UserPromptSubmit)",
+    ] {
+        assert!(text(&o).contains(added), "{}", text(&o));
+    }
+    let o = sync(true);
+    assert!(o.status.success(), "{}", text(&o));
+    let v = settings();
+    let theirs: serde_json::Value = serde_json::from_str(theirs).unwrap();
+    assert_eq!(
+        v["hooks"]["SessionStart"],
+        serde_json::json!([theirs, {"hooks": [lords("session")]}])
+    );
+    assert_eq!(
+        v["hooks"]["UserPromptSubmit"],
+        serde_json::json!([theirs, {"hooks": [lords("turn")]}])
+    );
+    assert!(v["hooks"].get("SubagentStart").is_none(), "{v}");
+    let out = text(&env.lords(d, &[&["check"][..], &stacks].concat()));
+    assert!(!out.contains("settings.json") && !out.contains("guards"), "{out}");
+    fs::write(private.join("stack.toml"), manifest(r#"["session"]"#)).unwrap();
+    env.git(&private, &["commit", "-q", "-a", "-m", "no turn guard"]);
+    let o = sync(true);
+    assert!(o.status.success(), "{}", text(&o));
+    let v = settings();
+    assert_eq!(v["hooks"]["UserPromptSubmit"], serde_json::json!([theirs]));
+    assert_eq!(
+        v["hooks"]["SessionStart"],
+        serde_json::json!([theirs, {"hooks": [lords("session")]}])
+    );
+}
