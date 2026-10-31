@@ -80,11 +80,14 @@ fn the_cli_answer_gives_the_latest_and_the_active_run() {
     }
 }
 
-// Spec (Lords owner, 31 Oct, accepting design D1 with rules (a) and (b); the attack list A1): with `latest != active`
-// something may wait when (a) no list of this thread's queue came at or after the latest run's first appearance in
-// the transcript, or (b) an id the session's latest listing showed has no `cancel` or `promote_to_steer` naming it
-// after it was shown, or that listing stopped at its `limit`. With `latest == active` no later run exists, so
-// nothing waits (E1.1). The calls of another thread's queue are not this thread's.
+// Spec (Lords owner, 31 Oct, accepting design D1 with rules (a) and (b), and after review r1: "Only a single complete
+// listing counts: a `list` with no cursor (or cursor 0) whose result has `nextCursor: null`. A listing with a cursor
+// or a non-null `nextCursor` never certifies; it's as if no listing happened"; the attack list A1): with `latest !=
+// active` something may wait when (a) no complete listing of this thread's queue came at or after the latest run's
+// first appearance in the transcript, or (b) an id the latest complete listing showed has no `cancel` or
+// `promote_to_steer` naming it after it was shown. With `latest == active` no later run exists, so nothing is held
+// (E1.1; review r1 R3 is the limit of that, design note D2). The calls of another thread's queue are not this
+// thread's.
 #[test]
 fn something_may_wait_unless_the_session_took_everything_it_was_shown() {
     let fresh = || json!({"action": "list"});
@@ -137,7 +140,7 @@ fn something_may_wait_unless_the_session_took_everything_it_was_shown() {
             true,
         ),
         (
-            "every page listed and every item taken",
+            "listed in two pages, every item taken: no page is a complete listing (held, at most to the cap)",
             runs("r3", "r1"),
             [
                 &list("l1", json!({"action": "list", "limit": 1}), &["r2"], true)[..],
@@ -145,7 +148,52 @@ fn something_may_wait_unless_the_session_took_everything_it_was_shown() {
                 &[take("c1", "cancel", "r2"), take("p1", "promote_to_steer", "r3")],
             ]
             .concat(),
+            true,
+        ),
+        (
+            "one complete listing with an explicit first cursor and a limit, every item taken",
+            runs("r3", "r1"),
+            [
+                &list("l1", json!({"action": "list", "cursor": 0, "limit": 100}), &["r2", "r3"], false)[..],
+                &[take("c1", "cancel", "r2"), take("p1", "promote_to_steer", "r3")],
+            ]
+            .concat(),
             false,
+        ),
+        // Review r1, R1 (witnesses): a last page certified a listing whose beginning was never read.
+        (
+            "only a later page listed, its item taken",
+            runs("r4", "r1"),
+            [
+                &list("l1", json!({"action": "list", "cursor": 2, "limit": 1}), &["r4"], false)[..],
+                &[take("c1", "cancel", "r4")],
+            ]
+            .concat(),
+            true,
+        ),
+        (
+            "a first page and a page past a skipped one, both items taken",
+            runs("r4", "r1"),
+            [
+                &list("l1", json!({"action": "list", "limit": 1}), &["r2"], true)[..],
+                &list("l2", json!({"action": "list", "cursor": 2, "limit": 1}), &["r4"], false),
+                &[take("c1", "cancel", "r2"), take("c2", "cancel", "r4")],
+            ]
+            .concat(),
+            true,
+        ),
+        // Review r1, R2 (witness): a reorder between two pages moved r4 before the second page's offset.
+        (
+            "a reorder between two pages, every shown item taken",
+            runs("r4", "r1"),
+            [
+                &list("l1", json!({"action": "list", "limit": 1}), &["r2"], true)[..],
+                &[call("o1", json!({"action": "reorder", "queuedRunId": "r4", "beforeRunId": "r2"}))],
+                &list("l2", json!({"action": "list", "cursor": 1, "limit": 2}), &["r2", "r3"], false),
+                &[take("c1", "cancel", "r2"), take("c2", "cancel", "r3")],
+            ]
+            .concat(),
+            true,
         ),
         // Sol-loop r1, S1 (witness): T3 pages the current queue by offset (handlers.ts, `runs.slice(cursor, end)`),
         // so a take between two pages of one listing shifts what the next page shows: r3 is never shown.
@@ -162,7 +210,7 @@ fn something_may_wait_unless_the_session_took_everything_it_was_shown() {
             true,
         ),
         (
-            "a take between two pages, then a fresh listing from the first page, all taken",
+            "a take between two pages, then one complete listing, all taken",
             runs("r4", "r1"),
             [
                 &list("l1", json!({"action": "list", "limit": 1}), &["r2"], true)[..],
@@ -276,12 +324,13 @@ fn only_the_sessions_own_entries_count() {
 }
 
 // Spec (brief, 30 Oct: "its reason tells the agent what to do, in the rule's words"; Lords owner, 31 Oct: "item(s)
-// may be queued… If the list is empty, nothing waits: end the turn"): the reason names the rule's steps.
+// may be queued… If the list is empty, nothing waits: end the turn", and after review r1: "The hold's reason gains
+// 'list it in one call'"): the reason names the rule's steps.
 #[test]
 fn the_reason_is_the_rules_steps() {
     for words in [
         "item(s) may be queued for this thread",
-        "list them",
+        "list it in one call",
         "read the truncated ones in full",
         "cancel the text-only ones",
         "promote those with an attachment",
