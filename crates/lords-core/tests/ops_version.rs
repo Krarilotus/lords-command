@@ -136,6 +136,28 @@ fn a_commit_holds_exactly_what_the_edit_wrote() {
     assert_eq!(left, Vec::<String>::new());
 }
 
+// Spec (sol-loop r4, S5 and S6): an agent's commit that lands on top of the edit's own before the edit has looked
+// (here from the repo's post-commit hook, which runs after git published the edit and before it returns) is never taken
+// for the edit's commit: it stays in HEAD, the edit's commit stays under it, and the edit reports itself committed.
+#[test]
+fn an_agents_commit_on_top_of_the_edits_stays() {
+    let f = Fixture::new();
+    f.write("priv/global/rules/a.md", &entry("rule.a", "global", "private", "", "Read.\n"));
+    f.git_init("priv");
+    let root = f.priv_root();
+    f.write(
+        "priv/.git/hooks/post-commit",
+        "#!/bin/sh\nunset GIT_INDEX_FILE\nmark=\"$(git rev-parse --git-dir)/agent-done\"\n[ -f \"$mark\" ] && exit 0\n: > \"$mark\"\ngit commit -q --allow-empty -m \"an agent's commit\"\n",
+    );
+    let base = f.stacks().find("rule.a").unwrap().version.clone();
+    let change = Edit { body: Some("Mine.\n".into()), base: Some(base), ..Default::default() };
+    let made = edit(&f.stacks(), "rule.a", &change, true);
+    assert!(matches!(&made, Ok(Some(_))), "{made:?}");
+    let log = git(&root, &["log", "-3", "--format=%s"]);
+    assert_eq!(log, "an agent's commit\nEdit rule.a\nfixture\n");
+    assert!(f.read("priv/global/rules/a.md").ends_with("---\nMine.\n"), "the edit stays");
+}
+
 // Spec (the owner's private stack repo has `core.autocrlf=true` and no eol attributes, so its files are CRLF on disk
 // and LF in HEAD): an edit made from the file's bytes on disk commits over HEAD's version of it, stored as `git add`
 // would store it (LF).

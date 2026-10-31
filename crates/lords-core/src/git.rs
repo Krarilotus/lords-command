@@ -217,9 +217,7 @@ pub fn commit_exact(
                 let now = run(&top, &["rev-parse", "--verify", &format!("{head}:{path}")])
                     .map_err(Refused)?;
                 if now.trim() != base {
-                    return Err(Refused(format!(
-                        "{path} was committed meanwhile by someone else; nothing changed"
-                    )));
+                    return Err(Refused(format!("{path} was committed meanwhile by someone else")));
                 }
             }
             run_env(&top, &["read-tree", &head], &env).map_err(Refused)?;
@@ -236,39 +234,44 @@ pub fn commit_exact(
             if same.status.success() {
                 return Ok(None);
             }
-            run_env(&top, &["commit", "-q", "-m", message], &env).map_err(Refused)?;
-            // From here the commit is published: what fails says so, and the caller's writes stay. The repo's index
-            // takes the commit's entries first, so its stale ones are there for one git call only (a commit made from
-            // it in that moment would undo this one: design note D7.5).
+            // Not quiet: git's summary line names the commit it made, which HEAD may no longer be by the time it is read
+            // (sol-loop r4, S5: an agent's commit on top of it).
+            let said = run_env(&top, &["commit", "-m", message], &env).map_err(Refused)?;
+            // From here the commit is published: what fails says so, and the caller's writes stay (S6). The repo's
+            // index takes the commit's entries first, so its stale ones are there for one git call only (a commit made
+            // from it in that moment would undo this one: design note D7.5).
             let published = |problem: String, commit: &str| Uncommitted::Published {
                 commit: commit.to_string(),
                 problem,
             };
+            let short = said
+                .lines()
+                .find_map(|l| l.strip_prefix('[')?.split(']').next()?.split_whitespace().last())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    published(format!("git named no commit: {}", said.trim()), "HEAD")
+                })?;
             let mut reset = vec!["reset", "-q", "--"];
             reset.extend(paths.iter().map(String::as_str));
             run(&top, &reset)
-                .map_err(|e| published(format!("the index wasn't updated for it: {e}"), "HEAD"))?;
-            let made = run(&top, &["rev-parse", "--verify", "HEAD"])
-                .map_err(|e| published(e, "HEAD"))?
+                .map_err(|e| published(format!("the index wasn't updated for it: {e}"), &short))?;
+            let made = run(&top, &["rev-parse", "--verify", &format!("{short}^{{commit}}")])
+                .map_err(|e| published(e, &short))?
                 .trim()
                 .to_string();
             let parent = run(&top, &["rev-parse", "--verify", &format!("{made}^")])
-                .map_err(|e| published(e, &made))?;
+                .map_err(|e| published(e, &short))?;
             if parent.trim() != head {
-                // HEAD moved before git read it: this commit undoes what that HEAD added. Off again while HEAD is it,
-                // and the index back to that HEAD's entries.
+                // HEAD moved before git read it, so this commit undoes what came between: off again while HEAD is
+                // still it (and only it), the index back to that HEAD's entries. Past it, it stays, said.
                 run(&top, &["update-ref", "-m", "lords: built on another HEAD; taken back", "HEAD", parent.trim(), &made])
-                    .map_err(|e| published(format!("it was built on {head} and HEAD moved past it again ({e}); check by hand"), &made))?;
+                    .map_err(|e| published(format!("it was built on {head} but committed on {}, so it undoes what that added, and HEAD has moved past it ({e}); check by hand", parent.trim()), &short))?;
                 run(&top, &reset).map_err(Refused)?;
                 continue;
             }
-            let short = run(&top, &["rev-parse", "--short", &made])
-                .map_err(|e| published(e, &made))?
-                .trim()
-                .to_string();
             return Ok(Some(short));
         }
-        Err(Refused(format!("HEAD moved {TRIES} times while committing; nothing changed")))
+        Err(Refused(format!("HEAD moved {TRIES} times while committing")))
     })();
     let removed = crate::fsguard::delete_file(&index);
     match (made, removed) {
