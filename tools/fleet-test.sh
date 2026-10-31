@@ -24,7 +24,8 @@ job=$(git rev-parse --git-path "lords-fleet-test-$short-$stamp.toml")
 top_toml=$(printf '%s' "$top" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
 # One step: each check's log and exit code go to the job's results; the job fails if any of them fails.
 # The target dir is in the job's own directory, so concurrent jobs never share one, and beside the checkout, not in
-# it: `check --public` reads every file git doesn't ignore, and a target dir inside would be 4 GB of it.
+# it: `check --public` reads every file git doesn't ignore, and a target dir inside would be 4 GB of it. The job also
+# has its own temp root there, fully resolved, so a host whose %TEMP% is an 8.3 short name doesn't change test paths.
 cat > "$job" <<EOF
 id = "lords-test-$short-$stamp"
 group = "lords"
@@ -32,7 +33,7 @@ kind = "lords.test"
 priority = 650
 priority_reason = "Lords Command's full check of $short: rustfmt, clippy -D warnings, workspace tests"
 est_min = 10
-steps = [["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", '''\$env:CARGO_TARGET_DIR = "\$PWD\\..\\target-job"; \$env:CARGO_BUILD_JOBS = '4'; \$env:RUST_TEST_THREADS = '4'; \$ErrorActionPreference = 'Continue'; \$cargo = "\$env:USERPROFILE\\.cargo\\bin\\cargo.exe"; @((git rev-parse HEAD), (git status --porcelain | Measure-Object).Count, (& \$cargo --version), (& "\$env:USERPROFILE\\.cargo\\bin\\rustc.exe" -vV | Select-Object -First 1), \$env:COMPUTERNAME) | Set-Content -Path "\$env:FLEET_OUT\\toolchain.txt"; & \$cargo fmt --all --check 2>&1 | ForEach-Object { "\$_" } | Out-File -Encoding utf8 -FilePath "\$env:FLEET_OUT\\fmt.log"; \$f = \$LASTEXITCODE; & \$cargo clippy --locked --workspace --all-targets -- -D warnings 2>&1 | ForEach-Object { "\$_" } | Out-File -Encoding utf8 -FilePath "\$env:FLEET_OUT\\clippy.log"; \$c = \$LASTEXITCODE; & \$cargo test --locked --workspace --no-fail-fast 2>&1 | ForEach-Object { "\$_" } | Out-File -Encoding utf8 -FilePath "\$env:FLEET_OUT\\test.log"; \$t = \$LASTEXITCODE; Set-Content -Path "\$env:FLEET_OUT\\codes.txt" -Value ("fmt " + \$f + "; clippy " + \$c + "; test " + \$t); if (\$f -ne 0 -or \$c -ne 0 -or \$t -ne 0) { exit 1 }; exit 0''']]
+steps = [["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", '''\$env:CARGO_TARGET_DIR = "\$PWD\\..\\target-job"; \$env:TEMP = (New-Item -ItemType Directory -Force -Path "\$PWD\\..\\tmp-job").FullName; \$env:TMP = \$env:TEMP; \$env:CARGO_BUILD_JOBS = '4'; \$env:RUST_TEST_THREADS = '4'; \$ErrorActionPreference = 'Continue'; \$cargo = "\$env:USERPROFILE\\.cargo\\bin\\cargo.exe"; @((git rev-parse HEAD), (git status --porcelain | Measure-Object).Count, (& \$cargo --version), (& "\$env:USERPROFILE\\.cargo\\bin\\rustc.exe" -vV | Select-Object -First 1), \$env:COMPUTERNAME) | Set-Content -Path "\$env:FLEET_OUT\\toolchain.txt"; & \$cargo fmt --all --check 2>&1 | ForEach-Object { "\$_" } | Out-File -Encoding utf8 -FilePath "\$env:FLEET_OUT\\fmt.log"; \$f = \$LASTEXITCODE; & \$cargo clippy --locked --workspace --all-targets -- -D warnings 2>&1 | ForEach-Object { "\$_" } | Out-File -Encoding utf8 -FilePath "\$env:FLEET_OUT\\clippy.log"; \$c = \$LASTEXITCODE; & \$cargo test --locked --workspace --no-fail-fast 2>&1 | ForEach-Object { "\$_" } | Out-File -Encoding utf8 -FilePath "\$env:FLEET_OUT\\test.log"; \$t = \$LASTEXITCODE; Set-Content -Path "\$env:FLEET_OUT\\codes.txt" -Value ("fmt " + \$f + "; clippy " + \$c + "; test " + \$t); if (\$f -ne 0 -or \$c -ne 0 -or \$t -ne 0) { exit 1 }; exit 0''']]
 [requires]
 os = "windows"
 has = ["rust"]
