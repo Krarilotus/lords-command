@@ -563,12 +563,14 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
     let partial_role = |e: &Entry| partial(&e.meta.roles);
     // An entry with a class goes by its parts (its lines, its index entry); any other by its whole text, as before.
     let by_parts = |e: &Entry| crate::core_lines::classified(e) && e.meta.kind != Kind::Intent;
-    // A native child's file leaves out what the place's file carries for every role: intent, skills and memory, and
-    // whatever is for every development role (an entry with a class keeps its other parts, below).
+    // A native child's file leaves out what the place's file carries for every role: intent, memory, skills without a
+    // class (each is listed there), and whatever is for every development role (an entry with a class keeps its other
+    // parts, below; sol-loop r1, S2: a skill's line for the child's role alone).
     let every_development = |roles: &[String]| development.iter().all(|r| roles.contains(r));
     let live: Vec<&Entry> = if ctx.child {
         live.into_iter()
-            .filter(|e| !matches!(e.meta.kind, Kind::Intent | Kind::Skill | Kind::Memory))
+            .filter(|e| !matches!(e.meta.kind, Kind::Intent | Kind::Memory))
+            .filter(|e| e.meta.kind != Kind::Skill || by_parts(e))
             .filter(|e| {
                 by_parts(e) || !(e.meta.roles.is_empty() || every_development(&e.meta.roles))
             })
@@ -623,7 +625,18 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             .collect(),
         ..Composed::default()
     };
-    let ids: BTreeSet<&str> = live.iter().map(|e| e.id()).collect();
+    // Whether an entry shows in its section: by its whole text, or by a line (an index entry shows in the index). A
+    // template shows only once it has a class.
+    let in_section = |e: &Entry| {
+        if by_parts(e) {
+            has_line(e)
+        } else {
+            e.meta.kind != Kind::Template
+        }
+    };
+    // An extension follows its parent where the parent shows in its section; otherwise it stands in its own place
+    // (sol-loop r1, S1: one whose parent is only in the index was dropped).
+    let ids: BTreeSet<&str> = live.iter().filter(|e| in_section(e)).map(|e| e.id()).collect();
     fn extension_of<'e>(e: &'e Entry, ids: &BTreeSet<&str>) -> Option<&'e str> {
         e.meta.extends.first().map(String::as_str).filter(|t| ids.contains(t))
     }
@@ -707,15 +720,6 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             b.meta.order.unwrap_or(0),
             b.id(),
         ))
-    };
-    // Whether an entry shows in its section: by its whole text, or by a line (an index entry shows in the index). A
-    // template shows only once it has a class.
-    let in_section = |e: &Entry| {
-        if by_parts(e) {
-            has_line(e)
-        } else {
-            e.meta.kind != Kind::Template
-        }
     };
     for (kind, heading) in SECTIONS {
         let mut section: Vec<&Entry> = live
@@ -809,6 +813,8 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             e.meta.kind == Kind::Skill
                 && (matches!(e.meta.origin, crate::model::Origin::InRepo { .. }) || !user_level(e))
         })
+        // A child's file lists only the skills with a line for it (the place's file lists them all).
+        .filter(|e| !ctx.child || has_line(e))
         .collect();
     if !here.is_empty() {
         if !lines.is_empty() {
@@ -816,9 +822,10 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         }
         lines.push("# Skills here".into());
         lines.push(String::new());
-        // A skill with a line for this file's readers shows it in place of its hook.
-        let mut items = index_items(&here);
-        for (e, text, name) in items.iter_mut() {
+        // A skill with lines for this file's readers shows them in place of its hook, one bullet each with its own
+        // label (sol-loop r1, S3).
+        let mut items = Vec::new();
+        for (e, text, name) in index_items(&here) {
             let shown: Vec<String> = shown_parts
                 .get(e.id())
                 .into_iter()
@@ -826,21 +833,15 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
                 .filter(|p| p.line.is_some())
                 .map(|p| part_line(p, ctx, stacks, &development))
                 .collect();
-            if let (false, Some(name)) = (shown.is_empty(), name.as_deref()) {
-                // `part_line` gives `- <id><label>: <line>`; the index names a skill by its name.
-                let rest: Vec<&str> = shown
-                    .iter()
-                    .enumerate()
-                    .map(|(i, l)| {
-                        let l = l.trim_start_matches("- ").trim_start_matches(e.id());
-                        if i == 0 {
-                            l
-                        } else {
-                            l.split_once(": ").map_or(l, |(_, t)| t)
-                        }
-                    })
-                    .collect();
-                *text = format!("{name}{}", rest.join(" "));
+            match name.as_deref() {
+                Some(n) if !shown.is_empty() => {
+                    // `part_line` gives `- <id><label>: <line>`; the index names a skill by its name.
+                    for l in &shown {
+                        let rest = l.trim_start_matches("- ").trim_start_matches(e.id());
+                        items.push((e, format!("{n}{rest}"), name.clone()));
+                    }
+                }
+                _ => items.push((e, text, name)),
             }
         }
         push_index(&items, ctx, &mut lines, &mut out);

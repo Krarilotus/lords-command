@@ -348,6 +348,8 @@ fn a_native_child_starts_with_its_own_roles_lines_beyond_the_place_file() {
         );
         put("lead", "roles: [orchestrator]\nstart: core\ncore: The lead's line.\n", "LEAD-BODY\n");
         put("whole", "roles: [helper]\n", "HELPER-BODY\n");
+        // Sol-loop r1, S2: a skill's line for the child's role only, which the place's file leaves to its hook.
+        skill(&f, "tool", "roles: [helper]\nstart: core\ncore: The helper's skill line.\n");
         let p = plan(&f.stacks(), &f.opts()).unwrap();
         let file = planned_in(&p, &checkout.join(".lords"), "child.md");
         let Some(role) = child_role else {
@@ -360,6 +362,7 @@ fn a_native_child_starts_with_its_own_roles_lines_beyond_the_place_file() {
             "- rule.help: The helpers' line.",
             "HELPER-BODY",
             "role-helper.md",
+            "- tool: The helper's skill line.",
             &opener(&f),
         ] {
             assert!(file.contains(want), "{want} in:\n{file}");
@@ -371,6 +374,59 @@ fn a_native_child_starts_with_its_own_roles_lines_beyond_the_place_file() {
         }
         let place_file = proposed(&p, &checkout.join("CLAUDE.local.md"));
         assert!(place_file.contains("- rule.all: Every role's line."), "{place_file}");
+    }
+}
+
+/// A skill `skill.<name>` in project `beta`, with `yaml` added to its metadata.
+fn skill(f: &Fixture, name: &str, yaml: &str) {
+    f.write(
+        &format!("priv/project/beta/skills/{name}/lords.yaml"),
+        &format!(
+            "id: skill.{name}\nkind: skill\ntitle: The {name}\naudience: [all]\nscope: project:beta\nstatus: active\nvisibility: private\norigin:\n  type: own\n{yaml}"
+        ),
+    );
+    f.write(
+        &format!("priv/project/beta/skills/{name}/SKILL.md"),
+        &format!("---\nname: {name}\ndescription: The {name}'s own description.\n---\nUse it.\n"),
+    );
+}
+
+// Spec (the invariant: "nothing that binds it is dropped"; sol-loop r1, S1, its witness): an entry that extends one
+// shown only in the index still shows, by its line or its whole text, where it would have followed its parent.
+#[test]
+fn an_extension_shows_when_its_parent_is_only_in_the_index() {
+    let (f, checkout) = place("orchestrator");
+    let put = |slug: &str, yaml: &str, body: &str| {
+        f.write(
+            &format!("priv/project/beta/rules/{slug}.md"),
+            &entry(&format!("rule.{slug}"), "project:beta", "private", yaml, body),
+        );
+    };
+    put("base", "start: detail\n", "BASE-BODY\n");
+    put("extra", "extends: [rule.base]\nstart: core\ncore: Do X.\n", "EXTRA-BODY\n");
+    put("more", "extends: [rule.base]\n", "MORE-BODY\n");
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    let coder = planned_in(&p, &checkout.join(".lords"), "role-coder.md");
+    for want in ["- rule.extra: Do X.", "MORE-BODY", "- rule.base: rule.base"] {
+        assert!(coder.contains(want), "{want} in:\n{coder}");
+    }
+    assert!(!coder.contains("BASE-BODY") && !coder.contains("EXTRA-BODY"), "{coder}");
+}
+
+// Spec (sol-loop r1, S3, its witness; design: a place's file labels a line for only some roles): a skill's lines each
+// keep their own label in the skills index, one bullet each.
+#[test]
+fn each_skill_line_keeps_its_own_label() {
+    let (f, checkout) = place("orchestrator");
+    skill(
+        &f,
+        "tool",
+        "start: core\ncore:\n- line: Shared instruction.\n- line: Lead instruction.\n  roles: [orchestrator]\n",
+    );
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    let claude = proposed(&p, &checkout.join("CLAUDE.local.md"));
+    for want in ["- tool: Shared instruction.", "- tool (orchestrator only): Lead instruction."] {
+        assert!(claude.lines().any(|l| l == want), "{want} in:\n{claude}");
     }
 }
 
