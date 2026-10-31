@@ -1,0 +1,19 @@
+id: skill.level-and-cost
+kind: skill
+title: "Level and cost: the work at its owner and level, modular, and its cost measured"
+audience: [all]
+roles: [orchestrator, coder, helper, reviewer]
+scope: global
+status: active
+visibility: public
+basis:
+- quote: "check why the skills don't prevent such a waste, is there no proper skill for checking fr the correct ownership level and abstraction and going for makign sure to have functional and modular design, does that not icnlude the benchmarking and efficiency in the process itself? If not, try to reframe the skill more concise and focussed and make sure it also applies to introspection and that agents actually make sure to also question their own design and strive for efficiency through the whole stack"
+  date: 2026-10-31
+  by: owner
+evidence:
+- summary: "On the night of 30-31 Oct, declared estimates were 5-40 times the measured runs and asks 6 times the use, one static gate ran 70 times in about 5 hours, duplicate jobs at older commits were cancelled by hand, and a release missed its own config step. The owner-and-level verdict and the measuring rules existed, but only as intent or report lines judged afterwards; no skill fired when an agent designed or ran something repeated."
+  date: 2026-10-31
+origin:
+  type: own
+topics: [design, performance, process, review]
+links: [rule.reports-short-and-plain, rule.one-tool-per-stage, rule.fix-recurring-mistakes-mechanically, rule.measure-before-believing, intent.organisation-principles]

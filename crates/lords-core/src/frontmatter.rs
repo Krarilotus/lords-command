@@ -17,15 +17,13 @@ pub fn split(text: &str) -> Split<'_> {
     };
     let open_len = text.len() - after_open.len();
     let mut pos = 0;
-    let mut line = 2;
-    for l in after_open.split_inclusive('\n') {
+    for (line, l) in (2..).zip(after_open.split_inclusive('\n')) {
         if l.trim_end_matches(['\r', '\n']) == "---" {
             let yaml = &after_open[..pos];
             let body = &text[open_len + pos + l.len()..];
             return Split { yaml: Some(yaml), body, body_line: line + 1 };
         }
         pos += l.len();
-        line += 1;
     }
     none
 }

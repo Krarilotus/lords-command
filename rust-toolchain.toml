@@ -1,0 +1,5 @@
+# Every check runs on the same toolchain, on this PC and on every fleet host, so a lint a newer clippy adds can't make
+# the same commit pass here and fail there (31 Oct: a check on another host failed on three lints new in 1.98).
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
