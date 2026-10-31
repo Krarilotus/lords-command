@@ -147,6 +147,34 @@ fn something_may_wait_unless_the_session_took_everything_it_was_shown() {
             .concat(),
             false,
         ),
+        // Sol-loop r1, S1 (witness): T3 pages the current queue by offset (handlers.ts, `runs.slice(cursor, end)`),
+        // so a take between two pages of one listing shifts what the next page shows: r3 is never shown.
+        (
+            "a take between two pages of one listing",
+            runs("r4", "r1"),
+            [
+                &list("l1", json!({"action": "list", "limit": 1}), &["r2"], true)[..],
+                &[take("c1", "cancel", "r2")],
+                &list("l2", json!({"action": "list", "cursor": 1, "limit": 1}), &["r4"], false),
+                &[take("c2", "cancel", "r4")],
+            ]
+            .concat(),
+            true,
+        ),
+        (
+            "a take between two pages, then a fresh listing from the first page, all taken",
+            runs("r4", "r1"),
+            [
+                &list("l1", json!({"action": "list", "limit": 1}), &["r2"], true)[..],
+                &[take("c1", "cancel", "r2")],
+                &list("l2", json!({"action": "list", "cursor": 1, "limit": 1}), &["r4"], false),
+                &[take("c2", "cancel", "r4")],
+                &list("l3", fresh(), &["r3"], false),
+                &[take("c3", "cancel", "r3")],
+            ]
+            .concat(),
+            false,
+        ),
         (
             "a later run someone else cancelled after the session listed it, then listed again",
             runs("r2", "r1"),
