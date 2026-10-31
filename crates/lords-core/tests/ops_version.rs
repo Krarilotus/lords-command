@@ -76,6 +76,45 @@ fn a_change_made_from_an_older_version_is_refused_and_writes_nothing() {
     assert!(!f.stacks().find("rule.v").unwrap().active());
 }
 
+// Spec (sol-loop r2, S2: "commit the verified bytes"): a commit made for an edit holds exactly the bytes the edit
+// wrote, whatever the file holds by the time it is committed: an agent's write that lands after the edit's own stays
+// the agent's, uncommitted in the working tree, and the index takes the commit's entries. The stack repo's hooks run
+// on what is committed; one that refuses leaves HEAD, the index and the working tree as they were.
+#[test]
+fn a_commit_holds_exactly_what_the_edit_wrote() {
+    let f = Fixture::new();
+    f.write("priv/global/rules/w.md", "before\n");
+    f.git_init("priv");
+    let root = f.priv_root();
+    // The edit wrote "mine"; an agent's write landed after it, before the commit.
+    f.write("priv/global/rules/w.md", "an agent's\n");
+    let file = std::path::Path::new("global/rules/w.md");
+    let made = lords_core::git::commit_exact(&root, &[(file, b"mine\n".as_slice())], "Edit rule.w")
+        .unwrap();
+    assert!(made.is_some());
+    assert_eq!(git(&root, &["show", "HEAD:global/rules/w.md"]), "mine\n");
+    assert_eq!(f.read("priv/global/rules/w.md"), "an agent's\n", "the agent's write stays its own");
+    assert_eq!(git(&root, &["diff", "--cached", "--name-only"]), "", "the index is the commit's");
+    assert_eq!(git(&root, &["log", "-1", "--format=%s"]).trim(), "Edit rule.w");
+
+    // A hook that sees what is committed, and refuses it.
+    f.write("priv/.git/hooks/pre-commit", "#!/bin/sh\ngit diff --cached | grep -q SECRET && { echo 'refused' >&2; exit 1; }\nexit 0\n");
+    let head = git(&root, &["rev-parse", "HEAD"]);
+    let refused =
+        lords_core::git::commit_exact(&root, &[(file, b"SECRET\n".as_slice())], "Edit rule.w");
+    assert!(refused.as_ref().is_err_and(|e| e.contains("refused")), "{refused:?}");
+    assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
+    assert_eq!(git(&root, &["diff", "--cached", "--name-only"]), "");
+    assert_eq!(f.read("priv/global/rules/w.md"), "an agent's\n");
+    // Nothing of its own left in the git dir.
+    let left: Vec<String> = std::fs::read_dir(root.join(".git"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("lords-"))
+        .collect();
+    assert_eq!(left, Vec::<String>::new());
+}
+
 // Spec (Lords owner, 31 Oct: "build the CAS at the file replacement … a write between your version check and the
 // replacement is a reachable witness"): a stack file is replaced only while it holds exactly the bytes the caller
 // read. A write that landed after the read stays as it is, the replacement is refused, and nothing is left beside

@@ -247,6 +247,12 @@ fn tree_ends_with_this_process() -> Result<(), String> {
     Err("nothing here can end the T3 CLI's process tree on this system".into())
 }
 
+/// Runs `git -C <dir> <args>` with `stdin` as its input (`hash-object --stdin`), within a minute. See `bounded`.
+pub(crate) fn git_input(dir: &Path, args: &[&str], stdin: Vec<u8>) -> Result<Output, String> {
+    bounded(command(dir, args), Some(stdin), Duration::from_secs(60))
+        .map_err(|e| format!("git {}: {e}", args.join(" ")))
+}
+
 /// Runs `git -C <dir> <args>` and waits at most `deadline` (a remote call: the panel's push). See `bounded`.
 pub(crate) fn git_bounded(dir: &Path, args: &[&str], deadline: Duration) -> Result<Output, String> {
     bounded(command(dir, args), None, deadline).map_err(|e| format!("git {}: {e}", args.join(" ")))

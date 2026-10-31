@@ -124,13 +124,60 @@ pub fn commit(dir: &Path, paths: &[&Path], message: &str) -> Result<Option<Strin
     Ok(Some(run(dir, &["rev-parse", "--short", "HEAD"])?.trim().to_string()))
 }
 
-/// Takes `paths` (relative to `dir`) out of the index again, as HEAD has them: after a commit its hooks refused, so
-/// nothing of it stays staged for the next commit.
-pub fn unstage(dir: &Path, paths: &[&Path]) -> Result<(), String> {
-    let owned: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-    let mut args = vec!["reset", "-q", "--"];
-    args.extend(owned.iter().map(String::as_str));
-    run(dir, &args).map(|_| ())
+/// `git -C dir args` with these variables set, run through `started`.
+fn run_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
+    let out = started(
+        args,
+        || crate::process::git_env(dir, args, env),
+        |out| out.status.code(),
+        std::thread::sleep,
+    )?;
+    text(args, out)
+}
+
+/// Commits exactly `files` (each a path relative to `dir`, with the bytes the commit gives it), whatever the working
+/// tree holds for them by then: an agent's write that lands after an edit's own is never committed as that edit
+/// (sol-loop r2, S2). The commit is made from an index of its own, HEAD's with these blobs, so the repo's hooks see
+/// exactly what is committed; then the repo's index takes the commit's entries for these paths, and the working tree
+/// stays as it is. A commit the hooks refuse leaves HEAD, the index and the working tree as they were. `None`: nothing
+/// would change.
+pub fn commit_exact(
+    dir: &Path,
+    files: &[(&Path, &[u8])],
+    message: &str,
+) -> Result<Option<String>, String> {
+    let git_dir = PathBuf::from(run(dir, &["rev-parse", "--absolute-git-dir"])?.trim());
+    let name = format!("lords-commit-index-{}", crate::process::id());
+    let index = crate::fsguard::Root::git(&git_dir)?.join(&[crate::fsguard::Part::new(&name)?]);
+    let at = index.path().to_string_lossy().into_owned();
+    let env = [("GIT_INDEX_FILE", at.as_str())];
+    let paths: Vec<String> =
+        files.iter().map(|(p, _)| p.to_string_lossy().replace('\\', "/")).collect();
+    let made = (|| -> Result<Option<String>, String> {
+        run_env(dir, &["read-tree", "HEAD"], &env)?;
+        for ((_, bytes), path) in files.iter().zip(&paths) {
+            let args = ["hash-object", "-w", "--stdin"];
+            let blob = text(&args, crate::process::git_input(dir, &args, bytes.to_vec())?)?;
+            let staged = run(dir, &["ls-files", "-s", "--", path])?;
+            let mode = staged.split_whitespace().next().unwrap_or("100644");
+            let entry = format!("{mode},{},{path}", blob.trim());
+            run_env(dir, &["update-index", "--add", "--cacheinfo", &entry], &env)?;
+        }
+        let unchanged =
+            crate::process::git_env(dir, &["diff", "--cached", "--quiet", "HEAD"], &env)?;
+        if unchanged.status.success() {
+            return Ok(None);
+        }
+        run_env(dir, &["commit", "-q", "-m", message], &env)?;
+        let mut reset = vec!["reset", "-q", "--"];
+        reset.extend(paths.iter().map(String::as_str));
+        run(dir, &reset)?;
+        Ok(Some(run(dir, &["rev-parse", "--short", "HEAD"])?.trim().to_string()))
+    })();
+    let removed = crate::fsguard::delete_file(&index);
+    let made = made?;
+    removed?;
+    Ok(made)
 }
 
 /// One commit in a file's history.
