@@ -323,9 +323,12 @@ fn a_write_whose_connection_drops_lands_whole_and_the_window_says_it_may_have() 
     assert!(matches!(unreachable, Err(Failure::Unreachable(_))), "{unreachable:?}");
 }
 
-// Spec (D2.5; brief: "Push goes through the pre-push privacy check"): the status counts the commits each stack repo's
-// upstream lacks; a push its pre-push hook refuses pushes nothing and says the hook's words, and the count stands;
-// once the hook lets it through, the upstream has them and the count is 0. A repo with no upstream counts nothing.
+// Spec (D2.5; brief: "Push goes through the pre-push privacy check"; review r1 R4, the Lords owner: the push probes
+// that the privacy pre-push hook is installed and dispatches, and refuses with the reason if not): the status counts
+// the commits each stack repo's upstream lacks. With no privacy pre-push hook that answers its probe (none at all, or
+// one that isn't Lords'), the push is refused and says why; with Lords' own hook, a push it refuses pushes nothing,
+// and one it lets through gives the upstream the commits. Each refusal leaves the count as it was. A repo with no
+// upstream counts nothing.
 #[test]
 fn a_push_the_privacy_check_refuses_pushes_nothing() {
     use lords_core::model::Visibility;
@@ -347,15 +350,28 @@ fn a_push_the_privacy_check_refuses_pushes_nothing() {
     assert_eq!(ahead(&s), (1, 1));
     let upstream = || git(&remote, &["rev-parse", "main"]);
     let before = upstream();
-    hook(&s.f, "priv", "pre-push", "echo 'privacy: a private detail in the push' >&2; exit 1");
-    let refused = s.remote.push();
-    assert!(
-        matches!(&refused, Err(Failure::Refused(m)) if m.contains("a private detail in the push")),
-        "{refused:?}"
-    );
-    assert_eq!(upstream(), before);
-    assert_eq!(ahead(&s), (1, 1));
+    let refused_for = |s: &Served, why: &str| {
+        let refused = s.remote.push();
+        assert!(
+            matches!(&refused, Err(Failure::Refused(m)) if m.contains(why)),
+            "{why}: {refused:?}"
+        );
+        assert_eq!(upstream(), before);
+        assert_eq!(ahead(s), (1, 1));
+    };
+    // No pre-push hook at all (a fresh clone), then one that isn't Lords' and doesn't answer the probe.
+    refused_for(&s, "pre-push: not verified");
+    hook(&s.f, "priv", "pre-push", "exit 0");
+    refused_for(&s, "pre-push: not verified");
     std::fs::remove_file(s.f.path("priv/.git/hooks/pre-push")).unwrap();
+    // Lords' own hook, whose privacy check (here `false`) refuses the push; then one whose check (`true`) passes.
+    let home = lords_core::sync::default_home().unwrap();
+    let install = |check: &str| {
+        lords_core::hooks::install(&s.f.priv_root(), Path::new(check), false, true, &home).unwrap();
+    };
+    install("false");
+    refused_for(&s, "git push failed");
+    install("true");
     s.remote.push().unwrap();
     assert_eq!(upstream(), git(&s.f.priv_root(), &["rev-parse", "HEAD"]));
     assert_eq!(ahead(&s), (0, 0));

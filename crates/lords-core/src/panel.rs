@@ -422,8 +422,25 @@ fn local_retire(p: &Paths, r: &RetireRequest) -> Result<Saved, Failure> {
     Ok(Saved { id: r.id.clone(), commit: retired.commit })
 }
 
+/// Each stack repo's privacy pre-push hook, probed: whether a push from it is checked, and why not (review r1 R4).
+/// `lords panel serve` says it at its start.
+pub fn push_ready(p: &Paths) -> Vec<String> {
+    let home = match sync::default_home() {
+        Ok(h) => h,
+        Err(e) => return vec![format!("push: no tool home ({e})")],
+    };
+    stack_repos(p)
+        .into_iter()
+        .map(|(stack, top)| match top.and_then(|t| crate::hooks::push_dispatch(&t, &home)) {
+            Ok(()) => format!("{stack}: push checked by its privacy pre-push hook"),
+            Err(e) => format!("{stack}: push refused until its privacy pre-push hook answers: {e}"),
+        })
+        .collect()
+}
+
 fn local_push(p: &Paths) -> Result<Pushed, Failure> {
     let _one = one_writer()?;
+    let home = sync::default_home().map_err(Failure::Refused)?;
     let (mut lines, mut refused) = (Vec::new(), false);
     for (stack, top) in stack_repos(p) {
         let ahead = top.and_then(|t| git::ahead(&t).map(|a| (t, a)));
@@ -437,15 +454,20 @@ fn local_push(p: &Paths) -> Result<Pushed, Failure> {
                 lines.push(format!("{stack}: {branch} has no upstream; nothing pushed"));
                 refused = true;
             }
-            Ok((top, (branch, Some(up), commits))) => match git::push(&top, PUSH_EACH) {
-                Ok(_) => {
-                    lines.push(format!("{stack}: {} commit(s) of {branch} to {up}", commits.len()))
+            // Only through a privacy pre-push hook that answers its probe: a plain push that succeeds is no sign the
+            // check ran (review r1 R4).
+            Ok((top, (branch, Some(up), commits))) => {
+                match crate::hooks::push_dispatch(&top, &home)
+                    .and_then(|()| git::push(&top, PUSH_EACH))
+                {
+                    Ok(_) => lines
+                        .push(format!("{stack}: {} commit(s) of {branch} to {up}", commits.len())),
+                    Err(e) => {
+                        lines.push(format!("{stack}: refused: {e}"));
+                        refused = true;
+                    }
                 }
-                Err(e) => {
-                    lines.push(format!("{stack}: refused: {e}"));
-                    refused = true;
-                }
-            },
+            }
         }
     }
     if refused {

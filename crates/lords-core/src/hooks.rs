@@ -98,7 +98,8 @@ fn staged_script(
 
 /// A stack repo's pre-push hook (orchestrator, 27 Oct): every commit's message and patch, secrets only where the
 /// stack is private; a public stack's whole tree too, as `lords check --public` checks it.
-fn pre_push_script(lords_exe: &Path, secrets_only: bool) -> String {
+/// It answers a probe like the commit hooks, so a push can tell that it is there and dispatches (review r1 R4).
+fn pre_push_script(lords_exe: &Path, secrets_only: bool, home: &Path) -> String {
     let exe = lords_exe.to_string_lossy().replace('\\', "/");
     let tail = if secrets_only {
         format!("exec \"{exe}\" privacy --history --secrets-only\n")
@@ -106,7 +107,8 @@ fn pre_push_script(lords_exe: &Path, secrets_only: bool) -> String {
         format!("\"{exe}\" privacy --history || exit $?\nexec \"{exe}\" check --public\n")
     };
     format!(
-        "#!/bin/sh\n{MARKER} of the history to push (installed by `lords hooks install`).\n{tail}"
+        "#!/bin/sh\n{MARKER} of the history to push (installed by `lords hooks install`).\n{}{tail}",
+        probe_lines(home, "pre-push")
     )
 }
 
@@ -142,7 +144,23 @@ fn nonce() -> String {
 /// outcome, a git error included, is one line saying it isn't. This says what holds now: `--no-verify`, a hooks path
 /// set later, or a commit made elsewhere isn't prevented by it (design: Privacy, "Guarantee 7").
 pub fn privacy_dispatch(repo: &Path, home: &Path) -> Vec<String> {
-    let both = |why: String| vec![format!("{}: not verified ({why})", PRIVACY.join(", "))];
+    dispatch(repo, home, &PRIVACY)
+}
+
+/// Whether a push from `repo` reaches the privacy pre-push hook, found out as `privacy_dispatch` finds out the commit
+/// hooks: `Err` with why not (review r1 R4: a fresh clone has no local hooks, and a push then checks nothing).
+pub fn push_dispatch(repo: &Path, home: &Path) -> Result<(), String> {
+    let problems = dispatch(repo, home, &["pre-push"]);
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
+    }
+}
+
+/// Probes `hooks` in `repo` (see `privacy_dispatch`): one line for each that doesn't answer.
+fn dispatch(repo: &Path, home: &Path, hooks: &[&str]) -> Vec<String> {
+    let both = |why: String| vec![format!("{}: not verified ({why})", hooks.join(", "))];
     let n = nonce();
     let made = (|| -> Result<(Contained, Contained), String> {
         let root = Root::home(home)?;
@@ -159,7 +177,7 @@ pub fn privacy_dispatch(repo: &Path, home: &Path) -> Vec<String> {
         Err(e) => return both(e),
     };
     let mut problems = Vec::new();
-    for hook in PRIVACY {
+    for &hook in hooks {
         let mut args = vec!["hook", "run", "--ignore-missing", hook];
         let msg = message.path().to_string_lossy().into_owned();
         if hook == "commit-msg" {
@@ -175,7 +193,8 @@ pub fn privacy_dispatch(repo: &Path, home: &Path) -> Vec<String> {
                 );
                 if !out.status.success() || !said.contains(&answer) {
                     problems.push(format!(
-                        "{hook}: not verified: a commit here doesn't reach the privacy hook (`git hook run {hook}` gave {} and no answer); `lords hooks install` puts it in the repo's own hooks dir",
+                        "{hook}: not verified: a {} here doesn't reach the privacy hook (`git hook run {hook}` gave {} and no answer); `lords hooks install` puts it in the repo's own hooks dir",
+                        if hook == "pre-push" { "push" } else { "commit" },
                         out.status
                     ));
                 }
@@ -270,7 +289,7 @@ pub fn install(
         ("commit-msg", commit_msg_script(lords_exe, secrets_only, home)),
     ];
     if stack {
-        hooks.push(("pre-push", pre_push_script(lords_exe, secrets_only)));
+        hooks.push(("pre-push", pre_push_script(lords_exe, secrets_only, home)));
     }
     let mut foreign = Vec::new();
     for (name, _) in &hooks {

@@ -39,6 +39,9 @@ fn serve(mut a: Args) -> Result<bool, String> {
         .map_err(|e| format!("127.0.0.1:{port}: {e} (does a panel serve there already?)"))?;
     let bound = listener.local_addr().map_err(|e| e.to_string())?;
     println!("lords panel: serving the stacks on {bound}");
+    for line in panel::push_ready(&paths) {
+        println!("lords panel: {line}");
+    }
     http::serve(listener, move |r| panel::handle(&paths, r));
     Ok(true)
 }

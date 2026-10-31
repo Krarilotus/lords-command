@@ -278,6 +278,10 @@ fn the_top_bar_counts_unpushed_commits_pushes_on_the_second_click_and_shows_a_br
     git(&s.path("priv"), &["push", "-q", "-u", "origin", "main"]);
     s.write("priv/global/rules/v.md", &entry("rule.v", "private", "v", "Unpushed.\n"));
     git(&s.path("priv"), &["commit", "-q", "-am", "to push"]);
+    // Lords' own hooks, as a stack repo has them: the push goes only through a privacy pre-push hook that answers
+    // its probe (here its check is `true`).
+    let home = lords_core::sync::default_home().unwrap();
+    lords_core::hooks::install(&s.path("priv"), Path::new("true"), false, true, &home).unwrap();
     let mut w = Window::new(s.serve());
     w.settle();
     assert!(w.shows("⇡1"), "{:?}", w.drawn);
