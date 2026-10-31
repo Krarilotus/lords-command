@@ -360,6 +360,34 @@ fn a_push_the_privacy_check_refuses_pushes_nothing() {
     assert_eq!(ahead(&s), (0, 0));
 }
 
+// Spec (overseer's config rule, kept for the panel): `api` takes only a loopback address (the server has no
+// authentication of its own: this PC, or an SSH forward), and `tunnel` only an SSH alias, never an option ssh would
+// read (`-oProxyCommand=…`); a config.txt with either wrong is refused whole, never read without them.
+#[test]
+fn config_takes_only_a_loopback_api_and_an_alias() {
+    let f = Fixture::new();
+    let read = |text: &str| {
+        let p = f.write("cfg/config.txt", text);
+        lords_core::config::Config::read(&p)
+    };
+    let c = read("api = http://127.0.0.1:17879\ntunnel = lords-panel.main_pc\n").unwrap().unwrap();
+    assert_eq!(
+        (c.api.as_deref(), c.tunnel.as_deref()),
+        (Some("http://127.0.0.1:17879"), Some("lords-panel.main_pc"))
+    );
+    for bad in [
+        "api = http://10.0.0.2:7879",
+        "api = http://localhost:7879",
+        "api = http://127.0.0.1:x",
+        "api = http://127.0.0.1:0",
+        "tunnel = -oProxyCommand=calc",
+        "tunnel = two words",
+        "tunnel = a;b",
+    ] {
+        assert!(read(bad).is_err(), "{bad}");
+    }
+}
+
 // Spec (D2.8): what a request names reaches git only as what it must be: a commit only as a hash (never an option
 // such as `--output=`), an entry only if it is loaded (its file comes from the entry), an adapter and a place only if
 // they exist and are declared.

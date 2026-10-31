@@ -94,10 +94,12 @@ fn extensions_allowed(d: Door) -> &'static [&'static str] {
 }
 
 /// The child processes a source may start: `git`, the file manager, the staged guard copy's self-test
-/// (`guard_copy`) and the queue guard's T3 CLI (`t3_cli`), all in process.rs.
+/// (`guard_copy`), the queue guard's T3 CLI (`t3_cli`) and the panel's tunnel (`ssh`), all in process.rs.
 fn programs_allowed(d: Door) -> &'static [&'static str] {
     match d {
-        Door::Process => &["\"git\"", "\"explorer\"", "\"xdg-open\"", "guard_copy", "t3_cli"],
+        Door::Process => {
+            &["\"git\"", "\"explorer\"", "\"xdg-open\"", "guard_copy", "t3_cli", "\"ssh\""]
+        }
         _ => &[],
     }
 }
@@ -376,10 +378,51 @@ fn only_fsguard_changes_the_filesystem() {
     let doors: Vec<Door> = files.iter().map(|f| door(&f.display().to_string())).collect();
     assert!(doors.contains(&Door::Fs) && doors.contains(&Door::Process), "both doors were found");
     let mut found = Vec::new();
-    for f in &files {
+    for f in files.iter().filter(|f| !test_only(f)) {
         found.extend(forbidden(&f.display().to_string(), &fs::read_to_string(f).unwrap()));
     }
     assert!(found.is_empty(), "past the doors:\n{}", found.join("\n"));
+}
+
+/// Whether a source is a module its crate root compiles only for its own tests: the root (`main.rs` or `lib.rs`
+/// beside it) declares it exactly as `#[cfg(test)] mod <name>;`, so it is never in a run-time build (the window's
+/// headless tests, which write their own temp dirs like any test). Any other declaration keeps it in the scan.
+fn test_only(file: &Path) -> bool {
+    let Some(name) = file.file_stem().and_then(|s| s.to_str()) else { return false };
+    let declared = format!("#[cfg(test)]mod{name};");
+    ["main.rs", "lib.rs"].iter().any(|root| {
+        let root = file.with_file_name(root);
+        root != file
+            && fs::read_to_string(&root).is_ok_and(|text| {
+                let code: String =
+                    code_of(&text, false).chars().filter(|c| !c.is_whitespace()).collect();
+                code.contains(&declared) && code.matches(&format!("mod{name}")).count() == 1
+            })
+    })
+}
+
+// Spec (the Lords panel, design note 2026-10-31-lords-panel-remote: the window's headless tests live beside it):
+// only a module its crate root compiles for tests alone is outside the scan; declared any other way, it is scanned.
+#[test]
+fn only_a_test_only_module_is_outside_the_scan() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().join("main.rs");
+    let module = dir.path().join("checks.rs");
+    fs::write(&module, "use std::fs;").unwrap();
+    for (declared, outside) in [
+        ("#[cfg(test)]\nmod checks;", true),
+        ("#[cfg(test)] // its tests\nmod checks;", true),
+        ("mod checks;", false),
+        ("#[cfg(not(test))]\nmod checks;", false),
+        (
+            "#[cfg(test)]\nmod checks;\n#[cfg(not(test))]\n#[path = \"checks.rs\"]\nmod checks;",
+            false,
+        ),
+    ] {
+        fs::write(&root, declared).unwrap();
+        assert_eq!(test_only(&module), outside, "{declared:?}");
+    }
+    assert!(!test_only(&root), "a crate root is never its own module");
 }
 
 // Spec (Sol review r3, R3-08: "The filesystem lint does not enforce its stated boundary"; property: the lint catches

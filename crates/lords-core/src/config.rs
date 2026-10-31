@@ -11,6 +11,11 @@ pub struct Config {
     pub public: Option<PathBuf>,
     /// The private stack root.
     pub private: Option<PathBuf>,
+    /// The panel's server, `http://127.0.0.1:<port>` (overseer's format): the window reads the stacks from it, on
+    /// another PC, instead of from `public` and `private`.
+    pub api: Option<String>,
+    /// An SSH alias whose `LocalForward` reaches the server's port: `ssh -N <alias>` runs while the window is open.
+    pub tunnel: Option<String>,
     /// Where it was read from.
     pub source: Option<PathBuf>,
 }
@@ -24,6 +29,22 @@ pub fn expand_home(path: &str) -> PathBuf {
     match (path.strip_prefix('~'), home()) {
         (Some(rest), Some(h)) => h.join(rest.trim_start_matches(['/', '\\'])),
         _ => PathBuf::from(path),
+    }
+}
+
+/// `api` takes only a loopback address: the panel's server has no authentication of its own, so it is reached from
+/// its own PC or through an SSH forward (overseer's rule).
+pub fn check_api(api: &str) -> Result<(), String> {
+    crate::http::Client::from_api(api).map(|_| ())
+}
+
+/// `tunnel` is an SSH alias, never an option: ssh would read `-oProxyCommand=…` as one.
+pub fn check_alias(alias: &str) -> Result<(), String> {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "._-".contains(c);
+    if !alias.is_empty() && !alias.starts_with('-') && alias.chars().all(plain) {
+        Ok(())
+    } else {
+        Err(format!("tunnel `{alias}` must be an SSH alias (letters, digits, `.`, `_`, `-`)"))
     }
 }
 
@@ -56,9 +77,19 @@ impl Config {
                 }
             })
         };
+        let at = |e: String| format!("{}: {e}", path.display());
+        let api =
+            keys.get("api").map(|a| check_api(a).map(|()| a.clone())).transpose().map_err(at)?;
+        let tunnel = keys
+            .get("tunnel")
+            .map(|t| check_alias(t).map(|()| t.clone()))
+            .transpose()
+            .map_err(at)?;
         Ok(Some(Config {
             public: resolve("public"),
             private: resolve("private"),
+            api,
+            tunnel,
             source: Some(path.to_path_buf()),
         }))
     }

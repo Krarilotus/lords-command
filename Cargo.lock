@@ -1689,6 +1689,7 @@ dependencies = [
  "eframe",
  "lords-core",
  "serde_json",
+ "tempfile",
  "winresource",
 ]
 

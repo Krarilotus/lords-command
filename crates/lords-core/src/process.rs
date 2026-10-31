@@ -4,7 +4,7 @@
 //! GUI asks to show a path or open a link, and which writes nothing itself, a staged copy of the guard, run once
 //! for its self-test before sync installs it, and the T3 CLI, which the queue guard asks about its thread (it
 //! reads; its process tree ends with the guard's). The panel's push is `git` too, bounded by a deadline that ends its
-//! whole tree (`bounded`).
+//! whole tree (`bounded`), and the window on another PC runs `ssh -N` for its forward while it is open (`Tunnel`).
 
 // The door: the one place the resolved boundary lints allow (clippy.toml).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -316,6 +316,99 @@ fn bounded(mut c: Command, stdin: Option<Vec<u8>>, deadline: Duration) -> Result
     let stdout = out.recv_timeout(grace).map_err(|_| "its output wasn't closed".to_string())?;
     let stderr = err.recv_timeout(grace).unwrap_or_default();
     Ok(Output { status, stdout, stderr })
+}
+
+/// `ssh -N <alias>` while the window is open: the alias's `LocalForward` to the panel's server on the PC that holds the
+/// stacks (overseer's runner). Restarted when it ends, at most once in 15 s; its whole tree ends with this value, or
+/// with the window however it ends.
+pub struct Tunnel {
+    alias: String,
+    child: Option<(std::process::Child, tree::Tree)>,
+    started: Option<Instant>,
+    /// ssh's last line on stderr: why it ended, when it did.
+    said: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+impl Tunnel {
+    /// `alias` as config.txt has it, checked there to be an alias and no option.
+    pub fn new(alias: &str) -> Tunnel {
+        Tunnel { alias: alias.to_string(), child: None, started: None, said: Default::default() }
+    }
+
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// Keeps it running: `None` while it runs, else why not.
+    pub fn ensure(&mut self) -> Option<String> {
+        use std::io::BufRead;
+        use std::process::Stdio;
+        if let Some((child, _)) = &mut self.child {
+            match child.try_wait() {
+                Ok(None) => return None,
+                Ok(Some(_)) | Err(_) => self.child = None,
+            }
+        }
+        let said = self.said.lock().map(|s| s.clone()).unwrap_or_default();
+        let ended = if said.is_empty() {
+            format!("ssh {} ended", self.alias)
+        } else {
+            format!("ssh {} ended: {said}", self.alias)
+        };
+        if self.started.is_some_and(|t| t.elapsed() < Duration::from_secs(15)) {
+            return Some(ended);
+        }
+        self.started = Some(Instant::now());
+        let mut c = Command::new("ssh");
+        c.args(["-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes"])
+            .args(["-o", "ServerAliveInterval=15", "-o", "ConnectTimeout=10"])
+            .arg(&self.alias)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            c.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = match c.spawn() {
+            Ok(child) => child,
+            Err(e) => return Some(format!("ssh can't start: {e}")),
+        };
+        let tree = match tree::Tree::holding(&child) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Some(e);
+            }
+        };
+        if let Some(err) = child.stderr.take() {
+            let said = self.said.clone();
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                    if !line.trim().is_empty() {
+                        if let Ok(mut s) = said.lock() {
+                            *s = line.trim().to_string();
+                        }
+                    }
+                }
+            });
+        }
+        self.child = Some((child, tree));
+        None
+    }
+}
+
+impl Drop for Tunnel {
+    fn drop(&mut self) {
+        if let Some((mut child, tree)) = self.child.take() {
+            drop(tree);
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 /// A job holding one child and what it starts, killed when the job's handle closes.

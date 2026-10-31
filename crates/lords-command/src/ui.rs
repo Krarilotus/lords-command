@@ -6,7 +6,8 @@ use eframe::egui::{
     Vec2,
 };
 use lords_core::finding::Severity;
-use lords_core::model::{Entry, Kind, Origin, Scope, Visibility};
+use lords_core::model::{Kind, Origin, Scope, Visibility};
+use lords_core::view::EntryView;
 
 pub const BG: Color32 = Color32::from_rgb(4, 9, 6);
 pub const GREEN: Color32 = Color32::from_rgb(57, 255, 136);
@@ -144,8 +145,8 @@ pub struct Frame {
 }
 
 impl Frame {
-    pub fn of(e: &Entry) -> Frame {
-        Frame { dashed: !e.active(), round: e.stack == Visibility::Public }
+    pub fn of(e: &EntryView) -> Frame {
+        Frame { dashed: !e.active, round: e.stack == Visibility::Public }
     }
 }
 
@@ -270,6 +271,8 @@ pub fn legend(ui: &mut egui::Ui) {
         ("✕", RED, "error"),
         ("⚠", AMBER, "warning"),
         ("?", BLUE, "for the owner to decide"),
+        ("⇆", GREEN, "the bridge to the stacks' PC is up"),
+        ("⇡", AMBER, "commits not pushed yet"),
     ] {
         rows.push((g.into(), c, w));
     }
