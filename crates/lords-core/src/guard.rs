@@ -219,15 +219,16 @@ pub fn rm_hook(input: &str) -> String {
 // A Claude Code `Stop` hook keeps a turn from ending while something may wait in the session's own T3 queue. T3's
 // CLI can't count the queue: `t3 thread show --json` gives the thread's latest and active run and drops the runs'
 // states, and a cancelled or promoted item stays the latest run (design note E1, Harness/notes/2026-10-31-lords-
-// queue-guard.md). So the guard reads both runs, and the session's transcript for what it listed and took (Lords
-// owner, 31 Oct, rules a and b). It fails open: a stop it can't judge goes through with a note. It never traps: at
-// most two blocks in a row.
+// queue-guard.md). So the guard reads both runs, and the session's transcript for what it listed in one call and
+// took (Lords owner, 31 Oct, rules a and b). It fails open: a stop it can't judge goes through with a note. It never
+// traps: at most two blocks in a row. Its limit: an item a later run overtook after a stop went through anyway isn't
+// held again (`Transcript::may_wait`).
 
 /// What the agent is told when its stop is held: the rule's steps (rule.orchestrator-queue-discipline). "May": the
-/// latest run can be one someone else cancelled (design note D1).
-pub const QUEUE_REASON: &str = "Lords: item(s) may be queued for this thread: list them, read the truncated ones in \
-    full, cancel the text-only ones, promote those with an attachment, then answer together. If the list is empty, \
-    nothing waits: end the turn.";
+/// latest run can be one someone else cancelled (design note D1). "In one call": only a listing on one page counts.
+pub const QUEUE_REASON: &str = "Lords: item(s) may be queued for this thread: list it in one call (no cursor, a \
+    `limit` up to 100, so no next cursor), read the truncated ones in full, cancel the text-only ones, promote those \
+    with an attachment, then answer together. If the list is empty, nothing waits: end the turn.";
 
 /// How long the T3 CLI may take: measured 0.8 to 8.3 s on T3 v0.1.5 on threads of 96 and 424 items (design note E2).
 pub const QUEUE_DEADLINE: Duration = Duration::from_secs(10);
@@ -259,13 +260,13 @@ pub fn thread_runs(show: &str) -> Result<Option<Runs>, String> {
     })
 }
 
-/// One page a `t3_queue list` call of this thread showed: the line of its result, whether the call started a
-/// listing (no cursor, or cursor 0), the queued runs it showed and whether more followed (a next cursor).
-struct Page {
+/// A complete listing of this thread's queue: a `t3_queue list` call with no cursor (or cursor 0) whose result has
+/// `nextCursor: null`, so it showed the whole queue at once. The line of its result and the queued runs it showed.
+/// A page of a longer listing never is one: T3 reads the queue afresh for each page and slices it by offset, so a
+/// take or a reorder between pages makes a later page skip runs (sol-loop r1 S1; review r1 R1, R2).
+struct Listing {
     line: usize,
-    fresh: bool,
     shown: Vec<String>,
-    more: bool,
 }
 
 /// What a session's transcript shows of its own thread's queue, fed line by line (Claude Code's JSONL, one entry a
@@ -280,9 +281,10 @@ pub struct Transcript {
     /// transcript can be hundreds of MB).
     wanted: regex::bytes::Regex,
     line: usize,
-    /// The `list` calls not answered yet, by tool-use id: whether each starts a listing.
-    lists: std::collections::HashMap<String, bool>,
-    pages: Vec<Page>,
+    /// The tool-use ids of the `list` calls with no cursor (or cursor 0).
+    lists: std::collections::HashSet<String>,
+    /// The latest complete listing.
+    listing: Option<Listing>,
     /// Each run taken, with the line of the call.
     taken: Vec<(usize, String)>,
     /// The first line of the session's own entries that names the latest run.
@@ -299,7 +301,7 @@ impl Transcript {
             wanted: regex::bytes::Regex::new(&wanted).expect("escaped literals make a regex"),
             line: 0,
             lists: Default::default(),
-            pages: Vec::new(),
+            listing: None,
             taken: Vec::new(),
             latest_seen: None,
         }
@@ -326,10 +328,11 @@ impl Transcript {
                 Some("tool_use") if self.own_queue_call(c) => {
                     let input = &c["input"];
                     match input["action"].as_str() {
-                        Some("list") => {
-                            let fresh = input.get("cursor").is_none_or(|v| v.is_null() || v == 0);
+                        Some("list")
+                            if input.get("cursor").is_none_or(|v| v.is_null() || v == 0) =>
+                        {
                             if let Some(id) = c["id"].as_str() {
-                                self.lists.insert(id.into(), fresh);
+                                self.lists.insert(id.into());
                             }
                         }
                         Some("cancel" | "promote_to_steer") => {
@@ -340,19 +343,19 @@ impl Transcript {
                         _ => {}
                     }
                 }
-                Some("tool_result") => {
-                    let Some(&fresh) = c["tool_use_id"].as_str().and_then(|id| self.lists.get(id))
-                    else {
-                        continue;
-                    };
+                Some("tool_result")
+                    if c["tool_use_id"].as_str().is_some_and(|id| self.lists.contains(id)) =>
+                {
                     let Ok(out) = serde_json::from_str::<Value>(&result_text(&c["content"])) else {
                         continue;
                     };
                     let Some(items) = out["items"].as_array() else { continue };
+                    if out.get("nextCursor") != Some(&Value::Null) {
+                        continue;
+                    }
                     let shown =
                         items.iter().filter_map(|i| i["queuedRunId"].as_str().map(String::from));
-                    let more = !out["nextCursor"].is_null();
-                    self.pages.push(Page { line: n, fresh, shown: shown.collect(), more });
+                    self.listing = Some(Listing { line: n, shown: shown.collect() });
                 }
                 _ => {}
             }
@@ -360,30 +363,24 @@ impl Transcript {
     }
 
     /// Whether something may wait that the session hasn't taken. Only while a run later than the active one exists
-    /// (design note E1); then (a) no listing came at or after the latest run first appeared, or (b) the session's
-    /// latest listing (its last page with no cursor, and the pages after it) stopped at a limit, had a take between
-    /// two of its pages, or showed a run no `cancel` or `promote_to_steer` named after it was shown (Lords owner, 31
-    /// Oct). Without a later run, items of an old listing were delivered as turns since, and nothing waits.
+    /// (design note E1); then (a) no complete listing came at or after the latest run first appeared, or (b) the
+    /// latest complete listing showed a run no `cancel` or `promote_to_steer` named after it (Lords owner, 31 Oct,
+    /// and after review r1). Pages of a longer listing count for nothing, so a queue listed in pages is held up to
+    /// the cap.
+    ///
+    /// The limit of the invariant (review r1 R3, Lords owner: documented, not repaired): with `latest == active`
+    /// nothing is held. Once a stop has gone through with items waiting (at the cap, or failing open), T3 may start
+    /// a later run first (an automatic completion goes ahead of older messages); an older item it overtook is then not
+    /// held again while that run is the latest. Only T3 itself can say what is still queued (design note F1).
     pub fn may_wait(&self) -> bool {
         if self.latest == self.active {
             return false;
         }
-        let listed_since = self.latest_seen.is_some_and(|f| self.pages.iter().any(|p| p.line >= f));
-        if !listed_since {
+        let Some(l) = &self.listing else { return true };
+        if self.latest_seen.is_none_or(|f| l.line < f) {
             return true;
         }
-        let start = self.pages.iter().rposition(|p| p.fresh).unwrap_or(0);
-        let listing = &self.pages[start..];
-        // T3 pages the queue as it is at each page, by offset: a take between two pages moves the runs after it
-        // forward, and the next page skips as many (sol-loop r1, S1). Such a listing shows no whole queue.
-        let (first, last) =
-            (listing.first().map_or(0, |p| p.line), listing.last().map_or(0, |p| p.line));
-        let shifted = self.taken.iter().any(|(n, _)| *n > first && *n < last);
-        listing.last().is_some_and(|p| p.more)
-            || shifted
-            || listing.iter().any(|p| {
-                p.shown.iter().any(|r| !self.taken.iter().any(|(n, t)| *n > p.line && t == r))
-            })
+        l.shown.iter().any(|r| !self.taken.iter().any(|(n, t)| *n > l.line && t == r))
     }
 
     fn own_queue_call(&self, c: &Value) -> bool {
