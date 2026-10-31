@@ -77,6 +77,34 @@ fn a_change_made_from_an_older_version_is_refused_and_writes_nothing() {
     assert!(!f.stacks().find("rule.v").unwrap().active());
 }
 
+// Spec (review r1 R3: a retirement holds its version over every file the version covers, as an edit does): a skill
+// whose text has a change nobody committed yet (an agent's, mid-work) is neither retired nor edited: each is refused
+// before anything is written or committed, since what the version was read from isn't in git to come back to.
+#[test]
+fn a_change_to_an_entry_whose_text_isnt_committed_is_refused_and_commits_nothing() {
+    let f = Fixture::new();
+    f.write(
+        "priv/global/skills/s/lords.yaml",
+        "id: skill.s\nkind: skill\ntitle: s\naudience: [all]\nscope: global\nstatus: active\nvisibility: private\norigin:\n  type: own\n",
+    );
+    f.write("priv/global/skills/s/SKILL.md", "---\nname: s\n---\nRead.\n");
+    f.git_init("priv");
+    let agents = "---\nname: s\n---\nThe agent's, not committed yet.\n";
+    f.write("priv/global/skills/s/SKILL.md", agents);
+    let read = f.stacks().find("skill.s").unwrap().version.clone();
+    let head = || git(&f.priv_root(), &["rev-parse", "HEAD"]);
+    let (before, meta) = (head(), f.read("priv/global/skills/s/lords.yaml"));
+
+    let retired = retire(&f.stacks(), &retire_from("skill.s", &read)).map(|r| r.file);
+    assert!(retired.as_ref().is_err_and(|e| e.contains("uncommitted changes")), "{retired:?}");
+    let title = Edit { title: Some("Mine".into()), base: Some(read), ..Default::default() };
+    let edited = edit(&f.stacks(), "skill.s", &title, true);
+    assert!(edited.as_ref().is_err_and(|e| e.contains("uncommitted changes")), "{edited:?}");
+    assert_eq!(head(), before, "nothing committed, nothing reverted");
+    assert_eq!(f.read("priv/global/skills/s/lords.yaml"), meta);
+    assert_eq!(f.read("priv/global/skills/s/SKILL.md"), agents, "the agent's work stands");
+}
+
 fn covered<'a>(path: &'a str, was: &'a [u8], wrote: Option<&'a [u8]>) -> Covered<'a> {
     Covered { path: std::path::Path::new(path), was, wrote }
 }

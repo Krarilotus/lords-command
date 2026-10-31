@@ -202,8 +202,11 @@ pub fn retire(stacks: &Stacks, r: &Retire) -> Result<Retired, String> {
         ("superseded_by", r.superseded_by.map(str::to_string)),
         ("retired", Some(format!("date: {}\nreason: {}", r.date, quote(r.reason)))),
     ];
-    git_keeps(&e.meta_file)?;
-    let now = read_all(&version_files(e))?;
+    let files = version_files(e);
+    for f in &files {
+        git_keeps(f)?;
+    }
+    let now = read_all(&files)?;
     still(e, r.base, &now)?;
     // The new text comes from the bytes just checked, and replaces only them.
     let before = &now[0];
@@ -221,7 +224,6 @@ pub fn retire(stacks: &Stacks, r: &Retire) -> Result<Retired, String> {
         // Committed over the version it was made from, every file that version covers included: a skill's text is
         // covered though only its sidecar is written (review r1 R3). One the hooks refuse leaves nothing behind; one
         // that is published, or reverted for a conflict, stays as git has it.
-        let files = version_files(e);
         let covered: Vec<git::Covered> = files
             .iter()
             .zip(&now)
