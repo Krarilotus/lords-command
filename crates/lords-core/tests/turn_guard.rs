@@ -329,3 +329,45 @@ fn a_hook_never_blocks() {
     assert_eq!(context(&a.stdout)[0], CLOCK, "{a:?}");
     assert!(a.note.is_some(), "{a:?}");
 }
+
+// Spec (sol-loop r1, S1, witness: a pre-install session resumed after its role rules changed heard only the clock): a
+// `resume` or `compact` with no record from before can't know what the agent read itself, so it leaves the session
+// unrecorded, and the next prompt is told, once, that the rules may have changed.
+#[test]
+fn a_resume_without_a_record_is_still_told_once() {
+    for source in ["resume", "compact"] {
+        let p = Place::new();
+        p.start("old", source);
+        let lines = p.turn("old");
+        assert!(
+            lines.get(1).is_some_and(
+                |l| l.starts_with("Lords rules may have changed since this session started")
+            ),
+            "{source}: {lines:?}"
+        );
+        assert_eq!(p.turn("old"), [CLOCK], "{source}");
+    }
+}
+
+// Spec (sol-loop r1, S2, witness: an unchanged recorded file that briefly couldn't be read was named as removed, then
+// named again once readable): a recorded file that can't be read is no change; the prompt gets the clock line and a
+// note, and the record keeps it, so it isn't named once it reads again. On Windows a file another process holds open
+// without sharing can't be read.
+#[cfg(windows)]
+#[test]
+fn a_file_that_cannot_be_read_is_no_change() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let p = Place::new();
+    p.start("s1", "startup");
+    let held = fs::File::options()
+        .read(true)
+        .share_mode(0)
+        .open(p.path("root/.lords/role-coder.md"))
+        .unwrap();
+    let ev = json!({"hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": p.cwd(), "prompt": "go"});
+    let a = turn_hook(&ev.to_string(), &p.env(), at(NOW), Some(&berlin()));
+    assert_eq!(context(&a.stdout), [CLOCK], "{a:?}");
+    assert!(a.note.is_some(), "{a:?}");
+    drop(held);
+    assert_eq!(p.turn("s1"), [CLOCK]);
+}
