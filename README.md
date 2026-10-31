@@ -49,14 +49,15 @@ colours, the words in the hover; `?` has the legend).
 
 ## > hack
 
-```powershell
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-.\tools\package.ps1
+```sh
+cargo test -j 2 -p lords-core --test <one>   # locally: only the test you're changing
+sh tools/fleet-test.sh                       # rustfmt, clippy -D warnings and every test, as one fleet job
 ```
 
-The ZIP (both exes, the example config, README, LICENSE) lands in `dist/`. Keep `config.txt` local.
+The full check runs as a fleet job (kind `lords.test`) on the committed `HEAD`, never by hand on a working PC; it
+prints the job's id, and `fleet results <id>` has each check's log and exit code. The commit hook still runs rustfmt
+and clippy locally. `.\tools\package.ps1` builds the ZIP (both exes, the example config, README, LICENSE) into
+`dist/`. Keep `config.txt` local.
 
 ## > known limits
 
