@@ -1346,18 +1346,20 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
     item
 }
 
-/// The hook event each guard runs on, and its matcher: `rm` before a Bash call, `queue` when a turn would end (never
-/// on a native subagent's `SubagentStop`).
+/// The hook event each guard runs on, and its matcher: `rm` before a Bash call, `queue` when a turn would end, `session`
+/// when a session starts, `turn` when a prompt does (never a native subagent's `SubagentStop` or `SubagentStart`).
 fn guard_event(name: &str) -> Option<(&'static str, Option<&'static str>)> {
     match name {
         "rm" => Some(("PreToolUse", Some("Bash"))),
         "queue" => Some(("Stop", None)),
+        "session" => Some(("SessionStart", None)),
+        "turn" => Some(("UserPromptSubmit", None)),
         _ => None,
     }
 }
 
 /// The hook events Lords' guards are written to.
-const GUARD_EVENTS: [&str; 2] = ["PreToolUse", "Stop"];
+const GUARD_EVENTS: [&str; 4] = ["PreToolUse", "Stop", "SessionStart", "UserPromptSubmit"];
 
 /// The names of Lords' guard hooks (`guard <name>` run from `guard`) a settings `hooks` value holds.
 fn guard_names(hooks: &serde_json::Value, guard: &Path) -> Vec<String> {
@@ -1436,8 +1438,8 @@ fn guard_hooks(
     }
     let mut wanted = Vec::new();
     for g in guards {
-        let (event, matcher) =
-            guard_event(g).ok_or_else(|| format!("no guard `{g}`; there are: rm, queue"))?;
+        let (event, matcher) = guard_event(g)
+            .ok_or_else(|| format!("no guard `{g}`; there are: rm, queue, session, turn"))?;
         wanted.push((g, event, matcher));
     }
     let mut hooks = match current {
