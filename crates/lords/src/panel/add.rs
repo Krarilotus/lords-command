@@ -29,6 +29,10 @@ pub struct Remote {
     pub config_txt: Option<String>,
     pub running: u32,
     pub listening: u32,
+    /// The app dir and every dir above it up to the profile, each one that lets an account other than this one,
+    /// SYSTEM and Administrators create, delete or change permissions there: why, one line each (fix check r2 N4).
+    /// Required: a probe that doesn't say is no answer.
+    pub open_to: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -246,6 +250,13 @@ pub fn plan(name: &str, local: &Local, remote: &Remote) -> Result<Plan, String> 
             remote.local_app_data
         ));
     }
+    // The panel's threat model (fix check r2 N4): the owner's own account, and no other account short of an
+    // administrator that may change the install path; an administrator gets past any file's access list anyway.
+    if let Some(why) = remote.open_to.first() {
+        return Err(format!(
+            "on {name}, {why}: only this account, SYSTEM and Administrators may (the panel's threat model); settle that there, then run panel add again"
+        ));
+    }
     let config = remote.ssh_config.clone().unwrap_or_default();
     let all = blocks(&config);
     let base = all
@@ -335,6 +346,11 @@ impl Plan {
         let ssh = format!("{}\\.ssh", remote.home);
         let app = format!("{}\\Programs\\lords-command", remote.local_app_data);
         let mut out = vec![format!("{name}:")];
+        // The plan refuses otherwise (fix check r2 N4); STAGE checks it again there.
+        out.push(format!(
+            "  = {app}\\ and every dir above it up to {}: only this account, SYSTEM and Administrators may create, delete or change permissions (checked again before staging)",
+            remote.home
+        ));
         out.push(format!(
             "  + {app}\\staging\\{run}\\ (this run's own: what it sends, removed at its end)"
         ));
@@ -501,6 +517,9 @@ mod tests {
         let backup =
             "X:\\fixture-home\\AppData\\Local\\Programs\\lords-command\\backup-20261031-0900-1\\";
         assert!(said.contains(backup), "{backup} in {said}");
+        // Fix check r2 N4: the dry run says who may change the install path, as the probe found it.
+        let path = "X:\\fixture-home\\AppData\\Local\\Programs\\lords-command\\ and every dir above it up to X:\\fixture-home: only this account, SYSTEM and Administrators may create, delete or change permissions";
+        assert!(said.contains(path), "{path} in {said}");
     }
 
     // Spec (P4: "The same command updates the exe later and keeps config.txt"): run again on a PC that has it all,
@@ -577,6 +596,13 @@ mod tests {
                 }),
             ),
             ("listener isn't running", Box::new(|l, _| l.listener = None)),
+            // Fix check r2 N4: the install path lets another account change it (the panel's threat model).
+            (
+                "BUILTIN\\Users (S-1-5-32-545)",
+                Box::new(|_, r| {
+                    r.open_to = vec!["X:\\fixture-home\\AppData\\Local\\Programs lets BUILTIN\\Users (S-1-5-32-545) create, delete or change permissions there".into()]
+                }),
+            ),
         ];
         for (why, change) in &cases {
             let (mut l, mut r) = (local(), remote());
@@ -590,6 +616,10 @@ mod tests {
         let mut l = local();
         l.authorized_keys.push_str(&format!("{PUB}\r\n"));
         assert!(plan("Other", &l, &r).is_err_and(|e| e.contains("other options")));
+        // A probe's answer that doesn't say who may change the install path is no answer (a missing reading fails
+        // closed).
+        let unsaid = r#"{"home":"X:\\h","local_app_data":"X:\\h\\L","app_data":"X:\\h\\R","ssh":true,"keygen":true,"app":false,"running":0,"listening":0}"#;
+        assert!(serde_json::from_str::<Remote>(unsaid).is_err());
     }
 
     // Spec (P3 step 2: the line restricts the key to the one forward): a public key becomes exactly that line;

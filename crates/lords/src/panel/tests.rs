@@ -1,5 +1,6 @@
 //! `lords panel add`'s remote steps, run here: the same PowerShell the other PC runs, in a local powershell with its
-//! `LOCALAPPDATA` in a temp dir of the test's own. What ssh adds (the transport, the other PC's shell) is not run here.
+//! `LOCALAPPDATA` and `USERPROFILE` in a temp dir of the test's own. What ssh adds (the transport, the other PC's
+//! shell) is not run here.
 
 // Tests are outside the filesystem and process boundary (fsguard.rs): their fixtures write their own temp dirs.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -22,6 +23,7 @@ fn run(
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", step])
         .args([deadline.to_string().as_str(), "run-1", name])
         .env("LOCALAPPDATA", home)
+        .env("USERPROFILE", home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -56,6 +58,21 @@ fn entries(path: &Path) -> Vec<String> {
 fn me() -> String {
     let out = Command::new("whoami").output().unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_lowercase()
+}
+
+/// A temp home as a profile is: this account, SYSTEM and Administrators, nothing inherited from the temp dir (whose
+/// list grants other accounts here).
+fn profile() -> tempfile::TempDir {
+    let home = tempfile::TempDir::new().unwrap();
+    let me = format!("{}:(OI)(CI)F", me());
+    let set = Command::new("icacls")
+        .arg(home.path())
+        .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"])
+        .arg(&me)
+        .output()
+        .unwrap();
+    assert!(set.status.success(), "{}", String::from_utf8_lossy(&set.stdout));
+    home
 }
 
 /// A step that starts a child (`ping`, a minute long), writes its pid into `$name`, and waits a minute.
@@ -95,7 +112,7 @@ fn a_step_is_ended_at_its_deadline_with_all_it_started() {
 // for byte and is never written over; the run's cleanup removes its dir and nothing beside it.
 #[test]
 fn files_reach_the_runs_own_staging_dir_byte_for_byte_and_only_it_is_removed() {
-    let home = tempfile::TempDir::new().unwrap();
+    let home = profile();
     let programs = home.path().join("Programs").join("lords-command");
     std::fs::create_dir_all(&programs).unwrap();
     std::fs::write(programs.join("beside.txt"), "not this run's").unwrap();
@@ -122,7 +139,7 @@ fn files_reach_the_runs_own_staging_dir_byte_for_byte_and_only_it_is_removed() {
 // is, inheriting its parent's list) gets nothing written into it.
 #[test]
 fn the_runs_staging_dir_is_owner_only_from_its_creation_and_a_wider_one_gets_nothing() {
-    let home = tempfile::TempDir::new().unwrap();
+    let home = profile();
     let (ok, said, _) = run(STAGE, 30, "staging", home.path(), b"");
     assert!(ok, "{said}");
     let staged = home.path().join("Programs").join("lords-command").join("staging").join("run-1");
@@ -147,7 +164,7 @@ fn the_runs_staging_dir_is_owner_only_from_its_creation_and_a_wider_one_gets_not
 // refused before anything is made behind it.
 #[test]
 fn a_staging_dir_behind_a_link_is_refused_before_anything_is_made() {
-    let home = tempfile::TempDir::new().unwrap();
+    let home = profile();
     let app = home.path().join("Programs").join("lords-command");
     let elsewhere = home.path().join("elsewhere");
     std::fs::create_dir_all(&app).unwrap();
@@ -162,6 +179,32 @@ fn a_staging_dir_behind_a_link_is_refused_before_anything_is_made() {
     let (ok, said, _) = run(STAGE, 30, "staging", home.path(), b"");
     assert!(!ok && said.contains("a link"), "{said}");
     assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0, "nothing made behind it");
+}
+
+// Spec (fix check r2 N4, the Lords owner: the panel's threat model is the owner's own account and no other non-admin
+// account with rights to change the install path; `panel add` refuses an install target unless the app dir and every
+// dir above it up to the user profile let only the owner, SYSTEM and Administrators create, delete or change
+// permissions there; the probe says it, STAGE checks it again): with a parent that grants another account
+// FullControl, the probe names that dir and account and STAGE refuses before it makes anything; with only those
+// three, the probe names nothing.
+#[test]
+fn an_install_path_another_account_may_change_is_named_and_refused() {
+    let home = profile();
+    let programs = home.path().join("Programs");
+    std::fs::create_dir_all(programs.join("lords-command")).unwrap();
+    let (ok, said, _) = run(PROBE, 30, "none", home.path(), b"");
+    assert!(ok && said.contains("\"open_to\":[]"), "{said}");
+    let grant = Command::new("icacls")
+        .arg(&programs)
+        .args(["/grant", "*S-1-5-32-545:(OI)(CI)F"])
+        .output()
+        .unwrap();
+    assert!(grant.status.success(), "{}", String::from_utf8_lossy(&grant.stdout));
+    let (ok, said, _) = run(PROBE, 30, "none", home.path(), b"");
+    assert!(ok && said.contains("S-1-5-32-545"), "{said}");
+    let (ok, said, _) = run(STAGE, 30, "staging", home.path(), b"");
+    assert!(!ok && said.contains("S-1-5-32-545"), "{said}");
+    assert!(!programs.join("lords-command").join("staging").exists(), "nothing made");
 }
 
 // Spec (review r1 R6: a step's arguments are data, never code): a run's id or a file's name that isn't a plain word
