@@ -361,9 +361,9 @@ impl Transcript {
 
     /// Whether something may wait that the session hasn't taken. Only while a run later than the active one exists
     /// (design note E1); then (a) no listing came at or after the latest run first appeared, or (b) the session's
-    /// latest listing (its last page with no cursor, and the pages after it) stopped at a limit, or showed a run no
-    /// `cancel` or `promote_to_steer` named after it was shown (Lords owner, 31 Oct). Without a later run, items of an
-    /// old listing were delivered as turns since, and nothing waits.
+    /// latest listing (its last page with no cursor, and the pages after it) stopped at a limit, had a take between
+    /// two of its pages, or showed a run no `cancel` or `promote_to_steer` named after it was shown (Lords owner, 31
+    /// Oct). Without a later run, items of an old listing were delivered as turns since, and nothing waits.
     pub fn may_wait(&self) -> bool {
         if self.latest == self.active {
             return false;
@@ -374,7 +374,13 @@ impl Transcript {
         }
         let start = self.pages.iter().rposition(|p| p.fresh).unwrap_or(0);
         let listing = &self.pages[start..];
+        // T3 pages the queue as it is at each page, by offset: a take between two pages moves the runs after it
+        // forward, and the next page skips as many (sol-loop r1, S1). Such a listing shows no whole queue.
+        let (first, last) =
+            (listing.first().map_or(0, |p| p.line), listing.last().map_or(0, |p| p.line));
+        let shifted = self.taken.iter().any(|(n, _)| *n > first && *n < last);
         listing.last().is_some_and(|p| p.more)
+            || shifted
             || listing.iter().any(|p| {
                 p.shown.iter().any(|r| !self.taken.iter().any(|(n, t)| *n > p.line && t == r))
             })
