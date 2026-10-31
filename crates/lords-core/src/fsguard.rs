@@ -109,6 +109,11 @@ pub fn read_lines(path: impl AsRef<Path>, mut each: impl FnMut(&[u8])) -> std::i
     Ok(())
 }
 
+/// When a file was last written (std's `metadata().modified()`): the session guard's age of a record.
+pub fn modified(path: impl AsRef<Path>) -> std::io::Result<std::time::SystemTime> {
+    fs::metadata(path)?.modified()
+}
+
 /// A file's bytes for display, `None` on any error (fonts in the GUI).
 pub fn read_bytes_lossy(path: impl AsRef<Path>) -> Option<Vec<u8>> {
     fs::read(path).ok()

@@ -1,5 +1,6 @@
 //! Guards a harness runs as hooks (owner, 30 Oct 2026): `rm` before an agent's tool call, answering at once instead
-//! of leaving the call to stop on an approval prompt nobody sees; `queue` when an agent's turn would end (below). A Claude child in full-access mode sat about 30
+//! of leaving the call to stop on an approval prompt nobody sees; `queue` when an agent's turn would end; `session`
+//! and `turn` when a session and a prompt start (below). A Claude child in full-access mode sat about 30
 //! minutes on Claude Code's "dangerous rm on a possibly-empty variable path" prompt for `rm -f $OUT/$id.json`; its
 //! parent saw only "running".
 //!
@@ -16,6 +17,7 @@
 
 use crate::fsguard::{Contained, Part, Root};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -531,28 +533,273 @@ impl Streak {
     }
 }
 
-// The session and turn guards: tests first; the stubs below answer nothing yet.
+// ---------------------------------------------------------------- session and turn
+//
+// `session` and `turn` (the Lords owner, 31 Oct): a running session keeps the Lords rules it started with, so rule
+// changes never reached long-running sessions; and agents guessed clock times. `session`, a `SessionStart` hook,
+// records the hash of each Lords-written file the session reads. `turn`, a `UserPromptSubmit` hook, gives the agent
+// the clock in one line and, only when one of those files changed since, names it, once. A few small reads per
+// prompt: no transcript, no network, no T3 (design note: Harness/notes/2026-10-31-lords-turn-hook.md).
 
+/// Days after which a session's record is stale: removed at any session's next start. A later prompt of that session
+/// finds no record and is told once, as a session that started before the guard was installed.
 pub const SESSION_RECORD_DAYS: u64 = 7;
 
+/// Where the session and turn guards look: the tool home (their records) and the user's Claude config dir, whose
+/// `CLAUDE.md` includes the user-level Lords files (`CLAUDE_CONFIG_DIR`, else `~/.claude`).
 pub struct RulesEnv {
     pub home: PathBuf,
     pub user_config: Option<PathBuf>,
 }
 
-pub fn clock_line(_now: jiff::Timestamp, _zone: Option<&jiff::tz::TimeZone>) -> String {
-    String::new()
+/// The clock line: the local time in the system's zone, labelled by the zone's city (`Berlin 07:41 Sat 31 Oct`), by
+/// its offset when it has no IANA name, and as UTC, said so, when the system reports no zone. Never an assumed zone.
+pub fn clock_line(now: jiff::Timestamp, zone: Option<&jiff::tz::TimeZone>) -> String {
+    let Some(tz) = zone else {
+        let utc = now.to_zoned(jiff::tz::TimeZone::UTC);
+        return format!("UTC {} (local zone unknown)", utc.strftime("%H:%M %a %-d %b"));
+    };
+    let local = now.to_zoned(tz.clone());
+    let label = match tz.iana_name() {
+        Some(name) => name.rsplit('/').next().unwrap_or(name).replace('_', " "),
+        None => {
+            let s = local.offset().seconds();
+            let sign = if s < 0 { '-' } else { '+' };
+            format!("UTC{sign}{:02}:{:02}", s.abs() / 3600, s.abs() % 3600 / 60)
+        }
+    };
+    format!("{label} {}", local.strftime("%H:%M %a %-d %b"))
 }
 
-pub fn session_hook(_input: &str, _env: &RulesEnv) -> Answer {
+/// The system's clock and zone, for the turn guard.
+pub fn system_clock() -> (jiff::Timestamp, Option<jiff::tz::TimeZone>) {
+    (jiff::Timestamp::now(), jiff::tz::TimeZone::try_system().ok())
+}
+
+/// How a session came to read a file: Claude Code loads it itself, again after a compaction and on resume (the place
+/// `CLAUDE.local.md` files, the user `CLAUDE.md`'s includes), or the agent read it on its own (a role file; Codex's
+/// `AGENTS.override.md`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Load {
+    Claude,
+    Agent,
+}
+
+/// Each Lords-written file a session in `cwd` reads, by path, with how it was read and its hash: the
+/// `CLAUDE.local.md`, `AGENTS.override.md` and `.lords/role-*.md` of the cwd and every dir above it, and the includes
+/// of the user `CLAUDE.md` that lie in the tool home. A file counts only with Lords' marker in it; one that can't be
+/// read counts as not there.
+fn rules_files(cwd: &Path, env: &RulesEnv) -> BTreeMap<String, (Load, String)> {
+    let mut out = BTreeMap::new();
+    let mut add = |p: &Path, load: Load| {
+        if let Ok(b) = crate::fsguard::read_bytes(p) {
+            let marker = crate::compose::BEGIN.as_bytes();
+            if b.windows(marker.len()).any(|w| w == marker) {
+                out.insert(crate::adapters::slashes(p), (load, crate::fsguard::sha(&b)));
+            }
+        }
+    };
+    for d in cwd.ancestors() {
+        add(&d.join("CLAUDE.local.md"), Load::Claude);
+        add(&d.join("AGENTS.override.md"), Load::Agent);
+        for p in crate::fsguard::list_dir(&d.join(crate::sync::ROLE_DIR)).unwrap_or_default() {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with("role-") && name.ends_with(".md") {
+                add(&p, Load::Agent);
+            }
+        }
+    }
+    let home = crate::adapters::slashes(&env.home).to_lowercase() + "/";
+    let user = env.user_config.as_ref().map(|c| c.join("CLAUDE.md"));
+    let text = user.and_then(|u| crate::fsguard::read_string(u).ok()).unwrap_or_default();
+    for line in text.lines() {
+        let Some(include) = line.trim().strip_prefix('@') else { continue };
+        let p = crate::config::expand_home(include.trim());
+        if crate::adapters::slashes(&p).to_lowercase().starts_with(&home) {
+            add(&p, Load::Claude);
+        }
+    }
+    out
+}
+
+/// What a session read at its start: its cwd and its files (`rules_files`).
+struct Record {
+    cwd: PathBuf,
+    files: BTreeMap<String, (Load, String)>,
+}
+
+const RECORD_HEADER: &str = "lords session record 1";
+
+/// A session's record: `<tool home>/guard/session/<session id>`.
+fn record_place(home: &Path, session: &str) -> Result<Contained, String> {
+    Ok(Root::home(home)?.join(&[Part::new("guard")?, Part::new("session")?, Part::new(session)?]))
+}
+
+/// The record, or `None` when there is none (or it isn't one: it is then made again).
+fn read_record(place: &Contained) -> Result<Option<Record>, String> {
+    let Some(text) = crate::fsguard::read_text(place.path())? else { return Ok(None) };
+    let mut lines = text.lines();
+    let (Some(RECORD_HEADER), Some(cwd)) =
+        (lines.next(), lines.next().and_then(|l| l.strip_prefix("cwd\t")))
+    else {
+        return Ok(None);
+    };
+    let mut files = BTreeMap::new();
+    for l in lines {
+        let mut f = l.splitn(3, '\t');
+        let load = match f.next() {
+            Some("claude") => Load::Claude,
+            Some("agent") => Load::Agent,
+            _ => return Ok(None),
+        };
+        let (Some(hash), Some(path)) = (f.next(), f.next()) else { return Ok(None) };
+        files.insert(path.to_string(), (load, hash.to_string()));
+    }
+    Ok(Some(Record { cwd: PathBuf::from(cwd), files }))
+}
+
+fn write_record(
+    place: &Contained,
+    cwd: &Path,
+    files: &BTreeMap<String, (Load, String)>,
+) -> Result<(), String> {
+    let mut text = format!("{RECORD_HEADER}\ncwd\t{}\n", cwd.display());
+    for (path, (load, hash)) in files {
+        let load = if *load == Load::Claude { "claude" } else { "agent" };
+        text.push_str(&format!("{load}\t{hash}\t{path}\n"));
+    }
+    crate::fsguard::create_dir_all(&place.root().join(&place.parts()[..place.parts().len() - 1]))?;
+    match crate::fsguard::kind(place.path())? {
+        crate::fsguard::Kind::Missing => crate::fsguard::create_file(place, text.as_bytes()),
+        _ => crate::fsguard::replace_own_file(place, text.as_bytes()),
+    }
+}
+
+/// Removes every session record older than `SESSION_RECORD_DAYS`. Best effort: a record left is only a small file.
+fn sweep_records(home: &Path) {
+    let Ok(dir) =
+        Root::home(home).and_then(|r| Ok(r.join(&[Part::new("guard")?, Part::new("session")?])))
+    else {
+        return;
+    };
+    let max = Duration::from_secs(SESSION_RECORD_DAYS * 24 * 3600);
+    for p in crate::fsguard::list_dir(dir.path()).unwrap_or_default() {
+        let stale = crate::fsguard::modified(&p)
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > max);
+        let name = p.file_name().and_then(|n| n.to_str()).and_then(|n| Part::new(n).ok());
+        if let (true, Some(name)) = (stale, name) {
+            let _ = crate::fsguard::delete_file(&dir.child(name));
+        }
+    }
+}
+
+fn quiet() -> Answer {
     Answer { stdout: String::new(), note: None }
 }
 
+fn noted(why: impl Into<String>) -> Answer {
+    Answer { stdout: String::new(), note: Some(why.into()) }
+}
+
+/// The event's session id and cwd.
+fn session_of(ev: &Value) -> Result<(&str, &Path), String> {
+    let session = ev["session_id"].as_str().ok_or("the event names no session")?;
+    let cwd = ev["cwd"].as_str().ok_or("the event names no cwd")?;
+    Ok((session, Path::new(cwd)))
+}
+
+/// The session guard's answer to one `SessionStart` event: always nothing on stdout. It records the files the
+/// session reads (`rules_files`). On `compact` and `resume` Claude reloads its own files, so they are recorded anew,
+/// while the files the agent read itself keep the hash recorded before: a change to one of them is still named. Then
+/// stale records go (`sweep_records`). Any failure is a note; the session goes on.
+pub fn session_hook(input: &str, env: &RulesEnv) -> Answer {
+    let Ok(ev) = serde_json::from_str::<Value>(input) else {
+        return noted("the event can't be read");
+    };
+    if ev["hook_event_name"] != "SessionStart" {
+        return quiet();
+    }
+    let recorded = session_of(&ev).and_then(|(session, cwd)| {
+        let place = record_place(&env.home, session)?;
+        let mut files = rules_files(cwd, env);
+        if matches!(ev["source"].as_str(), Some("compact" | "resume")) {
+            if let Some(before) = read_record(&place)? {
+                files.retain(|_, (load, _)| *load == Load::Claude);
+                files
+                    .extend(before.files.into_iter().filter(|(_, (load, _))| *load == Load::Agent));
+            }
+        }
+        write_record(&place, cwd, &files)
+    });
+    sweep_records(&env.home);
+    match recorded {
+        Ok(()) => quiet(),
+        Err(e) => noted(format!("the session's files aren't recorded ({e})")),
+    }
+}
+
+/// The turn guard's answer to one `UserPromptSubmit` event: context of the clock line and, only when a file the
+/// session read changed since it was recorded, a line naming each such file, once (the record then holds it as it
+/// is). A session with no record (it started before the guard) is told once that the rules may have changed, with
+/// every file it reads. Never a block: a failure in the rules part leaves the clock line, with a note.
 pub fn turn_hook(
-    _input: &str,
-    _env: &RulesEnv,
-    _now: jiff::Timestamp,
-    _zone: Option<&jiff::tz::TimeZone>,
+    input: &str,
+    env: &RulesEnv,
+    now: jiff::Timestamp,
+    zone: Option<&jiff::tz::TimeZone>,
 ) -> Answer {
-    Answer { stdout: String::new(), note: None }
+    let Ok(ev) = serde_json::from_str::<Value>(input) else {
+        return noted("the event can't be read");
+    };
+    if ev["hook_event_name"] != "UserPromptSubmit" {
+        return quiet();
+    }
+    let mut lines = vec![clock_line(now, zone)];
+    let mut note = None;
+    match rules_line(&ev, env) {
+        Ok(Some(line)) => lines.push(line),
+        Ok(None) => {}
+        Err(e) => note = Some(format!("the rules aren't checked ({e})")),
+    }
+    let out = json!({"hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": lines.join("\n"),
+    }});
+    Answer { stdout: out.to_string(), note }
+}
+
+/// The rules line for one prompt, if any (`turn_hook`).
+fn rules_line(ev: &Value, env: &RulesEnv) -> Result<Option<String>, String> {
+    let (session, cwd) = session_of(ev)?;
+    let place = record_place(&env.home, session)?;
+    let Some(before) = read_record(&place)? else {
+        let files = rules_files(cwd, env);
+        write_record(&place, cwd, &files)?;
+        let paths: Vec<&str> = files.keys().map(String::as_str).collect();
+        return Ok((!paths.is_empty()).then(|| {
+            format!(
+                "Lords rules may have changed since this session started: re-read {}",
+                paths.join(", ")
+            )
+        }));
+    };
+    let now = rules_files(&before.cwd, env);
+    let mut changed: Vec<String> = now
+        .iter()
+        .filter(|(path, (_, hash))| before.files.get(*path).is_none_or(|(_, h)| h != hash))
+        .map(|(path, _)| path.clone())
+        .collect();
+    changed.extend(
+        before.files.keys().filter(|p| !now.contains_key(*p)).map(|p| format!("{p} (removed)")),
+    );
+    if changed.is_empty() {
+        return Ok(None);
+    }
+    write_record(&place, &before.cwd, &now)?;
+    Ok(Some(format!(
+        "Lords rules changed since this session started: re-read {}",
+        changed.join(", ")
+    )))
 }

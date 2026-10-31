@@ -34,6 +34,8 @@ usage:
   lords sizes [--json]   every file sync writes, by section; fails past the warning line
   lords guard rm   Claude's PreToolUse hook: refuses an `rm` whose path holds a variable not written as quoted ${VAR:?}
   lords guard queue [--deadline-ms N]   Claude's Stop hook: holds a turn's end while items may wait in its T3 queue
+  lords guard session   Claude's SessionStart hook: records the Lords files the session reads
+  lords guard turn   Claude's UserPromptSubmit hook: the clock, and the Lords files changed since the session started
   lords guard install [--home DIR]   install or update the guard copy the hooks run (sync never writes it)
 
 stacks: --public-stack DIR, --private-stack DIR, else config.txt (beside the exe, or ~/.lords-command/),
@@ -127,6 +129,7 @@ fn cmd_guard(mut a: Args) -> ExitCode {
     if a.flag("--help") || a.flag("-h") {
         say("usage: lords guard rm   (Claude Code's PreToolUse hook; the event on stdin)");
         say("       lords guard queue [--deadline-ms N]   (Claude Code's Stop hook; the event on stdin)");
+        say("       lords guard session | turn   (Claude Code's SessionStart and UserPromptSubmit hooks)");
         return ExitCode::SUCCESS;
     }
     if a.flag("--self-test") {
@@ -142,6 +145,9 @@ fn cmd_guard(mut a: Args) -> ExitCode {
     if which.as_deref() == Some("queue") {
         return guard_queue(a);
     }
+    if let Some(w @ ("session" | "turn")) = which.as_deref() {
+        return guard_rules(w, a);
+    }
     if which.as_deref() != Some("rm") || a.done().is_err() {
         note("usage `lords guard rm` (event on stdin)");
         return ExitCode::SUCCESS;
@@ -156,6 +162,49 @@ fn cmd_guard(mut a: Args) -> ExitCode {
     let out = lords_core::guard::rm_hook(&input);
     if !out.is_empty() {
         say(&out);
+    }
+    ExitCode::SUCCESS
+}
+
+/// `lords guard session` and `lords guard turn`: the hooks Claude Code runs when a session and a prompt start
+/// (guard.rs). Each reads the event on stdin; `turn` prints the prompt's context, `session` nothing. Like the other
+/// guards they never fail: every problem is a note on stderr and exit 0.
+fn guard_rules(which: &str, a: Args) -> ExitCode {
+    use lords_core::guard::{session_hook, system_clock, turn_hook, RulesEnv};
+    let note = |line: &str| say_err(&format!("lords guard {which}: {line}"));
+    if a.done().is_err() {
+        note(&format!("usage `lords guard {which}` (event on stdin)"));
+        return ExitCode::SUCCESS;
+    }
+    let input = match std::io::read_to_string(std::io::stdin()) {
+        Ok(i) => i,
+        Err(e) => {
+            note(&format!("the event can't be read ({e})"));
+            return ExitCode::SUCCESS;
+        }
+    };
+    let home = match lords_core::sync::default_home() {
+        Ok(h) => h,
+        Err(e) => {
+            note(&e);
+            return ExitCode::SUCCESS;
+        }
+    };
+    let user_config = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| lords_core::config::home().map(|h| h.join(".claude")));
+    let env = RulesEnv { home, user_config };
+    let answer = if which == "session" {
+        session_hook(&input, &env)
+    } else {
+        let (now, zone) = system_clock();
+        turn_hook(&input, &env, now, zone.as_ref())
+    };
+    if let Some(n) = answer.note {
+        note(&n);
+    }
+    if !answer.stdout.is_empty() {
+        say(&answer.stdout);
     }
     ExitCode::SUCCESS
 }
