@@ -587,39 +587,45 @@ enum Load {
 
 /// Each Lords-written file a session in `cwd` reads, by path, with how it was read and its hash: the
 /// `CLAUDE.local.md`, `AGENTS.override.md` and `.lords/role-*.md` of the cwd and every dir above it, and the includes
-/// of the user `CLAUDE.md` that lie in the tool home. A file counts only with Lords' marker in it; one that can't be
-/// read counts as not there.
-fn rules_files(cwd: &Path, env: &RulesEnv) -> BTreeMap<String, (Load, String)> {
+/// of the user `CLAUDE.md` that lie in the tool home. A file counts only with Lords' marker in it. Any read that fails
+/// other than for a missing file is an error: a file that can't be read now is no change (sol-loop r1, S2).
+fn rules_files(cwd: &Path, env: &RulesEnv) -> Result<BTreeMap<String, (Load, String)>, String> {
+    let read = |p: &Path| match crate::fsguard::read_bytes(p) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", p.display())),
+    };
     let mut out = BTreeMap::new();
-    let mut add = |p: &Path, load: Load| {
-        if let Ok(b) = crate::fsguard::read_bytes(p) {
-            let marker = crate::compose::BEGIN.as_bytes();
-            if b.windows(marker.len()).any(|w| w == marker) {
-                out.insert(crate::adapters::slashes(p), (load, crate::fsguard::sha(&b)));
-            }
+    let mut add = |p: &Path, load: Load| -> Result<(), String> {
+        let marker = crate::compose::BEGIN.as_bytes();
+        if let Some(b) = read(p)?.filter(|b| b.windows(marker.len()).any(|w| w == marker)) {
+            out.insert(crate::adapters::slashes(p), (load, crate::fsguard::sha(&b)));
         }
+        Ok(())
     };
     for d in cwd.ancestors() {
-        add(&d.join("CLAUDE.local.md"), Load::Claude);
-        add(&d.join("AGENTS.override.md"), Load::Agent);
-        for p in crate::fsguard::list_dir(&d.join(crate::sync::ROLE_DIR)).unwrap_or_default() {
+        add(&d.join("CLAUDE.local.md"), Load::Claude)?;
+        add(&d.join("AGENTS.override.md"), Load::Agent)?;
+        for p in crate::fsguard::list_dir(&d.join(crate::sync::ROLE_DIR))? {
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.starts_with("role-") && name.ends_with(".md") {
-                add(&p, Load::Agent);
+                add(&p, Load::Agent)?;
             }
         }
     }
     let home = crate::adapters::slashes(&env.home).to_lowercase() + "/";
-    let user = env.user_config.as_ref().map(|c| c.join("CLAUDE.md"));
-    let text = user.and_then(|u| crate::fsguard::read_string(u).ok()).unwrap_or_default();
-    for line in text.lines() {
+    let user = match &env.user_config {
+        Some(c) => read(&c.join("CLAUDE.md"))?.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    for line in String::from_utf8_lossy(&user).lines() {
         let Some(include) = line.trim().strip_prefix('@') else { continue };
         let p = crate::config::expand_home(include.trim());
         if crate::adapters::slashes(&p).to_lowercase().starts_with(&home) {
-            add(&p, Load::Claude);
+            add(&p, Load::Claude)?;
         }
     }
-    out
+    Ok(out)
 }
 
 /// What a session read at its start: its cwd and its files (`rules_files`).
@@ -712,8 +718,9 @@ fn session_of(ev: &Value) -> Result<(&str, &Path), String> {
 
 /// The session guard's answer to one `SessionStart` event: always nothing on stdout. It records the files the
 /// session reads (`rules_files`). On `compact` and `resume` Claude reloads its own files, so they are recorded anew,
-/// while the files the agent read itself keep the hash recorded before: a change to one of them is still named. Then
-/// stale records go (`sweep_records`). Any failure is a note; the session goes on.
+/// while the files the agent read itself keep the hash recorded before: a change to one of them is still named. With
+/// no record from before, nothing is known of those, so the session stays unrecorded and its next prompt is told
+/// (sol-loop r1, S1). Then stale records go (`sweep_records`). Any failure is a note; the session goes on.
 pub fn session_hook(input: &str, env: &RulesEnv) -> Answer {
     let Ok(ev) = serde_json::from_str::<Value>(input) else {
         return noted("the event can't be read");
@@ -723,13 +730,11 @@ pub fn session_hook(input: &str, env: &RulesEnv) -> Answer {
     }
     let recorded = session_of(&ev).and_then(|(session, cwd)| {
         let place = record_place(&env.home, session)?;
-        let mut files = rules_files(cwd, env);
+        let mut files = rules_files(cwd, env)?;
         if matches!(ev["source"].as_str(), Some("compact" | "resume")) {
-            if let Some(before) = read_record(&place)? {
-                files.retain(|_, (load, _)| *load == Load::Claude);
-                files
-                    .extend(before.files.into_iter().filter(|(_, (load, _))| *load == Load::Agent));
-            }
+            let Some(before) = read_record(&place)? else { return Ok(()) };
+            files.retain(|_, (load, _)| *load == Load::Claude);
+            files.extend(before.files.into_iter().filter(|(_, (load, _))| *load == Load::Agent));
         }
         write_record(&place, cwd, &files)
     });
@@ -775,7 +780,7 @@ fn rules_line(ev: &Value, env: &RulesEnv) -> Result<Option<String>, String> {
     let (session, cwd) = session_of(ev)?;
     let place = record_place(&env.home, session)?;
     let Some(before) = read_record(&place)? else {
-        let files = rules_files(cwd, env);
+        let files = rules_files(cwd, env)?;
         write_record(&place, cwd, &files)?;
         let paths: Vec<&str> = files.keys().map(String::as_str).collect();
         return Ok((!paths.is_empty()).then(|| {
@@ -785,7 +790,7 @@ fn rules_line(ev: &Value, env: &RulesEnv) -> Result<Option<String>, String> {
             )
         }));
     };
-    let now = rules_files(&before.cwd, env);
+    let now = rules_files(&before.cwd, env)?;
     let mut changed: Vec<String> = now
         .iter()
         .filter(|(path, (_, hash))| before.files.get(*path).is_none_or(|(_, h)| h != hash))
