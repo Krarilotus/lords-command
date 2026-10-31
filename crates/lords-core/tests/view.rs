@@ -153,7 +153,8 @@ fn the_composed_view_maps_each_line_to_its_source() {
             default_role: None,
             default_role_inline: false,
             opener: None,
-            child: false,
+            child: None,
+            default_role_lines: true,
         },
     );
     let v = view::composed(&s, &c);

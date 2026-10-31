@@ -32,14 +32,14 @@ usage:
   lords set-aside PATH... [--yes]   move paths that aren't the tool's into a new backup dir
   (sync, uninstall, adopt, set-aside: --home DIR, the tool's own dir; default ~/.lords-command)
   lords hooks install --post-checkout [--repo DIR]   a new worktree gets its place files (`sync --place`)
-  lords compose [--repo NAME [--role ROLE | --child]] [--adapter ID] [--json]   what a harness reads there, with sources
+  lords compose [--repo NAME [--role ROLE | --child | --child-whole]] [--adapter ID] [--json]   what a harness reads there, with sources
   lords show ID   an entry's whole text, which its core line stands for at start (without frontmatter)
   lords sizes [--json]   every file sync writes, by section; fails past the warning line
   lords guard rm   Claude's PreToolUse hook: refuses an `rm` whose path holds a variable not written as quoted ${VAR:?}
   lords guard queue [--deadline-ms N]   Claude's Stop hook: holds a turn's end while items may wait in its T3 queue
   lords guard session   Claude's SessionStart hook: records the Lords files the session reads
   lords guard turn   Claude's UserPromptSubmit hook: the clock, and the Lords files changed since the session started
-  lords guard child   the SubagentStart hook: a native child starts with its role's start file in its place
+  lords guard child [--part N]   the SubagentStart hook: a native child starts with its role's start file in its place
   lords guard install [--home DIR]   install or update the guard copy the hooks run (sync never writes it)
   lords panel serve [--port N]   the window on another PC reads and edits these stacks through it (127.0.0.1:7879)
   lords panel add ALIAS --bridge DIR [--apply]   set a PC this one reaches as ALIAS up for the panel; prints the
@@ -220,13 +220,21 @@ fn guard_rules(which: &str, a: Args) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `lords guard child`: the `SubagentStart` hook (Claude Code, Codex) that gives a native child its place's start file
-/// (guard.rs). Reads the event on stdin; like the other guards it never fails: every problem is a note on stderr and
-/// exit 0.
-fn guard_child(a: Args) -> ExitCode {
+/// `lords guard child [--part N]`: the `SubagentStart` hook (Claude Code, Codex) that gives a native child its place's
+/// start file (guard.rs), with `--part` only its Nth part. Reads the event on stdin; like the other guards it never
+/// fails: every problem is a note on stderr and exit 0.
+fn guard_child(mut a: Args) -> ExitCode {
     let note = |line: &str| say_err(&format!("lords guard child: {line}"));
+    let part = match a.value("--part").map(|v| v.map(|n| n.parse::<usize>())) {
+        Ok(None) => None,
+        Ok(Some(Ok(n))) => Some(n),
+        _ => {
+            note("usage `lords guard child [--part N]` (event on stdin)");
+            return ExitCode::SUCCESS;
+        }
+    };
     if a.done().is_err() {
-        note("usage `lords guard child` (event on stdin)");
+        note("usage `lords guard child [--part N]` (event on stdin)");
         return ExitCode::SUCCESS;
     }
     let input = match std::io::read_to_string(std::io::stdin()) {
@@ -236,7 +244,7 @@ fn guard_child(a: Args) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
-    let answer = lords_core::guard::child_hook(&input);
+    let answer = lords_core::guard::child_hook(&input, part);
     if let Some(n) = answer.note {
         note(&n);
     }
@@ -876,7 +884,11 @@ fn cmd_hooks(mut a: Args) -> Result<bool, String> {
 /// What an adapter reads in one place: the user level, a repo or workspace's shared files, or one role's file.
 fn cmd_compose(mut a: Args) -> Result<bool, String> {
     let json = a.flag("--json");
-    let child = a.flag("--child");
+    let child = if a.flag("--child-whole") {
+        Some(lords_core::compose::ChildStart::Whole)
+    } else {
+        a.flag("--child").then_some(lords_core::compose::ChildStart::Beyond)
+    };
     let place = a.value("--repo")?;
     let role = a.value("--role")?;
     let adapter_id = a.value("--adapter")?.unwrap_or_else(|| "codex".into());
@@ -891,9 +903,10 @@ fn cmd_compose(mut a: Args) -> Result<bool, String> {
     })?;
     let home = sync::default_home()?;
     let composed = match (&place, &role) {
-        (Some(place), None) if child => {
+        (Some(place), None) if child.is_some() => {
             let role = sync::child_role(&stacks).ok_or("--child needs a stack's `child_role`")?;
-            sync::child_composed(&stacks, sync::place_layers(&stacks, place, true), role, &home)
+            let layers = sync::place_layers(&stacks, place, true);
+            sync::child_composed(&stacks, layers, role, &home, child.expect("matched"))
         }
         (Some(place), Some(role)) => {
             sync::role_composed(&stacks, sync::place_layers(&stacks, place, true), role, &home)

@@ -1020,7 +1020,8 @@ fn context(
         default_role: None,
         default_role_inline: false,
         opener: Some(opener(home)),
-        child: false,
+        child: None,
+        default_role_lines: true,
     }
 }
 
@@ -1381,17 +1382,20 @@ fn guard_event(name: &str) -> Option<(&'static str, Option<&'static str>)> {
 const GUARD_EVENTS: [&str; 5] =
     ["PreToolUse", "Stop", "SessionStart", "UserPromptSubmit", "SubagentStart"];
 
-/// The names of Lords' guard hooks (`guard <name>` run from `guard`) a settings `hooks` value holds.
+/// The names of Lords' guard hooks (`guard <name>` run from `guard`) a settings `hooks` value holds, each once (a
+/// guard may run as several hooks, one per part).
 fn guard_names(hooks: &serde_json::Value, adapter: &dyn Adapter, guard: &Path) -> Vec<String> {
     let exe = adapters::slashes(guard);
-    GUARD_EVENTS
+    let mut names: Vec<String> = GUARD_EVENTS
         .iter()
         .filter_map(|ev| hooks[*ev].as_array())
         .flatten()
         .filter_map(|e| e["hooks"].as_array())
         .flatten()
         .filter_map(|h| adapter.guard_of(h, &exe))
-        .collect()
+        .collect();
+    names.dedup();
+    names
 }
 
 /// What a settings plan shows: what Lords changes there, never the settings' text (rm-guard review r1, R6).
@@ -1486,10 +1490,10 @@ fn guard_hooks(
         list.retain(|e| e["hooks"].as_array().is_none_or(|hs| !hs.is_empty()));
     }
     for (g, event, matcher) in wanted {
-        let hook = adapter.guard_hook(&exe, g);
+        let hooks = adapter.guard_hooks(&exe, g);
         let entry = match matcher {
-            Some(m) => serde_json::json!({ "matcher": m, "hooks": [hook] }),
-            None => serde_json::json!({ "hooks": [hook] }),
+            Some(m) => serde_json::json!({ "matcher": m, "hooks": hooks }),
+            None => serde_json::json!({ "hooks": hooks }),
         };
         let list = events.entry(event).or_insert(serde_json::json!([]));
         list.as_array_mut().expect("a list, checked above").push(entry);
@@ -1820,8 +1824,10 @@ pub fn role_file(role: &str) -> String {
     format!("role-{role}.md")
 }
 
-/// A native child's start file in a place's role dir (`child_composed`).
+/// A native child's start files in a place's role dir (`child_composed`): for one that also loads the place's file,
+/// and for one that loads none.
 pub const CHILD_FILE: &str = "child.md";
+pub const CHILD_WHOLE_FILE: &str = "child-whole.md";
 
 /// Everything someone in `role` follows in a place, standing alone: every global entry for the role, the project,
 /// the place, and the memory index; for every agent family (lines for only some are labelled).
@@ -1842,7 +1848,8 @@ fn role_context(layers: Layers, role: &str, home: &Path) -> Context {
         default_role: None,
         default_role_inline: false,
         opener: Some(opener(home)),
-        child: false,
+        child: None,
+        default_role_lines: true,
     }
 }
 
@@ -1857,17 +1864,32 @@ pub fn child_role(stacks: &Stacks) -> Option<&str> {
     stacks.private.iter().chain([&stacks.public]).find_map(|s| s.manifest.child_role.as_deref())
 }
 
-/// A native child's start file in a place, `.lords/child.md` (the `child` guard gives it at `SubagentStart`): what
-/// of `role` the place's file doesn't carry (compose.rs, `Context::child`).
-pub fn child_composed(stacks: &Stacks, layers: Layers, role: &str, home: &Path) -> Composed {
+/// A native child's start file in a place (the `child` guard gives it at `SubagentStart`): `.lords/child.md`, what of
+/// `role` the place's file doesn't carry, or `.lords/child-whole.md`, the role's whole start for a child that loads no
+/// place file (compose.rs, `ChildStart`).
+pub fn child_composed(
+    stacks: &Stacks,
+    layers: Layers,
+    role: &str,
+    home: &Path,
+    start: compose::ChildStart,
+) -> Composed {
     let mut ctx = role_context(layers, role, home);
-    ctx.child = true;
+    ctx.child = Some(start);
     compose::compose(stacks, &ctx)
 }
 
 /// The most a `SubagentStart` hook's context may hold in characters before Claude Code saves it to a file and gives
-/// the child only a preview, which it isn't asked to read (code.claude.com/docs/en/hooks: 10,000, no setting).
+/// the child only a preview, which it isn't asked to read (code.claude.com/docs/en/hooks: 10,000, no setting). Each
+/// hook's context is measured on its own, so a child's start goes in parts of at most `CHILD_PART_CHARS`.
 pub const CHILD_CONTEXT_MAX_CHARS: usize = 10_000;
+
+/// The most one part of a child's start holds, its "part N of M" line included: under the cap, with room to spare.
+pub const CHILD_PART_CHARS: usize = 9_500;
+
+/// The parts Claude Code's `child` guard hooks deliver: one hook each (`guard child --part N`), so at most this many
+/// times `CHILD_PART_CHARS` (28,500 characters; the largest whole start measured on 31 Oct: about 19,500).
+pub const CHILD_PARTS: usize = 3;
 
 fn place_scope(place: &Place, adapter: Option<&dyn Adapter>) -> String {
     place_scope_of(place.workspace, &place.name, adapter)
@@ -2086,17 +2108,23 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
             tree.insert(role_file(role), c.text.clone().into_bytes());
         }
     }
-    // A native child's start file, for the `child` guard (plan L6, an orchestrator's condition 3).
+    // A native child's start files, for the `child` guard (plan L6, an orchestrator's condition 3; review r1, F1).
     if let Some(role) = child_role(pl.stacks) {
-        let text = child_composed(pl.stacks, place.layers(true), role, &pl.plan.home).text;
-        let chars = text.chars().count();
-        if chars > CHILD_CONTEXT_MAX_CHARS {
-            pl.plan.notes.push(format!(
-                "{}: {CHILD_FILE} is {chars} characters, past the {CHILD_CONTEXT_MAX_CHARS} a Claude Code hook's context holds; a child gets its start and a file to read",
-                place.label
-            ));
+        for (file, start) in [
+            (CHILD_FILE, compose::ChildStart::Beyond),
+            (CHILD_WHOLE_FILE, compose::ChildStart::Whole),
+        ] {
+            let text =
+                child_composed(pl.stacks, place.layers(true), role, &pl.plan.home, start).text;
+            let parts = crate::guard::child_parts(&crate::guard::child_context(&text)).len();
+            if parts > CHILD_PARTS {
+                pl.plan.notes.push(format!(
+                    "{}: {file} takes {parts} parts of {CHILD_PART_CHARS} characters, past the {CHILD_PARTS} Claude Code's child hooks deliver; a child starts without the rest",
+                    place.label
+                ));
+            }
+            tree.insert(file.into(), text.into_bytes());
         }
-        tree.insert(CHILD_FILE.into(), text.into_bytes());
     }
     tree.insert(".gitignore".into(), b"*\n".to_vec());
     let tree = std::sync::Arc::new(tree);
@@ -2171,7 +2199,8 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
             default_role: None,
             default_role_inline: false,
             opener: None,
-            child: false,
+            child: None,
+            default_role_lines: true,
         };
         let composed = compose::compose(pl.stacks, &ctx);
         let label = format!("{} (tracked AGENTS.md)", place.label);
@@ -3124,7 +3153,8 @@ fn place_skills(stacks: &Stacks, layers: Layers) -> Vec<&Entry> {
         default_role: None,
         default_role_inline: false,
         opener: None,
-        child: false,
+        child: None,
+        default_role_lines: true,
     };
     compose::applicable(stacks, &ctx)
         .into_iter()
@@ -3199,6 +3229,7 @@ fn place_context(
     ctx.role_dir = checkout.map(|c| c.join(ROLE_DIR));
     ctx.default_role = default_role;
     ctx.default_role_inline = adapter.default_role_inline();
+    ctx.default_role_lines = stacks.place_files(adapter.id()).default_role_lines.unwrap_or(true);
     if adapter.relative_paths() {
         ctx.relative_to = checkout.map(Path::to_path_buf);
     }
@@ -3466,12 +3497,19 @@ pub struct Size {
     pub sections: Vec<(String, usize)>,
     /// Whether sync writes it yet (the place's `adapters`); measured either way.
     pub enabled: bool,
+    /// The stack's warning line for this adapter's place files (`place_files.<adapter>.warn_bytes`), in place of
+    /// `SIZE_WARN_PERCENT` of the limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warn: Option<usize>,
 }
 
 impl Size {
-    /// Past the warning line (`SIZE_WARN_PERCENT` of the limit).
+    /// Past the warning line: the stack's (`warn`), else `SIZE_WARN_PERCENT` of the limit.
     pub fn over_line(&self) -> bool {
-        self.limit.is_some_and(|l| self.reads * 100 > l * SIZE_WARN_PERCENT)
+        match self.warn {
+            Some(w) => self.reads > w,
+            None => self.limit.is_some_and(|l| self.reads * 100 > l * SIZE_WARN_PERCENT),
+        }
     }
 
     /// One line for a reader who has to make it smaller: the place, the adapter and its file, what a session
@@ -3485,6 +3523,10 @@ impl Size {
         let against = match self.limit {
             Some(l) => format!("{} of {l} bytes ({} %)", self.reads, self.reads * 100 / l),
             None => format!("{} bytes", self.bytes),
+        };
+        let against = match self.warn {
+            Some(w) => format!("{against}, past the stack's budget of {w}"),
+            None => against,
         };
         let parts: Vec<String> = self.sections.iter().map(|(s, n)| format!("{s} {n}")).collect();
         let place = match &self.at {
@@ -3534,6 +3576,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
             limit: None,
             sections: sections(&text, &text),
             enabled: true,
+            warn: None,
         });
     }
     let mut places: Vec<(String, String, &[String])> = Vec::new();
@@ -3586,6 +3629,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
                 limit: adapter.byte_limit(),
                 sections: sections(&text, &rendered),
                 enabled,
+                warn: stacks.place_files(adapter.id()).warn_bytes,
             });
         }
         // The skill copies in each checkout and worktree (the adapters that read a skills dir there).
@@ -3618,6 +3662,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
                 limit: None,
                 sections: parts,
                 enabled: true,
+                warn: None,
             });
         }
         for role in declared_roles(stacks) {
@@ -3632,6 +3677,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
                 limit: None,
                 sections: sections(&text, &text),
                 enabled: true,
+                warn: None,
             });
         }
     }

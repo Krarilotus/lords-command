@@ -62,9 +62,10 @@ pub trait Adapter: Sync {
     fn guards(&self) -> &'static [&'static str] {
         &[]
     }
-    /// A hook entry that runs guard `guard` of Lords' copy `exe`.
-    fn guard_hook(&self, exe: &str, guard: &str) -> serde_json::Value {
-        serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard] })
+    /// The hook entries that run guard `guard` of Lords' copy `exe`: one, or for Claude Code's `child` one per part
+    /// (each hook's context is capped on its own; review r1, F1).
+    fn guard_hooks(&self, exe: &str, guard: &str) -> Vec<serde_json::Value> {
+        vec![serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard] })]
     }
     /// The guard a hook entry runs, when it runs Lords' copy `exe` (`guard_hook`): a user's own hook, whatever its
     /// args, is never Lords'.
@@ -114,6 +115,21 @@ impl Adapter for ClaudeCode {
         &["rm", "queue", "session", "turn", "child"]
     }
 
+    /// A child's start goes in `CHILD_PARTS` hooks, each its own 10,000 characters (code.claude.com/docs/en/hooks:
+    /// "Claude Code measures each string on its own, even when several hooks run for the same event"; probed 31 Oct).
+    fn guard_hooks(&self, exe: &str, guard: &str) -> Vec<serde_json::Value> {
+        if guard != "child" {
+            return vec![
+                serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard] }),
+            ];
+        }
+        (1..=crate::sync::CHILD_PARTS)
+            .map(|n| {
+                serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard, "--part", n.to_string()] })
+            })
+            .collect()
+    }
+
     fn repo_skills_dir(&self) -> Option<&'static str> {
         Some(".claude/skills")
     }
@@ -161,14 +177,14 @@ impl Adapter for Codex {
         &["child"]
     }
 
-    /// A command line, and the whole context passed on: sync keeps a child's file within a hook's reach.
-    fn guard_hook(&self, exe: &str, guard: &str) -> serde_json::Value {
-        serde_json::json!({
+    /// A command line, and the whole context passed on (`additionalContextLimit` 0): no parts.
+    fn guard_hooks(&self, exe: &str, guard: &str) -> Vec<serde_json::Value> {
+        vec![serde_json::json!({
             "type": "command",
             "command": format!("\"{exe}\" guard {guard}"),
             "timeout": 30,
             "additionalContextLimit": 0,
-        })
+        })]
     }
 
     fn guard_of(&self, hook: &serde_json::Value, exe: &str) -> Option<String> {

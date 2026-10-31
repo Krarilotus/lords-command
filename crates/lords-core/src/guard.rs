@@ -789,9 +789,55 @@ pub fn turn_hook(
 // `SubagentStart` hook in Claude Code and in Codex: it gives a native child the start file sync wrote for the stack's
 // `child_role` in the child's place, `.lords/child.md`, as the child's context. One small read, no stack loaded.
 
-/// The child guard's answer to one `SubagentStart` event: the nearest `.lords/child.md` at or above the event's cwd,
-/// without its marker lines, as `additionalContext`; nothing where no place has one. Never a block.
-pub fn child_hook(input: &str) -> Answer {
+/// The agent types that load no place file (Claude Code's docs, sub-agents: "Explore and Plan start without your
+/// CLAUDE.md files"; probed 31 Oct, design note D4): they get the role's whole start, every other the part beyond the
+/// place's file.
+pub const NO_PLACE_FILE_AGENTS: [&str; 2] = ["Explore", "Plan"];
+
+/// A child file's text as context: without its marker lines.
+pub fn child_context(text: &str) -> String {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| *l != crate::compose::BEGIN && *l != crate::compose::END)
+        .collect();
+    lines.join("\n").trim().to_string()
+}
+
+/// A child's start in parts, cut at line ends, each with its "part N of M" line at most `CHILD_PART_CHARS`
+/// characters; one part, unlabelled, when it fits in one. A line longer than a part is a part of its own.
+pub fn child_parts(context: &str) -> Vec<String> {
+    let max = crate::sync::CHILD_PART_CHARS;
+    if context.chars().count() <= max {
+        return vec![context.to_string()];
+    }
+    // Room for the label: "Lords start, part NN of NN:\n".
+    let room = max - 32;
+    let mut parts: Vec<String> = Vec::new();
+    let mut part = String::new();
+    for line in context.lines() {
+        if !part.is_empty() && part.chars().count() + 1 + line.chars().count() > room {
+            parts.push(std::mem::take(&mut part));
+        }
+        if !part.is_empty() {
+            part.push('\n');
+        }
+        part.push_str(line);
+    }
+    parts.push(part);
+    let n = parts.len();
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| format!("Lords start, part {} of {n}:\n{p}", i + 1))
+        .collect()
+}
+
+/// The child guard's answer to one `SubagentStart` event: the nearest place's child file at or above the event's cwd
+/// (`child-whole.md` for an agent type that loads no place file, else `child.md`), without its marker lines, as
+/// `additionalContext`; with `part`, only that part of it (`child_parts`; review r1, F1: Claude Code holds 10,000
+/// characters per hook), and nothing past the last. Nothing where no place has one. Never a block.
+pub fn child_hook(input: &str, part: Option<usize>) -> Answer {
     let Ok(ev) = serde_json::from_str::<Value>(input) else {
         return noted("the event can't be read");
     };
@@ -799,24 +845,34 @@ pub fn child_hook(input: &str) -> Answer {
         return quiet();
     }
     let Some(cwd) = ev["cwd"].as_str() else { return noted("the event names no cwd") };
-    let marker = crate::compose::BEGIN;
+    let whole = ev["agent_type"].as_str().is_some_and(|t| NO_PLACE_FILE_AGENTS.contains(&t));
+    let names: &[&str] = if whole {
+        &[crate::sync::CHILD_WHOLE_FILE, crate::sync::CHILD_FILE]
+    } else {
+        &[crate::sync::CHILD_FILE]
+    };
     for d in Path::new(cwd).ancestors() {
-        let file = d.join(crate::sync::ROLE_DIR).join(crate::sync::CHILD_FILE);
-        let text = match crate::fsguard::read_text(&file) {
-            Ok(Some(t)) if t.contains(marker) => t,
-            Ok(_) => continue,
-            Err(e) => return noted(format!("{}: {e}", file.display())),
-        };
-        let context: Vec<&str> = text
-            .lines()
-            .map(|l| l.trim_end_matches('\r'))
-            .filter(|l| *l != marker && *l != crate::compose::END)
-            .collect();
-        let out = json!({"hookSpecificOutput": {
-            "hookEventName": "SubagentStart",
-            "additionalContext": context.join("\n").trim(),
-        }});
-        return Answer { stdout: out.to_string(), note: None };
+        for name in names {
+            let file = d.join(crate::sync::ROLE_DIR).join(name);
+            let text = match crate::fsguard::read_text(&file) {
+                Ok(Some(t)) if t.contains(crate::compose::BEGIN) => t,
+                Ok(_) => continue,
+                Err(e) => return noted(format!("{}: {e}", file.display())),
+            };
+            let context = child_context(&text);
+            let context = match part {
+                None => context,
+                Some(n) => match child_parts(&context).into_iter().nth(n.wrapping_sub(1)) {
+                    Some(p) => p,
+                    None => return quiet(),
+                },
+            };
+            let out = json!({"hookSpecificOutput": {
+                "hookEventName": "SubagentStart",
+                "additionalContext": context,
+            }});
+            return Answer { stdout: out.to_string(), note: None };
+        }
     }
     quiet()
 }

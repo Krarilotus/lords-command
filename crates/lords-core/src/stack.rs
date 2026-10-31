@@ -148,6 +148,33 @@ pub struct Manifest {
     /// The role a native subagent starts as (design: Sync, a native child's start file).
     #[serde(default)]
     pub child_role: Option<String>,
+    /// Per adapter id: how its place files are composed and measured (design: Sync, place files per adapter).
+    #[serde(default)]
+    pub place_files: BTreeMap<String, PlaceFiles>,
+}
+
+/// One adapter's place files (stack.toml `[place_files.<adapter>]`).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlaceFiles {
+    /// Whether the default role's lines for only some roles show there, labelled (default), or stay in its role file.
+    #[serde(default)]
+    pub default_role_lines: Option<bool>,
+    /// The warning line for those files in `check`, in bytes, in place of 75 % of the adapter's limit.
+    #[serde(default)]
+    pub warn_bytes: Option<usize>,
+}
+
+impl Stacks {
+    /// An adapter's place-file settings: the private stack's, else the public stack's, else the defaults.
+    pub fn place_files(&self, adapter: &str) -> PlaceFiles {
+        self.private
+            .iter()
+            .chain([&self.public])
+            .find_map(|s| s.manifest.place_files.get(adapter))
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Debug)]

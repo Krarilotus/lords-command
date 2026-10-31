@@ -260,10 +260,15 @@ fn opener_line(ctx: &Context) -> String {
 }
 
 /// The first line of a native child's start file: its role, and how the place's file it also reads binds it.
-fn child_intro(role: &str) -> String {
-    format!(
-        "You start as a {role} here, a native subagent. Besides the place's file you read, these bind you; its lines marked for other roles don't. Your role's whole start file is `role-{role}.md` in the place's `.lords` dir."
-    )
+fn child_intro(role: &str, start: ChildStart) -> String {
+    match start {
+        ChildStart::Beyond => format!(
+            "You start as a {role} here, a native subagent. Besides the place's file you read, these bind you; its lines marked for other roles don't. Your role's whole start file is `role-{role}.md` in the place's `.lords` dir."
+        ),
+        ChildStart::Whole => {
+            format!("You start as a {role} here, a native subagent: this is your role's whole start.")
+        }
+    }
 }
 
 /// One part of an entry with a class (core_lines.rs): one of its lines, or its index entry, for these roles.
@@ -371,9 +376,22 @@ pub struct Context {
     pub default_role_inline: bool,
     /// The `lords` the composed file names to open an entry by id (`opener_line`): the installed guard copy.
     pub opener: Option<PathBuf>,
-    /// A native child's start file (with `roles` its one role): what of that role the place's file doesn't carry,
-    /// its entries and lines for only some development roles, after a line naming the role (`child_intro`).
-    pub child: bool,
+    /// A native child's start file (with `roles` its one role), after a line naming the role (`child_intro`).
+    pub child: Option<ChildStart>,
+    /// In a place's file, whether the default role's lines for only some roles show (labelled) or stay in its role
+    /// file like any other role's (stack.toml `place_files.<adapter>.default_role_lines`).
+    pub default_role_lines: bool,
+}
+
+/// Which start file a native child gets (sync.rs `CHILD_FILE`, `CHILD_WHOLE_FILE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildStart {
+    /// For a child that also loads the place's file: what of its role that file doesn't carry, its entries and lines
+    /// for only some development roles.
+    Beyond,
+    /// For a child that loads no place file (Claude Code's Explore and Plan): its role's whole start, as its role
+    /// file has it, without the notes.
+    Whole,
 }
 
 impl Context {
@@ -563,20 +581,25 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
     let partial_role = |e: &Entry| partial(&e.meta.roles);
     // An entry with a class goes by its parts (its lines, its index entry); any other by its whole text, as before.
     let by_parts = |e: &Entry| crate::core_lines::classified(e) && e.meta.kind != Kind::Intent;
-    // A native child's file leaves out what the place's file carries for every role: intent, memory, skills without a
-    // class (each is listed there), and whatever is for every development role (an entry with a class keeps its other
-    // parts, below; sol-loop r1, S2: a skill's line for the child's role alone).
+    // A native child's file leaves out the notes; the one for a child that also reads the place's file leaves out what
+    // that file carries for every role too: intent, skills without a class (each is listed there), and whatever is for
+    // every development role (an entry with a class keeps its other parts, below; sol-loop r1, S2: a skill's line
+    // for the child's role alone).
     let every_development = |roles: &[String]| development.iter().all(|r| roles.contains(r));
-    let live: Vec<&Entry> = if ctx.child {
-        live.into_iter()
+    let beyond = ctx.child == Some(ChildStart::Beyond);
+    let live: Vec<&Entry> = match ctx.child {
+        Some(ChildStart::Beyond) => live
+            .into_iter()
             .filter(|e| !matches!(e.meta.kind, Kind::Intent | Kind::Memory))
             .filter(|e| e.meta.kind != Kind::Skill || by_parts(e))
             .filter(|e| {
                 by_parts(e) || !(e.meta.roles.is_empty() || every_development(&e.meta.roles))
             })
-            .collect()
-    } else {
-        live
+            .collect(),
+        Some(ChildStart::Whole) => {
+            live.into_iter().filter(|e| e.meta.kind != Kind::Memory).collect()
+        }
+        None => live,
     };
     // Where role files exist, their entries and notes stay there: one line points to them (orchestrator, 25 Oct:
     // cut "index lines that the role files already carry in full").
@@ -591,19 +614,20 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         _ => (Vec::new(), live),
     };
     // Each part shows here unless, in a place's file, it is for only some roles and not the default role's: then its
-    // roles' files carry it. A line is short, so the default role's lines show in every adapter's file alike.
+    // roles' files carry it. A line is short, so the default role's lines show in every adapter's file alike, unless
+    // the stack leaves them out of one adapter's (`default_role_lines`, the Lords owner, 31 Oct: Codex headroom).
     let declared = crate::sync::declared_roles(stacks);
     let stays = |p: &Part| {
         place_file
             && partial(&p.roles)
-            && !ctx.default_role.as_ref().is_some_and(|d| p.roles.contains(d))
+            && !(ctx.default_role_lines
+                && ctx.default_role.as_ref().is_some_and(|d| p.roles.contains(d)))
     };
     let mut shown_parts: std::collections::BTreeMap<&str, Vec<Part>> = Default::default();
     let mut pointed_parts: Vec<Part> = Vec::new();
     for e in live.iter().copied().filter(|e| by_parts(e)) {
-        for p in parts(e, ctx, &declared)
-            .into_iter()
-            .filter(|p| !(ctx.child && every_development(&p.of)))
+        for p in
+            parts(e, ctx, &declared).into_iter().filter(|p| !(beyond && every_development(&p.of)))
         {
             // A skill is listed wherever it applies; a line not for this file's readers leaves its own hook there.
             match (stays(&p), e.meta.kind == Kind::Skill) {
@@ -613,7 +637,9 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             }
         }
     }
-    let opens = shown_parts.keys().any(|id| !id.starts_with("skill."));
+    // Whether something here goes by its id: a line, or an index entry (a skill's index entry is its own hook line).
+    let opens =
+        shown_parts.values().flatten().any(|p| p.e.meta.kind != Kind::Skill || p.line.is_some());
     let has_line =
         |e: &Entry| shown_parts.get(e.id()).is_some_and(|ps| ps.iter().any(|p| p.line.is_some()));
     let mut out = Composed {
@@ -636,12 +662,27 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             e.meta.kind != Kind::Template
         }
     };
-    // An extension follows its parent where the parent shows in its section; otherwise it stands in its own place
-    // (sol-loop r1, S1: one whose parent is only in the index was dropped; r2, T1: one whose parent is a skill).
+    // An extension follows its parent where the parent's own form there carries it; otherwise it stands in its own
+    // place (sol-loop r1, S1: one whose parent is only in the index was dropped; r2, T1: one whose parent is a skill).
+    // An intent shown as a title carries only intents, as titles: anything else would lose its line or text there
+    // (review r1, F2).
     let ids: BTreeSet<&str> = live.iter().filter(|e| in_section(e)).map(|e| e.id()).collect();
-    fn extension_of<'e>(e: &'e Entry, ids: &BTreeSet<&str>) -> Option<&'e str> {
-        e.meta.extends.first().map(String::as_str).filter(|t| ids.contains(t))
-    }
+    let titled: BTreeSet<&str> = live
+        .iter()
+        .filter(|e| {
+            e.meta.kind == Kind::Intent
+                && (ctx.by_reference || e.meta.start == Some(crate::model::Start::Detail))
+        })
+        .map(|e| e.id())
+        .collect();
+    let extension_of = |e: &Entry, ids: &BTreeSet<&str>| -> Option<String> {
+        e.meta
+            .extends
+            .first()
+            .filter(|t| ids.contains(t.as_str()))
+            .filter(|t| e.meta.kind == Kind::Intent || !titled.contains(t.as_str()))
+            .cloned()
+    };
 
     let mut lines: Vec<String> = Vec::new();
     let pointed_roles: Vec<(&Entry, &[String])> = pointed
@@ -752,7 +793,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
                     let mut ext: Vec<&Entry> = live
                         .iter()
                         .copied()
-                        .filter(|x| extension_of(x, &ids) == Some(e.id()))
+                        .filter(|x| extension_of(x, &ids).as_deref() == Some(e.id()))
                         .collect();
                     ext.sort_by_key(|x| x.id().to_string());
                     for x in std::iter::once(e).chain(ext) {
@@ -775,7 +816,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             let mut ext: Vec<&Entry> = live
                 .iter()
                 .copied()
-                .filter(|x| extension_of(x, &ids) == Some(e.id()) && in_section(x))
+                .filter(|x| extension_of(x, &ids).as_deref() == Some(e.id()) && in_section(x))
                 .collect();
             ext.sort_by_key(|x| x.id().to_string());
             for x in ext {
@@ -807,16 +848,19 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         }
     }
     // The skills of this place: the repo's own (backbone requirement BB-8, listed where they are) and the stack's development
-    // skills (installed per checkout for harnesses that read a skills dir); listed so every harness finds them.
+    // skills (installed per checkout for harnesses that read a skills dir); listed so every harness finds them. A
+    // skill every run has installed is listed where it has a line, its line being nowhere else (review r1, F3).
     let here: Vec<&Entry> = live
         .iter()
         .copied()
         .filter(|e| {
             e.meta.kind == Kind::Skill
-                && (matches!(e.meta.origin, crate::model::Origin::InRepo { .. }) || !user_level(e))
+                && (matches!(e.meta.origin, crate::model::Origin::InRepo { .. })
+                    || !user_level(e)
+                    || has_line(e))
         })
-        // A child's file lists only the skills with a line for it (the place's file lists them all).
-        .filter(|e| !ctx.child || has_line(e))
+        // A child's file beside a place's lists only the skills with a line for it (the place's file lists them all).
+        .filter(|e| !beyond || has_line(e))
         .collect();
     if !here.is_empty() {
         if !lines.is_empty() {
@@ -825,7 +869,8 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         lines.push("# Skills here".into());
         lines.push(String::new());
         // A skill with lines for this file's readers shows them in place of its hook, one bullet each with its own
-        // label (sol-loop r1, S3).
+        // label (sol-loop r1, S3), after its id, which `lords show` opens (review r1, F4); its file follows from its
+        // name as before, or is named.
         let mut items = Vec::new();
         for (e, text, name) in index_items(&here) {
             let shown: Vec<String> = shown_parts
@@ -835,15 +880,11 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
                 .filter(|p| p.line.is_some())
                 .map(|p| part_line(p, ctx, stacks, &development))
                 .collect();
-            match name.as_deref() {
-                Some(n) if !shown.is_empty() => {
-                    // `part_line` gives `- <id><label>: <line>`; the index names a skill by its name.
-                    for l in &shown {
-                        let rest = l.trim_start_matches("- ").trim_start_matches(e.id());
-                        items.push((e, format!("{n}{rest}"), name.clone()));
-                    }
-                }
-                _ => items.push((e, text, name)),
+            for l in &shown {
+                items.push((e, l.trim_start_matches("- ").to_string(), name.clone()));
+            }
+            if shown.is_empty() {
+                items.push((e, text, name));
             }
         }
         push_index(&items, ctx, &mut lines, &mut out);
@@ -871,7 +912,7 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
     // And by the rules memory notes follow: memory is private, so never in a public-only composition, and never for a
     // reader who is only `product` (sol-loop r2, S2, S3).
     let memory_here = !ctx.public_only
-        && !ctx.child
+        && ctx.child.is_none()
         && ctx.roles.as_ref().is_none_or(|roles| roles.iter().any(|r| r != PRODUCT_ROLE));
     // Only an index that is a readable file is named (review r1, R2): a missing one is the plan's conflict and check's
     // error (`live_index_problem`), never a dead pointer.
@@ -915,14 +956,15 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         }
     }
     // A child's file names its role even with nothing else: the place's file's labels then say what binds it.
-    let child = ctx.roles.as_deref().filter(|_| ctx.child).and_then(|r| r.first());
+    let child = ctx.child.zip(ctx.roles.as_deref().and_then(|r| r.first()));
     if out.ids.is_empty() && lines.is_empty() && child.is_none() {
         return out;
     }
     // Two header lines precede the composed lines, and the opener where an entry goes by its id.
     let mut header = 2;
     if opens || child.is_some() {
-        let mut opener: Vec<String> = child.map(|r| child_intro(r)).into_iter().collect();
+        let mut opener: Vec<String> =
+            child.map(|(start, r)| child_intro(r, start)).into_iter().collect();
         if opens {
             opener.push(opener_line(ctx));
         }

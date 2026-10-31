@@ -203,7 +203,8 @@ fn relative_paths_are_one_switch() {
             default_role: None,
             default_role_inline: false,
             opener: None,
-            child: false,
+            child: None,
+            default_role_lines: true,
         };
         lords_core::compose::compose(&f.stacks(), &ctx).text
     };

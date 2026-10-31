@@ -118,8 +118,12 @@ by id when a task touches it: `lords show <id>`, named once with its full path a
 - An entry with several lines (one per actor or trigger) stays one entry; each line traces to it by the same id.
 - Composition: a role's file carries the lines for that role, then the index of the rest (`- <id>: <title>`). A
   place's file carries the lines for every development role, and the default role's lines labelled, in every
-  adapter's file alike; another role's lines are in its role file. A skill's line stands in its index line. A template
-  is composed only once it has a class. An entry with no class composes exactly as before.
+  adapter's file alike unless the stack's `[place_files.<adapter>] default_role_lines = false` leaves them to the role
+  file for that adapter; another role's lines are in its role file. A skill's line stands in its index line, after
+  the skill's id; a skill every run has installed (global, no roles) is listed in the user-level file for its line. A
+  template is composed only once it has a class. An extension follows its parent only where the parent's form carries
+  it: an intent shown as a title carries only intents, so a rule extending it keeps its own line or text. An entry
+  with no class composes exactly as before.
 - A stack's `require_core = true` makes `check` refuse an entry of that stack with no class, or a `core`/`role` one
   with no line (memory and a repo's own skills excepted), so a store can land its lines before the check holds them.
 
@@ -240,11 +244,14 @@ guard name the place, the adapter, its file and each section's bytes.
 **A native child's start file** (plan L6, an orchestrator's condition 3: children start with their own role's core). With a
 stack's `child_role` (the role a subagent a session starts itself has), each place's `.lords/` also holds `child.md`:
 what of that role the place's file doesn't carry (its lines and entries for only some development roles), after a line
-naming the role. The `child` guard, a `SubagentStart` hook, gives it to the child as context: in Claude Code's
-settings and Codex's `~/.codex/hooks.json` (a settings target with `guards = ["child"]`; Codex runs it once reviewed
-under /hooks). Both providers' children also load the place's file (probed 31 Oct), except Claude's Explore and Plan,
-which load no `CLAUDE.md` and get only `child.md`, which names the role file to read. Claude Code holds 10,000
-characters of hook context; sync notes a `child.md` past that.
+naming the role, and `child-whole.md`: the role's whole start without the notes, for a child that loads no place file
+(Claude Code's Explore and Plan, which load no `CLAUDE.md`). The `child` guard, a `SubagentStart` hook, gives the child
+the one its agent type needs: in Claude Code's settings and Codex's `~/.codex/hooks.json` (a settings target with
+`guards = ["child"]`; Codex runs it once reviewed under /hooks). Claude Code holds 10,000 characters per hook, each
+hook's measured on its own, so Lords registers three hooks there (`guard child --part N`), each giving one part of at
+most 9,500 characters, cut at line ends; sync notes a start that needs more than three. Codex takes the whole in one
+hook (`additionalContextLimit` 0). Probed 31 Oct: general-purpose and Codex children load the place's file and get
+`child.md`; Explore and Plan get `child-whole.md` in three parts and quote its shared and own lines.
 
 **New worktrees.** `lords hooks install --post-checkout` writes the repo's own `.git/hooks/post-checkout` (the
 common dir, so every worktree runs it). On a new worktree (old HEAD all zeros) it runs `lords sync --repo X --place
@@ -496,7 +503,7 @@ never writes memory back.
 | adapted or inherited entry without repo, commit, path and licence; inherited skill differs from its recorded source hash | error |
 | privacy findings (public stack: all classes; private stack: secret) | error |
 | deployed target drifted from a fresh composition | warning |
-| a place's file past 75 % of its adapter's limit on project files (the user-level file is outside it); past the limit, sync doesn't write it and fails | warning |
+| a place's file past 75 % of its adapter's limit on project files, or past the stack's `[place_files.<adapter>] warn_bytes` where it sets one (the user-level file is outside it); past the limit, sync doesn't write it and fails | warning |
 | an entry naming a topic or role its stack doesn't list | error |
 | near-duplicate text across entries (shingled similarity over normalised sentences) | candidate |
 | same topic, conflicting numbers or keywords, no relation named | candidate |
