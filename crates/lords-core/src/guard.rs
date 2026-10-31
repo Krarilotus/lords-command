@@ -717,10 +717,11 @@ fn session_of(ev: &Value) -> Result<(&str, &Path), String> {
 }
 
 /// The session guard's answer to one `SessionStart` event: always nothing on stdout. It records the files the
-/// session reads (`rules_files`). On `compact` and `resume` Claude reloads its own files, so they are recorded anew,
-/// while the files the agent read itself keep the hash recorded before: a change to one of them is still named. With
-/// no record from before, nothing is known of those, so the session stays unrecorded and its next prompt is told
-/// (sol-loop r1, S1). Then stale records go (`sweep_records`). Any failure is a note; the session goes on.
+/// session reads (`rules_files`). On `compact`, `resume` and `fork` (a fork carries its parent's conversation under a
+/// new id; review r1, R1) Claude reloads its own files, so they are recorded anew, while the files the agent read
+/// itself keep the hash recorded before: a change to one of them is still named. With no record from before, nothing
+/// is known of those, so the session stays unrecorded and its next prompt is told (sol-loop r1, S1). Then stale
+/// records go (`sweep_records`). Any failure is a note; the session goes on.
 pub fn session_hook(input: &str, env: &RulesEnv) -> Answer {
     let Ok(ev) = serde_json::from_str::<Value>(input) else {
         return noted("the event can't be read");
@@ -731,7 +732,7 @@ pub fn session_hook(input: &str, env: &RulesEnv) -> Answer {
     let recorded = session_of(&ev).and_then(|(session, cwd)| {
         let place = record_place(&env.home, session)?;
         let mut files = rules_files(cwd, env)?;
-        if matches!(ev["source"].as_str(), Some("compact" | "resume")) {
+        if matches!(ev["source"].as_str(), Some("compact" | "resume" | "fork")) {
             let Some(before) = read_record(&place)? else { return Ok(()) };
             files.retain(|_, (load, _)| *load == Load::Claude);
             files.extend(before.files.into_iter().filter(|(_, (load, _))| *load == Load::Agent));
@@ -763,8 +764,15 @@ pub fn turn_hook(
     }
     let mut lines = vec![clock_line(now, zone)];
     let mut note = None;
-    match rules_line(&ev, env) {
-        Ok(Some(line)) => lines.push(line),
+    match rules_found(&ev, env) {
+        Ok(Some(found)) => {
+            // Said first, saved second: a record that can't be saved keeps the old one, so it is said again
+            // (review r1, R4).
+            lines.extend(found.line);
+            if let Err(e) = write_record(&found.place, &found.cwd, &found.files) {
+                note = Some(format!("the record isn't saved, so this is said again ({e})"));
+            }
+        }
         Ok(None) => {}
         Err(e) => note = Some(format!("the rules aren't checked ({e})")),
     }
@@ -775,20 +783,28 @@ pub fn turn_hook(
     Answer { stdout: out.to_string(), note }
 }
 
-/// The rules line for one prompt, if any (`turn_hook`).
-fn rules_line(ev: &Value, env: &RulesEnv) -> Result<Option<String>, String> {
+/// What one prompt finds (`rules_found`): the line to say, if any, and the record to save.
+struct Found {
+    line: Option<String>,
+    place: Contained,
+    cwd: PathBuf,
+    files: BTreeMap<String, (Load, String)>,
+}
+
+/// What one prompt finds, or `None` when nothing changed (`turn_hook`).
+fn rules_found(ev: &Value, env: &RulesEnv) -> Result<Option<Found>, String> {
     let (session, cwd) = session_of(ev)?;
     let place = record_place(&env.home, session)?;
     let Some(before) = read_record(&place)? else {
         let files = rules_files(cwd, env)?;
-        write_record(&place, cwd, &files)?;
         let paths: Vec<&str> = files.keys().map(String::as_str).collect();
-        return Ok((!paths.is_empty()).then(|| {
+        let line = (!paths.is_empty()).then(|| {
             format!(
                 "Lords rules may have changed since this session started: re-read {}",
                 paths.join(", ")
             )
-        }));
+        });
+        return Ok(Some(Found { line, place, cwd: cwd.to_path_buf(), files }));
     };
     let now = rules_files(&before.cwd, env)?;
     let mut changed: Vec<String> = now
@@ -802,9 +818,7 @@ fn rules_line(ev: &Value, env: &RulesEnv) -> Result<Option<String>, String> {
     if changed.is_empty() {
         return Ok(None);
     }
-    write_record(&place, &before.cwd, &now)?;
-    Ok(Some(format!(
-        "Lords rules changed since this session started: re-read {}",
-        changed.join(", ")
-    )))
+    let line =
+        format!("Lords rules changed since this session started: re-read {}", changed.join(", "));
+    Ok(Some(Found { line: Some(line), place, cwd: before.cwd, files: now }))
 }
