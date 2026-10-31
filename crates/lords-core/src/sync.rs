@@ -525,6 +525,9 @@ struct Planner<'a> {
     /// Each repo's checkouts and worktrees, verified once per plan: the ledger check and the repo's own items
     /// (its two scopes and itself) all ask, and each answer costs a git call per worktree.
     checkouts: BTreeMap<String, Result<Checkouts, String>>,
+    /// A place whose child start its hooks can't deliver whole: the plan fails whatever else its role files' item
+    /// has against it (repair sol-loop r2, R2).
+    undeliverable: bool,
 }
 
 /// Every place sync puts a tool-owned path (design: Ownership boundary), as one grammar: a scope names roots (a
@@ -2128,6 +2131,7 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
         }
     }
     tree.insert(".gitignore".into(), b"*\n".to_vec());
+    pl.undeliverable |= !undeliverable.is_empty();
     let tree = std::sync::Arc::new(tree);
     let scope = place_scope(place, None);
     for root in place.paths.iter().filter(|r| r.path().is_dir()) {
@@ -2309,6 +2313,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
     }
     let ledger = Ledger::load(&opts.home)?;
     let mut pl = Planner {
+        undeliverable: false,
         stacks,
         plan: Plan {
             home: opts.home.clone(),
@@ -2459,7 +2464,8 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         .filter(|i| i.action == Action::Conflict && i.conflict != ConflictKind::ModifiedCopy)
         .count();
     let complete = (problems == 0 && conflicts == 0).then_some(Complete(()));
-    pl.plan.over_limit = pl.plan.items.iter().any(|i| i.conflict == ConflictKind::OverLimit);
+    pl.plan.over_limit =
+        pl.undeliverable || pl.plan.items.iter().any(|i| i.conflict == ConflictKind::OverLimit);
     let why = format!(
         "the stacks loaded with {problems} problem(s) and the plan has {conflicts} conflict(s) where it couldn't see what is wanted (`lords check` and `lords sync` list them)"
     );

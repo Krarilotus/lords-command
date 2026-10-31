@@ -614,7 +614,7 @@ fn a_child_start_past_the_parts_delivered_is_refused() {
             "rule.long",
             "project:beta",
             "private",
-            &format!("start: core\ncore:\n{}\n", lines.join("\n")),
+            &format!("roles: [helper]\nstart: core\ncore:\n{}\n", lines.join("\n")),
             "Long.\n",
         ),
     );
@@ -624,6 +624,42 @@ fn a_child_start_past_the_parts_delivered_is_refused() {
     assert_eq!(item.action, lords_core::sync::Action::Conflict, "{:?}", item.notes);
     assert!(item.notes.iter().any(|n| n.contains("parts")), "{:?}", item.notes);
     assert!(p.over_limit, "the plan fails like an over-limit file");
+}
+
+// Spec (repair sol-loop r2, R2 still open, its witness): the refusal holds when the role files' item already has a
+// conflict of its own (a file someone changed in `.lords`), and in the install stage too, which skips that place: the
+// plan still fails.
+#[test]
+fn an_undeliverable_child_start_fails_the_plan_beside_another_conflict() {
+    let (f, checkout) = bare_place("child_role = \"helper\"\n");
+    f.write(
+        "priv/project/beta/rules/r.md",
+        &entry("rule.r", "project:beta", "private", "", "A rule.\n"),
+    );
+    lords_core::sync::apply(&plan(&f.stacks(), &f.opts()).unwrap()).unwrap();
+    f.write("checkout/.lords/role-coder.md", "changed by someone\n");
+    let lines: Vec<String> =
+        (0..80).map(|i| format!("- line: \"{i:02} {}\"", "x".repeat(400))).collect();
+    f.write(
+        "priv/project/beta/rules/long.md",
+        &entry(
+            "rule.long",
+            "project:beta",
+            "private",
+            &format!("roles: [helper]\nstart: core\ncore:\n{}\n", lines.join("\n")),
+            "Long.\n",
+        ),
+    );
+    for stage in [lords_core::sync::Stage::Full, lords_core::sync::Stage::Install] {
+        let p = plan(&f.stacks(), &lords_core::sync::Options { stage, ..f.opts() }).unwrap();
+        let item = p.items.iter().find(|i| i.path == checkout.join(".lords"));
+        let seen = item.map(|i| (i.action.clone(), i.notes.clone()));
+        assert!(p.over_limit, "{stage:?}: the plan fails; the item: {seen:?}");
+        assert!(
+            item.is_none_or(|i| i.notes.iter().any(|n| n.contains("changed"))),
+            "{stage:?}: the witness's own conflict: {seen:?}"
+        );
+    }
 }
 
 // Spec (repair sol-loop r1, R5, its witness; the Lords owner: "the limit itself stays a refusal"): a stack budget
