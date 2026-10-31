@@ -88,7 +88,7 @@ pub struct Target {
     /// settings: instruction files the harness must skip (its settings' exclude list).
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// settings: tool-call guards registered as the harness's hooks (guard.rs): `rm`.
+    /// settings: guards registered as the harness's hooks (guard.rs): `rm` (PreToolUse, Bash), `queue` (Stop).
     #[serde(default)]
     pub guards: Vec<String>,
 }

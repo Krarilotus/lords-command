@@ -95,6 +95,20 @@ pub fn read_string(path: impl AsRef<Path>) -> std::io::Result<String> {
     fs::read_to_string(path)
 }
 
+/// A file's lines in turn, each without its line end, read a piece at a time: a session's transcript, which the queue
+/// guard scans, can be hundreds of MB. Any error comes back.
+pub fn read_lines(path: impl AsRef<Path>, mut each: impl FnMut(&[u8])) -> std::io::Result<()> {
+    use std::io::BufRead;
+    let mut r = std::io::BufReader::with_capacity(1 << 16, fs::File::open(path)?);
+    let mut line = Vec::new();
+    while r.read_until(b'\n', &mut line)? > 0 {
+        let l = line.strip_suffix(b"\n").unwrap_or(&line);
+        each(l.strip_suffix(b"\r").unwrap_or(l));
+        line.clear();
+    }
+    Ok(())
+}
+
 /// A file's bytes for display, `None` on any error (fonts in the GUI).
 pub fn read_bytes_lossy(path: impl AsRef<Path>) -> Option<Vec<u8>> {
     fs::read(path).ok()

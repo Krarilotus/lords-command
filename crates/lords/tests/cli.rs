@@ -1474,3 +1474,159 @@ fn a_commit_hook_reads_another_repo_from_its_own_index() {
     let commit = env.git(&private, &["commit", "-a", "-m", "a rule"]);
     assert!(commit.status.success() && text(&commit).contains(loaded), "{}", text(&commit));
 }
+
+/// `lords guard queue` as Claude Code runs it, for a session of T3 thread `thread:own` whose T3 CLI is `cli` (never
+/// the real one: the session running these tests may carry its own).
+fn queue_guard(env: &Env, args: &[&str], cli: &Path, event: &str) -> Output {
+    use std::io::Write;
+    let mut c = env
+        .cmd(env!("CARGO_BIN_EXE_lords"), env.dir.path())
+        .args(args)
+        .env("T3CODE_THREAD_ID", "thread:own")
+        .env("T3CODE_CLI_PATH", cli)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(event.as_bytes()).unwrap();
+    c.wait_with_output().unwrap()
+}
+
+// Spec (brief, 30 Oct: the queue guard fails open, as the rm guard does: "on a timeout, an error, no thread id, or no
+// CLI, let the stop through with a one-line note"): a usage error or input it can't read is exit 0, nothing on
+// stdout and a note on stderr naming the queue guard; the T3 CLI doesn't run.
+#[test]
+fn the_queue_guard_fails_open_on_usage_and_input() {
+    let env = Env::new();
+    let cli = env.dir.path().join("t3.cmd");
+    let ran = env.dir.path().join("ran.txt");
+    fs::write(&cli, format!("@echo off\r\necho ran>\"{}\"\r\n", ran.display())).unwrap();
+    for (args, input) in [
+        (&["guard", "queue", "extra"][..], "{}"),
+        (&["guard", "queue", "--deadline-ms"], "{}"),
+        (&["guard", "queue", "--deadline-ms", "soon"], "{}"),
+        (&["guard", "queue"], "not json"),
+        (&["guard", "queue"], ""),
+    ] {
+        let o = queue_guard(&env, args, &cli, input);
+        assert_eq!(o.status.code(), Some(0), "{args:?} {input}: {}", text(&o));
+        assert!(o.stdout.is_empty(), "{args:?} {input}: {}", text(&o));
+        assert!(
+            String::from_utf8_lossy(&o.stderr).contains("guard queue"),
+            "{args:?} {input}: {}",
+            text(&o)
+        );
+    }
+    assert!(!ran.exists(), "the CLI never ran");
+}
+
+// Spec (brief, 30 Oct: "give the CLI a short deadline, and kill its process tree when the deadline passes
+// (rule.stop-processes-by-tree)"): a T3 CLI still running at the deadline, and a process it started, are gone once
+// the guard has answered: the CLI's child never gets to write its file. The guard answers soon after the deadline.
+#[cfg(windows)]
+#[test]
+fn the_queue_guard_kills_the_clis_process_tree_at_its_deadline() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (started, late) = (d.join("started.txt"), d.join("late.txt"));
+    assert!(!late.display().to_string().contains(' '), "an unquoted path in the fake CLI");
+    let cli = d.join("t3.cmd");
+    // The CLI's child (a second cmd) writes `late.txt` after about 3 s.
+    fs::write(
+        &cli,
+        format!(
+            "@echo off\r\necho started>\"{}\"\r\ncmd /d /c \"ping -n 4 127.0.0.1 >nul & echo late>{}\"\r\n",
+            started.display(),
+            late.display()
+        ),
+    )
+    .unwrap();
+    let transcript = d.join("session.jsonl");
+    fs::write(&transcript, "").unwrap();
+    let event = serde_json::json!({"hook_event_name": "Stop", "session_id": "s1", "transcript_path": transcript, "stop_hook_active": false}).to_string();
+    let t0 = std::time::Instant::now();
+    let o = queue_guard(&env, &["guard", "queue", "--deadline-ms", "1000"], &cli, &event);
+    let took = t0.elapsed();
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    assert!(o.stdout.is_empty() && text(&o).contains("deadline"), "{}", text(&o));
+    assert!(took < std::time::Duration::from_secs(3), "answered after {took:?}");
+    assert!(started.exists(), "the CLI ran");
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    assert!(!late.exists(), "the CLI's child outlived the guard");
+}
+
+// Spec (brief, 30 Oct: "Registration goes through the settings target's existing `guards` list … `queue` becomes a
+// `Stop` entry. Foreign hook entries stay"; "SubagentStop … must not be registered"): with `guards = ["rm",
+// "queue"]` and the copy installed, sync names the copy in a `PreToolUse` Bash entry (`guard rm`) and in a `Stop` entry
+// without a matcher (`guard queue`) after the user's own `Stop` hook, writes no `SubagentStop`, and the plan says what
+// it adds; `lords check` accepts the target; taking `queue` out of the list takes out only Lords' `Stop` hook.
+#[test]
+fn sync_registers_the_queue_guard_as_a_stop_hook() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (public, private) = (d.join("pub"), d.join("priv"));
+    fs::create_dir_all(&public).unwrap();
+    fs::create_dir_all(&private).unwrap();
+    fs::create_dir_all(d.join("home/.claude-balanced")).unwrap();
+    let theirs = r#"{"hooks": [{"type": "command", "command": "notify"}]}"#;
+    fs::write(
+        d.join("home/.claude-balanced/settings.json"),
+        format!("{{\n  \"hooks\": {{\"Stop\": [{theirs}]}}\n}}\n"),
+    )
+    .unwrap();
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    let manifest = |guards: &str| {
+        format!("name = \"priv\"\nvisibility = \"private\"\n[[targets]]\nname = \"balanced settings\"\nadapter = \"claude\"\nkind = \"settings\"\npath = \"~/.claude-balanced/settings.json\"\nguards = {guards}\n")
+    };
+    fs::write(private.join("stack.toml"), manifest(r#"["rm", "queue"]"#)).unwrap();
+    assert!(env.git(&private, &["init", "-q"]).status.success());
+    env.git(&private, &["add", "-A"]);
+    env.git(&private, &["commit", "-q", "-m", "start"]);
+    let stacks =
+        ["--public-stack", public.to_str().unwrap(), "--private-stack", private.to_str().unwrap()];
+    let sync = |apply: bool| {
+        let mut args = vec!["sync", "--user"];
+        if apply {
+            args.push("--apply");
+        }
+        env.lords(d, &[&args[..], &stacks].concat())
+    };
+    let settings = || -> serde_json::Value {
+        serde_json::from_str(
+            &fs::read_to_string(d.join("home/.claude-balanced/settings.json")).unwrap(),
+        )
+        .unwrap()
+    };
+    let o = env.lords(d, &["guard", "install"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let copy = d.join("home/.lords-command/bin/lords-guard.exe");
+    let named = copy.display().to_string().replace('\\', "/");
+    let lords =
+        |g: &str| serde_json::json!({"type": "command", "command": named, "args": ["guard", g]});
+    let o = sync(false);
+    assert!(text(&o).contains("Lords hook added: the queue guard (Stop)"), "{}", text(&o));
+    let o = sync(true);
+    assert!(o.status.success(), "{}", text(&o));
+    let v = settings();
+    let theirs: serde_json::Value = serde_json::from_str(theirs).unwrap();
+    assert_eq!(
+        v["hooks"]["PreToolUse"],
+        serde_json::json!([{"matcher": "Bash", "hooks": [lords("rm")]}])
+    );
+    assert_eq!(v["hooks"]["Stop"], serde_json::json!([theirs, {"hooks": [lords("queue")]}]));
+    assert!(v["hooks"].get("SubagentStop").is_none(), "{v}");
+    let out = text(&env.lords(d, &[&["check"][..], &stacks].concat()));
+    assert!(!out.contains("settings.json") && !out.contains("guards"), "{out}");
+    // `queue` out of the list: only Lords' Stop hook goes.
+    fs::write(private.join("stack.toml"), manifest(r#"["rm"]"#)).unwrap();
+    env.git(&private, &["commit", "-q", "-a", "-m", "no queue guard"]);
+    let o = sync(true);
+    assert!(o.status.success(), "{}", text(&o));
+    let v = settings();
+    assert_eq!(v["hooks"]["Stop"], serde_json::json!([theirs]));
+    assert_eq!(
+        v["hooks"]["PreToolUse"],
+        serde_json::json!([{"matcher": "Bash", "hooks": [lords("rm")]}])
+    );
+}

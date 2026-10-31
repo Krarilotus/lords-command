@@ -33,6 +33,7 @@ usage:
   lords compose [--repo NAME [--role ROLE]] [--adapter ID] [--json]   what a harness reads there, with sources
   lords sizes [--json]   every file sync writes, by section; fails past the warning line
   lords guard rm   Claude's PreToolUse hook: refuses an `rm` whose path holds a variable not written as quoted ${VAR:?}
+  lords guard queue [--deadline-ms N]   Claude's Stop hook: holds a turn's end while items may wait in its T3 queue
   lords guard install [--home DIR]   install or update the guard copy the hooks run (sync never writes it)
 
 stacks: --public-stack DIR, --private-stack DIR, else config.txt (beside the exe, or ~/.lords-command/),
@@ -125,6 +126,7 @@ fn cmd_guard(mut a: Args) -> ExitCode {
     let note = |line: &str| say_err(&format!("lords guard: {line}; this call is let through"));
     if a.flag("--help") || a.flag("-h") {
         say("usage: lords guard rm   (Claude Code's PreToolUse hook; the event on stdin)");
+        say("       lords guard queue [--deadline-ms N]   (Claude Code's Stop hook; the event on stdin)");
         return ExitCode::SUCCESS;
     }
     if a.flag("--self-test") {
@@ -136,6 +138,9 @@ fn cmd_guard(mut a: Args) -> ExitCode {
     let which = a.positional();
     if which.as_deref() == Some("install") {
         return guard_install(a);
+    }
+    if which.as_deref() == Some("queue") {
+        return guard_queue(a);
     }
     if which.as_deref() != Some("rm") || a.done().is_err() {
         note("usage `lords guard rm` (event on stdin)");
@@ -151,6 +156,58 @@ fn cmd_guard(mut a: Args) -> ExitCode {
     let out = lords_core::guard::rm_hook(&input);
     if !out.is_empty() {
         say(&out);
+    }
+    ExitCode::SUCCESS
+}
+
+/// `lords guard queue [--deadline-ms N]`: the Stop hook Claude Code runs when a turn would end (guard.rs). Reads the
+/// event on stdin and prints a block, or nothing; like `guard rm` it never fails: every problem is a note on stderr
+/// and exit 0. `--deadline-ms`: the T3 CLI's deadline, `QUEUE_DEADLINE` unless given.
+fn guard_queue(mut a: Args) -> ExitCode {
+    use lords_core::guard::{queue_hook, QueueEnv, QUEUE_DEADLINE};
+    let note = |line: &str| say_err(&format!("lords guard queue: {line}; this stop goes through"));
+    let deadline = match a.value("--deadline-ms").map(|v| v.map(|ms| ms.parse::<u64>())) {
+        Ok(None) => QUEUE_DEADLINE,
+        Ok(Some(Ok(ms))) => std::time::Duration::from_millis(ms),
+        Ok(Some(Err(_))) => {
+            note("--deadline-ms takes a number of milliseconds");
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            note(&e);
+            return ExitCode::SUCCESS;
+        }
+    };
+    if a.done().is_err() {
+        note("usage `lords guard queue [--deadline-ms N]` (event on stdin)");
+        return ExitCode::SUCCESS;
+    }
+    let input = match std::io::read_to_string(std::io::stdin()) {
+        Ok(i) => i,
+        Err(e) => {
+            note(&format!("the event can't be read ({e})"));
+            return ExitCode::SUCCESS;
+        }
+    };
+    let home = match lords_core::sync::default_home() {
+        Ok(h) => h,
+        Err(e) => {
+            note(&e);
+            return ExitCode::SUCCESS;
+        }
+    };
+    let env = QueueEnv {
+        thread: std::env::var("T3CODE_THREAD_ID").ok(),
+        cli: std::env::var_os("T3CODE_CLI_PATH").map(PathBuf::from),
+        home,
+        deadline,
+    };
+    let answer = queue_hook(&input, &env);
+    if let Some(n) = answer.note {
+        note(&n);
+    }
+    if !answer.stdout.is_empty() {
+        say(&answer.stdout);
     }
     ExitCode::SUCCESS
 }
