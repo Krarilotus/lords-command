@@ -218,12 +218,22 @@ pub fn retire(stacks: &Stacks, r: &Retire) -> Result<Retired, String> {
         return Err(format!("retiring `{}` would leave invalid metadata; nothing changed", r.id));
     }
     let commit = if r.commit && is_repo(&root) {
-        // Exactly what this wrote is committed, over the version it was made from (sol-loop r2-r3, S2, S5); one the
-        // hooks refuse leaves nothing behind, one that is published stays (S6).
-        let committed = [(rel(&root, &e.meta_file), before.as_slice(), new.as_bytes())];
-        git::commit_exact(&root, &committed, &format!("Retire {}: {}", r.id, r.reason)).map_err(
+        // Committed over the version it was made from, every file that version covers included: a skill's text is
+        // covered though only its sidecar is written (review r1 R3). One the hooks refuse leaves nothing behind; one
+        // that is published, or reverted for a conflict, stays as git has it.
+        let files = version_files(e);
+        let covered: Vec<git::Covered> = files
+            .iter()
+            .zip(&now)
+            .enumerate()
+            .map(|(i, (f, was))| git::Covered {
+                path: rel(&root, f),
+                was,
+                wrote: (i == 0).then_some(new.as_bytes()),
+            })
+            .collect();
+        git::commit_entry(&root, &covered, &format!("Retire {}: {}", r.id, r.reason)).map_err(
             |err| match err {
-                git::Uncommitted::Published { .. } => err.to_string(),
                 git::Uncommitted::Refused(_) => {
                     match stack_replace(&root, &e.meta_file, new.as_bytes(), before) {
                         Ok(()) => format!("{err}; nothing changed"),
@@ -232,6 +242,7 @@ pub fn retire(stacks: &Stacks, r: &Retire) -> Result<Retired, String> {
                         ),
                     }
                 }
+                _ => err.to_string(),
             },
         )?
     } else {
@@ -869,17 +880,6 @@ pub fn edit(
         }
         written.push(i);
     }
-    // The version covers every file of the entry: one this edit didn't write must still hold what was checked, or the
-    // edit landed on a newer entry and is undone (sol-loop r1 S2: an agent's sidecar change during a body edit).
-    for i in (0..files.len()).filter(|i| !written.contains(i)) {
-        if fsguard::read_bytes(&files[i]).ok().as_deref() != Some(before[i].as_slice()) {
-            return Err(format!(
-                "`{id}` changed while it was being saved ({}); nothing changed{}",
-                files[i].display(),
-                restore(&written)
-            ));
-        }
-    }
     // The entry must still load, with no new problem in its files; otherwise put them back.
     let reloaded = Stack::load(&stack.root);
     let broken = match &reloaded {
@@ -898,20 +898,19 @@ pub fn edit(
         return Err(format!("that edit would break `{id}` ({why}); {changed}{undo}"));
     }
     if commit && is_repo(&stack.root) {
-        // Exactly what this edit wrote, and only those files, over the version it was made from: neither an agent's
-        // write to another of the entry's files nor one that lands after this edit's own is committed as this edit,
-        // and nothing someone committed meanwhile is undone (sol-loop r1-r3, S2, S5).
-        let committed: Vec<(&Path, &[u8], &[u8])> = written
-            .iter()
-            .map(|&i| (rel(&stack.root, &files[i]), before[i].as_slice(), after[i].as_slice()))
+        // Only what this edit wrote is committed, over the version it was made from, every file that version covers
+        // included, written or not (sol-loop r1 S2, review r1 R1, R3).
+        let covered: Vec<git::Covered> = (0..files.len())
+            .map(|i| git::Covered {
+                path: rel(&stack.root, &files[i]),
+                was: &before[i],
+                wrote: written.contains(&i).then_some(after[i].as_slice()),
+            })
             .collect();
-        if committed.is_empty() {
-            return Ok(None);
-        }
-        // Refused: nothing was published, so the files are put back (the index was never touched). Published: the edit
-        // is committed and stays, whatever failed after it (S6).
-        return git::commit_exact(&stack.root, &committed, &format!("Edit {id}")).map_err(|err| {
-            if let git::Uncommitted::Published { .. } = err {
+        // Refused: nothing was published, so the files are put back. A conflict (reverted) or a published commit that
+        // isn't this edit: git has it as it is, and the window reloads.
+        return git::commit_entry(&stack.root, &covered, &format!("Edit {id}")).map_err(|err| {
+            if !matches!(err, git::Uncommitted::Refused(_)) {
                 return err.to_string();
             }
             let undo = restore(&written);

@@ -124,31 +124,24 @@ pub fn commit(dir: &Path, paths: &[&Path], message: &str) -> Result<Option<Strin
     Ok(Some(run(dir, &["rev-parse", "--short", "HEAD"])?.trim().to_string()))
 }
 
-/// `git -C dir args` with these variables set, run through `started`.
-fn run_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
-    let out = started(
-        args,
-        || crate::process::git_env(dir, args, env),
-        |out| out.status.code(),
-        std::thread::sleep,
-    )?;
-    text(args, out)
-}
-
-/// Why `commit_exact` committed nothing, or committed and then failed.
+/// Why `commit_entry` gives no commit of its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Uncommitted {
-    /// Nothing was published: HEAD and the index are as they were (the hooks refused, git failed, or one of the
-    /// files was committed meanwhile by someone else). The caller puts its own writes back.
+    /// Nothing was published: HEAD and the index are as they were (the hooks refused, git failed). The caller puts its
+    /// own writes back.
     Refused(String),
-    /// The commit is in HEAD, and a step after it failed: the caller's writes are committed and stay.
+    /// Published and then reverted by a new commit, or found committed by someone else with other bytes: the entry
+    /// changed under the edit. Nothing of the caller's is left to put back; it reloads.
+    Conflict(String),
+    /// The commit is in HEAD and isn't this change as made (it carries another writer's bytes, or a revert it needs
+    /// failed): what it says is for its owner to settle by hand.
     Published { commit: String, problem: String },
 }
 
 impl std::fmt::Display for Uncommitted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Uncommitted::Refused(m) => f.write_str(m),
+            Uncommitted::Refused(m) | Uncommitted::Conflict(m) => f.write_str(m),
             Uncommitted::Published { commit, problem } => {
                 write!(f, "committed as {commit}, but {problem}")
             }
@@ -156,132 +149,130 @@ impl std::fmt::Display for Uncommitted {
     }
 }
 
-/// How often `commit_exact` builds again when HEAD moved under it.
-const TRIES: usize = 3;
+/// One file an entry's version covers: its path relative to the stack's dir, the bytes the version was read from, and
+/// the bytes this change wrote to it, if it wrote it.
+#[derive(Clone, Copy, Debug)]
+pub struct Covered<'a> {
+    pub path: &'a Path,
+    pub was: &'a [u8],
+    pub wrote: Option<&'a [u8]>,
+}
 
-/// Commits exactly `files`, each a path relative to `dir`, the bytes it was edited from and the bytes the commit gives
-/// it, whatever the working tree holds for them by then (sol-loop r2-r3, S2, S4-S6):
-/// - an agent's write that lands after an edit's own is never committed as that edit: the blobs come from the bytes;
-/// - the commit is made from an index of its own (the HEAD it builds on, with these blobs), so the repo's hooks see
-///   exactly what is committed, and paths are the repo's, wherever in it `dir` is;
-/// - a file someone else committed since its `was` refuses it, and so does a commit whose parent turns out not to be
-///   the HEAD it was built on (it would undo what that HEAD added): that commit is taken back off HEAD, while HEAD is
-///   still it, and it builds again, at most `TRIES` times;
-/// - then the repo's index takes the commit's entries for these paths; the working tree stays as it is.
+/// Commits the files a change wrote, as one of an entry's versions (review r1 R1 and R3, the Lords owner's direction):
+/// - with git's own `git commit --only -- <paths>` in the repo's own index. Git holds the index lock for the whole
+///   commit, hooks included, so ordinary committers wait rather than race; it moves HEAD only from the parent it read,
+///   and updates the index for these paths before it lets go. The repo's normal hooks run unchanged.
+/// - The version must hold in that parent for every file it covers, written or not: one that differs there means the
+///   entry changed under the change, so the commit is undone by a new `git revert` commit (never a reset or rewrite)
+///   and the outcome is a conflict.
+/// - The commit must hold the bytes the change wrote; a write by someone else between the change's own and git's
+///   staging is committed under the change's message and said, never reported as its success.
+/// - When nothing is left to commit because someone's commit (an agent's `git commit -a`) already holds exactly these
+///   bytes, that commit is the change's.
 ///
-/// `None`: nothing would change.
-pub fn commit_exact(
+/// `None`: the change wrote nothing.
+pub fn commit_entry(
     dir: &Path,
-    files: &[(&Path, &[u8], &[u8])],
+    files: &[Covered],
     message: &str,
 ) -> Result<Option<String>, Uncommitted> {
-    use Uncommitted::Refused;
+    use Uncommitted::{Conflict, Published, Refused};
     let top =
         toplevel(dir).ok_or_else(|| Refused(format!("{}: not in a git repo", dir.display())))?;
     let prefix = run(dir, &["rev-parse", "--show-prefix"]).map_err(Refused)?.trim().to_string();
+    // The repo's paths, wherever in it the stack is (sol-loop r3, S4).
     let paths: Vec<String> = files
         .iter()
-        .map(|(p, _, _)| format!("{prefix}{}", p.to_string_lossy().replace('\\', "/")))
+        .map(|c| format!("{prefix}{}", c.path.to_string_lossy().replace('\\', "/")))
         .collect();
-    // Each blob as `git add` would store the file at its path: its filters and line ends applied.
-    let blob = |bytes: &[u8], path: &str, write: bool| -> Result<String, String> {
-        let mut args = vec!["hash-object", "--stdin", "--path", path];
-        if write {
-            args.push("-w");
-        }
+    // Each blob as `git add` stores the file at its path: its filters and line ends applied (core.autocrlf, D7.6).
+    let blob = |bytes: &[u8], path: &str| -> Result<String, String> {
+        let args = ["hash-object", "--stdin", "--path", path];
         Ok(text(&args, crate::process::git_input(&top, &args, bytes.to_vec())?)?.trim().to_string())
     };
-    let pairs = files.iter().zip(&paths);
-    let bases: Vec<String> = pairs
-        .clone()
-        .map(|((_, was, _), p)| blob(was, p, false))
-        .collect::<Result<_, _>>()
-        .map_err(Refused)?;
-    let blobs: Vec<String> = pairs
-        .map(|((_, _, new), p)| blob(new, p, true))
-        .collect::<Result<_, _>>()
-        .map_err(Refused)?;
-    let git_dir =
-        PathBuf::from(run(&top, &["rev-parse", "--absolute-git-dir"]).map_err(Refused)?.trim());
-    let name = format!("lords-commit-index-{}", crate::process::id());
-    let index = crate::fsguard::Root::git(&git_dir)
-        .and_then(|r| Ok(r.join(&[crate::fsguard::Part::new(&name)?])))
-        .map_err(Refused)?;
-    let at = index.path().to_string_lossy().into_owned();
-    let env = [("GIT_INDEX_FILE", at.as_str())];
-    let made = (|| -> Result<Option<String>, Uncommitted> {
-        for _ in 0..TRIES {
-            let head =
-                run(&top, &["rev-parse", "--verify", "HEAD"]).map_err(Refused)?.trim().to_string();
-            for (path, base) in paths.iter().zip(&bases) {
-                let now = run(&top, &["rev-parse", "--verify", &format!("{head}:{path}")])
-                    .map_err(Refused)?;
-                if now.trim() != base {
-                    return Err(Refused(format!("{path} was committed meanwhile by someone else")));
-                }
-            }
-            run_env(&top, &["read-tree", &head], &env).map_err(Refused)?;
-            for (path, blob) in paths.iter().zip(&blobs) {
-                let listed =
-                    run(&top, &["ls-tree", "--full-tree", &head, "--", path]).map_err(Refused)?;
-                let mode = listed.split_whitespace().next().unwrap_or("100644");
-                let entry = format!("{mode},{blob},{path}");
-                run_env(&top, &["update-index", "--add", "--cacheinfo", &entry], &env)
-                    .map_err(Refused)?;
-            }
-            let same = crate::process::git_env(&top, &["diff", "--cached", "--quiet", &head], &env)
-                .map_err(Refused)?;
-            if same.status.success() {
-                return Ok(None);
-            }
-            // Not quiet: git's summary line names the commit it made, which HEAD may no longer be by the time it is read
-            // (sol-loop r4, S5: an agent's commit on top of it).
-            let said = run_env(&top, &["commit", "-m", message], &env).map_err(Refused)?;
-            // From here the commit is published: what fails says so, and the caller's writes stay (S6). The repo's
-            // index takes the commit's entries first, so its stale ones are there for one git call only (a commit made
-            // from it in that moment would undo this one: design note D7.5).
-            let published = |problem: String, commit: &str| Uncommitted::Published {
-                commit: commit.to_string(),
-                problem,
-            };
-            let short = said
-                .lines()
-                .find_map(|l| l.strip_prefix('[')?.split(']').next()?.split_whitespace().last())
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    published(format!("git named no commit: {}", said.trim()), "HEAD")
-                })?;
-            let mut reset = vec!["reset", "-q", "--"];
-            reset.extend(paths.iter().map(String::as_str));
-            run(&top, &reset)
-                .map_err(|e| published(format!("the index wasn't updated for it: {e}"), &short))?;
-            let made = run(&top, &["rev-parse", "--verify", &format!("{short}^{{commit}}")])
-                .map_err(|e| published(e, &short))?
-                .trim()
-                .to_string();
-            let parent = run(&top, &["rev-parse", "--verify", &format!("{made}^")])
-                .map_err(|e| published(e, &short))?;
-            if parent.trim() != head {
-                // HEAD moved before git read it, so this commit undoes what came between: off again while HEAD is
-                // still it (and only it), the index back to that HEAD's entries. Past it, it stays, said.
-                run(&top, &["update-ref", "-m", "lords: built on another HEAD; taken back", "HEAD", parent.trim(), &made])
-                    .map_err(|e| published(format!("it was built on {head} but committed on {}, so it undoes what that added, and HEAD has moved past it ({e}); check by hand", parent.trim()), &short))?;
-                run(&top, &reset).map_err(Refused)?;
-                continue;
-            }
-            return Ok(Some(short));
+    // A blob in a commit, or none where the commit has no such path.
+    let at = |commit: &str, path: &str| -> Option<String> {
+        run(&top, &["rev-parse", "--verify", "--quiet", &format!("{commit}:{path}")])
+            .ok()
+            .map(|b| b.trim().to_string())
+    };
+    let mut bases = Vec::new();
+    let mut wrote: Vec<(&str, String)> = Vec::new();
+    for (c, path) in files.iter().zip(&paths) {
+        bases.push(blob(c.was, path).map_err(Refused)?);
+        if let Some(bytes) = c.wrote {
+            wrote.push((path.as_str(), blob(bytes, path).map_err(Refused)?));
         }
-        Err(Refused(format!("HEAD moved {TRIES} times while committing")))
-    })();
-    let removed = crate::fsguard::delete_file(&index);
-    match (made, removed) {
-        (Err(e), _) => Err(e),
-        (Ok(made), Err(e)) => match made {
-            Some(commit) => Err(Uncommitted::Published { commit, problem: e }),
-            None => Err(Refused(e)),
-        },
-        (Ok(made), Ok(())) => Ok(made),
     }
+    if wrote.is_empty() {
+        return Ok(None);
+    }
+    let written: Vec<&str> = wrote.iter().map(|(p, _)| *p).collect();
+    // Nothing left to commit: the files hold what HEAD holds.
+    let mut same = vec!["diff", "--quiet", "HEAD", "--"];
+    same.extend(&written);
+    if status(&top, &same).map_err(Refused)? {
+        if let Some((path, _)) = wrote.iter().find(|(p, b)| at("HEAD", p).as_deref() != Some(b)) {
+            return Err(Conflict(format!(
+                "{path} was committed meanwhile by someone else, with other bytes"
+            )));
+        }
+        let mut last = vec!["log", "-1", "--format=%h", "--"];
+        last.extend(&written);
+        return Ok(Some(run(&top, &last).map_err(Refused)?.trim().to_string()));
+    }
+    // Not quiet: git's summary line names the commit it made (sol-loop r4, S5).
+    let mut commit = vec!["commit", "--only", "-m", message, "--"];
+    commit.extend(&written);
+    let said = run(&top, &commit).map_err(Refused)?;
+    let short = said
+        .lines()
+        .find_map(|l| l.strip_prefix('[')?.split(']').next()?.split_whitespace().last())
+        .map(str::to_string)
+        .ok_or_else(|| Published {
+            commit: "HEAD".into(),
+            problem: format!("git named no commit: {}", said.trim()),
+        })?;
+    let published = |problem: String| Published { commit: short.clone(), problem };
+    let made = run(&top, &["rev-parse", "--verify", &format!("{short}^{{commit}}")])
+        .map_err(published)?
+        .trim()
+        .to_string();
+    let parent = run(&top, &["rev-parse", "--verify", &format!("{made}^")])
+        .map_err(published)?
+        .trim()
+        .to_string();
+    // The version over every covered file, in the parent git committed on.
+    if let Some(path) = paths
+        .iter()
+        .zip(&bases)
+        .find(|(p, b)| at(&parent, p).as_deref() != Some(b.as_str()))
+        .map(|(p, _)| p)
+    {
+        return match run(&top, &["revert", "--no-edit", &made]) {
+            Ok(_) => {
+                let reverted = run(&top, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
+                Err(Conflict(format!(
+                    "{path} changed in HEAD after it was read; this edit, committed as {short}, is reverted as {}",
+                    reverted.trim()
+                )))
+            }
+            Err(e) => {
+                // A revert git stopped half way is taken back to where it started; the commit stays, said.
+                let _ = run(&top, &["revert", "--abort"]);
+                Err(published(format!(
+                    "it lands over a newer {path}, and reverting it failed ({e}); revert it by hand"
+                )))
+            }
+        };
+    }
+    if let Some((path, _)) = wrote.iter().find(|(p, b)| at(&made, p).as_deref() != Some(b.as_str()))
+    {
+        return Err(published(format!(
+            "another writer's bytes for {path} were committed under its message; the edit's own aren't in it"
+        )));
+    }
+    Ok(Some(short))
 }
 
 /// One commit in a file's history.

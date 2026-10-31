@@ -776,16 +776,6 @@ impl Root {
         Root::at(dir.to_path_buf())
     }
 
-    /// A repo's git dir (`git rev-parse --absolute-git-dir`), where a commit's own index lives while it is made
-    /// (`git::commit_exact`).
-    pub fn git(dir: &Path) -> Result<Root, String> {
-        let root = Root::at(dir.to_path_buf())?;
-        if kind(&root.path.join("HEAD"))? != Kind::File {
-            return Err(format!("{}: no HEAD, so no git dir", dir.display()));
-        }
-        Ok(root)
-    }
-
     /// An SSH bridge's dir, which `lords panel add` changes: it holds the bridge's `sshd_config`.
     pub fn bridge(dir: &Path) -> Result<Root, String> {
         let root = Root::at(dir.to_path_buf())?;

@@ -7,6 +7,7 @@
 mod common;
 use common::*;
 use lords_core::fsguard;
+use lords_core::git::Covered;
 use lords_core::ops::{edit, retire, Edit, Retire};
 
 fn retire_from<'a>(id: &'a str, base: &'a str) -> Retire<'a> {
@@ -76,69 +77,102 @@ fn a_change_made_from_an_older_version_is_refused_and_writes_nothing() {
     assert!(!f.stacks().find("rule.v").unwrap().active());
 }
 
-// Spec (sol-loop r2, S2: "commit the verified bytes"): a commit made for an edit holds exactly the bytes the edit
-// wrote, whatever the file holds by the time it is committed: an agent's write that lands after the edit's own stays
-// the agent's, uncommitted in the working tree, and the index takes the commit's entries. The stack repo's hooks run
-// on what is committed; one that refuses leaves HEAD, the index and the working tree as they were.
+fn covered<'a>(path: &'a str, was: &'a [u8], wrote: Option<&'a [u8]>) -> Covered<'a> {
+    Covered { path: std::path::Path::new(path), was, wrote }
+}
+
+// Spec (review r1 R1, the Lords owner's direction: git's own `git commit --only -- <paths>` in the repo's own index, the
+// version checked against the new commit's parent): an entry's commit
+// - holds the bytes the edit wrote, and the repo's index agrees with it at once;
+// - when the stack repo's hooks refuse it, leaves HEAD, the index and the file as they were (Refused);
+// - when it carries another writer's bytes for a file it wrote (a write between the edit's own and git's staging), is
+//   reported for what it is, never as this edit's success;
+// - when a file the version covers, written or not, changed in the commit's parent since it was read, is reverted by a
+//   new commit and reported as a conflict, so the window reloads;
+// - when an agent's `git commit -a` already took the file the edit wrote, so nothing is left to commit, is reported as
+//   that commit.
 #[test]
-fn a_commit_holds_exactly_what_the_edit_wrote() {
+fn an_entrys_commit_holds_its_version_over_every_covered_file() {
+    use lords_core::git::{commit_entry, Uncommitted};
     let f = Fixture::new();
-    f.write("priv/global/rules/w.md", "before\n");
+    f.write("priv/global/skills/s/lords.yaml", "meta 1\n");
+    f.write("priv/global/skills/s/SKILL.md", "body 1\n");
     f.git_init("priv");
     let root = f.priv_root();
-    // The edit wrote "mine"; an agent's write landed after it, before the commit.
-    f.write("priv/global/rules/w.md", "an agent's\n");
-    let file = std::path::Path::new("global/rules/w.md");
-    let (before, mine) = (b"before\n".as_slice(), b"mine\n".as_slice());
-    let made =
-        lords_core::git::commit_exact(&root, &[(file, before, mine)], "Edit rule.w").unwrap();
-    assert!(made.is_some());
-    assert_eq!(git(&root, &["show", "HEAD:global/rules/w.md"]), "mine\n");
-    assert_eq!(f.read("priv/global/rules/w.md"), "an agent's\n", "the agent's write stays its own");
-    assert_eq!(git(&root, &["diff", "--cached", "--name-only"]), "", "the index is the commit's");
-    assert_eq!(git(&root, &["log", "-1", "--format=%s"]).trim(), "Edit rule.w");
+    let (meta, body) = ("global/skills/s/lords.yaml", "global/skills/s/SKILL.md");
+    let head = || git(&root, &["rev-parse", "HEAD"]);
+
+    // The ordinary case: the sidecar written, the text only covered.
+    f.write(&format!("priv/{meta}"), "meta 2\n");
+    let made = commit_entry(
+        &root,
+        &[covered(meta, b"meta 1\n", Some(b"meta 2\n")), covered(body, b"body 1\n", None)],
+        "Edit skill.s",
+    );
+    assert!(matches!(&made, Ok(Some(_))), "{made:?}");
+    assert_eq!(git(&root, &["show", &format!("HEAD:{meta}")]), "meta 2\n");
+    assert_eq!(git(&root, &["status", "--porcelain"]), "", "the index agrees at once");
 
     // A hook that sees what is committed, and refuses it.
     f.write("priv/.git/hooks/pre-commit", "#!/bin/sh\ngit diff --cached | grep -q SECRET && { echo 'refused' >&2; exit 1; }\nexit 0\n");
-    let head = git(&root, &["rev-parse", "HEAD"]);
-    let refused = lords_core::git::commit_exact(
-        &root,
-        &[(file, mine, b"SECRET\n".as_slice())],
-        "Edit rule.w",
-    );
+    let before = head();
+    f.write(&format!("priv/{meta}"), "SECRET\n");
+    let refused =
+        commit_entry(&root, &[covered(meta, b"meta 2\n", Some(b"SECRET\n"))], "Edit skill.s");
     assert!(
-        matches!(&refused, Err(lords_core::git::Uncommitted::Refused(m)) if m.contains("refused")),
+        matches!(&refused, Err(Uncommitted::Refused(m)) if m.contains("refused")),
         "{refused:?}"
     );
-    assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
+    assert_eq!(head(), before);
     assert_eq!(git(&root, &["diff", "--cached", "--name-only"]), "");
-    assert_eq!(f.read("priv/global/rules/w.md"), "an agent's\n");
-    // sol-loop r3 S5: made from a version someone committed over since, it is refused; nothing that commit added is
-    // undone.
+    f.write(&format!("priv/{meta}"), "meta 2\n");
     std::fs::remove_file(root.join(".git/hooks/pre-commit")).unwrap();
-    let stale = lords_core::git::commit_exact(
-        &root,
-        &[(file, before, b"late\n".as_slice())],
-        "Edit rule.w",
-    );
+
+    // Another writer's bytes on disk when git stages: committed, but never as this edit's success.
+    f.write(&format!("priv/{meta}"), "an agent's\n");
+    let theirs =
+        commit_entry(&root, &[covered(meta, b"meta 2\n", Some(b"meta 3\n"))], "Edit skill.s");
     assert!(
-        matches!(&stale, Err(lords_core::git::Uncommitted::Refused(m)) if m.contains("committed meanwhile")),
-        "{stale:?}"
+        matches!(&theirs, Err(Uncommitted::Published { problem, .. }) if problem.contains("another writer's bytes")),
+        "{theirs:?}"
     );
-    assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
-    assert_eq!(git(&root, &["show", "HEAD:global/rules/w.md"]), "mine\n");
-    // Nothing of its own left in the git dir.
-    let left: Vec<String> = std::fs::read_dir(root.join(".git"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("lords-"))
-        .collect();
-    assert_eq!(left, Vec::<String>::new());
+    let at = head();
+
+    // The covered text changed in HEAD since the version was read: reverted by a new commit, a conflict.
+    f.write(&format!("priv/{body}"), "body 2\n");
+    git(&root, &["commit", "-q", "-am", "an agent's text"]);
+    let read_before = git(&root, &["rev-parse", "HEAD"]);
+    f.write(&format!("priv/{meta}"), "meta 4\n");
+    let stale = commit_entry(
+        &root,
+        &[covered(meta, b"an agent's\n", Some(b"meta 4\n")), covered(body, b"body 1\n", None)],
+        "Edit skill.s",
+    );
+    assert!(matches!(&stale, Err(Uncommitted::Conflict(m)) if m.contains(body)), "{stale:?}");
+    let subjects = git(&root, &["log", "-2", "--format=%s"]);
+    assert!(subjects.starts_with("Revert \"Edit skill.s\"\nEdit skill.s"), "{subjects}");
+    assert_eq!(
+        git(&root, &["rev-parse", "HEAD^{tree}"]),
+        git(&root, &["rev-parse", &format!("{}^{{tree}}", read_before.trim())])
+    );
+    assert_ne!(at, head());
+
+    // An agent's `commit -a` already took the edit's bytes: that commit is the edit's.
+    f.write(&format!("priv/{meta}"), "meta 5\n");
+    git(&root, &["commit", "-q", "-am", "an agent's commit -a"]);
+    let theirs_commit = git(&root, &["rev-parse", "--short", "HEAD"]);
+    let taken = commit_entry(
+        &root,
+        &[covered(meta, b"an agent's\n", Some(b"meta 5\n")), covered(body, b"body 2\n", None)],
+        "Edit skill.s",
+    );
+    assert_eq!(taken, Ok(Some(theirs_commit.trim().to_string())));
 }
 
-// Spec (sol-loop r4, S5 and S6): an agent's commit that lands on top of the edit's own before the edit has looked
-// (here from the repo's post-commit hook, which runs after git published the edit and before it returns) is never taken
-// for the edit's commit: it stays in HEAD, the edit's commit stays under it, and the edit reports itself committed.
+// Spec (sol-loop r4, S5 and S6; review r1 R1 witness A): an agent's plain commit from the repo's own index that lands
+// on top of the edit's (here from the repo's post-commit hook, which runs after git published the edit and before it
+// returns) keeps the edit: HEAD holds the edit's text, the agent's commit stays on top, and the edit reports itself
+// committed.
 #[test]
 fn an_agents_commit_on_top_of_the_edits_stays() {
     let f = Fixture::new();
@@ -155,7 +189,10 @@ fn an_agents_commit_on_top_of_the_edits_stays() {
     assert!(matches!(&made, Ok(Some(_))), "{made:?}");
     let log = git(&root, &["log", "-3", "--format=%s"]);
     assert_eq!(log, "an agent's commit\nEdit rule.a\nfixture\n");
+    let committed = git(&root, &["show", "HEAD:global/rules/a.md"]);
+    assert!(committed.ends_with("---\nMine.\n"), "HEAD holds the edit: {committed}");
     assert!(f.read("priv/global/rules/a.md").ends_with("---\nMine.\n"), "the edit stays");
+    assert_eq!(git(&root, &["status", "--porcelain"]), "");
 }
 
 // Spec (the owner's private stack repo has `core.autocrlf=true` and no eol attributes, so its files are CRLF on disk
@@ -170,12 +207,11 @@ fn an_edit_in_a_repo_that_converts_line_ends_commits() {
     git(&f.priv_root(), &["add", "-A"]);
     git(&f.priv_root(), &["commit", "-q", "-m", "fixture"]);
     let root = f.priv_root();
-    let file = std::path::Path::new("global/rules/c.md");
     // The edit's own write, as ops makes it before committing.
     f.write("priv/global/rules/c.md", "mine\r\n");
-    let made = lords_core::git::commit_exact(
+    let made = lords_core::git::commit_entry(
         &root,
-        &[(file, b"line\r\n".as_slice(), b"mine\r\n".as_slice())],
+        &[covered("global/rules/c.md", b"line\r\n", Some(b"mine\r\n"))],
         "Edit rule.c",
     );
     assert!(matches!(made, Ok(Some(_))), "{made:?}");
