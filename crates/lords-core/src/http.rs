@@ -2,10 +2,13 @@
 //! own server, over std's TCP. One request per connection (`Connection: close`), bodies by `Content-Length` only, JSON
 //! both ways.
 //!
-//! The server listens on 127.0.0.1 alone, and answers only what no browser page can send: a `Host` of 127.0.0.1 (a
-//! rebound DNS name is refused), no `Origin`, `Referer` or `Sec-Fetch-*` header (every current browser sends one of
-//! them), and a POST only as `application/json` (which a page can't send to another site without a preflight, and the
-//! preflight's OPTIONS is refused). Each limit is checked before what it limits is read.
+//! The server listens on 127.0.0.1 alone, and answers only a request that carries the panel's token (review r1 R2:
+//! loopback is open to every local account, and to every account of the PC a forward runs on); without it, 401 and
+//! nothing else. Of the rest, only what no browser page can send: a `Host` of 127.0.0.1 (a rebound DNS name is refused),
+//! no `Origin`, `Referer` or `Sec-Fetch-*` header (every current browser sends one of them), and a POST only as
+//! `application/json` (which a page can't send to another site without a preflight, and the preflight's OPTIONS is
+//! refused). Each limit is checked before what it limits is read, and a request has one deadline from its accept to its
+//! last byte, however it trickles (review r1 R5).
 
 use serde::Serialize;
 use std::io::{Read, Write};
@@ -20,10 +23,60 @@ pub const MAX_HEAD: usize = 16 * 1024;
 pub const MAX_BODY: usize = 4 * 1024 * 1024;
 /// A reply's body, at most, as the client reads it.
 pub const MAX_REPLY: usize = 256 * 1024 * 1024;
-/// How long the server waits on a client's next bytes, or for it to take the reply.
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
-/// Connections served at once; past them a new one is told to come back.
-const MAX_CONNECTIONS: usize = 16;
+/// How long the server waits for a client to take its reply.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The header that carries the panel's token.
+pub const TOKEN_HEADER: &str = "Lords-Panel-Token";
+
+/// What the server takes from its clients, at most: each a setting, these its defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// From a connection's accept to its request's last byte, however the bytes come; then the request is refused
+    /// (408) and its connection's place freed.
+    pub request: Duration,
+    /// Connections served at once; past them a new one is told to come back.
+    pub connections: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits { request: Duration::from_secs(60), connections: 16 }
+    }
+}
+
+/// The panel's capability: every request carries it, reads and writes alike. Shown nowhere: its `Debug` says only
+/// that it is one.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Token(String);
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Token(…)")
+    }
+}
+
+impl Token {
+    /// A token as its file holds it: hex digits, at least 32.
+    pub fn new(text: &str) -> Result<Token, String> {
+        let t = text.trim();
+        if t.len() >= 32 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Ok(Token(t.to_string()))
+        } else {
+            Err("the panel's token file holds no token".into())
+        }
+    }
+
+    /// Its text, for the one place it travels: `lords panel add`'s copy to the other PC, over ssh. Never printed.
+    pub fn secret(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether `other` is this token, in a time that doesn't depend on where they differ.
+    fn is(&self, other: &str) -> bool {
+        let (a, b) = (self.0.as_bytes(), other.as_bytes());
+        a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+    }
+}
 /// Headers only a browser sends.
 const BROWSER_HEADERS: [&str; 6] =
     ["origin", "referer", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "sec-fetch-user"];
@@ -67,9 +120,11 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         409 => "Conflict",
         411 => "Length Required",
         413 => "Content Too Large",
@@ -88,23 +143,28 @@ pub fn bind(port: u16) -> std::io::Result<TcpListener> {
 }
 
 /// Serves `listener` until the process ends: each connection on its own thread, one request each, `handle` called
-/// only for a request that passed every check. A client that goes away mid-reply changes nothing: `handle` has run
-/// whole by then.
-pub fn serve(listener: TcpListener, handle: impl Fn(&Request) -> Reply + Send + Sync + 'static) {
-    let handle = Arc::new(handle);
+/// only for a request that carries `token` and passed every check, within `limits`. A client that goes away mid-reply
+/// changes nothing: `handle` has run whole by then.
+pub fn serve(
+    listener: TcpListener,
+    limits: Limits,
+    token: Token,
+    handle: impl Fn(&Request) -> Reply + Send + Sync + 'static,
+) {
+    let (handle, token) = (Arc::new(handle), Arc::new(token));
     let open = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
-        if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+        let until = Instant::now() + limits.request;
+        if open.fetch_add(1, Ordering::SeqCst) >= limits.connections {
             open.fetch_sub(1, Ordering::SeqCst);
             let _ = write_reply(&mut stream, &Reply::error(503, "busy: too many connections"));
             continue;
         }
-        let (handle, open) = (handle.clone(), open.clone());
+        let (handle, token, open) = (handle.clone(), token.clone(), open.clone());
         std::thread::spawn(move || {
-            let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-            let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-            let reply = match read_request(&mut stream) {
+            let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+            let reply = match read_request(&mut stream, until, &token) {
                 Ok(request) => handle(&request),
                 Err(refused) => refused,
             };
@@ -141,8 +201,35 @@ fn loopback_host(value: &str) -> bool {
     }
 }
 
-/// One request off `stream`, or the reply that refuses it.
-pub fn read_request(stream: &mut impl Read) -> Result<Request, Reply> {
+/// Reads what `stream` has into `buf`, by `until` at the latest: 0 at its end, or the reply that refuses a request
+/// past its deadline (review r1 R5: a read that waits on each next byte alone lets a trickle hold its place for ever).
+fn read_by(stream: &mut TcpStream, buf: &mut [u8], until: Instant) -> Result<usize, Reply> {
+    let late = || Reply::error(408, "the request wasn't sent in time");
+    let left = until.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(late());
+    }
+    stream.set_read_timeout(Some(left)).map_err(|e| Reply::error(400, e.to_string()))?;
+    match stream.read(buf) {
+        Ok(n) => Ok(n),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Err(late())
+        }
+        Err(e) => Err(Reply::error(400, format!("the request couldn't be read: {e}"))),
+    }
+}
+
+/// One request off `stream`, all of it by `until`, carrying `token`; or the reply that refuses it.
+pub fn read_request(
+    stream: &mut TcpStream,
+    until: Instant,
+    token: &Token,
+) -> Result<Request, Reply> {
     let bad = |m: &str| Reply::error(400, m);
     let mut head = Vec::new();
     let mut buf = [0u8; 4096];
@@ -153,10 +240,9 @@ pub fn read_request(stream: &mut impl Read) -> Result<Request, Reply> {
         if head.len() > MAX_HEAD {
             return Err(Reply::error(431, format!("the request's head is over {MAX_HEAD} bytes")));
         }
-        match stream.read(&mut buf) {
-            Ok(0) => return Err(bad("the request ended before its head did")),
-            Ok(n) => head.extend_from_slice(&buf[..n]),
-            Err(e) => return Err(bad(&format!("the request couldn't be read: {e}"))),
+        match read_by(stream, &mut buf, until)? {
+            0 => return Err(bad("the request ended before its head did")),
+            n => head.extend_from_slice(&buf[..n]),
         }
     };
     if end > MAX_HEAD {
@@ -191,6 +277,11 @@ pub fn read_request(stream: &mut impl Read) -> Result<Request, Reply> {
             _ => Err(bad(&format!("more than one {name}"))),
         }
     };
+    // Before anything else is read or said: without the token, once, 401 and nothing else.
+    let carried = all(&headers, &TOKEN_HEADER.to_ascii_lowercase());
+    if !matches!(carried[..], [t] if token.is(t)) {
+        return Err(Reply { status: 401, body: Vec::new() });
+    }
     if !one("host")?.is_some_and(loopback_host) {
         return Err(Reply::error(403, "only requests to 127.0.0.1 are answered"));
     }
@@ -226,9 +317,14 @@ pub fn read_request(stream: &mut impl Read) -> Result<Request, Reply> {
     if body.len() > length {
         return Err(bad("more bytes than the Content-Length"));
     }
-    let have = body.len();
+    let mut have = body.len();
     body.resize(length, 0);
-    stream.read_exact(&mut body[have..]).map_err(|e| bad(&format!("the body ended early: {e}")))?;
+    while have < length {
+        match read_by(stream, &mut body[have..], until)? {
+            0 => return Err(bad("the body ended early")),
+            n => have += n,
+        }
+    }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let mut pairs = Vec::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
@@ -272,10 +368,20 @@ fn decode(s: &str) -> Option<String> {
 
 // ---------------------------------------------------------------- client
 
+/// `api`'s port: `http://127.0.0.1:<port>` only (this PC, or an SSH forward).
+pub fn api_port(api: &str) -> Result<u16, String> {
+    api.trim_end_matches('/')
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|p| p.parse::<u16>().ok())
+        .filter(|p| *p != 0)
+        .ok_or_else(|| "api must be http://127.0.0.1:<port> (this PC, or an SSH forward)".into())
+}
+
 /// The panel's server at `http://127.0.0.1:<port>`: this PC's, or another's through an SSH forward.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Client {
     port: u16,
+    token: Token,
 }
 
 /// Why a call got no reply.
@@ -290,19 +396,14 @@ pub enum CallError {
 }
 
 impl Client {
-    pub fn new(port: u16) -> Client {
-        Client { port }
+    /// The server on `port`, reached with its `token`.
+    pub fn new(port: u16, token: Token) -> Client {
+        Client { port, token }
     }
 
     /// `api` as config.txt has it: `http://127.0.0.1:<port>`, loopback only (this PC, or an SSH forward).
-    pub fn from_api(api: &str) -> Result<Client, String> {
-        let port = api
-            .trim_end_matches('/')
-            .strip_prefix("http://127.0.0.1:")
-            .and_then(|p| p.parse::<u16>().ok())
-            .filter(|p| *p != 0)
-            .ok_or("api must be http://127.0.0.1:<port> (this PC, or an SSH forward)")?;
-        Ok(Client { port })
+    pub fn from_api(api: &str, token: Token) -> Result<Client, String> {
+        Ok(Client { port: api_port(api)?, token })
     }
 
     pub fn port(&self) -> u16 {
@@ -334,8 +435,8 @@ impl Client {
         )
         .map_err(unreachable)?;
         let mut request = format!(
-            "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n",
-            self.port
+            "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{TOKEN_HEADER}: {}\r\nConnection: close\r\n",
+            self.port, self.token.0
         );
         if let Some(b) = body {
             request.push_str(&format!(

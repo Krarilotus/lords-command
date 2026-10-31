@@ -59,7 +59,10 @@ fn panel_serve_serves_the_stacks_on_loopback() {
     let at = first.trim().rsplit(' ').next().unwrap().to_string();
     let addr: std::net::SocketAddr = at.parse().unwrap_or_else(|e| panic!("{first:?}: {e}"));
     assert!(addr.ip().is_loopback(), "{first}");
-    let stacks = Source::Remote(Client::new(addr.port())).stacks().unwrap();
+    // The token `serve` made in its home, as `lords panel add` copies it to another PC.
+    let saved = fs::read_to_string(dir.path().join("home/.lords-command/panel-token")).unwrap();
+    let token = lords_core::http::Token::new(&saved).unwrap();
+    let stacks = Source::Remote(Client::new(addr.port(), token)).stacks().unwrap();
     assert_eq!(stacks.entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["rule.v"]);
     assert!(stacks.entries[0].body.ends_with("Served.\n"));
 

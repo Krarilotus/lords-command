@@ -49,6 +49,9 @@ pub struct Local {
     pub sessions: Vec<u32>,
     pub task: bool,
     pub served: bool,
+    /// The tool's home, and whether it has the panel's token yet.
+    pub home: PathBuf,
+    pub token: bool,
 }
 
 /// The changes, each `None` where it is there already.
@@ -326,11 +329,15 @@ pub fn plan(name: &str, local: &Local, remote: &Remote) -> Result<Plan, String> 
 
 impl Plan {
     /// The exact targets on both PCs, in the order `--apply` carries them out.
-    pub fn describe(&self, name: &str, local: &Local, remote: &Remote) -> Vec<String> {
+    /// `run`: this run's own id, which names its staging dirs on both PCs and its backup dir (review r1 R7).
+    pub fn describe(&self, name: &str, local: &Local, remote: &Remote, run: &str) -> Vec<String> {
         let b = local.bridge.display();
         let ssh = format!("{}\\.ssh", remote.home);
         let app = format!("{}\\Programs\\lords-command", remote.local_app_data);
         let mut out = vec![format!("{name}:")];
+        out.push(format!(
+            "  + {app}\\staging\\{run}\\ (this run's own: what it sends, removed at its end)"
+        ));
         out.push(match &self.public {
             Some(_) => format!("  = {ssh}\\{} (there: its .pub is used)", self.key),
             None => format!(
@@ -345,8 +352,16 @@ impl Plan {
             ),
             None => format!("  = {ssh}\\config: Host {} is there", self.alias),
         });
-        let verb = if remote.app { "~ (replaced)" } else { "+" };
-        out.push(format!("  {verb} {app}\\: lords-command.exe, README.md, LICENSE"));
+        if remote.app {
+            out.push(format!(
+                "  ~ {app}\\: lords-command.exe, README.md, LICENSE, each backed up first into {app}\\backup-{run}\\"
+            ));
+        } else {
+            out.push(format!("  + {app}\\: lords-command.exe, README.md, LICENSE"));
+        }
+        out.push(format!(
+            "  + {app}\\panel-token: a copy of this PC's, owner-only (replaced, never backed up: a secret keeps no copies)"
+        ));
         out.push(match &self.config_txt {
             Some(_) => format!(
                 "  + {app}\\config.txt: api = http://127.0.0.1:{LOCAL_PORT}, tunnel = {}",
@@ -359,6 +374,16 @@ impl Plan {
             remote.app_data
         ));
         out.push("this PC:".into());
+        let home = local.home.display();
+        out.push(format!(
+            "  + {home}\\panel-add-{run}\\ (this run's own: the task's definition, removed at its end)"
+        ));
+        if !local.token {
+            out.push(format!(
+                "  + {home}\\{}: the panel's token (random, owner-only; its text is never shown)",
+                lords_core::panel::TOKEN_FILE
+            ));
+        }
         out.push(match &self.public {
             Some(p) => format!(
                 "  + {b}\\authorized_keys: {} (backup authorized_keys.before-lords-panel)",
@@ -418,8 +443,8 @@ mod tests {
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample0123456789abcdefABCDEF lords-panel-other";
 
     fn remote() -> Remote {
-        // Built at run time, so the repo's own privacy check doesn't see a user's path in this source.
-        let home = ["C:", "Users", "someone"].join("\\");
+        // A neutral fixture home: no user's path, so the privacy check has nothing to take for one.
+        let home = "X:\\fixture-home".to_string();
         Remote {
             local_app_data: format!("{home}\\AppData\\Local"),
             app_data: format!("{home}\\AppData\\Roaming"),
@@ -438,6 +463,7 @@ mod tests {
             authorized_keys: "restrict,port-forwarding,permitopen=\"127.0.0.1:7878\" ssh-ed25519 AAAAother fleet-panel-other\r\n".into(),
             listener: Some(21100),
             sessions: vec![42532, 33456],
+            home: "X:\\fixture-tool-home".into(),
             ..Local::default()
         }
     }
@@ -466,7 +492,7 @@ mod tests {
             p.config_txt.as_deref(),
             Some("api = http://127.0.0.1:17879\r\ntunnel = lords-panel-main\r\n")
         );
-        let said = p.describe("Other", &local(), &remote()).join("\n");
+        let said = p.describe("Other", &local(), &remote(), "20261031-0900-1").join("\n");
         assert!(
             said.contains("kept: 2 live session(s) (42532, 33456)")
                 && said.contains("dropped: none"),
@@ -498,6 +524,19 @@ mod tests {
             authorized_with(&l.authorized_keys, &authorized_line(PUB, &p.comment).unwrap()),
             Ok(None)
         );
+        // Review r1 R7: the dry run names every target this run touches: its staging dirs on both PCs, the backup of
+        // each installed file it replaces, the token's copy; never the token's text.
+        l.token = true;
+        let said = p.describe("Other", &l, &r, "20261031-0900-1").join("\n");
+        for target in [
+            "X:\\fixture-home\\AppData\\Local\\Programs\\lords-command\\staging\\20261031-0900-1\\",
+            "X:\\fixture-home\\AppData\\Local\\Programs\\lords-command\\backup-20261031-0900-1\\",
+            "X:\\fixture-home\\AppData\\Local\\Programs\\lords-command\\panel-token",
+            "X:\\fixture-tool-home\\panel-add-20261031-0900-1\\",
+        ] {
+            assert!(said.contains(target), "{target} in {said}");
+        }
+        assert!(!said.contains("X:\\fixture-tool-home\\panel-token"), "made already: {said}");
     }
 
     // Spec (brief, inputs to attack: "`panel add` against an alias that already exists, or that has a different

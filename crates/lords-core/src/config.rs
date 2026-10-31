@@ -35,7 +35,7 @@ pub fn expand_home(path: &str) -> PathBuf {
 /// `api` takes only a loopback address: the panel's server has no authentication of its own, so it is reached from
 /// its own PC or through an SSH forward (overseer's rule).
 pub fn check_api(api: &str) -> Result<(), String> {
-    crate::http::Client::from_api(api).map(|_| ())
+    crate::http::api_port(api).map(|_| ())
 }
 
 /// `tunnel` is an SSH alias, never an option: ssh would read `-oProxyCommand=…` as one.

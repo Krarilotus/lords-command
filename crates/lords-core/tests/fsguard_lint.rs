@@ -95,8 +95,8 @@ fn extensions_allowed(d: Door) -> &'static [&'static str] {
 
 /// The child processes a source may start: `git`, the file manager, the staged guard copy's self-test
 /// (`guard_copy`), the queue guard's T3 CLI (`t3_cli`), the panel's tunnel and `lords panel add`'s remote steps
-/// (`ssh`, `scp`), its task for `lords panel serve` (`schtasks`) and its test of the bridge's sshd config
-/// (`sshd_exe`), all in process.rs.
+/// (`ssh`), its task for `lords panel serve` (`schtasks`) and its test of the bridge's sshd config (`sshd_exe`), all
+/// in process.rs.
 fn programs_allowed(d: Door) -> &'static [&'static str] {
     match d {
         Door::Process => &[
@@ -106,7 +106,6 @@ fn programs_allowed(d: Door) -> &'static [&'static str] {
             "guard_copy",
             "t3_cli",
             "\"ssh\"",
-            "\"scp\"",
             "\"schtasks\"",
             "sshd_exe",
         ],
@@ -400,7 +399,8 @@ fn only_fsguard_changes_the_filesystem() {
 fn test_only(file: &Path) -> bool {
     let Some(name) = file.file_stem().and_then(|s| s.to_str()) else { return false };
     let declared = format!("#[cfg(test)]mod{name};");
-    ["main.rs", "lib.rs"].iter().any(|root| {
+    // The module's parent: the crate root, or the `mod.rs` of the dir it is in.
+    ["main.rs", "lib.rs", "mod.rs"].iter().any(|root| {
         let root = file.with_file_name(root);
         root != file
             && fs::read_to_string(&root).is_ok_and(|text| {
@@ -433,6 +433,13 @@ fn only_a_test_only_module_is_outside_the_scan() {
         assert_eq!(test_only(&module), outside, "{declared:?}");
     }
     assert!(!test_only(&root), "a crate root is never its own module");
+    // A module of a dir's `mod.rs` (`panel/tests.rs` beside `panel/mod.rs`), declared the same two ways.
+    std::fs::remove_file(&root).unwrap();
+    let parent = dir.path().join("mod.rs");
+    for (declared, outside) in [("#[cfg(test)]\nmod checks;", true), ("mod checks;", false)] {
+        fs::write(&parent, declared).unwrap();
+        assert_eq!(test_only(&module), outside, "mod.rs: {declared:?}");
+    }
 }
 
 // Spec (Sol review r3, R3-08: "The filesystem lint does not enforce its stated boundary"; property: the lint catches

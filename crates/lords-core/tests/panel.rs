@@ -8,7 +8,7 @@
 
 mod common;
 use common::*;
-use lords_core::http::{self, Client, Reply};
+use lords_core::http::{self, Client, Limits, Reply, Token};
 use lords_core::ops::Edit;
 use lords_core::panel::{self, EditRequest, Failure, Paths, RetireRequest, Source};
 use std::io::{Read, Write};
@@ -44,6 +44,16 @@ struct Served {
     remote: Source,
 }
 
+/// The fixtures' panel token, built at run time so the repo's own privacy check doesn't take this source for one.
+fn token() -> Token {
+    Token::new(&"0123456789abcdef".repeat(2)).unwrap()
+}
+
+/// The header line that carries it.
+fn with_token() -> String {
+    format!("Lords-Panel-Token: {}\r\n", "0123456789abcdef".repeat(2))
+}
+
 fn served() -> Served {
     isolate_home();
     let f = Fixture::new();
@@ -55,8 +65,11 @@ fn served() -> Served {
     let listener = http::bind(0).unwrap();
     let port = listener.local_addr().unwrap().port();
     let served = paths.clone();
-    std::thread::spawn(move || http::serve(listener, move |r| panel::handle(&served, r)));
-    Served { f, port, local: Source::Local(paths), remote: Source::Remote(Client::new(port)) }
+    std::thread::spawn(move || {
+        http::serve(listener, Limits::default(), token(), move |r| panel::handle(&served, r))
+    });
+    let remote = Source::Remote(Client::new(port, token()));
+    Served { f, port, local: Source::Local(paths), remote }
 }
 
 fn version(s: &Source, id: &str) -> String {
@@ -178,8 +191,10 @@ fn a_second_write_is_refused_while_one_runs() {
     let remote = s.remote.clone();
     let running =
         std::thread::spawn(move || remote.edit(&body_edit("rule.v", "First.\n", Some(first))));
+    // The file is moved aside for a moment while it is replaced: absent then, never an error here.
     wait_until("the first write's file change", || {
-        s.f.read("priv/global/rules/v.md").ends_with("First.\n")
+        std::fs::read_to_string(s.f.path("priv/global/rules/v.md"))
+            .is_ok_and(|t| t.ends_with("First.\n"))
     });
     let refused = s.remote.edit(&body_edit("rule.p", "Second.\n", Some(second.clone())));
     assert!(
@@ -197,6 +212,7 @@ fn a_second_write_is_refused_while_one_runs() {
 fn the_size_limits_hold_to_the_byte() {
     let _t = turn();
     let s = served();
+    let with_token = with_token();
     let base = version(&s.remote, "rule.v");
     let size = |n: usize| {
         serde_json::to_vec(&body_edit("rule.v", &"x".repeat(n), Some(base.clone()))).unwrap().len()
@@ -216,15 +232,102 @@ fn the_size_limits_hold_to_the_byte() {
     assert_eq!(body, "x".repeat(n));
 
     let head = format!(
-        "GET /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\nX: {}\r\n\r\n",
+        "GET /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\n{with_token}X: {}\r\n\r\n",
         "y".repeat(http::MAX_HEAD)
     );
     assert_eq!(raw(s.port, head.as_bytes()).0, 431);
     let declared = format!(
-        "POST /edit HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        "POST /edit HTTP/1.1\r\nHost: 127.0.0.1\r\n{with_token}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         http::MAX_BODY + 1
     );
     assert_eq!(raw(s.port, declared.as_bytes()).0, 413);
+}
+
+// Spec (review r1 R5, the Lords owner: an absolute deadline per request, head and body, that frees its slot when it
+// expires): a client that trickles its request, each byte well inside any wait for the next, is refused at the
+// request's deadline (408), and the place it held is free again for the next request.
+#[test]
+fn a_trickled_request_is_cut_off_at_its_deadline_and_frees_its_place() {
+    let with_token = with_token();
+    let listener = http::bind(0).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let limits = Limits { request: Duration::from_secs(1), connections: 1 };
+    std::thread::spawn(move || http::serve(listener, limits, token(), |_| Reply::json(&"ok")));
+    let start = Instant::now();
+    let mut slow = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    slow.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    let head = format!("GET /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\n{with_token}X: ");
+    slow.write_all(head.as_bytes()).unwrap();
+    let mut reply = Vec::new();
+    while start.elapsed() < Duration::from_secs(10) {
+        let _ = slow.write_all(b"y");
+        let mut buf = [0u8; 512];
+        match slow.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => reply.extend_from_slice(&buf[..n]),
+            Err(_) => {}
+        }
+        if !reply.is_empty() {
+            break;
+        }
+    }
+    let said = String::from_utf8_lossy(&reply).into_owned();
+    assert!(said.starts_with("HTTP/1.1 408"), "{said:?} after {:?}", start.elapsed());
+    assert!(start.elapsed() < Duration::from_secs(5), "at its deadline: {:?}", start.elapsed());
+    let next = format!("GET /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\n{with_token}\r\n");
+    wait_until("the trickled request's place freed", || raw(port, next.as_bytes()).0 == 200);
+}
+
+// Spec (review r1 R2, the Lords owner: a capability token for reads and writes alike; a wrong or missing token gets
+// 401, and nothing else): a request from another local account (loopback, the right Host, no browser header) without
+// the token, or with another, gets 401 and an empty body, for a read and a write alike; the window's own, with it, is
+// answered.
+#[test]
+fn only_a_request_with_the_panels_token_is_answered() {
+    let s = served();
+    let reads = format!("GET /stacks HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n", s.port);
+    let body = r#"{"id":"rule.v","edit":{"body":"theirs\n","base":"x"}}"#;
+    let writes = format!(
+        "POST /edit HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+        s.port,
+        body.len()
+    );
+    for (head, tail) in [(&reads, ""), (&writes, body)] {
+        for token in ["", "Lords-Panel-Token: 00\r\n"] {
+            let (status, text) = raw(s.port, format!("{head}{token}\r\n{tail}").as_bytes());
+            assert_eq!(status, 401, "{head}{token}: {text}");
+            assert!(
+                text.ends_with("Content-Length: 0\r\n\r\n") || text.ends_with("\r\n\r\n"),
+                "{text}"
+            );
+            assert!(!text.contains("rule.v") && !text.contains("error"), "nothing else: {text}");
+        }
+    }
+    assert!(s.remote.stacks().is_ok(), "the window's own, with the token");
+}
+
+// Spec (review r1 R2, the Lords owner: `panel serve` makes the token once, random, in the tool home, with owner-only
+// permissions; never printed or logged): the token file is made once and read back after; another home gets another
+// token; a token shows nothing of itself; and the file's access list is protected (nothing inherited) with one entry,
+// full access for its owner, from its first moment.
+#[test]
+fn the_panels_token_is_made_once_and_owner_only() {
+    let f = Fixture::new();
+    let home = f.path("home-a");
+    let first = panel::token(&home).unwrap();
+    assert_eq!(panel::token(&home).unwrap(), first, "made once");
+    assert_ne!(panel::token(&f.path("home-b")).unwrap(), first, "random");
+    assert_eq!(format!("{first:?}"), "Token(…)");
+    #[cfg(windows)]
+    {
+        let out =
+            std::process::Command::new("icacls").arg(home.join("panel-token")).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        // Account names are the OS's language; an entry is `NAME:(rights)`, an inherited one carries `(I)`.
+        let entries: Vec<&str> = text.lines().filter(|l| l.contains(":(")).collect();
+        assert_eq!(entries.len(), 1, "one entry: {text}");
+        assert!(entries[0].trim_end().ends_with(":(F)"), "full access, nothing inherited: {text}");
+    }
 }
 
 // Spec (D2.3; brief: "a request from outside loopback, and a forged Host header"): the server listens on 127.0.0.1
@@ -233,13 +336,14 @@ fn the_size_limits_hold_to_the_byte() {
 // cross-site POST), an OPTIONS preflight, a chunked body. A plain request to 127.0.0.1 does.
 #[test]
 fn only_this_pcs_own_requests_are_answered_and_never_a_browsers() {
+    let with_token = with_token();
     let listener = http::bind(0).unwrap();
     let addr = listener.local_addr().unwrap();
     assert!(addr.ip().is_loopback());
     let calls = Arc::new(AtomicUsize::new(0));
     let counted = calls.clone();
     std::thread::spawn(move || {
-        http::serve(listener, move |_| {
+        http::serve(listener, Limits::default(), token(), move |_| {
             counted.fetch_add(1, Ordering::SeqCst);
             Reply::json(&"ok")
         })
@@ -255,7 +359,8 @@ fn only_this_pcs_own_requests_are_answered_and_never_a_browsers() {
         assert!(tried.is_err(), "reached through {ip}");
     }
     let port = addr.port();
-    let get = |headers: &str| format!("GET /stacks HTTP/1.1\r\n{headers}\r\n");
+    // Each with the token: what refuses them is the check each one is about.
+    let get = |headers: &str| format!("GET /stacks HTTP/1.1\r\n{with_token}{headers}\r\n");
     let host = format!("Host: 127.0.0.1:{port}\r\n");
     let refused = [
         get(&format!("Host: evil.example:{port}\r\n")),
@@ -266,10 +371,10 @@ fn only_this_pcs_own_requests_are_answered_and_never_a_browsers() {
         get(&format!("{host}Referer: http://evil.example/\r\n")),
         get(&format!("{host}Sec-Fetch-Site: cross-site\r\n")),
         format!(
-            "POST /edit HTTP/1.1\r\n{host}Content-Type: text/plain\r\nContent-Length: 2\r\n\r\n{{}}"
+            "POST /edit HTTP/1.1\r\n{with_token}{host}Content-Type: text/plain\r\nContent-Length: 2\r\n\r\n{{}}"
         ),
-        format!("OPTIONS /edit HTTP/1.1\r\n{host}\r\n"),
-        format!("POST /edit HTTP/1.1\r\n{host}Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"),
+        format!("OPTIONS /edit HTTP/1.1\r\n{with_token}{host}\r\n"),
+        format!("POST /edit HTTP/1.1\r\n{with_token}{host}Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"),
     ];
     for r in &refused {
         let (status, text) = raw(port, r.as_bytes());
@@ -287,10 +392,11 @@ fn only_this_pcs_own_requests_are_answered_and_never_a_browsers() {
 fn a_write_whose_connection_drops_lands_whole_and_the_window_says_it_may_have() {
     let _t = turn();
     let s = served();
+    let with_token = with_token();
     let edit = body_edit("rule.v", "Dropped.\n", Some(version(&s.remote, "rule.v")));
     let body = serde_json::to_string(&edit).unwrap();
     let request = format!(
-        "POST /edit HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "POST /edit HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{with_token}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         s.port,
         body.len()
     );
@@ -309,17 +415,18 @@ fn a_write_whose_connection_drops_lands_whole_and_the_window_says_it_may_have() 
     let silent_port = silent.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for mut c in silent.incoming().flatten() {
-            let _ = http::read_request(&mut c);
+            let until = Instant::now() + Duration::from_secs(10);
+            let _ = http::read_request(&mut c, until, &token());
         }
     });
-    let lost = Source::Remote(Client::new(silent_port)).edit(&body_edit(
+    let lost = Source::Remote(Client::new(silent_port, token())).edit(&body_edit(
         "rule.v",
         "x\n",
         Some("v".into()),
     ));
     assert!(matches!(lost, Err(Failure::Lost(_))), "{lost:?}");
     let gone = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let unreachable = Source::Remote(Client::new(gone)).stacks();
+    let unreachable = Source::Remote(Client::new(gone, token())).stacks();
     assert!(matches!(unreachable, Err(Failure::Unreachable(_))), "{unreachable:?}");
 }
 
@@ -411,12 +518,13 @@ fn config_takes_only_a_loopback_api_and_an_alias() {
 #[test]
 fn request_fields_never_steer_git() {
     let s = served();
+    let with_token = with_token();
     let out = s.f.path("priv/written-by-git");
     let option = format!("--output={}", out.display());
     let r = s.remote.patch("rule.v", &option);
     assert!(matches!(&r, Err(Failure::Refused(m)) if m.contains("no commit hash")), "{r:?}");
     let target = http::target("/patch", &[("id", "rule.v"), ("commit", &option)]);
-    let request = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    let request = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n{with_token}\r\n");
     assert_eq!(raw(s.port, request.as_bytes()).0, 409);
     assert!(!out.exists());
     // sol-loop r1 S1: a hash that is no commit (a blob, a tree) never reaches git show, which would print that object

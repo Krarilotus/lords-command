@@ -19,7 +19,6 @@ use eframe::egui::{self, Button, ComboBox, FontId, RichText, ScrollArea, TextEdi
 use lords_core::config::Config;
 use lords_core::finding::Severity;
 use lords_core::git::Commit;
-use lords_core::http::Client;
 use lords_core::model::{Audience, Kind, Origin, Scope, Visibility};
 use lords_core::ops::Edit;
 use lords_core::panel::{EditRequest, Failure, Paths, RetireRequest, Source};
@@ -232,7 +231,9 @@ impl App {
             Err(e) => (Err(e), None),
             Ok(cfg) => match (&cfg.api, cfg.public) {
                 (Some(api), _) => {
-                    (Client::from_api(api).map(Source::Remote), cfg.tunnel.as_deref().map(Tunnel::new))
+                    // The panel's token is in the file beside config.txt (review r1 R2).
+                    let dir = cfg.source.as_deref().and_then(Path::parent).unwrap_or(Path::new("."));
+                    (lords_core::panel::remote(api, dir), cfg.tunnel.as_deref().map(Tunnel::new))
                 }
                 (None, Some(public)) => (Ok(Source::Local(Paths { public, private: cfg.private })), None),
                 (None, None) => (

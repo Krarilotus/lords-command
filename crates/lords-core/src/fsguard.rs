@@ -254,6 +254,107 @@ fn create_file_at(path: &Path, bytes: &[u8]) -> Result<(), String> {
     f.write_all(bytes).and_then(|()| f.sync_all()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// `n` random bytes from the OS.
+#[cfg(windows)]
+fn random(n: usize) -> Result<Vec<u8>, String> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
+    let mut buf = vec![0u8; n];
+    // SAFETY: a buffer of `n` bytes that lives across the call; no algorithm handle, as the system-preferred flag asks.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            n as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status == 0 {
+        Ok(buf)
+    } else {
+        Err(format!("no random bytes from the OS (status {status:#x})"))
+    }
+}
+
+#[cfg(not(windows))]
+fn random(n: usize) -> Result<Vec<u8>, String> {
+    let mut buf = vec![0u8; n];
+    std::io::Read::read_exact(
+        &mut fs::File::open("/dev/urandom").map_err(|e| e.to_string())?,
+        &mut buf,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(buf)
+}
+
+/// Creates a new file only its owner can open, from its first moment: its access list is set as it is made (a
+/// protected list with one entry, the file's owner), never loosened after. Refused when anything is there.
+#[cfg(windows)]
+fn create_owner_only_at(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{LocalFree, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL};
+    check(path)?;
+    let failed =
+        |what: &str| format!("{}: {what}: {}", path.display(), std::io::Error::last_os_error());
+    // A protected DACL ("P", no inherited entries) with one entry: full access for the owner ("OW").
+    let sddl: Vec<u16> = "D:P(A;;FA;;;OW)".encode_utf16().chain([0]).collect();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: NUL-terminated wide strings that live across the calls; the descriptor the first call allocates is
+    // freed once, after CreateFileW has copied it; the handle CreateFileW returns is owned by the `File` made from it.
+    unsafe {
+        let mut sd = std::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return Err(failed("no owner-only security descriptor"));
+        }
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd,
+            bInheritHandle: 0,
+        };
+        let h = CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            &sa,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        );
+        let made = if h == INVALID_HANDLE_VALUE { Err(failed("can't be made")) } else { Ok(h) };
+        LocalFree(sd);
+        let mut f = fs::File::from_raw_handle(made? as _);
+        f.write_all(bytes)
+            .and_then(|()| f.sync_all())
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+}
+
+#[cfg(not(windows))]
+fn create_owner_only_at(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    check(path)?;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    f.write_all(bytes).and_then(|()| f.sync_all()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// Appends one line to a file that is the tool's alone (a backup manifest); its bytes are on disk when this returns.
 fn append_line_at(path: &Path, line: &str) -> Result<(), String> {
     check(path)?;
@@ -1014,6 +1115,14 @@ pub fn create_dir_all(p: &Contained) -> Result<(), String> {
 /// Writes a new file where nothing is; refused when anything is there.
 pub fn create_file(p: &Contained, bytes: &[u8]) -> Result<(), String> {
     create_file_at(&p.path, bytes)
+}
+
+/// Makes a new secret where nothing is: `len` random bytes from the OS, as hex, in a file only its owner can open
+/// from its first moment (the panel's token, review r1 R2). Gives the hex; refused when anything is there.
+pub fn create_secret(p: &Contained, len: usize) -> Result<String, String> {
+    let hex: String = random(len)?.iter().map(|b| format!("{b:02x}")).collect();
+    create_owner_only_at(&p.path, hex.as_bytes())?;
+    Ok(hex)
 }
 
 /// Appends one line to a file that is the tool's alone (a backup manifest).

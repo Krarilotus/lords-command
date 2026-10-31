@@ -338,16 +338,6 @@ pub fn ssh(
     bounded(c, stdin, deadline).map_err(|e| format!("ssh {alias}: {e}"))
 }
 
-/// `scp <from> <alias>:<to>`, bounded; `to` is relative to the remote user's home.
-pub fn scp(from: &Path, alias: &str, to: &str, deadline: Duration) -> Result<Output, String> {
-    crate::config::check_alias(alias)?;
-    let mut c = Command::new("scp");
-    c.args(["-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--"])
-        .arg(from)
-        .arg(format!("{alias}:{to}"));
-    bounded(c, None, deadline).map_err(|e| format!("scp {} {alias}:{to}: {e}", from.display()))
-}
-
 /// `schtasks <args>`, bounded (`lords panel add`'s task for `lords panel serve`).
 pub fn schtasks(args: &[&str], deadline: Duration) -> Result<Output, String> {
     let mut c = Command::new("schtasks");

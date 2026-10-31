@@ -8,6 +8,7 @@
 use super::*;
 use eframe::egui::accesskit::{self, ActionRequest, NodeId};
 use lords_core::http;
+use lords_core::http::Client;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, Once};
@@ -87,16 +88,23 @@ impl Stacks {
         Paths { public: self.path("pub"), private: Some(self.path("priv")) }
     }
 
-    /// `lords panel serve`'s answers for these stacks, on a port of their own.
+    /// `lords panel serve`'s answers for these stacks, on a port of their own, behind the fixtures' token.
     fn serve(&self) -> Source {
         let listener = http::bind(0).unwrap();
         let port = listener.local_addr().unwrap().port();
         let paths = self.paths();
         std::thread::spawn(move || {
-            http::serve(listener, move |r| lords_core::panel::handle(&paths, r))
+            http::serve(listener, http::Limits::default(), token(), move |r| {
+                lords_core::panel::handle(&paths, r)
+            })
         });
-        Source::Remote(Client::new(port))
+        Source::Remote(Client::new(port, token()))
     }
+}
+
+/// The fixtures' panel token, built at run time so the repo's own privacy check doesn't take this source for one.
+fn token() -> http::Token {
+    http::Token::new(&"0123456789abcdef".repeat(2)).unwrap()
 }
 
 /// The window, drawn headless.
@@ -300,7 +308,7 @@ fn the_top_bar_counts_unpushed_commits_pushes_on_the_second_click_and_shows_a_br
     assert!(!w.drawn.iter().any(|(_, l)| l.starts_with('⇡')), "{:?}", w.drawn);
 
     let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let mut down = Window::new(Source::Remote(Client::new(gone)));
+    let mut down = Window::new(Source::Remote(Client::new(gone, token())));
     down.settle();
     assert!(down.shows("✕") && !down.shows("⇆"), "{:?}", down.drawn);
 }

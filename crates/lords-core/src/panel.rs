@@ -7,7 +7,8 @@
 //! each repo's pre-push privacy check. Nothing is sent but these views: an entry's files are found from the entry,
 //! never from a path in a request.
 
-use crate::http::{self, CallError, Client, Reply, Request};
+use crate::fsguard::{self, Part};
+use crate::http::{self, CallError, Client, Reply, Request, Token};
 use crate::model::Visibility;
 use crate::ops::{self, Edit, Retire};
 use crate::privacy::Rules;
@@ -15,15 +16,45 @@ use crate::view::{self, AheadView, ComposedView, FindingsView, PlanView, StacksV
 use crate::{adapters, check, git, sync, Finding, Stacks};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
 /// The port `lords panel serve` listens on, on 127.0.0.1.
 pub const PORT: u16 = 7879;
 
-/// How long the window waits for a read, for one that runs `check` or a sync plan, for a write (its commit runs the
-/// stack repo's hooks) and for a push of both stack repos.
+/// The panel's token's file: in the tool's home where the stacks are, beside config.txt where a window reads them.
+pub const TOKEN_FILE: &str = "panel-token";
+
+/// The panel's token (review r1 R2): read from the tool's home, or made there once, random, in a file only its owner
+/// can open. It is never printed or logged.
+pub fn token(home: &Path) -> Result<Token, String> {
+    if let Some(t) = existing_token(home)? {
+        return Ok(t);
+    }
+    let root = fsguard::Root::home(home)?;
+    root.create()?;
+    Token::new(&fsguard::create_secret(&root.join(&[Part::new(TOKEN_FILE)?]), 32)?)
+}
+
+/// The panel's token if the tool's home has one; reads only (a dry run).
+pub fn existing_token(home: &Path) -> Result<Option<Token>, String> {
+    fsguard::read_text(&home.join(TOKEN_FILE))?.map(|t| Token::new(&t)).transpose()
+}
+
+/// The window's source on another PC: the server `api` names, reached with the token in the file beside its
+/// config.txt (`lords panel add` puts it there).
+pub fn remote(api: &str, config_dir: &Path) -> Result<Source, String> {
+    let file = config_dir.join(TOKEN_FILE);
+    let text = fsguard::read_text(&file)?.ok_or_else(|| {
+        format!("{}: no panel token; `lords panel add` puts it there", file.display())
+    })?;
+    Ok(Source::Remote(Client::from_api(api, Token::new(&text)?)?))
+}
+
+/// How long the window waits for a read, for one that runs `check` or a sync plan, for a write's answer, and for a
+/// push of both stack repos. These are the window's waits, not limits on the server: a write's commit and its hooks
+/// run there to their end (review r1 R5), and a write the window stops waiting for is `Lost`, reloaded.
 const READ: Duration = Duration::from_secs(60);
 const SLOW_READ: Duration = Duration::from_secs(180);
 const WRITE: Duration = Duration::from_secs(300);
