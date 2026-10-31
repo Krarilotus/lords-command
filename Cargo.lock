@@ -1678,6 +1678,7 @@ name = "lords"
 version = "0.1.0"
 dependencies = [
  "lords-core",
+ "serde",
  "serde_json",
  "tempfile",
 ]

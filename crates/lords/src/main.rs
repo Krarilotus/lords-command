@@ -1,5 +1,7 @@
 //! `lords`: the Lords Command CLI. Small on purpose: the pre-commit hook runs it.
 
+mod panel;
+
 use lords_core::check;
 use lords_core::config::Config;
 use lords_core::model::Visibility;
@@ -35,6 +37,9 @@ usage:
   lords guard rm   Claude's PreToolUse hook: refuses an `rm` whose path holds a variable not written as quoted ${VAR:?}
   lords guard queue [--deadline-ms N]   Claude's Stop hook: holds a turn's end while items may wait in its T3 queue
   lords guard install [--home DIR]   install or update the guard copy the hooks run (sync never writes it)
+  lords panel serve [--port N]   the window on another PC reads and edits these stacks through it (127.0.0.1:7879)
+  lords panel add ALIAS --bridge DIR [--apply]   set a PC this one reaches as ALIAS up for the panel; prints the
+    exact targets on both PCs, and with --apply carries them out (backups first, the route checked last)
 
 stacks: --public-stack DIR, --private-stack DIR, else config.txt (beside the exe, or ~/.lords-command/),
 else the public stack is <this git repo>/stack.
@@ -894,6 +899,7 @@ fn main() -> ExitCode {
         "adopt" => cmd_adopt(a),
         "set-aside" => cmd_set_aside(a),
         "sizes" => cmd_sizes(a),
+        "panel" => panel::cmd(a),
         other => Err(format!("unknown command `{other}`\n\n{USAGE}")),
     };
     match result {

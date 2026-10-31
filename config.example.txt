@@ -3,3 +3,7 @@
 public = ~/lords-command/stack
 # Your private stack: intent with private details, memories, project and repo rules, sync targets.
 private = ~/lords-command-private
+# On another PC, instead of the two lines above: the panel's server on the stacks' PC (`lords panel serve`), through
+# an SSH forward. `api` takes only 127.0.0.1; `tunnel` is an ssh alias whose LocalForward reaches its port there.
+# api = http://127.0.0.1:17879
+# tunnel = my-panel-forward

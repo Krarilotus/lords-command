@@ -776,6 +776,15 @@ impl Root {
         Root::at(dir.to_path_buf())
     }
 
+    /// An SSH bridge's dir, which `lords panel add` changes: it holds the bridge's `sshd_config`.
+    pub fn bridge(dir: &Path) -> Result<Root, String> {
+        let root = Root::at(dir.to_path_buf())?;
+        if kind(&root.path.join("sshd_config"))? != Kind::File {
+            return Err(format!("{}: no sshd_config, so no SSH bridge", dir.display()));
+        }
+        Ok(root)
+    }
+
     /// A target's dir: a skills target's own, or the dir of an instructions target's shared (`via`) file.
     pub fn target(t: &crate::stack::Target) -> Result<Root, String> {
         let dir = match (t.kind.as_str(), &t.via) {

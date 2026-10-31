@@ -318,6 +318,158 @@ fn bounded(mut c: Command, stdin: Option<Vec<u8>>, deadline: Duration) -> Result
     Ok(Output { status, stdout, stderr })
 }
 
+/// `ssh <alias> <command…>`, bounded (`lords panel add`'s remote steps; each script run there carries its own
+/// deadline too). `alias` is checked to be an alias, never an option.
+pub fn ssh(
+    alias: &str,
+    command: &[&str],
+    stdin: Option<Vec<u8>>,
+    deadline: Duration,
+) -> Result<Output, String> {
+    crate::config::check_alias(alias)?;
+    let mut c = Command::new("ssh");
+    c.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", alias]).args(command);
+    bounded(c, stdin, deadline).map_err(|e| format!("ssh {alias}: {e}"))
+}
+
+/// `scp <from> <alias>:<to>`, bounded; `to` is relative to the remote user's home.
+pub fn scp(from: &Path, alias: &str, to: &str, deadline: Duration) -> Result<Output, String> {
+    crate::config::check_alias(alias)?;
+    let mut c = Command::new("scp");
+    c.args(["-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--"])
+        .arg(from)
+        .arg(format!("{alias}:{to}"));
+    bounded(c, None, deadline).map_err(|e| format!("scp {} {alias}:{to}: {e}", from.display()))
+}
+
+/// `schtasks <args>`, bounded (`lords panel add`'s task for `lords panel serve`).
+pub fn schtasks(args: &[&str], deadline: Duration) -> Result<Output, String> {
+    let mut c = Command::new("schtasks");
+    c.args(args);
+    bounded(c, None, deadline).map_err(|e| format!("schtasks {}: {e}", args.join(" ")))
+}
+
+/// `<sshd_exe> -t -f <config>`: whether an sshd would start with this config, bounded.
+pub fn sshd_check(sshd_exe: &Path, config: &Path, deadline: Duration) -> Result<Output, String> {
+    let mut c = Command::new(sshd_exe);
+    c.arg("-t").arg("-f").arg(config);
+    bounded(c, None, deadline).map_err(|e| format!("{} -t: {e}", sshd_exe.display()))
+}
+
+/// One running process: its id, its parent's, and its image's path (empty where it can't be read).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Running {
+    pub pid: u32,
+    pub parent: u32,
+    pub image: std::path::PathBuf,
+}
+
+/// Every running process, as one snapshot.
+#[cfg(windows)]
+pub fn running() -> Result<Vec<Running>, String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: a snapshot handle made here and closed here; the entry struct lives across each call, its size set as
+    // the API asks.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return Err(format!("no process snapshot: {}", std::io::Error::last_os_error()));
+        }
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut all = Vec::new();
+        let mut more = Process32FirstW(snap, &mut e) != 0;
+        while more {
+            let (pid, parent) = (e.th32ProcessID, e.th32ParentProcessID);
+            all.push(Running { pid, parent, image: image_of(pid).unwrap_or_default() });
+            more = Process32NextW(snap, &mut e) != 0;
+        }
+        CloseHandle(snap);
+        Ok(all)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn running() -> Result<Vec<Running>, String> {
+    Err("processes are listed on Windows only".into())
+}
+
+/// The image path of the process that `handle` (opened with query rights) is.
+#[cfg(windows)]
+unsafe fn image_by_handle(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Option<std::path::PathBuf> {
+    use windows_sys::Win32::System::Threading::{QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: the caller's open handle; a buffer and its length that live across the call.
+    let ok = unsafe {
+        QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
+    };
+    (ok != 0).then(|| std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
+}
+
+#[cfg(windows)]
+fn image_of(pid: u32) -> Option<std::path::PathBuf> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: a handle opened here, read through `image_by_handle` and closed here.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let image = image_by_handle(h);
+        CloseHandle(h);
+        image
+    }
+}
+
+/// Stops process `pid` alone, not its children (a bridge listener's live sessions are its children, and stay), and
+/// only while it is `image`: the check and the stop go through one open handle, so a pid reused by another program
+/// is never stopped.
+#[cfg(windows)]
+pub fn stop_one(pid: u32, image: &Path) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+    let key = |p: &Path| p.to_string_lossy().replace('/', "\\").to_lowercase();
+    // SAFETY: a handle opened here, used for the image check and the stop, and closed here.
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return Err(format!("process {pid}: {}", std::io::Error::last_os_error()));
+        }
+        let is = image_by_handle(h);
+        let result = match &is {
+            Some(found) if key(found) == key(image) => {
+                if TerminateProcess(h, 1) != 0 {
+                    Ok(())
+                } else {
+                    Err(format!("process {pid}: {}", std::io::Error::last_os_error()))
+                }
+            }
+            other => Err(format!(
+                "process {pid} is {}, not {}: left alone",
+                other.as_ref().map_or("unknown".into(), |p| p.display().to_string()),
+                image.display()
+            )),
+        };
+        CloseHandle(h);
+        result
+    }
+}
+
+#[cfg(not(windows))]
+pub fn stop_one(pid: u32, _image: &Path) -> Result<(), String> {
+    Err(format!("process {pid}: stopped on Windows only"))
+}
+
 /// `ssh -N <alias>` while the window is open: the alias's `LocalForward` to the panel's server on the PC that holds the
 /// stacks (overseer's runner). Restarted when it ends, at most once in 15 s; its whole tree ends with this value, or
 /// with the window however it ends.

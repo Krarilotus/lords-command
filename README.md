@@ -47,6 +47,26 @@ colours, the words in the hover; `?` has the legend).
 
 `--view entries|findings|sync|compose`, `--pick <id>`, `--adapter <id>` and `--repo <name>` open it at a place.
 
+**From another PC.** The stacks stay on the PC that holds them; there, `lords panel serve` answers on 127.0.0.1:7879
+only. On the other PC, the window's `config.txt` names that server through an SSH forward instead of the stacks
+(overseer's two lines):
+
+```text
+api = http://127.0.0.1:17879
+tunnel = <an ssh alias whose LocalForward reaches 127.0.0.1:7879 there>
+```
+
+While the window is open it runs `ssh -N <alias>`. It reads and edits the same stacks, and every edit is made on their
+PC: checked, committed through the stack repo's hooks under that PC's git identity, and refused if the entry changed
+since it was read (the window reloads and keeps what you typed). The top bar shows the bridge (⇆ up, ✕ down; a click
+tries again) and ⇡n, the commits not pushed yet; a second click pushes them through the pre-push privacy check. Sync
+applies only on the stacks' PC.
+
+`lords panel add <alias> --bridge <dir>`, run on the stacks' PC, sets up a PC it reaches as `<alias>`: it prints the
+exact changes on both PCs (the other PC's key, made there, and its alias, a copy of overseer's; this PC's bridge
+permits the port; a task serves the panel at logon), and `--apply` carries them out, backing each file up first and
+checking the route last. Run again, it replaces the exe and keeps `config.txt`.
+
 ## > hack
 
 ```sh
