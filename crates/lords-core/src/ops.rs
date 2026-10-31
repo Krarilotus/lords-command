@@ -218,13 +218,19 @@ pub fn retire(stacks: &Stacks, r: &Retire) -> Result<Retired, String> {
         return Err(format!("retiring `{}` would leave invalid metadata; nothing changed", r.id));
     }
     let commit = if r.commit && is_repo(&root) {
-        // Exactly what this wrote is committed (sol-loop r2, S2); one the hooks refuse leaves nothing behind.
-        let committed = [(rel(&root, &e.meta_file), new.as_bytes())];
+        // Exactly what this wrote is committed, over the version it was made from (sol-loop r2-r3, S2, S5); one the
+        // hooks refuse leaves nothing behind, one that is published stays (S6).
+        let committed = [(rel(&root, &e.meta_file), before.as_slice(), new.as_bytes())];
         git::commit_exact(&root, &committed, &format!("Retire {}: {}", r.id, r.reason)).map_err(
-            |err| match stack_replace(&root, &e.meta_file, new.as_bytes(), before) {
-                Ok(()) => format!("{err}; nothing changed"),
-                Err(back) => {
-                    format!("{err}; and putting it back failed: {back} (git holds the file)")
+            |err| match err {
+                git::Uncommitted::Published { .. } => err.to_string(),
+                git::Uncommitted::Refused(_) => {
+                    match stack_replace(&root, &e.meta_file, new.as_bytes(), before) {
+                        Ok(()) => format!("{err}; nothing changed"),
+                        Err(back) => format!(
+                            "{err}; and putting it back failed: {back} (git holds the file)"
+                        ),
+                    }
                 }
             },
         )?
@@ -892,15 +898,22 @@ pub fn edit(
         return Err(format!("that edit would break `{id}` ({why}); {changed}{undo}"));
     }
     if commit && is_repo(&stack.root) {
-        // Exactly what this edit wrote, and only those files: neither an agent's write to another of the entry's files
-        // nor one that lands after this edit's own is committed as this edit (sol-loop r1 and r2, S2).
-        let committed: Vec<(&Path, &[u8])> =
-            written.iter().map(|&i| (rel(&stack.root, &files[i]), after[i].as_slice())).collect();
+        // Exactly what this edit wrote, and only those files, over the version it was made from: neither an agent's
+        // write to another of the entry's files nor one that lands after this edit's own is committed as this edit,
+        // and nothing someone committed meanwhile is undone (sol-loop r1-r3, S2, S5).
+        let committed: Vec<(&Path, &[u8], &[u8])> = written
+            .iter()
+            .map(|&i| (rel(&stack.root, &files[i]), before[i].as_slice(), after[i].as_slice()))
+            .collect();
         if committed.is_empty() {
             return Ok(None);
         }
-        // A commit the hooks refuse leaves nothing behind: the files are put back, and the index was never touched.
+        // Refused: nothing was published, so the files are put back (the index was never touched). Published: the edit
+        // is committed and stays, whatever failed after it (S6).
         return git::commit_exact(&stack.root, &committed, &format!("Edit {id}")).map_err(|err| {
+            if let git::Uncommitted::Published { .. } = err {
+                return err.to_string();
+            }
             let undo = restore(&written);
             let changed =
                 if undo.is_empty() { "nothing changed" } else { "it was undone where it could be" };

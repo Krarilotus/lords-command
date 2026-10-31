@@ -135,49 +135,150 @@ fn run_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String, St
     text(args, out)
 }
 
-/// Commits exactly `files` (each a path relative to `dir`, with the bytes the commit gives it), whatever the working
-/// tree holds for them by then: an agent's write that lands after an edit's own is never committed as that edit
-/// (sol-loop r2, S2). The commit is made from an index of its own, HEAD's with these blobs, so the repo's hooks see
-/// exactly what is committed; then the repo's index takes the commit's entries for these paths, and the working tree
-/// stays as it is. A commit the hooks refuse leaves HEAD, the index and the working tree as they were. `None`: nothing
-/// would change.
+/// Why `commit_exact` committed nothing, or committed and then failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Uncommitted {
+    /// Nothing was published: HEAD and the index are as they were (the hooks refused, git failed, or one of the
+    /// files was committed meanwhile by someone else). The caller puts its own writes back.
+    Refused(String),
+    /// The commit is in HEAD, and a step after it failed: the caller's writes are committed and stay.
+    Published { commit: String, problem: String },
+}
+
+impl std::fmt::Display for Uncommitted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Uncommitted::Refused(m) => f.write_str(m),
+            Uncommitted::Published { commit, problem } => {
+                write!(f, "committed as {commit}, but {problem}")
+            }
+        }
+    }
+}
+
+/// How often `commit_exact` builds again when HEAD moved under it.
+const TRIES: usize = 3;
+
+/// Commits exactly `files`, each a path relative to `dir`, the bytes it was edited from and the bytes the commit gives
+/// it, whatever the working tree holds for them by then (sol-loop r2-r3, S2, S4-S6):
+/// - an agent's write that lands after an edit's own is never committed as that edit: the blobs come from the bytes;
+/// - the commit is made from an index of its own (the HEAD it builds on, with these blobs), so the repo's hooks see
+///   exactly what is committed, and paths are the repo's, wherever in it `dir` is;
+/// - a file someone else committed since its `was` refuses it, and so does a commit whose parent turns out not to be
+///   the HEAD it was built on (it would undo what that HEAD added): that commit is taken back off HEAD, while HEAD is
+///   still it, and it builds again, at most `TRIES` times;
+/// - then the repo's index takes the commit's entries for these paths; the working tree stays as it is.
+///
+/// `None`: nothing would change.
 pub fn commit_exact(
     dir: &Path,
-    files: &[(&Path, &[u8])],
+    files: &[(&Path, &[u8], &[u8])],
     message: &str,
-) -> Result<Option<String>, String> {
-    let git_dir = PathBuf::from(run(dir, &["rev-parse", "--absolute-git-dir"])?.trim());
+) -> Result<Option<String>, Uncommitted> {
+    use Uncommitted::Refused;
+    let top =
+        toplevel(dir).ok_or_else(|| Refused(format!("{}: not in a git repo", dir.display())))?;
+    let prefix = run(dir, &["rev-parse", "--show-prefix"]).map_err(Refused)?.trim().to_string();
+    let paths: Vec<String> = files
+        .iter()
+        .map(|(p, _, _)| format!("{prefix}{}", p.to_string_lossy().replace('\\', "/")))
+        .collect();
+    // Each blob as `git add` would store the file at its path: its filters and line ends applied.
+    let blob = |bytes: &[u8], path: &str, write: bool| -> Result<String, String> {
+        let mut args = vec!["hash-object", "--stdin", "--path", path];
+        if write {
+            args.push("-w");
+        }
+        Ok(text(&args, crate::process::git_input(&top, &args, bytes.to_vec())?)?.trim().to_string())
+    };
+    let pairs = files.iter().zip(&paths);
+    let bases: Vec<String> = pairs
+        .clone()
+        .map(|((_, was, _), p)| blob(was, p, false))
+        .collect::<Result<_, _>>()
+        .map_err(Refused)?;
+    let blobs: Vec<String> = pairs
+        .map(|((_, _, new), p)| blob(new, p, true))
+        .collect::<Result<_, _>>()
+        .map_err(Refused)?;
+    let git_dir =
+        PathBuf::from(run(&top, &["rev-parse", "--absolute-git-dir"]).map_err(Refused)?.trim());
     let name = format!("lords-commit-index-{}", crate::process::id());
-    let index = crate::fsguard::Root::git(&git_dir)?.join(&[crate::fsguard::Part::new(&name)?]);
+    let index = crate::fsguard::Root::git(&git_dir)
+        .and_then(|r| Ok(r.join(&[crate::fsguard::Part::new(&name)?])))
+        .map_err(Refused)?;
     let at = index.path().to_string_lossy().into_owned();
     let env = [("GIT_INDEX_FILE", at.as_str())];
-    let paths: Vec<String> =
-        files.iter().map(|(p, _)| p.to_string_lossy().replace('\\', "/")).collect();
-    let made = (|| -> Result<Option<String>, String> {
-        run_env(dir, &["read-tree", "HEAD"], &env)?;
-        for ((_, bytes), path) in files.iter().zip(&paths) {
-            let args = ["hash-object", "-w", "--stdin"];
-            let blob = text(&args, crate::process::git_input(dir, &args, bytes.to_vec())?)?;
-            let staged = run(dir, &["ls-files", "-s", "--", path])?;
-            let mode = staged.split_whitespace().next().unwrap_or("100644");
-            let entry = format!("{mode},{},{path}", blob.trim());
-            run_env(dir, &["update-index", "--add", "--cacheinfo", &entry], &env)?;
+    let made = (|| -> Result<Option<String>, Uncommitted> {
+        for _ in 0..TRIES {
+            let head =
+                run(&top, &["rev-parse", "--verify", "HEAD"]).map_err(Refused)?.trim().to_string();
+            for (path, base) in paths.iter().zip(&bases) {
+                let now = run(&top, &["rev-parse", "--verify", &format!("{head}:{path}")])
+                    .map_err(Refused)?;
+                if now.trim() != base {
+                    return Err(Refused(format!(
+                        "{path} was committed meanwhile by someone else; nothing changed"
+                    )));
+                }
+            }
+            run_env(&top, &["read-tree", &head], &env).map_err(Refused)?;
+            for (path, blob) in paths.iter().zip(&blobs) {
+                let listed =
+                    run(&top, &["ls-tree", "--full-tree", &head, "--", path]).map_err(Refused)?;
+                let mode = listed.split_whitespace().next().unwrap_or("100644");
+                let entry = format!("{mode},{blob},{path}");
+                run_env(&top, &["update-index", "--add", "--cacheinfo", &entry], &env)
+                    .map_err(Refused)?;
+            }
+            let same = crate::process::git_env(&top, &["diff", "--cached", "--quiet", &head], &env)
+                .map_err(Refused)?;
+            if same.status.success() {
+                return Ok(None);
+            }
+            run_env(&top, &["commit", "-q", "-m", message], &env).map_err(Refused)?;
+            // From here the commit is published: what fails says so, and the caller's writes stay. The repo's index
+            // takes the commit's entries first, so its stale ones are there for one git call only (a commit made from
+            // it in that moment would undo this one: design note D7.5).
+            let published = |problem: String, commit: &str| Uncommitted::Published {
+                commit: commit.to_string(),
+                problem,
+            };
+            let mut reset = vec!["reset", "-q", "--"];
+            reset.extend(paths.iter().map(String::as_str));
+            run(&top, &reset)
+                .map_err(|e| published(format!("the index wasn't updated for it: {e}"), "HEAD"))?;
+            let made = run(&top, &["rev-parse", "--verify", "HEAD"])
+                .map_err(|e| published(e, "HEAD"))?
+                .trim()
+                .to_string();
+            let parent = run(&top, &["rev-parse", "--verify", &format!("{made}^")])
+                .map_err(|e| published(e, &made))?;
+            if parent.trim() != head {
+                // HEAD moved before git read it: this commit undoes what that HEAD added. Off again while HEAD is it,
+                // and the index back to that HEAD's entries.
+                run(&top, &["update-ref", "-m", "lords: built on another HEAD; taken back", "HEAD", parent.trim(), &made])
+                    .map_err(|e| published(format!("it was built on {head} and HEAD moved past it again ({e}); check by hand"), &made))?;
+                run(&top, &reset).map_err(Refused)?;
+                continue;
+            }
+            let short = run(&top, &["rev-parse", "--short", &made])
+                .map_err(|e| published(e, &made))?
+                .trim()
+                .to_string();
+            return Ok(Some(short));
         }
-        let unchanged =
-            crate::process::git_env(dir, &["diff", "--cached", "--quiet", "HEAD"], &env)?;
-        if unchanged.status.success() {
-            return Ok(None);
-        }
-        run_env(dir, &["commit", "-q", "-m", message], &env)?;
-        let mut reset = vec!["reset", "-q", "--"];
-        reset.extend(paths.iter().map(String::as_str));
-        run(dir, &reset)?;
-        Ok(Some(run(dir, &["rev-parse", "--short", "HEAD"])?.trim().to_string()))
+        Err(Refused(format!("HEAD moved {TRIES} times while committing; nothing changed")))
     })();
     let removed = crate::fsguard::delete_file(&index);
-    let made = made?;
-    removed?;
-    Ok(made)
+    match (made, removed) {
+        (Err(e), _) => Err(e),
+        (Ok(made), Err(e)) => match made {
+            Some(commit) => Err(Uncommitted::Published { commit, problem: e }),
+            None => Err(Refused(e)),
+        },
+        (Ok(made), Ok(())) => Ok(made),
+    }
 }
 
 /// One commit in a file's history.

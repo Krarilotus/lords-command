@@ -297,11 +297,12 @@ fn a_write_whose_connection_drops_lands_whole_and_the_window_says_it_may_have() 
     let mut dropped = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
     dropped.write_all(request.as_bytes()).unwrap();
     drop(dropped);
-    wait_until("the dropped write's commit", || {
+    // The write finishes on the server after the client has gone: committed, and nothing left staged or modified.
+    wait_until("the dropped write's commit, whole", || {
         git(&s.f.priv_root(), &["log", "-1", "--format=%s"]).trim() == "Edit rule.v"
+            && git(&s.f.priv_root(), &["status", "--porcelain"]).is_empty()
     });
     assert!(s.f.read("priv/global/rules/v.md").ends_with("---\nDropped.\n"));
-    assert_eq!(git(&s.f.priv_root(), &["status", "--porcelain"]), "");
 
     // A server that takes the whole request and closes without a reply.
     let silent = TcpListener::bind("127.0.0.1:0").unwrap();

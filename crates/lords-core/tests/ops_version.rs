@@ -89,8 +89,9 @@ fn a_commit_holds_exactly_what_the_edit_wrote() {
     // The edit wrote "mine"; an agent's write landed after it, before the commit.
     f.write("priv/global/rules/w.md", "an agent's\n");
     let file = std::path::Path::new("global/rules/w.md");
-    let made = lords_core::git::commit_exact(&root, &[(file, b"mine\n".as_slice())], "Edit rule.w")
-        .unwrap();
+    let (before, mine) = (b"before\n".as_slice(), b"mine\n".as_slice());
+    let made =
+        lords_core::git::commit_exact(&root, &[(file, before, mine)], "Edit rule.w").unwrap();
     assert!(made.is_some());
     assert_eq!(git(&root, &["show", "HEAD:global/rules/w.md"]), "mine\n");
     assert_eq!(f.read("priv/global/rules/w.md"), "an agent's\n", "the agent's write stays its own");
@@ -100,12 +101,32 @@ fn a_commit_holds_exactly_what_the_edit_wrote() {
     // A hook that sees what is committed, and refuses it.
     f.write("priv/.git/hooks/pre-commit", "#!/bin/sh\ngit diff --cached | grep -q SECRET && { echo 'refused' >&2; exit 1; }\nexit 0\n");
     let head = git(&root, &["rev-parse", "HEAD"]);
-    let refused =
-        lords_core::git::commit_exact(&root, &[(file, b"SECRET\n".as_slice())], "Edit rule.w");
-    assert!(refused.as_ref().is_err_and(|e| e.contains("refused")), "{refused:?}");
+    let refused = lords_core::git::commit_exact(
+        &root,
+        &[(file, mine, b"SECRET\n".as_slice())],
+        "Edit rule.w",
+    );
+    assert!(
+        matches!(&refused, Err(lords_core::git::Uncommitted::Refused(m)) if m.contains("refused")),
+        "{refused:?}"
+    );
     assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
     assert_eq!(git(&root, &["diff", "--cached", "--name-only"]), "");
     assert_eq!(f.read("priv/global/rules/w.md"), "an agent's\n");
+    // sol-loop r3 S5: made from a version someone committed over since, it is refused; nothing that commit added is
+    // undone.
+    std::fs::remove_file(root.join(".git/hooks/pre-commit")).unwrap();
+    let stale = lords_core::git::commit_exact(
+        &root,
+        &[(file, before, b"late\n".as_slice())],
+        "Edit rule.w",
+    );
+    assert!(
+        matches!(&stale, Err(lords_core::git::Uncommitted::Refused(m)) if m.contains("committed meanwhile")),
+        "{stale:?}"
+    );
+    assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
+    assert_eq!(git(&root, &["show", "HEAD:global/rules/w.md"]), "mine\n");
     // Nothing of its own left in the git dir.
     let left: Vec<String> = std::fs::read_dir(root.join(".git"))
         .unwrap()
@@ -113,6 +134,54 @@ fn a_commit_holds_exactly_what_the_edit_wrote() {
         .filter(|n| n.starts_with("lords-"))
         .collect();
     assert_eq!(left, Vec::<String>::new());
+}
+
+// Spec (the owner's private stack repo has `core.autocrlf=true` and no eol attributes, so its files are CRLF on disk
+// and LF in HEAD): an edit made from the file's bytes on disk commits over HEAD's version of it, stored as `git add`
+// would store it (LF).
+#[test]
+fn an_edit_in_a_repo_that_converts_line_ends_commits() {
+    let f = Fixture::new();
+    f.write("priv/global/rules/c.md", "line\r\n");
+    git(&f.priv_root(), &["init", "-q"]);
+    git(&f.priv_root(), &["config", "core.autocrlf", "true"]);
+    git(&f.priv_root(), &["add", "-A"]);
+    git(&f.priv_root(), &["commit", "-q", "-m", "fixture"]);
+    let root = f.priv_root();
+    let file = std::path::Path::new("global/rules/c.md");
+    // The edit's own write, as ops makes it before committing.
+    f.write("priv/global/rules/c.md", "mine\r\n");
+    let made = lords_core::git::commit_exact(
+        &root,
+        &[(file, b"line\r\n".as_slice(), b"mine\r\n".as_slice())],
+        "Edit rule.c",
+    );
+    assert!(matches!(made, Ok(Some(_))), "{made:?}");
+    assert_eq!(git(&root, &["cat-file", "-p", "HEAD:global/rules/c.md"]), "mine\n");
+    assert_eq!(git(&root, &["status", "--porcelain"]), "");
+}
+
+// Spec (sol-loop r3 S4; the public stack lives in its repo's `stack/` dir): an edit of an entry in a stack below its
+// repo's top commits that entry's own file, at its path in the repo, and leaves nothing uncommitted or staged.
+#[test]
+fn a_stack_below_its_repos_top_commits_its_own_file() {
+    let f = Fixture::new();
+    f.write("pub/global/rules/s.md", &entry("rule.s", "global", "public", "", "Read.\n"));
+    // One repo at the fixture's top: the public stack is its `pub/` dir.
+    git(f.dir.path(), &["init", "-q"]);
+    git(f.dir.path(), &["add", "-A"]);
+    git(f.dir.path(), &["commit", "-q", "-m", "fixture"]);
+    let base = f.stacks().find("rule.s").unwrap().version.clone();
+    let change = Edit { body: Some("Mine.\n".into()), base: Some(base), ..Default::default() };
+    assert!(edit(&f.stacks(), "rule.s", &change, true).unwrap().is_some());
+    let committed = git(f.dir.path(), &["show", "HEAD:pub/global/rules/s.md"]);
+    assert!(committed.ends_with("---\nMine.\n"), "{committed}");
+    assert_eq!(
+        git(f.dir.path(), &["status", "--porcelain"]),
+        "",
+        "nothing left uncommitted or staged"
+    );
+    assert!(!f.path("global").exists(), "nothing at the repo's top");
 }
 
 // Spec (Lords owner, 31 Oct: "build the CAS at the file replacement … a write between your version check and the
