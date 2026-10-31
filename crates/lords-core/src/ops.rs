@@ -865,6 +865,17 @@ pub fn edit(
         }
         written.push(i);
     }
+    // The version covers every file of the entry: one this edit didn't write must still hold what was checked, or the
+    // edit landed on a newer entry and is undone (sol-loop r1 S2: an agent's sidecar change during a body edit).
+    for i in (0..files.len()).filter(|i| !written.contains(i)) {
+        if fsguard::read_bytes(&files[i]).ok().as_deref() != Some(before[i].as_slice()) {
+            return Err(format!(
+                "`{id}` changed while it was being saved ({}); nothing changed{}",
+                files[i].display(),
+                restore(&written)
+            ));
+        }
+    }
     // The entry must still load, with no new problem in its files; otherwise put them back.
     let reloaded = Stack::load(&stack.root);
     let broken = match &reloaded {
@@ -883,7 +894,12 @@ pub fn edit(
         return Err(format!("that edit would break `{id}` ({why}); {changed}{undo}"));
     }
     if commit && is_repo(&stack.root) {
-        let rels: Vec<&Path> = files.iter().map(|f| rel(&stack.root, f)).collect();
+        // Only what this edit wrote: an agent's write to another of the entry's files is never committed as this edit
+        // (sol-loop r1 S2).
+        let rels: Vec<&Path> = written.iter().map(|&i| rel(&stack.root, &files[i])).collect();
+        if rels.is_empty() {
+            return Ok(None);
+        }
         // A commit the hooks refuse leaves nothing behind: not in the files, not in the index.
         return git::commit(&stack.root, &rels, &format!("Edit {id}")).map_err(|err| {
             let mut undo = restore(&written);

@@ -189,11 +189,16 @@ pub fn push(dir: &Path, deadline: std::time::Duration) -> Result<String, String>
     }
 }
 
-/// What one commit changed in a file, as a patch.
+/// What one commit changed in a file, as a patch. `hash` must name a commit: `git show` of a blob or a tree prints
+/// that object whatever the path (sol-loop r1 S1), so anything else is refused before it runs.
 pub fn show(dir: &Path, hash: &str, file: &Path) -> Result<String, String> {
     let file = file.to_string_lossy();
-    run(dir, &["show", "--format=", "--follow", hash, "--", &file])
-        .or_else(|_| run(dir, &["show", "--format=", hash, "--", &file]))
+    let named = format!("{hash}^{{commit}}");
+    let commit = run(dir, &["rev-parse", "--verify", "--quiet", "--end-of-options", &named])
+        .map_err(|_| format!("`{hash}` names no commit"))?;
+    let commit = commit.trim();
+    run(dir, &["show", "--format=", "--follow", commit, "--", &file])
+        .or_else(|_| run(dir, &["show", "--format=", commit, "--", &file]))
 }
 
 #[cfg(test)]

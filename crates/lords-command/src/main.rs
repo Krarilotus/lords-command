@@ -332,8 +332,10 @@ impl App {
         Some(Task::start(ctx, move || call(&source)))
     }
 
-    /// Reads the stacks again, and runs `check` (with drift) and the push state beside it.
+    /// Reads the stacks again, and runs `check` (with drift) and the push state beside it. Composed text is made from
+    /// the stacks, so ◫ asks for it again (sol-loop r1 S3).
     fn reload(&mut self, ctx: &egui::Context) {
+        (self.composed, self.composing) = (None, None);
         self.loading = self.start(ctx, |s| s.stacks());
         self.checking = self.start(ctx, |s| s.findings());
         self.start_status(ctx);

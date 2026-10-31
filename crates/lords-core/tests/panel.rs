@@ -402,6 +402,16 @@ fn request_fields_never_steer_git() {
     let request = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
     assert_eq!(raw(s.port, request.as_bytes()).0, 409);
     assert!(!out.exists());
+    // sol-loop r1 S1: a hash that is no commit (a blob, a tree) never reaches git show, which would print that object
+    // whatever the path: another file's text, or a listing.
+    s.f.write("priv/elsewhere.txt", "not the entry's\n");
+    git(&s.f.priv_root(), &["add", "elsewhere.txt"]);
+    git(&s.f.priv_root(), &["commit", "-q", "-m", "another file"]);
+    for object in ["HEAD:elsewhere.txt", "HEAD^{tree}"] {
+        let id = git(&s.f.priv_root(), &["rev-parse", object]).trim().to_string();
+        let shown = s.remote.patch("rule.v", &id);
+        assert!(matches!(&shown, Err(Failure::Refused(_))), "{object}: {shown:?}");
+    }
     assert!(matches!(s.remote.history("rule.none"), Err(Failure::Refused(_))));
     assert!(matches!(s.remote.compose("nope", None), Err(Failure::Refused(_))));
     assert!(matches!(s.remote.compose("claude", Some("not-declared")), Err(Failure::Refused(_))));

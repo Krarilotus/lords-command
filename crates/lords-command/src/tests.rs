@@ -242,6 +242,28 @@ fn a_stale_save_keeps_what_was_typed_and_lands_on_the_new_version() {
     assert!(file.contains("title: The agent's title") && file.ends_with("---\nMine.\n"), "{file}");
 }
 
+// Spec (sol-loop r1 S3; the window before this branch composed every frame, so ◫ always showed the stacks as loaded):
+// after the stacks change and the window reloads, ◫ shows what each harness reads now, not what it read before.
+#[test]
+fn what_each_harness_reads_is_read_again_after_a_reload() {
+    let _t = turn();
+    let s = Stacks::new();
+    let mut w = Window::new(Source::Local(s.paths()));
+    w.app.view = View::Compose;
+    w.settle();
+    let text = |w: &Window| {
+        let c = w.app.composed.as_ref().and_then(|(_, c)| c.as_ref().ok()).expect("composed");
+        c.lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>().join("\n")
+    };
+    assert!(text(&w).contains("Read."), "{}", text(&w));
+    s.write("priv/global/rules/v.md", &entry("rule.v", "private", "v", "Changed.\n"));
+    git(&s.path("priv"), &["commit", "-q", "-am", "an agent's change"]);
+    let ctx = w.ctx.clone();
+    w.app.reload(&ctx);
+    w.settle();
+    assert!(text(&w).contains("Changed.") && !text(&w).contains("Read."), "{}", text(&w));
+}
+
 // Spec (brief, the top bar: "⇡n (unpushed commits; a click pushes)", "a bridge glyph (⇆ up, ✕ down)"): the top bar
 // counts the commits the stack repos' upstreams lack; a first click asks (⇡1 ✓), the second pushes through the
 // pre-push check, and the count goes. A window whose server can't be reached shows ✕.
