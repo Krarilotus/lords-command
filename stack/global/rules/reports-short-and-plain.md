@@ -36,9 +36,8 @@ place each project sets, with stable ids and an index at the top, linked from th
 evidence home is `Harness/notes`, a private repository that syncs itself. Don't repeat an automatic completion notice
 or narrate routine activity.
 
-Every report on code or design also gives its owner and level verdict: whether the work sits with the owner of the job
-at the right level of abstraction. Question the design where it doesn't, and raise an issue with its owner, with
-evidence, instead of working around it.
+Every report on code or design also gives its owner and level verdict, and one line on whether you would build it
+this way again (the level-and-cost skill).
 
 Machine-readable fields only where a consumer checks them; reuse the harness's own result and check data before adding
 any. A declared batch of results is collected and then consolidated top-down, by requirement and owner, before
