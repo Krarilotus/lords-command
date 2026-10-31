@@ -124,8 +124,17 @@ pub fn commit(dir: &Path, paths: &[&Path], message: &str) -> Result<Option<Strin
     Ok(Some(run(dir, &["rev-parse", "--short", "HEAD"])?.trim().to_string()))
 }
 
+/// Takes `paths` (relative to `dir`) out of the index again, as HEAD has them: after a commit its hooks refused, so
+/// nothing of it stays staged for the next commit.
+pub fn unstage(dir: &Path, paths: &[&Path]) -> Result<(), String> {
+    let owned: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    let mut args = vec!["reset", "-q", "--"];
+    args.extend(owned.iter().map(String::as_str));
+    run(dir, &args).map(|_| ())
+}
+
 /// One commit in a file's history.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Commit {
     pub hash: String,
     pub date: String,
@@ -137,8 +146,11 @@ pub fn log(dir: &Path, file: &Path) -> Result<Vec<Commit>, String> {
     let file = file.to_string_lossy();
     let out =
         run(dir, &["log", "--follow", "--date=short", "--format=%h%x1f%ad%x1f%s", "--", &file])?;
-    Ok(out
-        .lines()
+    Ok(commits(&out))
+}
+
+fn commits(out: &str) -> Vec<Commit> {
+    out.lines()
         .filter_map(|l| {
             let mut parts = l.split('\u{1f}');
             Some(Commit {
@@ -147,7 +159,34 @@ pub fn log(dir: &Path, file: &Path) -> Result<Vec<Commit>, String> {
                 subject: parts.next().unwrap_or("").to_string(),
             })
         })
-        .collect())
+        .collect()
+}
+
+/// The branch checked out in `dir`'s repo, its upstream (`None` when it has none, so nothing can be pushed), and the
+/// commits the upstream doesn't have, newest first. A git that fails is an error, never "nothing to push".
+pub fn ahead(dir: &Path) -> Result<(String, Option<String>, Vec<Commit>), String> {
+    let branch = run(dir, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim().to_string();
+    let reference = format!("refs/heads/{branch}");
+    let upstream = run(dir, &["for-each-ref", "--format=%(upstream:short)", &reference])?;
+    let upstream = Some(upstream.trim().to_string()).filter(|u| !u.is_empty());
+    let Some(up) = &upstream else { return Ok((branch, None, Vec::new())) };
+    let range = format!("{up}..HEAD");
+    let out = run(dir, &["log", "--date=short", "--format=%h%x1f%ad%x1f%s", &range])?;
+    Ok((branch, upstream, commits(&out)))
+}
+
+/// `git push` of the branch checked out in `dir`'s repo to its upstream, through the repo's pre-push hook, within
+/// `deadline`. What git said, or why it refused (the hook's words included).
+pub fn push(dir: &Path, deadline: std::time::Duration) -> Result<String, String> {
+    let args = ["push"];
+    let out = crate::process::git_bounded(dir, &args, deadline)?;
+    let said =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    if out.status.success() {
+        Ok(said.trim().to_string())
+    } else {
+        Err(failed(&args, out.status, &out.stderr, &out.stdout))
+    }
 }
 
 /// What one commit changed in a file, as a patch.

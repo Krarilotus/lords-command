@@ -3,7 +3,8 @@
 //! calls it; its writing commands change only the stack repo an operation names), the file manager, which the
 //! GUI asks to show a path or open a link, and which writes nothing itself, a staged copy of the guard, run once
 //! for its self-test before sync installs it, and the T3 CLI, which the queue guard asks about its thread (it
-//! reads; its process tree ends with the guard's).
+//! reads; its process tree ends with the guard's). The panel's push is `git` too, bounded by a deadline that ends its
+//! whole tree (`bounded`).
 
 // The door: the one place the resolved boundary lints allow (clippy.toml).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -244,6 +245,149 @@ fn join_kill_on_close_job() -> Result<(), String> {
 #[cfg(not(windows))]
 fn tree_ends_with_this_process() -> Result<(), String> {
     Err("nothing here can end the T3 CLI's process tree on this system".into())
+}
+
+/// Runs `git -C <dir> <args>` and waits at most `deadline` (a remote call: the panel's push). See `bounded`.
+pub(crate) fn git_bounded(dir: &Path, args: &[&str], deadline: Duration) -> Result<Output, String> {
+    bounded(command(dir, args), None, deadline).map_err(|e| format!("git {}: {e}", args.join(" ")))
+}
+
+/// Runs `c`, gives it `stdin`, and waits at most `deadline` for it to end: its status and output, or why not (rule
+/// .remote-calls-have-deadlines). The child is put in a job of its own, which kills every process in it once its
+/// handle closes: at the deadline, and however this returns. A child it can't put in such a job is killed and refused.
+/// What the child starts before it joins the job (its first moments) is outside that job; on Windows a process that
+/// joined `tree_ends_with_this_process` still ends it with this one.
+fn bounded(mut c: Command, stdin: Option<Vec<u8>>, deadline: Duration) -> Result<Output, String> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    let started = Instant::now();
+    c.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // No console window of its own when the window or a hidden task starts it.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = c.spawn().map_err(|e| e.to_string())?;
+    let tree = match tree::Tree::holding(&child) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
+    if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(&bytes);
+        });
+    }
+    let read = |pipe: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut bytes);
+            }
+            let _ = tx.send(bytes);
+        });
+        rx
+    };
+    let out = read(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err = read(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let status = loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(s) => break s,
+            None if started.elapsed() >= deadline => {
+                drop(tree);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("no answer within its deadline ({} s)", deadline.as_secs()));
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    // Whatever the child started ends now, so the pipes close.
+    drop(tree);
+    let grace = Duration::from_millis(500);
+    let stdout = out.recv_timeout(grace).map_err(|_| "its output wasn't closed".to_string())?;
+    let stderr = err.recv_timeout(grace).unwrap_or_default();
+    Ok(Output { status, stdout, stderr })
+}
+
+/// A job holding one child and what it starts, killed when the job's handle closes.
+#[cfg(windows)]
+mod tree {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    pub struct Tree(HANDLE);
+
+    // The handle is only closed, from whichever thread drops it.
+    unsafe impl Send for Tree {}
+
+    impl Tree {
+        pub fn holding(child: &std::process::Child) -> Result<Tree, String> {
+            let failed = |call: &str| {
+                format!("no job to bound the child ({call}: {})", std::io::Error::last_os_error())
+            };
+            // SAFETY: Win32 calls with null (default) attributes and name, a limit struct that lives across the call,
+            // the job handle made here (closed by `Drop`, or here on failure), and the child's own process handle,
+            // valid while `child` lives.
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if job.is_null() {
+                    return Err(failed("CreateJobObjectW"));
+                }
+                let tree = Tree(job);
+                let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+                if SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    (&raw const limits).cast(),
+                    size,
+                ) == 0
+                {
+                    return Err(failed("SetInformationJobObject"));
+                }
+                if AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) == 0 {
+                    return Err(failed("AssignProcessToJobObject"));
+                }
+                Ok(tree)
+            }
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            // SAFETY: the job handle this value owns, closed once.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// Elsewhere only the child itself is killed at the deadline.
+#[cfg(not(windows))]
+mod tree {
+    pub struct Tree;
+
+    impl Tree {
+        pub fn holding(_: &std::process::Child) -> Result<Tree, String> {
+            Ok(Tree)
+        }
+    }
 }
 
 /// Shows a path in the file manager, or opens a link in the browser; doesn't wait.

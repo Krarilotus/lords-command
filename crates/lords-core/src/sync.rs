@@ -14,11 +14,11 @@ use crate::git;
 use crate::ledger::{self, Ledger};
 use crate::model::{Audience, Entry, Kind};
 use crate::stack::{self, Stack, Stacks, Target};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Action {
     /// A file where nothing is.
@@ -43,7 +43,7 @@ pub enum Action {
 }
 
 /// Whose a path is (design: Ownership boundary).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Class {
     /// Created by sync, recorded in the ledger, replaced whole and never edited.

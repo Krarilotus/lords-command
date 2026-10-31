@@ -5,7 +5,8 @@
 //! R4-06): outside the two doors, no runtime source reaches `std::fs`, `std::os` or `std::process` by any spelling
 //! (a path through them, a grouped or renamed `use`, a renamed `std`); and, so a name that reaches them some other
 //! way is still caught, no call that changes a file and no child process. fsguard.rs may reach `std::fs` and
-//! `std::os`, process.rs `std::process`, each nothing else of the three.
+//! `std::os`, process.rs `std::process` and its two platform process extensions (`extensions_allowed`), each nothing
+//! else of the three.
 //!
 //! This text layer is the second of two (Sol review r5, R5-03; decision 3). The first is clippy's resolved
 //! `disallowed-types`/`disallowed-methods` (clippy.toml), which tools/commit-check.sh runs before every commit: the
@@ -79,6 +80,16 @@ fn modules_allowed(d: Door) -> &'static [&'static str] {
         Door::Fs => &["fs", "os"],
         Door::Process => &["process"],
         Door::None => &[],
+    }
+}
+
+/// The platform extensions a door may reach beyond its modules, each one module of `std::os`: the process door's child
+/// handles and creation flags (a child's tree in a job of its own, no console window of its own; the Lords panel,
+/// design note 2026-10-31-lords-panel-remote). Imported one item per `use`.
+fn extensions_allowed(d: Door) -> &'static [&'static str] {
+    match d {
+        Door::Process => &["std::os::windows::process::", "std::os::windows::io::"],
+        _ => &[],
     }
 }
 
@@ -215,8 +226,11 @@ fn forbidden(file: &str, text: &str) -> Vec<String> {
     let d = door(file);
     let allowed = modules_allowed(d);
     let squeeze = |s: String| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
-    // Strings emptied for the module ban (a string naming a module reaches nothing), kept for the program names.
-    let code = squeeze(unraw(&code_of(text, false)));
+    // Strings emptied for the module ban (a string naming a module reaches nothing), kept for the program names. A
+    // door's own platform extensions are taken out first, and only they.
+    let code = extensions_allowed(d)
+        .iter()
+        .fold(squeeze(unraw(&code_of(text, false))), |c, e| c.replace(e, ""));
     let with_strings = squeeze(unraw(&code_of(text, true)));
     let mut found = Vec::new();
     let ident = |c: char| c.is_alphanumeric() || c == '_';
@@ -241,6 +255,13 @@ fn forbidden(file: &str, text: &str) -> Vec<String> {
             continue;
         }
         let stmt = words.join(" ");
+        let extension = |e: &&str| {
+            let parts: Vec<&str> = e.trim_end_matches(':').split("::").collect();
+            words.len() == parts.len() + 2 && words[1..=parts.len()] == parts[..]
+        };
+        if extensions_allowed(d).iter().any(extension) {
+            continue;
+        }
         if words.get(2) == Some(&"as") || words.windows(2).any(|w| w == ["self", "as"]) {
             found.push(format!("{file}: std or a std module imported under another name ({stmt})"));
         }
@@ -416,6 +437,30 @@ fn r4_06_no_spelling_reaches_std_fs_or_process() {
     // A comment or a string that names them is not code that reaches them; other std modules are fine.
     let fine = "// std::fs::write is fsguard's\nlet s = \"std::process\";\nuse std::io::Write;\nuse std::path::Path;";
     assert_eq!(forbidden("crates/lords-core/src/sync.rs", fine), Vec::<String>::new());
+}
+
+// Spec (the Lords panel, design note 2026-10-31-lords-panel-remote: the process door bounds a child's whole tree in a
+// job and starts it without a console window): process.rs may import exactly its two platform process extensions, one
+// item each; anything else of `std::os` stays out of it, and no other source reaches those two.
+#[test]
+fn the_process_door_reaches_only_its_platform_process_extensions() {
+    let process = "crates/lords-core/src/process.rs";
+    let fine = "use std::os::windows::process::CommandExt;\nuse std::os::windows::io::AsRawHandle;\nc.creation_flags(f);";
+    assert_eq!(forbidden(process, fine), Vec::<String>::new());
+    let cases = [
+        ("a platform fs extension", "use std::os::windows::fs::MetadataExt;"),
+        ("a link made by path", "std::os::windows::fs::symlink_dir(a, b)?;"),
+        ("an extension renamed", "use std::os::windows::process::CommandExt as C;"),
+        ("an extension in a group with fs", "use std::os::windows::{process::CommandExt, fs};"),
+        ("all of os", "use std::os;"),
+    ];
+    let missed: Vec<&str> = cases
+        .iter()
+        .filter(|(_, code)| forbidden(process, code).is_empty())
+        .map(|(w, _)| *w)
+        .collect();
+    assert!(missed.is_empty(), "not caught in process.rs: {missed:?}");
+    assert!(!forbidden("crates/lords-core/src/panel.rs", fine).is_empty(), "outside the door");
 }
 
 // Spec (Sol review r5, R5-03; decision 3: the resolved compiler check closes aliases and raw identifiers, and this

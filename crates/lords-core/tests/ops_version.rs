@@ -6,6 +6,7 @@
 
 mod common;
 use common::*;
+use lords_core::fsguard;
 use lords_core::ops::{edit, retire, Edit, Retire};
 
 fn retire_from<'a>(id: &'a str, base: &'a str) -> Retire<'a> {
@@ -73,4 +74,29 @@ fn a_change_made_from_an_older_version_is_refused_and_writes_nothing() {
     let now = f.stacks().find("rule.v").unwrap().version.clone();
     assert!(retire(&f.stacks(), &retire_from("rule.v", &now)).is_ok());
     assert!(!f.stacks().find("rule.v").unwrap().active());
+}
+
+// Spec (Lords owner, 31 Oct: "build the CAS at the file replacement … a write between your version check and the
+// replacement is a reachable witness"): a stack file is replaced only while it holds exactly the bytes the caller
+// read. A write that landed after the read stays as it is, the replacement is refused, and nothing is left beside
+// the file; from the bytes there now, it goes through.
+#[test]
+fn a_file_is_replaced_only_while_it_holds_what_was_read() {
+    let f = Fixture::new();
+    let file = f.write("priv/global/rules/w.md", "read\n");
+    let at = fsguard::Root::stack(&f.priv_root()).unwrap().below(&file).unwrap();
+    f.write("priv/global/rules/w.md", "an agent's\n");
+    let refused = fsguard::replace_file_if(&at, b"read\n", b"mine\n");
+    assert!(refused.as_ref().is_err_and(|e| e.contains("changed")), "{refused:?}");
+    assert_eq!(f.read("priv/global/rules/w.md"), "an agent's\n");
+    let beside: Vec<String> = std::fs::read_dir(f.path("priv/global/rules"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(beside, ["w.md"]);
+    fsguard::replace_file_if(&at, b"an agent's\n", b"mine\n").unwrap();
+    assert_eq!(f.read("priv/global/rules/w.md"), "mine\n");
+    std::fs::remove_file(&file).unwrap();
+    assert!(fsguard::replace_file_if(&at, b"mine\n", b"again\n").is_err(), "a file gone since");
+    assert!(!file.exists());
 }

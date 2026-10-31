@@ -5,7 +5,8 @@
 //!
 //! The boundary, exactly (Sol review r3, R3-08; r4, R4-06), which tests/fsguard_lint.rs enforces: in the run-time
 //! sources of the library, the CLI and the GUI (`src/` of each crate), only this file reaches `std::fs` (and the
-//! platform `std::os` extensions), and only process.rs reaches `std::process`, by any spelling: no path through
+//! platform `std::os` extensions), and only process.rs reaches `std::process` (and its two platform process
+//! extensions, a child's handle and its creation flags), by any spelling: no path through
 //! them, no grouped or renamed `use` of them, no renamed `std`. Every other source reads and writes through here:
 //! the checked calls for anything sync decides on, and the plain reads below (which follow links, as std does) for
 //! the stacks, configs and files only shown or scanned. Build scripts (Cargo's `OUT_DIR`) and tests (their own temp
@@ -596,14 +597,29 @@ fn move_to_at(from: &Path, to: &Path) -> Result<(), String> {
 
 /// Replaces the file at `path` (or puts it where nothing is): the old one moves aside, the new one goes in, and the
 /// old one is deleted. For files that are the tool's alone: its ledger, a backup manifest.
-fn replace_own_file_at(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn replace_own_file_at(path: &Path, was: Option<&[u8]>, bytes: &[u8]) -> Result<(), String> {
+    let changed =
+        || format!("{} changed while it was being replaced; nothing changed", path.display());
     // The new file keeps the old one's attributes (Sol review r5, R5-05: a stack edit kept them nowhere).
     let (old, like) = match kind(path)? {
+        Kind::Missing if was.is_some() => return Err(changed()),
         Kind::Missing => (None, None),
         Kind::File => {
             // Kept exactly, or refused before anything moves (rule C).
             let like = attrs(path)?.keep().map_err(|e| format!("{}: {e}", path.display()))?;
-            (Some(move_aside_at(path)?), Some(like))
+            let aside = move_aside_at(path)?;
+            // What was moved aside is what the file held at the move, which no later write can change: unless it is
+            // what the caller read, it goes back and nothing changes.
+            if let Some(was) = was {
+                let held = fs::read(&aside).map_err(|e| format!("{}: {e}", aside.display()));
+                if held.as_deref().ok() != Some(was) {
+                    return Err(match move_back_at(&aside, path) {
+                        Ok(()) => held.err().unwrap_or_else(changed),
+                        Err(back) => format!("{}; and it couldn't go back ({back})", changed()),
+                    });
+                }
+            }
+            (Some(aside), Some(like))
         }
         Kind::Dir => return Err(format!("{} is a dir", path.display())),
     };
@@ -1056,7 +1072,14 @@ pub fn install_exe(
 
 /// Replaces a file that is the tool's alone, keeping its attributes or refusing.
 pub fn replace_own_file(p: &impl Place, bytes: &[u8]) -> Result<(), String> {
-    replace_own_file_at(p.place(), bytes)
+    replace_own_file_at(p.place(), None, bytes)
+}
+
+/// Replaces a file only if it holds exactly `was` at the moment it is moved aside (a compare-and-swap): a write that
+/// lands after the caller read `was` is put back untouched, and this one refused. A stack edit made from what was read
+/// never replaces a newer file.
+pub fn replace_file_if(p: &impl Place, was: &[u8], bytes: &[u8]) -> Result<(), String> {
+    replace_own_file_at(p.place(), Some(was), bytes)
 }
 
 pub fn delete_file(p: &impl Place) -> Result<(), String> {
