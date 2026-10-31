@@ -530,3 +530,29 @@ impl Streak {
         }
     }
 }
+
+// The session and turn guards: tests first; the stubs below answer nothing yet.
+
+pub const SESSION_RECORD_DAYS: u64 = 7;
+
+pub struct RulesEnv {
+    pub home: PathBuf,
+    pub user_config: Option<PathBuf>,
+}
+
+pub fn clock_line(_now: jiff::Timestamp, _zone: Option<&jiff::tz::TimeZone>) -> String {
+    String::new()
+}
+
+pub fn session_hook(_input: &str, _env: &RulesEnv) -> Answer {
+    Answer { stdout: String::new(), note: None }
+}
+
+pub fn turn_hook(
+    _input: &str,
+    _env: &RulesEnv,
+    _now: jiff::Timestamp,
+    _zone: Option<&jiff::tz::TimeZone>,
+) -> Answer {
+    Answer { stdout: String::new(), note: None }
+}

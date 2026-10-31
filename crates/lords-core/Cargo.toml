@@ -12,6 +12,8 @@ publish.workspace = true
 icu_casemap = { version = "2", default-features = false, features = ["compiled_data"] }
 # Unicode normalisation (NFKD) for privacy terms; already in the tree through jsonschema's url → idna.
 icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
+# The turn guard's clock line: the system's zone (on Windows its zone id, mapped to IANA by CLDR) and tzdb's DST rules.
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo"] }
 jsonschema = { version = "0.33", default-features = false }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
