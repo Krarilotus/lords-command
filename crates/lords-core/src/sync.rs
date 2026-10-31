@@ -1006,6 +1006,7 @@ fn context(
     adapter: &dyn Adapter,
     audience: Vec<Audience>,
     layers: Layers,
+    home: &Path,
 ) -> Context {
     Context {
         audience,
@@ -1018,6 +1019,8 @@ fn context(
         relative_to: None,
         default_role: None,
         default_role_inline: false,
+        opener: Some(opener(home)),
+        child: false,
     }
 }
 
@@ -1068,7 +1071,13 @@ fn size_note(item: &mut Item, adapter: &dyn Adapter, text: &str, composed: &Comp
 /// one copy.
 fn instructions_items(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Vec<Item> {
     let path = expand_home(&t.path);
-    let mut ctx = context(pl.stacks, adapter, audience_of(&t.audience, adapter), Layers::Global);
+    let mut ctx = context(
+        pl.stacks,
+        adapter,
+        audience_of(&t.audience, adapter),
+        Layers::Global,
+        &pl.plan.home,
+    );
     ctx.roles = roles_of(t);
     let composed = compose::compose(pl.stacks, &ctx);
     let replace = t.own_text.as_deref() == Some("replace");
@@ -1247,18 +1256,20 @@ fn json_set_key(text: &str, key: &str, value: &serde_json::Value) -> Result<Stri
 /// A settings target (an owner file): the adapter's exclude list in a JSON settings file holds every path in
 /// `exclude`, and its tool-call hooks hold one Lords guard per name in `guards` (guard.rs). Only those two keys change;
 /// the rest of the file keeps its bytes. Hooks that aren't Lords' keep their content and order; the `hooks` value
-/// is written whole, so their spacing may change (sol-loop r1, S3, declined as a nit: no behaviour changes).
+/// is written whole, so their spacing may change (sol-loop r1, S3, declined as a nit: no behaviour changes). An
+/// adapter with no exclude setting (Codex's `hooks.json`) takes a target with no `exclude`: its hooks only.
 fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
     let owner = OwnerFile::target(t);
     pl.plan.owner_files.push(owner.clone());
     let path = owner.path().to_path_buf();
-    let Some(key) = adapter.excludes_key() else {
+    let key = adapter.excludes_key();
+    if key.is_none() && !t.exclude.is_empty() {
         return conflict(
             &t.name,
             &path,
             format!("adapter {} has no exclude setting", adapter.id()),
         );
-    };
+    }
     let current = match fsguard::read_text(&path) {
         Ok(c) => c,
         Err(e) => return conflict(&t.name, &path, e),
@@ -1269,24 +1280,27 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
             Some(Ok(v @ serde_json::Value::Object(_))) => v,
             Some(_) => return conflict(&t.name, &path, "not a JSON object; left alone"),
         };
-    let list =
-        value.as_object_mut().expect("an object").entry(key).or_insert(serde_json::json!([]));
-    let Some(list) = list.as_array_mut() else {
-        return conflict(&t.name, &path, format!("`{key}` isn't a list; left alone"));
-    };
-    // One path, however its separators and case are spelt (Sol review r2, R2-20).
-    let same = |a: &str, b: &str| ledger::key(Path::new(a)) == ledger::key(Path::new(b));
     let mut added = false;
     let mut added_excludes = Vec::new();
-    for e in &t.exclude {
-        let want = adapters::slashes(&expand_home(e));
-        if !list.iter().any(|v| v.as_str().is_some_and(|s| same(s, &want))) {
-            added_excludes.push(want.clone());
-            list.push(serde_json::Value::String(want));
-            added = true;
+    let mut list = serde_json::Value::Null;
+    if let Some(key) = key {
+        let current =
+            value.as_object_mut().expect("an object").entry(key).or_insert(serde_json::json!([]));
+        let Some(current) = current.as_array_mut() else {
+            return conflict(&t.name, &path, format!("`{key}` isn't a list; left alone"));
+        };
+        // One path, however its separators and case are spelt (Sol review r2, R2-20).
+        let same = |a: &str, b: &str| ledger::key(Path::new(a)) == ledger::key(Path::new(b));
+        for e in &t.exclude {
+            let want = adapters::slashes(&expand_home(e));
+            if !current.iter().any(|v| v.as_str().is_some_and(|s| same(s, &want))) {
+                added_excludes.push(want.clone());
+                current.push(serde_json::Value::String(want));
+                added = true;
+            }
         }
+        list = serde_json::Value::Array(current.clone());
     }
-    let list = serde_json::Value::Array(list.clone());
     let guard = match guard_place(&pl.plan.home) {
         Ok(g) => g,
         Err(e) => return conflict(&t.name, &path, e),
@@ -1317,7 +1331,7 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
         None => serde_json::to_string_pretty(&value).expect("JSON serialises") + "\n",
         Some(c) => {
             let mut text = c.clone();
-            if added {
+            if let (true, Some(key)) = (added, key) {
                 text = match json_set_key(&text, key, &list) {
                     Ok(t) => t,
                     Err(e) => return conflict(&t.name, &path, e),
@@ -1337,32 +1351,38 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
     item.redacted = true;
     item.notes.extend(not_ready);
     item.names_guard = (!guards.is_empty()).then(|| guard.clone());
-    item.diff = settings_summary(
-        &added_excludes,
-        hooks
-            .as_ref()
-            .map(|h| (guard_names(&before_hooks, guard.path()), guard_names(h, guard.path()))),
-    );
+    let names = |h: &serde_json::Value| guard_names(h, adapter, guard.path());
+    let changed = hooks.as_ref().map(|h| (names(&before_hooks), names(h)));
+    if let (Some((before, after)), Some(why)) = (&changed, adapter.guard_note()) {
+        if after.iter().any(|g| !before.contains(g)) {
+            item.notes.push(why.to_string());
+        }
+    }
+    item.diff = settings_summary(&added_excludes, changed);
     item
 }
 
 /// The hook event each guard runs on, and its matcher: `rm` before a Bash call, `queue` when a turn would end, `session`
-/// when a session starts, `turn` when a prompt does (never a native subagent's `SubagentStop` or `SubagentStart`).
+/// when a session starts, `turn` when a prompt does (never a native subagent's `SubagentStop`), and `child` when a
+/// native subagent starts.
 fn guard_event(name: &str) -> Option<(&'static str, Option<&'static str>)> {
     match name {
         "rm" => Some(("PreToolUse", Some("Bash"))),
         "queue" => Some(("Stop", None)),
         "session" => Some(("SessionStart", None)),
         "turn" => Some(("UserPromptSubmit", None)),
+        // Every agent type: a native child of any kind starts as the stack's `child_role`.
+        "child" => Some(("SubagentStart", None)),
         _ => None,
     }
 }
 
 /// The hook events Lords' guards are written to.
-const GUARD_EVENTS: [&str; 4] = ["PreToolUse", "Stop", "SessionStart", "UserPromptSubmit"];
+const GUARD_EVENTS: [&str; 5] =
+    ["PreToolUse", "Stop", "SessionStart", "UserPromptSubmit", "SubagentStart"];
 
 /// The names of Lords' guard hooks (`guard <name>` run from `guard`) a settings `hooks` value holds.
-fn guard_names(hooks: &serde_json::Value, guard: &Path) -> Vec<String> {
+fn guard_names(hooks: &serde_json::Value, adapter: &dyn Adapter, guard: &Path) -> Vec<String> {
     let exe = adapters::slashes(guard);
     GUARD_EVENTS
         .iter()
@@ -1370,10 +1390,7 @@ fn guard_names(hooks: &serde_json::Value, guard: &Path) -> Vec<String> {
         .flatten()
         .filter_map(|e| e["hooks"].as_array())
         .flatten()
-        .filter(|h| {
-            h["command"].as_str().is_some_and(|c| c.replace('\\', "/").eq_ignore_ascii_case(&exe))
-        })
-        .map(|h| h["args"][1].as_str().unwrap_or("").to_string())
+        .filter_map(|h| adapter.guard_of(h, &exe))
         .collect()
 }
 
@@ -1409,9 +1426,10 @@ fn settings_summary(
 }
 
 /// The settings' `hooks` with one Lords guard per name in the target's `guards`, each on its event (`guard_event`), or
-/// `None` when they already hold exactly those. A guard runs the `lords` that syncs (exec form: `command` and `args`,
-/// no shell), as `lords hooks install` does for git hooks. A hook entry is Lords' when its args are `guard <name>`;
-/// any other entry stays as it is, and so does every event Lords writes no guard to.
+/// `None` when they already hold exactly those. A guard runs the `lords` that syncs, in the adapter's form
+/// (`Adapter::guard_hook`: Claude Code's exec form, `command` and `args`, no shell, as `lords hooks install` does for
+/// git hooks; Codex's command line). A hook entry is Lords' when it runs Lords' copy (`Adapter::guard_of`); any other
+/// entry stays as it is, and so does every event Lords writes no guard to.
 fn guard_hooks(
     guards: &[String],
     adapter: &dyn Adapter,
@@ -1422,9 +1440,7 @@ fn guard_hooks(
     // Lords' hook: one that runs Lords' guard copy, the only command Lords writes (sol-loop r1, S1). A user's own hook,
     // whatever its args, is never Lords'.
     let exe = adapters::slashes(guard);
-    let ours = |h: &serde_json::Value| {
-        h["command"].as_str().is_some_and(|c| c.replace('\\', "/").eq_ignore_ascii_case(&exe))
-    };
+    let ours = |h: &serde_json::Value| adapter.guard_of(h, &exe).is_some();
     let lords_entry =
         |e: &serde_json::Value| e["hooks"].as_array().is_some_and(|hs| hs.iter().any(&ours));
     let has_lords = GUARD_EVENTS
@@ -1433,13 +1449,17 @@ fn guard_hooks(
     if guards.is_empty() && !has_lords {
         return Ok(None);
     }
-    if !guards.is_empty() && adapter.id() != "claude" {
-        return Err(format!("guards are Claude Code hooks; adapter {} has none", adapter.id()));
-    }
     let mut wanted = Vec::new();
     for g in guards {
         let (event, matcher) = guard_event(g)
-            .ok_or_else(|| format!("no guard `{g}`; there are: rm, queue, session, turn"))?;
+            .ok_or_else(|| format!("no guard `{g}`; there are: rm, queue, session, turn, child"))?;
+        if !adapter.guards().contains(&g.as_str()) {
+            return Err(format!(
+                "adapter {} runs no `{g}` guard (it runs: {})",
+                adapter.id(),
+                adapter.guards().join(", ")
+            ));
+        }
         wanted.push((g, event, matcher));
     }
     let mut hooks = match current {
@@ -1466,7 +1486,7 @@ fn guard_hooks(
         list.retain(|e| e["hooks"].as_array().is_none_or(|hs| !hs.is_empty()));
     }
     for (g, event, matcher) in wanted {
-        let hook = serde_json::json!({ "type": "command", "command": exe, "args": ["guard", g] });
+        let hook = adapter.guard_hook(&exe, g);
         let entry = match matcher {
             Some(m) => serde_json::json!({ "matcher": m, "hooks": [hook] }),
             None => serde_json::json!({ "hooks": [hook] }),
@@ -1530,7 +1550,13 @@ fn skills_items(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Vec<Item
         Err(e) => return vec![conflict(&t.name, &dir, e)],
     };
     pl.verified(&root);
-    let mut ctx = context(pl.stacks, adapter, audience_of(&t.audience, adapter), Layers::Global);
+    let mut ctx = context(
+        pl.stacks,
+        adapter,
+        audience_of(&t.audience, adapter),
+        Layers::Global,
+        &pl.plan.home,
+    );
     // A target that names roles also takes the global skills for those roles, as a file that must stand alone takes
     // every global entry (orchestrator, 30 Oct, item 2: Codex's user-level skills); one that names none keeps only
     // skills without roles (25 Oct).
@@ -1794,10 +1820,17 @@ pub fn role_file(role: &str) -> String {
     format!("role-{role}.md")
 }
 
+/// A native child's start file in a place's role dir (`child_composed`).
+pub const CHILD_FILE: &str = "child.md";
+
 /// Everything someone in `role` follows in a place, standing alone: every global entry for the role, the project,
 /// the place, and the memory index; for every agent family (lines for only some are labelled).
-pub fn role_composed(stacks: &Stacks, layers: Layers, role: &str) -> Composed {
-    let ctx = Context {
+pub fn role_composed(stacks: &Stacks, layers: Layers, role: &str, home: &Path) -> Composed {
+    compose::compose(stacks, &role_context(layers, role, home))
+}
+
+fn role_context(layers: Layers, role: &str, home: &Path) -> Context {
+    Context {
         audience: vec![Audience::Opus, Audience::Sol, Audience::Astra],
         layers,
         public_only: false,
@@ -1808,9 +1841,33 @@ pub fn role_composed(stacks: &Stacks, layers: Layers, role: &str) -> Composed {
         relative_to: None,
         default_role: None,
         default_role_inline: false,
-    };
+        opener: Some(opener(home)),
+        child: false,
+    }
+}
+
+/// The `lords` a composed file names to open an entry by id: the installed guard copy (`lords guard install`), a
+/// whole `lords`, at one path per tool home.
+pub fn opener(home: &Path) -> PathBuf {
+    home.join("bin").join("lords-guard.exe")
+}
+
+/// The role a native subagent starts as (stack.toml `child_role`; the private stack's first).
+pub fn child_role(stacks: &Stacks) -> Option<&str> {
+    stacks.private.iter().chain([&stacks.public]).find_map(|s| s.manifest.child_role.as_deref())
+}
+
+/// A native child's start file in a place, `.lords/child.md` (the `child` guard gives it at `SubagentStart`): what
+/// of `role` the place's file doesn't carry (compose.rs, `Context::child`).
+pub fn child_composed(stacks: &Stacks, layers: Layers, role: &str, home: &Path) -> Composed {
+    let mut ctx = role_context(layers, role, home);
+    ctx.child = true;
     compose::compose(stacks, &ctx)
 }
+
+/// The most a `SubagentStart` hook's context may hold in characters before Claude Code saves it to a file and gives
+/// the child only a preview, which it isn't asked to read (code.claude.com/docs/en/hooks: 10,000, no setting).
+pub const CHILD_CONTEXT_MAX_CHARS: usize = 10_000;
 
 fn place_scope(place: &Place, adapter: Option<&dyn Adapter>) -> String {
     place_scope_of(place.workspace, &place.name, adapter)
@@ -1944,7 +2001,8 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
                 pl.plan.items.push(conflict(&target, &path, e));
                 continue;
             }
-            let (text, composed) = place_text(pl.stacks, place.layers(false), adapter, p);
+            let (text, composed) =
+                place_text(pl.stacks, place.layers(false), adapter, p, &pl.plan.home);
             let mut item = pl.tool_file(&target, &scope, &at, text.clone(), &composed);
             size_note(&mut item, adapter, &text, &composed);
             pl.plan.items.push(item);
@@ -2018,7 +2076,7 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
     let roles: Vec<(String, Composed)> = declared_roles(pl.stacks)
         .into_iter()
         .map(|role| {
-            let c = role_composed(pl.stacks, place.layers(true), &role);
+            let c = role_composed(pl.stacks, place.layers(true), &role, &pl.plan.home);
             (role, c)
         })
         .collect();
@@ -2027,6 +2085,18 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
         if !c.text.is_empty() {
             tree.insert(role_file(role), c.text.clone().into_bytes());
         }
+    }
+    // A native child's start file, for the `child` guard (plan L6, an orchestrator's condition 3).
+    if let Some(role) = child_role(pl.stacks) {
+        let text = child_composed(pl.stacks, place.layers(true), role, &pl.plan.home).text;
+        let chars = text.chars().count();
+        if chars > CHILD_CONTEXT_MAX_CHARS {
+            pl.plan.notes.push(format!(
+                "{}: {CHILD_FILE} is {chars} characters, past the {CHILD_CONTEXT_MAX_CHARS} a Claude Code hook's context holds; a child gets its start and a file to read",
+                place.label
+            ));
+        }
+        tree.insert(CHILD_FILE.into(), text.into_bytes());
     }
     tree.insert(".gitignore".into(), b"*\n".to_vec());
     let tree = std::sync::Arc::new(tree);
@@ -2100,6 +2170,8 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
             relative_to: None,
             default_role: None,
             default_role_inline: false,
+            opener: None,
+            child: false,
         };
         let composed = compose::compose(pl.stacks, &ctx);
         let label = format!("{} (tracked AGENTS.md)", place.label);
@@ -3051,6 +3123,8 @@ fn place_skills(stacks: &Stacks, layers: Layers) -> Vec<&Entry> {
         relative_to: None,
         default_role: None,
         default_role_inline: false,
+        opener: None,
+        child: false,
     };
     compose::applicable(stacks, &ctx)
         .into_iter()
@@ -3063,7 +3137,8 @@ fn place_skills(stacks: &Stacks, layers: Layers) -> Vec<&Entry> {
 
 /// What an adapter's user-level file holds: the composition sync writes (the GUI shows it line by line).
 pub fn user_composed(stacks: &Stacks, adapter: &dyn Adapter) -> Composed {
-    compose::compose(stacks, &context(stacks, adapter, adapter.audience(), Layers::Global))
+    let home = default_home().unwrap_or_default();
+    compose::compose(stacks, &context(stacks, adapter, adapter.audience(), Layers::Global, &home))
 }
 
 /// What an adapter's untracked file in a repo holds, before the tracked-instructions preamble, as written in
@@ -3074,6 +3149,7 @@ pub fn repo_composed(stacks: &Stacks, place: &str, adapter: &dyn Adapter) -> Com
         adapter,
         place_layers(stacks, place, false),
         first_path(stacks, place).as_deref(),
+        &default_home().unwrap_or_default(),
     );
     compose::compose(stacks, &ctx)
 }
@@ -3115,9 +3191,10 @@ fn place_context(
     adapter: &dyn Adapter,
     layers: Layers,
     checkout: Option<&Path>,
+    home: &Path,
 ) -> Context {
     let default_role = place_default_role(stacks, &layers);
-    let mut ctx = context(stacks, adapter, adapter.audience(), layers);
+    let mut ctx = context(stacks, adapter, adapter.audience(), layers, home);
     ctx.by_reference = true;
     ctx.role_dir = checkout.map(|c| c.join(ROLE_DIR));
     ctx.default_role = default_role;
@@ -3135,9 +3212,10 @@ pub fn place_text(
     layers: Layers,
     adapter: &dyn Adapter,
     checkout: &Path,
+    home: &Path,
 ) -> (String, Composed) {
     let composed =
-        compose::compose(stacks, &place_context(stacks, adapter, layers, Some(checkout)));
+        compose::compose(stacks, &place_context(stacks, adapter, layers, Some(checkout), home));
     let text = adapter.render(&composed);
     let text = match adapter.repo_preamble(checkout) {
         Some(pre) if !text.is_empty() => compose::with_preamble(&text, &pre),
@@ -3441,6 +3519,7 @@ fn sections(text: &str, composed: &str) -> Vec<(String, usize)> {
 /// and each place's role files.
 pub fn sizes(stacks: &Stacks) -> Vec<Size> {
     let Some(private) = &stacks.private else { return Vec::new() };
+    let home = default_home().unwrap_or_default();
     let mut out = Vec::new();
     for adapter in adapters::ALL.iter().copied() {
         let text = adapter.render(&user_composed(stacks, adapter));
@@ -3482,13 +3561,18 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
                 .iter()
                 .map(|p| {
                     let (text, composed) =
-                        place_text(stacks, place_layers(stacks, &name, false), adapter, p);
+                        place_text(stacks, place_layers(stacks, &name, false), adapter, p, &home);
                     (p, text, composed)
                 })
                 .max_by_key(|(_, text, _)| text.len())
                 .unwrap_or_else(|| {
-                    let (text, composed) =
-                        place_text(stacks, place_layers(stacks, &name, false), adapter, &dir);
+                    let (text, composed) = place_text(
+                        stacks,
+                        place_layers(stacks, &name, false),
+                        adapter,
+                        &dir,
+                        &home,
+                    );
                     (&dir, text, composed)
                 });
             let rendered = adapter.render(&composed);
@@ -3537,7 +3621,7 @@ pub fn sizes(stacks: &Stacks) -> Vec<Size> {
             });
         }
         for role in declared_roles(stacks) {
-            let text = role_composed(stacks, place_layers(stacks, &name, true), &role).text;
+            let text = role_composed(stacks, place_layers(stacks, &name, true), &role, &home).text;
             out.push(Size {
                 place: label.clone(),
                 at: None,

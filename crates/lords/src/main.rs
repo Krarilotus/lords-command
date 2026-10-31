@@ -32,12 +32,14 @@ usage:
   lords set-aside PATH... [--yes]   move paths that aren't the tool's into a new backup dir
   (sync, uninstall, adopt, set-aside: --home DIR, the tool's own dir; default ~/.lords-command)
   lords hooks install --post-checkout [--repo DIR]   a new worktree gets its place files (`sync --place`)
-  lords compose [--repo NAME [--role ROLE]] [--adapter ID] [--json]   what a harness reads there, with sources
+  lords compose [--repo NAME [--role ROLE | --child]] [--adapter ID] [--json]   what a harness reads there, with sources
+  lords show ID   an entry's whole text, which its core line stands for at start (without frontmatter)
   lords sizes [--json]   every file sync writes, by section; fails past the warning line
   lords guard rm   Claude's PreToolUse hook: refuses an `rm` whose path holds a variable not written as quoted ${VAR:?}
   lords guard queue [--deadline-ms N]   Claude's Stop hook: holds a turn's end while items may wait in its T3 queue
   lords guard session   Claude's SessionStart hook: records the Lords files the session reads
   lords guard turn   Claude's UserPromptSubmit hook: the clock, and the Lords files changed since the session started
+  lords guard child   the SubagentStart hook: a native child starts with its role's start file in its place
   lords guard install [--home DIR]   install or update the guard copy the hooks run (sync never writes it)
   lords panel serve [--port N]   the window on another PC reads and edits these stacks through it (127.0.0.1:7879)
   lords panel add ALIAS --bridge DIR [--apply]   set a PC this one reaches as ALIAS up for the panel; prints the
@@ -135,6 +137,7 @@ fn cmd_guard(mut a: Args) -> ExitCode {
         say("usage: lords guard rm   (Claude Code's PreToolUse hook; the event on stdin)");
         say("       lords guard queue [--deadline-ms N]   (Claude Code's Stop hook; the event on stdin)");
         say("       lords guard session | turn   (Claude Code's SessionStart and UserPromptSubmit hooks)");
+        say("       lords guard child   (the SubagentStart hook: a native child's start file)");
         return ExitCode::SUCCESS;
     }
     if a.flag("--self-test") {
@@ -152,6 +155,9 @@ fn cmd_guard(mut a: Args) -> ExitCode {
     }
     if let Some(w @ ("session" | "turn")) = which.as_deref() {
         return guard_rules(w, a);
+    }
+    if which.as_deref() == Some("child") {
+        return guard_child(a);
     }
     if which.as_deref() != Some("rm") || a.done().is_err() {
         note("usage `lords guard rm` (event on stdin)");
@@ -205,6 +211,32 @@ fn guard_rules(which: &str, a: Args) -> ExitCode {
         let (now, zone) = system_clock();
         turn_hook(&input, &env, now, zone.as_ref())
     };
+    if let Some(n) = answer.note {
+        note(&n);
+    }
+    if !answer.stdout.is_empty() {
+        say(&answer.stdout);
+    }
+    ExitCode::SUCCESS
+}
+
+/// `lords guard child`: the `SubagentStart` hook (Claude Code, Codex) that gives a native child its place's start file
+/// (guard.rs). Reads the event on stdin; like the other guards it never fails: every problem is a note on stderr and
+/// exit 0.
+fn guard_child(a: Args) -> ExitCode {
+    let note = |line: &str| say_err(&format!("lords guard child: {line}"));
+    if a.done().is_err() {
+        note("usage `lords guard child` (event on stdin)");
+        return ExitCode::SUCCESS;
+    }
+    let input = match std::io::read_to_string(std::io::stdin()) {
+        Ok(i) => i,
+        Err(e) => {
+            note(&format!("the event can't be read ({e})"));
+            return ExitCode::SUCCESS;
+        }
+    };
+    let answer = lords_core::guard::child_hook(&input);
     if let Some(n) = answer.note {
         note(&n);
     }
@@ -844,6 +876,7 @@ fn cmd_hooks(mut a: Args) -> Result<bool, String> {
 /// What an adapter reads in one place: the user level, a repo or workspace's shared files, or one role's file.
 fn cmd_compose(mut a: Args) -> Result<bool, String> {
     let json = a.flag("--json");
+    let child = a.flag("--child");
     let place = a.value("--repo")?;
     let role = a.value("--role")?;
     let adapter_id = a.value("--adapter")?.unwrap_or_else(|| "codex".into());
@@ -856,15 +889,20 @@ fn cmd_compose(mut a: Args) -> Result<bool, String> {
             lords_core::adapters::ids().join(", ")
         )
     })?;
+    let home = sync::default_home()?;
     let composed = match (&place, &role) {
+        (Some(place), None) if child => {
+            let role = sync::child_role(&stacks).ok_or("--child needs a stack's `child_role`")?;
+            sync::child_composed(&stacks, sync::place_layers(&stacks, place, true), role, &home)
+        }
         (Some(place), Some(role)) => {
-            sync::role_composed(&stacks, sync::place_layers(&stacks, place, true), role)
+            sync::role_composed(&stacks, sync::place_layers(&stacks, place, true), role, &home)
         }
         (Some(place), None) if !json => {
             let dir = sync::first_path(&stacks, place)
                 .ok_or_else(|| format!("no checkout or dir declared for `{place}`"))?;
             let layers = sync::place_layers(&stacks, place, false);
-            let (text, _) = sync::place_text(&stacks, layers, adapter, &dir);
+            let (text, _) = sync::place_text(&stacks, layers, adapter, &dir, &home);
             print!("{text}");
             eprintln!("{} bytes", text.len());
             return Ok(true);
@@ -913,6 +951,25 @@ fn cmd_sizes(mut a: Args) -> Result<bool, String> {
     Ok(!over)
 }
 
+/// `lords show <id>`: the whole text on stdout; a refusal (no such entry, two of them, retired or ended) on stderr,
+/// exit 1.
+fn cmd_show(mut a: Args) -> Result<bool, String> {
+    let id = a.positional().ok_or("show needs an id")?;
+    let p = paths(&mut a)?;
+    a.done()?;
+    let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    match lords_core::core_lines::show(&stacks, &id) {
+        Ok(body) => {
+            print!("{body}");
+            Ok(true)
+        }
+        Err(why) => {
+            say_err(&format!("lords show: {why}"));
+            Ok(false)
+        }
+    }
+}
+
 fn cmd_hash(mut a: Args) -> Result<bool, String> {
     let p = a.positional().ok_or("hash needs a path")?;
     a.done()?;
@@ -944,6 +1001,7 @@ fn main() -> ExitCode {
         "hash" => cmd_hash(a),
         "sync" => cmd_sync(a),
         "compose" => cmd_compose(a),
+        "show" => cmd_show(a),
         "uninstall" => cmd_uninstall(a),
         "adopt" => cmd_adopt(a),
         "set-aside" => cmd_set_aside(a),

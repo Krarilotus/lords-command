@@ -142,6 +142,12 @@ pub struct Manifest {
     pub memory_stores: Vec<MemoryStore>,
     #[serde(default)]
     pub privacy: PrivacyConfig,
+    /// `check` refuses an entry of this stack that has neither a core line nor `start: detail` (design: Check).
+    #[serde(default)]
+    pub require_core: bool,
+    /// The role a native subagent starts as (design: Sync, a native child's start file).
+    #[serde(default)]
+    pub child_role: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -510,6 +516,8 @@ impl Stack {
                         roles: Vec::new(),
                         scope: format!("repo:{name}"),
                         status: crate::model::Status::Active,
+                        start: None,
+                        core: None,
                         superseded_by: None,
                         retired: None,
                         visibility: self.visibility(),

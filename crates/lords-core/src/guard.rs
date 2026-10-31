@@ -783,6 +783,44 @@ pub fn turn_hook(
     Answer { stdout: out.to_string(), note }
 }
 
+// ---------------------------------------------------------------- child
+//
+// `child` (plan L6, an orchestrator's condition 3: "Children start with their own role's core, not the parent's"), a
+// `SubagentStart` hook in Claude Code and in Codex: it gives a native child the start file sync wrote for the stack's
+// `child_role` in the child's place, `.lords/child.md`, as the child's context. One small read, no stack loaded.
+
+/// The child guard's answer to one `SubagentStart` event: the nearest `.lords/child.md` at or above the event's cwd,
+/// without its marker lines, as `additionalContext`; nothing where no place has one. Never a block.
+pub fn child_hook(input: &str) -> Answer {
+    let Ok(ev) = serde_json::from_str::<Value>(input) else {
+        return noted("the event can't be read");
+    };
+    if ev["hook_event_name"] != "SubagentStart" {
+        return quiet();
+    }
+    let Some(cwd) = ev["cwd"].as_str() else { return noted("the event names no cwd") };
+    let marker = crate::compose::BEGIN;
+    for d in Path::new(cwd).ancestors() {
+        let file = d.join(crate::sync::ROLE_DIR).join(crate::sync::CHILD_FILE);
+        let text = match crate::fsguard::read_text(&file) {
+            Ok(Some(t)) if t.contains(marker) => t,
+            Ok(_) => continue,
+            Err(e) => return noted(format!("{}: {e}", file.display())),
+        };
+        let context: Vec<&str> = text
+            .lines()
+            .map(|l| l.trim_end_matches('\r'))
+            .filter(|l| *l != marker && *l != crate::compose::END)
+            .collect();
+        let out = json!({"hookSpecificOutput": {
+            "hookEventName": "SubagentStart",
+            "additionalContext": context.join("\n").trim(),
+        }});
+        return Answer { stdout: out.to_string(), note: None };
+    }
+    quiet()
+}
+
 /// What one prompt finds (`rules_found`): the line to say, if any, and the record to save.
 struct Found {
     line: Option<String>,

@@ -58,6 +58,26 @@ pub trait Adapter: Sync {
     fn default_role_inline(&self) -> bool {
         true
     }
+    /// The Lords guards its harness runs as hooks (sync.rs `guard_event`); none: it runs none.
+    fn guards(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// A hook entry that runs guard `guard` of Lords' copy `exe`.
+    fn guard_hook(&self, exe: &str, guard: &str) -> serde_json::Value {
+        serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard] })
+    }
+    /// The guard a hook entry runs, when it runs Lords' copy `exe` (`guard_hook`): a user's own hook, whatever its
+    /// args, is never Lords'.
+    fn guard_of(&self, hook: &serde_json::Value, exe: &str) -> Option<String> {
+        hook["command"]
+            .as_str()
+            .is_some_and(|c| c.replace('\\', "/").eq_ignore_ascii_case(exe))
+            .then(|| hook["args"][1].as_str().unwrap_or("").to_string())
+    }
+    /// What a settings plan that adds a guard hook says, where the harness runs it only after a step of its own.
+    fn guard_note(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Claude Code: user file `CLAUDE.md` in the profile dir; `CLAUDE.local.md` per checkout, which also keeps a
@@ -88,6 +108,10 @@ impl Adapter for ClaudeCode {
 
     fn excludes_key(&self) -> Option<&'static str> {
         Some("claudeMdExcludes")
+    }
+
+    fn guards(&self) -> &'static [&'static str] {
+        &["rm", "queue", "session", "turn", "child"]
     }
 
     fn repo_skills_dir(&self) -> Option<&'static str> {
@@ -129,6 +153,33 @@ impl Adapter for Codex {
     /// Codex stops at its byte limit, so the default role's text stays in its role file, named first.
     fn default_role_inline(&self) -> bool {
         false
+    }
+
+    /// Codex's hooks (`~/.codex/hooks.json`) run a command line; `child` is the guard a probe showed it runs (design
+    /// note 2026-10-31-lords-core-lines-composer, P2): the child took its context, once the hook was trusted.
+    fn guards(&self) -> &'static [&'static str] {
+        &["child"]
+    }
+
+    /// A command line, and the whole context passed on: sync keeps a child's file within a hook's reach.
+    fn guard_hook(&self, exe: &str, guard: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "command",
+            "command": format!("\"{exe}\" guard {guard}"),
+            "timeout": 30,
+            "additionalContextLimit": 0,
+        })
+    }
+
+    fn guard_of(&self, hook: &serde_json::Value, exe: &str) -> Option<String> {
+        let line = hook["command"].as_str()?.replace('\\', "/");
+        let prefix = format!("\"{exe}\" guard ");
+        let at = line.get(..prefix.len()).filter(|p| p.eq_ignore_ascii_case(&prefix))?;
+        Some(line[at.len()..].trim().to_string())
+    }
+
+    fn guard_note(&self) -> Option<&'static str> {
+        Some("Codex runs a new or changed hook once it is reviewed: open Codex and accept it under /hooks")
     }
 
     /// The override replaces the tracked `AGENTS.md` and Codex doesn't expand includes, so the tracked text is

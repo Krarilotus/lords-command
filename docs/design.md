@@ -96,6 +96,8 @@ it replaces.
 | `roles` | roles from the `roles` list in `stack.toml` (e.g. orchestrator, coder, reviewer) | absent: every role. A target that knows its reader's role (`roles` on the target) gets only entries for that role or every role; where the role is unknown, role-specific entries are labelled, and role-specific notes leave the memory index for one pointer line |
 | `scope` | global, `project:<p>`, `repo:<r>`, `path:<r>:<sub>` | must match the directory |
 | `status` | active, retired | retired needs `retired.date` and `retired.reason`, and `superseded_by` when there is a successor |
+| `start` | core, role, detail | how it reaches an agent at start (below, Core lines). Absent: its whole text, as before core lines |
+| `core` | a line, or a list of {line, roles} | its hard line, at most two sentences and 450 UTF-8 bytes; several lines each name their roles |
 | `visibility` | public, private | must match the stack |
 | `basis` | list of {quote, date, by} | the owner's words behind the entry, where there are any |
 | `evidence` | list of {summary, date, links} | the cases behind the entry (incidents, measurements); kept beside it, never composed, so the rule stays a short principle; links are checked |
@@ -106,6 +108,20 @@ it replaces.
 | `overrides`, `extends` | entry ids | see Layers |
 | `order` | integer | optional, for ordering within a section |
 | `links` | paths or ids | checked for dangling targets |
+
+**Core lines** (the Lords owner, 31 Oct, plan L8; design note `Harness/notes/2026-10-31-lords-core-lines-composer.md`).
+An agent starts with each binding entry's hard line, its id first, and opens the whole text, which stays authoritative,
+by id when a task touches it: `lords show <id>`, named once with its full path at the top of each composed file.
+- `start: core`: its lines reach every role it binds (`check` refuses a line set that leaves one out). `role`: each
+  line names its roles; the entry's other roles find it in the index. `detail`: no line, only the index. Intent takes
+  only `detail` and stays a title in the intent index; memory and a repo's own skills take neither field.
+- An entry with several lines (one per actor or trigger) stays one entry; each line traces to it by the same id.
+- Composition: a role's file carries the lines for that role, then the index of the rest (`- <id>: <title>`). A
+  place's file carries the lines for every development role, and the default role's lines labelled, in every
+  adapter's file alike; another role's lines are in its role file. A skill's line stands in its index line. A template
+  is composed only once it has a class. An entry with no class composes exactly as before.
+- A stack's `require_core = true` makes `check` refuse an entry of that stack with no class, or a `core`/`role` one
+  with no line (memory and a repo's own skills excepted), so a store can land its lines before the check holds them.
 
 The model is a graph: entries are nodes with stable ids, and every relation between them is a typed field
 (`overrides`, `extends`, `superseded_by`, `links`, `basis`), never a position in prose. So an RDF export (for the
@@ -220,6 +236,15 @@ option 1): Claude's file has its entries and notes inline, labelled; Codex's, wh
 them by reference like every other role's, and its role-files line names the default role's file first ("the
 default role here"). The role-files line stays for briefed agents of the other roles. `lords sizes` and the size
 guard name the place, the adapter, its file and each section's bytes.
+
+**A native child's start file** (plan L6, an orchestrator's condition 3: children start with their own role's core). With a
+stack's `child_role` (the role a subagent a session starts itself has), each place's `.lords/` also holds `child.md`:
+what of that role the place's file doesn't carry (its lines and entries for only some development roles), after a line
+naming the role. The `child` guard, a `SubagentStart` hook, gives it to the child as context: in Claude Code's
+settings and Codex's `~/.codex/hooks.json` (a settings target with `guards = ["child"]`; Codex runs it once reviewed
+under /hooks). Both providers' children also load the place's file (probed 31 Oct), except Claude's Explore and Plan,
+which load no `CLAUDE.md` and get only `child.md`, which names the role file to read. Claude Code holds 10,000
+characters of hook context; sync notes a `child.md` past that.
 
 **New worktrees.** `lords hooks install --post-checkout` writes the repo's own `.git/hooks/post-checkout` (the
 common dir, so every worktree runs it). On a new worktree (old HEAD all zeros) it runs `lords sync --repo X --place
@@ -476,6 +501,8 @@ never writes memory back.
 | near-duplicate text across entries (shingled similarity over normalised sentences) | candidate |
 | same topic, conflicting numbers or keywords, no relation named | candidate |
 | active entry links a retired one | warning |
+| a core line past 450 UTF-8 bytes or holding a line break; a line's role the entry doesn't bind; a class its lines don't hold (`core-line-long`, `core-line-break`, `core-roles`, `core-class`) | error |
+| with the stack's `require_core`, an entry with no class, or a `core` or `role` one with no line (`core-missing`) | error |
 
 ## Binaries
 

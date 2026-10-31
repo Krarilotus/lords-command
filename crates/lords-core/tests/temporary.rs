@@ -30,6 +30,8 @@ fn user_level(f: &Fixture) -> String {
         relative_to: None,
         default_role: None,
         default_role_inline: false,
+        opener: None,
+        child: false,
     };
     compose(&f.stacks(), &ctx).text
 }
