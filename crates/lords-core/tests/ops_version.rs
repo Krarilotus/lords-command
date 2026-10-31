@@ -208,7 +208,7 @@ fn an_entrys_commit_holds_its_version_over_every_covered_file() {
 // Spec (fix check r1 R3, the review's witness; the Lords owner: check every covered file on that one identified
 // commit, never revert the agent's): the panel writes a skill's sidecar (a retirement), then an agent saves the skill's
 // text and `git commit -a`s both. That commit holds the change's bytes and a text the change never read: a conflict
-// naming it, and nothing further changes.
+// naming it, saying it is the one commit that carries the change (fix check r2), and nothing further changes.
 #[test]
 fn an_agents_commit_that_holds_the_change_and_a_text_it_never_read_is_a_conflict() {
     use lords_core::git::{commit_entry, Uncommitted};
@@ -229,7 +229,9 @@ fn an_agents_commit_that_holds_the_change_and_a_text_it_never_read_is_a_conflict
         "Retire skill.s",
     );
     assert!(
-        matches!(&mixed, Err(Uncommitted::Conflict(m)) if m.contains(body) && m.contains(theirs.trim())),
+        matches!(&mixed, Err(Uncommitted::Conflict(m)) if m.contains(body)
+            && m.contains(&format!("{}, the commit that carries this change, changed it too", theirs.trim()))
+            && !m.contains("both stay")),
         "{mixed:?}"
     );
     assert_eq!(
@@ -238,6 +240,39 @@ fn an_agents_commit_that_holds_the_change_and_a_text_it_never_read_is_a_conflict
         "the agent's commit stays, nothing on top"
     );
     assert_eq!(git(&root, &["status", "--porcelain"]), "");
+}
+
+// Spec (fix check r2 N3, the Lords owner: one candidate commit, named once by its id and checked whole there: its
+// written files hold the change's bytes, its parent holds every covered file as read, it changes no covered file the
+// change didn't write; success names only that id): the panel writes a skill's sidecar, an agent commits it
+// (`commit -a`), then amends that commit with a sidecar of its own. The commit that now carries the file holds bytes
+// the change didn't write: never the change's success; a conflict, and the agent's commit stays. (The review's
+// schedule puts the amend between two reads of HEAD, where git runs nothing of the repo's that a test could time; with
+// one read of one id there is no between, and this is the amend before it.)
+#[test]
+fn an_agents_amended_commit_without_the_changes_bytes_is_never_its_success() {
+    use lords_core::git::{commit_entry, Uncommitted};
+    let f = Fixture::new();
+    f.write("priv/global/skills/s/lords.yaml", "meta 1\n");
+    f.write("priv/global/skills/s/SKILL.md", "body 1\n");
+    f.git_init("priv");
+    let root = f.priv_root();
+    let (meta, body) = ("global/skills/s/lords.yaml", "global/skills/s/SKILL.md");
+    f.write(&format!("priv/{meta}"), "retired\n");
+    git(&root, &["commit", "-q", "-am", "an agent's commit -a"]);
+    f.write(&format!("priv/{meta}"), "the agent's own\n");
+    git(&root, &["commit", "-q", "-a", "--amend", "--no-edit"]);
+    let before = git(&root, &["rev-parse", "HEAD"]);
+    let amended = commit_entry(
+        &root,
+        &[covered(meta, b"meta 1\n", Some(b"retired\n")), covered(body, b"body 1\n", None)],
+        "Retire skill.s",
+    );
+    assert!(
+        matches!(&amended, Err(Uncommitted::Conflict(m)) if m.contains(meta) && m.contains("other bytes")),
+        "{amended:?}"
+    );
+    assert_eq!(git(&root, &["rev-parse", "HEAD"]), before, "the agent's commit stays");
 }
 
 // Spec (sol-loop r4, S5 and S6; review r1 R1 witness A): an agent's plain commit from the repo's own index that lands

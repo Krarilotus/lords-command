@@ -212,9 +212,9 @@ pub fn commit_entry(
         return Ok(None);
     }
     let written: Vec<&str> = wrote.iter().map(|(p, _)| *p).collect();
-    // The first covered file `commit` doesn't hold as the version read it (its parent must hold each as read, and it
-    // must change none the change didn't write), with the commit that changed it there.
-    let newer = |commit: &str| -> Result<Option<(String, String)>, String> {
+    // The first covered file `commit` (a full id) doesn't hold as the version read it (its parent must hold each as
+    // read, and it must change none the change didn't write), with the commit that changed it there: full id, short.
+    let newer = |commit: &str| -> Result<Option<(String, String, String)>, String> {
         let parent = format!("{commit}^");
         for ((c, path), base) in files.iter().zip(&paths).zip(&bases) {
             let since = if at(&parent, path).as_deref() != Some(base.as_str()) {
@@ -224,33 +224,50 @@ pub fn commit_entry(
             } else {
                 continue;
             };
-            let by = run(&top, &["log", "-1", "--format=%h", since, "--", path])?;
-            return Ok(Some((path.clone(), by.trim().to_string())));
+            let by = run(&top, &["log", "-1", "--format=%H %h", since, "--", path])?;
+            let (full, short) = by.trim().split_once(' ').unwrap_or((by.trim(), by.trim()));
+            return Ok(Some((path.clone(), full.to_string(), short.to_string())));
         }
         Ok(None)
     };
-    let conflict = |(path, by): (String, String), commit: &str| {
-        Conflict(format!(
-            "{path} changed in {by} after it was read; this change is committed as {commit}, over it: both stay in \
-             history, nothing is reverted"
-        ))
+    // The conflict names the commit that changed the file and the one carrying the change: one commit, said as one.
+    let conflict = |(path, by, by_short): (String, String, String), commit: &str, short: &str| {
+        Conflict(if by == commit {
+            format!(
+                "{path} isn't as it was read: {short}, the commit that carries this change, changed it too; nothing \
+                 is reverted"
+            )
+        } else {
+            format!(
+                "{path} changed in {by_short} after it was read; this change is committed as {short}, over it: both \
+                 stay in history, nothing is reverted"
+            )
+        })
     };
     // Nothing left to commit: the files hold what HEAD holds.
     let mut same = vec!["diff", "--quiet", "HEAD", "--"];
     same.extend(&written);
     if status(&top, &same).map_err(Refused)? {
-        if let Some((path, _)) = wrote.iter().find(|(p, b)| at("HEAD", p).as_deref() != Some(b)) {
+        // Someone's commit (an agent's `git commit -a`) holds them: one candidate, the last commit to touch them, named
+        // once by its id; every check is on that id, and success names only it (fix check r2 N3).
+        let mut last = vec!["log", "-1", "--format=%H %h", "--"];
+        last.extend(&written);
+        let found = run(&top, &last).map_err(Refused)?;
+        let Some((id, theirs)) = found.trim().split_once(' ') else {
+            return Err(Published {
+                commit: "HEAD".into(),
+                problem: format!("git named no commit that holds {}", written.join(", ")),
+            });
+        };
+        if let Some((path, _)) = wrote.iter().find(|(p, b)| at(id, p).as_deref() != Some(b)) {
             return Err(Conflict(format!(
                 "{path} was committed meanwhile by someone else, with other bytes"
             )));
         }
-        let mut last = vec!["log", "-1", "--format=%h", "--"];
-        last.extend(&written);
-        let theirs = run(&top, &last).map_err(Refused)?.trim().to_string();
-        return match newer(&theirs) {
-            Ok(None) => Ok(Some(theirs)),
-            Ok(Some(changed)) => Err(conflict(changed, &theirs)),
-            Err(problem) => Err(Published { commit: theirs, problem }),
+        return match newer(id) {
+            Ok(None) => Ok(Some(theirs.to_string())),
+            Ok(Some(changed)) => Err(conflict(changed, id, theirs)),
+            Err(problem) => Err(Published { commit: theirs.to_string(), problem }),
         };
     }
     // Not quiet: git's summary line names the commit it made (sol-loop r4, S5).
@@ -272,7 +289,7 @@ pub fn commit_entry(
         .to_string();
     // The version over every covered file, around the commit git made on the parent it read.
     if let Some(changed) = newer(&made).map_err(published)? {
-        return Err(conflict(changed, &short));
+        return Err(conflict(changed, &made, &short));
     }
     if let Some((path, _)) = wrote.iter().find(|(p, b)| at(&made, p).as_deref() != Some(b.as_str()))
     {
