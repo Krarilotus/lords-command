@@ -69,12 +69,15 @@ const HERE: Duration = Duration::from_secs(20);
 /// step's whole process tree at the step's deadline however the step is stuck; at its end the step ends the watchdog.
 /// A step whose watchdog can't start stops before it does anything, with an error. `$staging` is this run's own dir
 /// there (review r1 R7); `$me` is the account the step runs as, and `Only-Mine` refuses a dir that grants anyone else
-/// (fix check r1 R2). `Open-Path` says why a dir and every dir above it up to the profile aren't closed to other
-/// accounts, or nothing: the first that lets an account other than this one, SYSTEM and Administrators (and the owner
-/// placeholders, CREATOR OWNER and OWNER RIGHTS) create, delete, delete what it holds, or change its permissions or
-/// owner, as an entry or as its owner (fix check r2 N4: the panel's threat model); or the first that is a link (a
-/// junction, symlink or mount point: the dir behind it, and what may change it, the walk can't see), never followed
-/// (fix check r3 N5). A dir's attributes are read without following it, so a link to nothing counts too. Static: the
+/// (fix check r1 R2). `Open-Path` says why a dir's path isn't closed to other accounts, or nothing, failing closed:
+/// any dir from it up to the drive's root that is a link (a junction, symlink or mount point: the dir behind it, and
+/// what may change it, the walk can't see), never followed (fix check r3 N5, r4 N6); a profile whose parent isn't the
+/// OS's own profiles directory (`ProfilesDirectory` under ProfileList, which the OS protects; fix check r4 N6); or the
+/// first dir from it up to the profile that lets an account other than this one, SYSTEM and Administrators (and the
+/// owner placeholders, CREATOR OWNER and OWNER RIGHTS) create, delete, delete what it holds, or change its permissions
+/// or owner, as an entry or as its owner (fix check r2 N4: the panel's threat model; above the profile, a drive's root
+/// lets every user create, so no list rule goes there). A dir's attributes are read without following it, so a link to
+/// nothing counts too. Static: the
 /// literals are joined at compile time, and what changes per run (the deadline, the run's id, a file's name) comes in
 /// as arguments, each checked to be a plain word. No double quote and no `%` in any of it: cmd.exe, ssh's shell there,
 /// would read them.
@@ -96,13 +99,19 @@ macro_rules! step {
             "foreach ($r in $a.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) { ",
             "if ($r.AccessControlType -eq 'Allow' -and $keep -notcontains $r.IdentityReference.Value -and ",
             "([int64]$r.FileSystemRights -band 0x500D0046)) { return $r.IdentityReference.Value } } }; ",
+            "function Attr($d) { try { [IO.File]::GetAttributes($d) } ",
+            "catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] {} }; ",
             "function Open-Path($p) { $top = $env:USERPROFILE.TrimEnd('\\'); $p = $p.TrimEnd('\\'); ",
             "if (-not $p.StartsWith($top + '\\', [StringComparison]::OrdinalIgnoreCase)) { ",
-            "return ($p + ' is outside the user profile ' + $top) }; while ($true) { $at = $null; ",
-            "try { $at = [IO.File]::GetAttributes($p) } catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] {}; ",
-            "if ($null -ne $at) { if ($at -band [IO.FileAttributes]::ReparsePoint) { return ($p + ' is a link (a junction, ",
-            "symlink or mount point): the dir behind it is not checked') }; ",
-            "$who = Open-To $p; if ($who) { $n = $who; try { $n = (New-Object ",
+            "return ($p + ' is outside the user profile ' + $top) }; ",
+            "$q = $p; while ($q) { $at = Attr $q; if ($null -ne $at -and ($at -band [IO.FileAttributes]::ReparsePoint)) { ",
+            "return ($q + ' is a link (a junction, symlink or mount point): the dir behind it is not checked') }; ",
+            "$q = Split-Path -Parent $q }; ",
+            "$os = [Environment]::ExpandEnvironmentVariables((Get-ItemProperty -LiteralPath ",
+            "'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList').ProfilesDirectory).TrimEnd('\\'); ",
+            "if ((Split-Path -Parent $top) -ine $os) { ",
+            "return ($top + ' is not a profile in the OS profiles directory ' + $os) }; ",
+            "while ($true) { if ($null -ne (Attr $p)) { $who = Open-To $p; if ($who) { $n = $who; try { $n = (New-Object ",
             "Security.Principal.SecurityIdentifier($who)).Translate([Security.Principal.NTAccount]).Value + ' (' + ",
             "$who + ')' } catch {}; return ($p + ' lets ' + $n + ' create, delete or change permissions there') } }; ",
             "if ($p -ieq $top) { return }; $p = Split-Path -Parent $p } }; ",

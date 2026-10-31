@@ -1,6 +1,6 @@
 //! `lords panel add`'s remote steps, run here: the same PowerShell the other PC runs, in a local powershell with its
-//! `LOCALAPPDATA` and `USERPROFILE` in a temp dir of the test's own. What ssh adds (the transport, the other PC's
-//! shell) is not run here.
+//! `LOCALAPPDATA` and `USERPROFILE` in a temp dir of the test's own, and the OS's profiles directory (HKLM, which a
+//! test can't change) answered by the test. What ssh adds (the transport, the other PC's shell) is not run here.
 
 // Tests are outside the filesystem and process boundary (fsguard.rs): their fixtures write their own temp dirs.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -10,7 +10,8 @@ use super::*;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-/// Runs `step` as the other PC would (its arguments after it), with `stdin`; its status, output and time.
+/// Runs `step` as the other PC would (its arguments after it), with `stdin`, `home` its profile and its
+/// `LOCALAPPDATA`, in a profiles directory that is `home`'s parent; its status, output and time.
 fn run(
     step: &str,
     deadline: u64,
@@ -18,12 +19,35 @@ fn run(
     home: &Path,
     stdin: &[u8],
 ) -> (bool, String, Duration) {
+    run_with(step, deadline, name, [home, home], home.parent(), stdin)
+}
+
+/// `run`, with `LOCALAPPDATA` and `USERPROFILE` as given, and the OS's profiles directory answered as `profiles`. The
+/// step reads it with `Get-ItemProperty` from HKLM; here a function of that name, which PowerShell finds before the
+/// cmdlet, answers instead (`-NoProfile` keeps any other out on the other PC). `None`: the registry answers.
+fn run_with(
+    step: &str,
+    deadline: u64,
+    name: &str,
+    [local_app_data, profile]: [&Path; 2],
+    profiles: Option<&Path>,
+    stdin: &[u8],
+) -> (bool, String, Duration) {
+    let os = match profiles {
+        Some(_) => "function Get-ItemProperty { [pscustomobject]@{ ProfilesDirectory = $env:TEST_PROFILES } }; ",
+        None => "",
+    };
     let start = Instant::now();
-    let mut child = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", step])
+    let mut command = Command::new("powershell");
+    if let Some(dir) = profiles {
+        command.env("TEST_PROFILES", dir);
+    }
+    let mut child = command
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"])
+        .arg(format!("{os}{step}"))
         .args([deadline.to_string().as_str(), "run-1", name])
-        .env("LOCALAPPDATA", home)
-        .env("USERPROFILE", home)
+        .env("LOCALAPPDATA", local_app_data)
+        .env("USERPROFILE", profile)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -232,6 +256,56 @@ fn an_install_path_through_a_link_is_named_and_refused() {
         0,
         "nothing made behind it"
     );
+}
+
+// Spec (fix check r4 N6, the Lords owner: links are refused on every dir from the app dir up to the drive's root, not
+// only up to the profile; the review's witness): a profile reached through a junction above it, `LOCALAPPDATA` and
+// `USERPROFILE` agreeing, is named as a link and refused by the probe and by STAGE, even where the profiles directory
+// is said to be the profile's parent; nothing is made behind it.
+#[test]
+fn a_profile_reached_through_a_link_above_it_is_refused() {
+    let root = profile();
+    let real = root.path().join("real");
+    let app = ["PanelOwner", "AppData", "Local", "Programs", "lords-command"];
+    std::fs::create_dir_all(app.iter().fold(real.clone(), |p, c| p.join(c))).unwrap();
+    std::fs::create_dir_all(root.path().join("routes")).unwrap();
+    let current = root.path().join("routes").join("Current");
+    let link =
+        Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&current).arg(&real).output().unwrap();
+    assert!(link.status.success(), "{}", String::from_utf8_lossy(&link.stdout));
+    let owner = current.join("PanelOwner");
+    let local = owner.join("AppData").join("Local");
+    let (ok, said, _) = run_with(PROBE, 30, "none", [&local, &owner], Some(&current), b"");
+    assert!(ok && said.contains("Current is a link"), "{said}");
+    let (ok, said, _) = run_with(STAGE, 30, "staging", [&local, &owner], Some(&current), b"");
+    assert!(!ok && said.contains("is a link"), "{said}");
+    let staging = app.iter().fold(real.clone(), |p, c| p.join(c)).join("staging");
+    assert!(!staging.exists(), "nothing made behind it");
+}
+
+// Spec (fix check r4 N6, the Lords owner: the profile's parent must be the OS's own profiles directory,
+// `ProfilesDirectory` under ProfileList, which the OS protects): a profile elsewhere is named and refused by the probe
+// and by STAGE, and nothing is made. Read from this PC's registry itself, the profiles directory is a real one, and a
+// temp dir's profile isn't in it.
+#[test]
+fn a_profile_outside_the_os_profiles_directory_is_refused() {
+    let root = profile();
+    let owner = root.path().join("elsewhere").join("PanelOwner");
+    let local = owner.join("AppData").join("Local");
+    let app = local.join("Programs").join("lords-command");
+    std::fs::create_dir_all(&app).unwrap();
+    let profiles = root.path().join("Users");
+    std::fs::create_dir_all(&profiles).unwrap();
+    let (ok, said, _) = run_with(PROBE, 30, "none", [&local, &owner], Some(&profiles), b"");
+    assert!(ok && said.contains("not a profile in the OS profiles directory"), "{said}");
+    let (ok, said, _) = run_with(STAGE, 30, "staging", [&local, &owner], Some(&profiles), b"");
+    assert!(!ok && said.contains("not a profile in the OS profiles directory"), "{said}");
+    assert!(!app.join("staging").exists(), "nothing made");
+    let (ok, said, _) = run_with(PROBE, 30, "none", [&local, &owner], None, b"");
+    let named =
+        said.split("not a profile in the OS profiles directory ").nth(1).unwrap_or_default();
+    let dir = named.split('"').next().unwrap_or_default().replace("\\\\", "\\");
+    assert!(ok && !dir.is_empty() && Path::new(&dir).is_dir(), "{said}");
 }
 
 // Spec (review r1 R6: a step's arguments are data, never code): a run's id or a file's name that isn't a plain word
