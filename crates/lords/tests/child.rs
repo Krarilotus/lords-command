@@ -71,6 +71,82 @@ fn the_child_guard_gives_a_child_its_places_child_file() {
     }
 }
 
+/// The context one `guard child` call answers, or `None` for no output.
+fn context(o: &Output) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).ok()?;
+    Some(v["hookSpecificOutput"]["additionalContext"].as_str()?.to_string())
+}
+
+// Spec (review r1, F1: Explore and Plan "start without the shared binding core"; Claude Code's hooks docs: a hook's
+// `additionalContext` past 10,000 characters becomes a file path and a preview, and "Claude Code measures each string on
+// its own, even when several hooks run for the same event"; the parts probe, design note D4): a child that loads no
+// place file (`agent_type` Explore or Plan) gets the place's `.lords/child-whole.md`, any other `child.md`. With
+// `--part N` each call answers the Nth piece, cut at line ends, each under 10,000 characters, together the whole file
+// in order, and nothing past the last; without `--part` (Codex, no such limit), the whole file at once.
+#[test]
+fn a_child_with_no_place_file_gets_the_whole_start_in_parts() {
+    let d = TempDir::new().unwrap();
+    let home = d.path().join("home");
+    let cwd = d.path().join("place");
+    fs::create_dir_all(cwd.join(".lords")).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let lines: Vec<String> = (0..300)
+        .map(|i| format!("- rule.r{i:03}: Line {i}, about as long as a core line is."))
+        .collect();
+    fs::write(cwd.join(".lords/child-whole.md"), format!("{BEGIN}\n{}\n{END}\n", lines.join("\n")))
+        .unwrap();
+    fs::write(cwd.join(".lords/child.md"), format!("{BEGIN}\nONLY THE DELTA.\n{END}\n")).unwrap();
+    let with = |agent: &str| event(&cwd).replace("general-purpose", agent);
+    for agent in ["Explore", "Plan"] {
+        let parts: Vec<Option<String>> = (1..=4)
+            .map(|n| {
+                context(&run(
+                    &home,
+                    &cwd,
+                    &["guard", "child", "--part", &n.to_string()],
+                    &with(agent),
+                ))
+            })
+            .collect();
+        assert!(
+            parts[0].is_some() && parts[1].is_some() && parts[3].is_none(),
+            "{agent}: {parts:?}"
+        );
+        let got: Vec<&str> = parts
+            .iter()
+            .flatten()
+            .flat_map(|p| p.lines())
+            .filter(|l| l.starts_with("- rule."))
+            .collect();
+        assert_eq!(
+            got,
+            lines.iter().map(String::as_str).collect::<Vec<_>>(),
+            "{agent}: every line, in order"
+        );
+        for p in parts.iter().flatten() {
+            assert!(
+                p.chars().count() < 10_000,
+                "{agent}: a part of {} characters",
+                p.chars().count()
+            );
+        }
+        let all = context(&run(&home, &cwd, &["guard", "child"], &with(agent))).unwrap();
+        assert_eq!(
+            all.lines().filter(|l| l.starts_with("- rule.")).count(),
+            300,
+            "{agent}: whole without --part"
+        );
+    }
+    let first = context(&run(&home, &cwd, &["guard", "child", "--part", "1"], &event(&cwd)));
+    assert_eq!(
+        first.as_deref().map(|c| c.contains("ONLY THE DELTA.")),
+        Some(true),
+        "general-purpose: the delta"
+    );
+    let second = run(&home, &cwd, &["guard", "child", "--part", "2"], &event(&cwd));
+    assert!(second.stdout.is_empty(), "nothing past the delta's one part");
+}
+
 // Spec (the brief, slice 4: "through each provider's subagent-start hook"; the Codex probe, design note: Codex's child
 // takes a command hook's context once the hook is trusted): with `guards = ["child"]` and the copy installed, sync
 // names the copy in one `SubagentStart` entry (`guard child`, no matcher, so every agent type), after the user's own,
@@ -129,10 +205,15 @@ fn sync_registers_the_child_guard_on_subagent_start() {
     };
     let copy =
         home.join(".lords-command/bin/lords-guard.exe").display().to_string().replace('\\', "/");
-    let lords = serde_json::json!({"type": "command", "command": copy, "args": ["guard", "child"]});
+    // Claude Code: one hook per part (review r1, F1), each its own 10,000 characters.
+    let part = |n: &str| serde_json::json!({"type": "command", "command": copy, "args": ["guard", "child", "--part", n]});
     let theirs: serde_json::Value = serde_json::from_str(theirs).unwrap();
     let v = read(&settings);
-    assert_eq!(v["hooks"]["SubagentStart"], serde_json::json!([theirs, {"hooks": [lords]}]), "{v}");
+    assert_eq!(
+        v["hooks"]["SubagentStart"],
+        serde_json::json!([theirs, {"hooks": [part("1"), part("2"), part("3")]}]),
+        "{v}"
+    );
     let v = read(&codex);
     let line = format!("\"{copy}\" guard child");
     let lords = serde_json::json!({"type": "command", "command": line, "timeout": 30, "additionalContextLimit": 0});

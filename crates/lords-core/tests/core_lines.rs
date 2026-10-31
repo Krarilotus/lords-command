@@ -352,22 +352,25 @@ fn a_native_child_starts_with_its_own_roles_lines_beyond_the_place_file() {
         // and a rule extending that skill, which the skills index doesn't carry.
         skill(&f, "tool", "roles: [helper]\nstart: core\ncore: The helper's skill line.\n");
         put("extra", "roles: [helper]\nextends: [skill.tool]\n", "EXTRA-BODY\n");
+        f.write(
+            "priv/project/beta/memory/n.md",
+            &entry("memory.n", "project:beta", "private", "roles: [helper]\n", "A NOTE.\n"),
+        );
         let p = plan(&f.stacks(), &f.opts()).unwrap();
         let file = planned_in(&p, &checkout.join(".lords"), "child.md");
+        let whole = planned_in(&p, &checkout.join(".lords"), "child-whole.md");
         let Some(role) = child_role else {
-            assert_eq!(file, "", "no child role, no file");
+            assert_eq!((file.as_str(), whole.as_str()), ("", ""), "no child role, no files");
             continue;
         };
         let intro = format!("as a {role}");
-        for want in [
-            &intro,
+        let own = [
             "- rule.help: The helpers' line.",
             "HELPER-BODY",
-            "role-helper.md",
-            "- tool: The helper's skill line.",
+            "- skill.tool: The helper's skill line.",
             "EXTRA-BODY",
-            &opener(&f),
-        ] {
+        ];
+        for want in own.iter().chain(&[intro.as_str(), "role-helper.md", &opener(&f)]) {
             assert!(file.contains(want), "{want} in:\n{file}");
         }
         for never in
@@ -377,6 +380,16 @@ fn a_native_child_starts_with_its_own_roles_lines_beyond_the_place_file() {
         }
         let place_file = proposed(&p, &checkout.join("CLAUDE.local.md"));
         assert!(place_file.contains("- rule.all: Every role's line."), "{place_file}");
+        // Review r1, F1: a child that loads no place file (Claude's Explore and Plan) starts with the whole: the lines
+        // every role has as well as its own, and nothing of another role's or a note's.
+        for want in
+            own.iter().chain(&[intro.as_str(), "- rule.all: Every role's line.", &opener(&f)])
+        {
+            assert!(whole.contains(want), "{want} in the whole start:\n{whole}");
+        }
+        for never in ["The lead's line.", "ALL-BODY", "A NOTE.", "# Memory"] {
+            assert!(!whole.contains(never), "{never} not in the whole start:\n{whole}");
+        }
     }
 }
 
@@ -416,21 +429,136 @@ fn an_extension_shows_when_its_parent_is_only_in_the_index() {
     assert!(!coder.contains("BASE-BODY") && !coder.contains("EXTRA-BODY"), "{coder}");
 }
 
-// Spec (sol-loop r1, S3, its witness; design: a place's file labels a line for only some roles): a skill's lines each
-// keep their own label in the skills index, one bullet each.
+// Spec (sol-loop r1, S3, its witness; review r1, F4: "retain the canonical id visibly beside every classified skill
+// line"; design: a place's file labels a line for only some roles): a skill's lines each keep their own label in the
+// skills index, one bullet each, after the skill's id, which `lords show` opens; a skill whose name isn't its dir's
+// keeps its file named too.
 #[test]
-fn each_skill_line_keeps_its_own_label() {
+fn each_skill_line_keeps_its_own_label_and_its_id() {
     let (f, checkout) = place("orchestrator");
     skill(
         &f,
         "tool",
         "start: core\ncore:\n- line: Shared instruction.\n- line: Lead instruction.\n  roles: [orchestrator]\n",
     );
-    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    skill(&f, "audit", "start: core\ncore: Review every draft.\n");
+    let audit = f
+        .read("priv/project/beta/skills/audit/SKILL.md")
+        .replace("name: audit", "name: draft-check");
+    f.write("priv/project/beta/skills/audit/SKILL.md", &audit);
+    let stacks = f.stacks();
+    let p = plan(&stacks, &f.opts()).unwrap();
     let claude = proposed(&p, &checkout.join("CLAUDE.local.md"));
-    for want in ["- tool: Shared instruction.", "- tool (orchestrator only): Lead instruction."] {
+    for want in [
+        "- skill.tool: Shared instruction.",
+        "- skill.tool (orchestrator only): Lead instruction.",
+        "- skill.audit: Review every draft. (`audit\\SKILL.md`)",
+    ] {
+        let want = if cfg!(windows) { want.to_string() } else { want.replace('\\', "/") };
         assert!(claude.lines().any(|l| l == want), "{want} in:\n{claude}");
     }
+    for id in ["skill.tool", "skill.audit"] {
+        assert!(lords_core::core_lines::show(&stacks, id).is_ok(), "{id} opens");
+    }
+}
+
+// Spec (review r1, F2, its witness): a rule extending an intent whose class is `detail` keeps its own line, and one
+// with no class its whole text, in a role's file and a place's file; neither is swallowed by the intent's title.
+#[test]
+fn a_rule_extending_a_detail_intent_keeps_its_own_form() {
+    let (f, checkout) = place("coder");
+    let put = |kind_dir: &str, slug: &str, id: &str, yaml: &str, body: &str| {
+        f.write(
+            &format!("priv/project/beta/{kind_dir}/{slug}.md"),
+            &entry(id, "project:beta", "private", yaml, body),
+        );
+    };
+    put("intent", "base", "intent.base", "start: detail\n", "BASE-BODY\n");
+    put(
+        "rules",
+        "extra",
+        "rule.extra",
+        "extends: [intent.base]\nstart: core\ncore: Never publish the draft.\n",
+        "EXTRA-BODY\n",
+    );
+    put("rules", "more", "rule.more", "extends: [intent.base]\n", "MORE-BODY\n");
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    let coder = planned_in(&p, &checkout.join(".lords"), "role-coder.md");
+    let claude = proposed(&p, &checkout.join("CLAUDE.local.md"));
+    for (name, file) in [("role file", &coder), ("place file", &claude)] {
+        for want in ["- rule.extra: Never publish the draft.", "MORE-BODY"] {
+            assert!(file.contains(want), "{want} in the {name}:\n{file}");
+        }
+        assert!(!file.contains("BASE-BODY") && !file.contains("EXTRA-BODY"), "{name}:\n{file}");
+    }
+}
+
+// Spec (review r1, F3, its witness): a global skill naming no roles (every role) with a core line has that line, by
+// id, in the user-level file every run reads, and in a role's file, which stands alone.
+#[test]
+fn a_role_free_global_skills_line_reaches_the_user_level_file() {
+    let (f, checkout) = place("coder");
+    f.write(
+        "pub/global/skills/audit/lords.yaml",
+        "id: skill.audit\nkind: skill\ntitle: Review before publication\naudience: [all]\nscope: global\nstatus: active\nvisibility: public\norigin:\n  type: own\nstart: core\ncore: Review every draft before publication.\n",
+    );
+    f.write(
+        "pub/global/skills/audit/SKILL.md",
+        "---\nname: audit\ndescription: Audit drafts.\n---\nAudit.\n",
+    );
+    let stacks = f.stacks();
+    let line = "- skill.audit: Review every draft before publication.";
+    for adapter in ["claude", "codex"] {
+        let user =
+            lords_core::sync::user_composed(&stacks, lords_core::adapters::get(adapter).unwrap())
+                .text;
+        assert!(user.contains(line), "{adapter}'s user-level file:\n{user}");
+    }
+    let p = plan(&stacks, &f.opts()).unwrap();
+    let coder = planned_in(&p, &checkout.join(".lords"), "role-coder.md");
+    assert!(coder.contains(line), "{coder}");
+}
+
+// Spec (the Lords owner, 31 Oct: "a per-adapter setting in the stack gives Codex place files no default-role
+// (orchestrator-only) lines; `check` reports a Codex place file over a byte budget the stack sets"): with
+// `[place_files.codex] default_role_lines = false`, Codex's place file leaves the default role's lines for only some
+// roles to its role file (counted there), while Claude's keeps them; the stack's `warn_bytes` is the warning line for
+// that adapter's place files in `check`, and without it the 75 % line stands.
+#[test]
+fn a_stack_can_leave_the_default_roles_lines_out_of_codex_place_files() {
+    let (f, checkout) = place("orchestrator");
+    let manifest = f.read("priv/stack.toml");
+    f.write(
+        "priv/stack.toml",
+        &format!("{manifest}[place_files.codex]\ndefault_role_lines = false\n"),
+    );
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    let claude = proposed(&p, &checkout.join("CLAUDE.local.md"));
+    let codex = proposed(&p, &checkout.join("AGENTS.override.md"));
+    let lead = "- rule.lead (orchestrator only): The lead's line.";
+    assert!(claude.contains(lead), "{claude}");
+    assert!(!codex.contains(lead) && !codex.contains("The lead's half."), "{codex}");
+    assert!(codex.contains("- rule.all: Every role's line."), "{codex}");
+    let pointer = codex.lines().find(|l| l.contains("has them in full:")).unwrap_or_default();
+    assert!(pointer.contains("role-orchestrator.md"), "the lead's file is named: {pointer}");
+    // What `lords check` reports of the places' files (main.rs: `sync::drift_findings`).
+    let size_warnings = |f: &Fixture| -> Vec<String> {
+        lords_core::sync::drift_findings(&f.stacks(), &f.home())
+            .into_iter()
+            .filter(|x| x.code == "size" && x.severity == lords_core::Severity::Warning)
+            .map(|x| x.message)
+            .collect()
+    };
+    assert_eq!(size_warnings(&f), Vec::<String>::new(), "a small file is under the 75 % line");
+    f.write(
+        "priv/stack.toml",
+        &format!("{manifest}[place_files.codex]\ndefault_role_lines = false\nwarn_bytes = 200\n"),
+    );
+    let warned = size_warnings(&f);
+    assert!(
+        warned.len() == 1 && warned[0].contains("AGENTS.override.md") && warned[0].contains("200"),
+        "past the stack's budget for Codex only: {warned:?}"
+    );
 }
 
 // Spec (the invariant: "nothing private reaches a public file"; design: Privacy): a composition of public entries
