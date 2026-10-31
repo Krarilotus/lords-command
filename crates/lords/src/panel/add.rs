@@ -254,7 +254,7 @@ pub fn plan(name: &str, local: &Local, remote: &Remote) -> Result<Plan, String> 
     // administrator that may change the install path; an administrator gets past any file's access list anyway.
     if let Some(why) = remote.open_to.first() {
         return Err(format!(
-            "on {name}, {why}; the install path must be plain dirs up to the profile in which only this account, SYSTEM and Administrators may create, delete or change permissions (the panel's threat model); settle that there, then run panel add again"
+            "on {name}, {why}; the panel installs only where no dir from the app dir up to the drive's root is a link, the profile is directly in the OS profiles directory, and from the app dir up to the profile only this account, SYSTEM and Administrators may create, delete or change permissions (the panel's threat model); settle that there, then run panel add again"
         ));
     }
     let config = remote.ssh_config.clone().unwrap_or_default();
@@ -348,8 +348,8 @@ impl Plan {
         let mut out = vec![format!("{name}:")];
         // The plan refuses otherwise (fix check r2 N4); STAGE checks it again there.
         out.push(format!(
-            "  = {app}\\ and every dir above it up to {}: plain dirs, no link among them, in which only this account, SYSTEM and Administrators may create, delete or change permissions (checked again before staging)",
-            remote.home
+            "  = {app}\\: no link on any dir from it up to the drive's root; {home} directly in the OS profiles directory; from it up to {home}, only this account, SYSTEM and Administrators may create, delete or change permissions (checked again before staging)",
+            home = remote.home
         ));
         out.push(format!(
             "  + {app}\\staging\\{run}\\ (this run's own: what it sends, removed at its end)"
@@ -518,7 +518,7 @@ mod tests {
             "X:\\fixture-home\\AppData\\Local\\Programs\\lords-command\\backup-20261031-0900-1\\";
         assert!(said.contains(backup), "{backup} in {said}");
         // Fix check r2 N4: the dry run says who may change the install path, as the probe found it.
-        let path = "X:\\fixture-home\\AppData\\Local\\Programs\\lords-command\\ and every dir above it up to X:\\fixture-home: plain dirs, no link among them, in which only this account, SYSTEM and Administrators may create, delete or change permissions";
+        let path = "X:\\fixture-home\\AppData\\Local\\Programs\\lords-command\\: no link on any dir from it up to the drive's root; X:\\fixture-home directly in the OS profiles directory; from it up to X:\\fixture-home, only this account, SYSTEM and Administrators may create, delete or change permissions";
         assert!(said.contains(path), "{path} in {said}");
     }
 
