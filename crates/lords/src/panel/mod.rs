@@ -72,9 +72,12 @@ const HERE: Duration = Duration::from_secs(20);
 /// (fix check r1 R2). `Open-Path` says why a dir and every dir above it up to the profile aren't closed to other
 /// accounts, or nothing: the first that lets an account other than this one, SYSTEM and Administrators (and the owner
 /// placeholders, CREATOR OWNER and OWNER RIGHTS) create, delete, delete what it holds, or change its permissions or
-/// owner, as an entry or as its owner (fix check r2 N4: the panel's threat model). Static: the literals are joined at
-/// compile time, and what changes per run (the deadline, the run's id, a file's name) comes in as arguments, each
-/// checked to be a plain word. No double quote and no `%` in any of it: cmd.exe, ssh's shell there, would read them.
+/// owner, as an entry or as its owner (fix check r2 N4: the panel's threat model); or the first that is a link (a
+/// junction, symlink or mount point: the dir behind it, and what may change it, the walk can't see), never followed
+/// (fix check r3 N5). A dir's attributes are read without following it, so a link to nothing counts too. Static: the
+/// literals are joined at compile time, and what changes per run (the deadline, the run's id, a file's name) comes in
+/// as arguments, each checked to be a plain word. No double quote and no `%` in any of it: cmd.exe, ssh's shell there,
+/// would read them.
 macro_rules! step {
     ($body:literal) => {
         concat!(
@@ -95,8 +98,11 @@ macro_rules! step {
             "([int64]$r.FileSystemRights -band 0x500D0046)) { return $r.IdentityReference.Value } } }; ",
             "function Open-Path($p) { $top = $env:USERPROFILE.TrimEnd('\\'); $p = $p.TrimEnd('\\'); ",
             "if (-not $p.StartsWith($top + '\\', [StringComparison]::OrdinalIgnoreCase)) { ",
-            "return ($p + ' is outside the user profile ' + $top) }; while ($true) { ",
-            "if (Test-Path -LiteralPath $p) { $who = Open-To $p; if ($who) { $n = $who; try { $n = (New-Object ",
+            "return ($p + ' is outside the user profile ' + $top) }; while ($true) { $at = $null; ",
+            "try { $at = [IO.File]::GetAttributes($p) } catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] {}; ",
+            "if ($null -ne $at) { if ($at -band [IO.FileAttributes]::ReparsePoint) { return ($p + ' is a link (a junction, ",
+            "symlink or mount point): the dir behind it is not checked') }; ",
+            "$who = Open-To $p; if ($who) { $n = $who; try { $n = (New-Object ",
             "Security.Principal.SecurityIdentifier($who)).Translate([Security.Principal.NTAccount]).Value + ' (' + ",
             "$who + ')' } catch {}; return ($p + ' lets ' + $n + ' create, delete or change permissions there') } }; ",
             "if ($p -ieq $top) { return }; $p = Split-Path -Parent $p } }; ",

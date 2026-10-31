@@ -30,8 +30,8 @@ pub struct Remote {
     pub running: u32,
     pub listening: u32,
     /// The app dir and every dir above it up to the profile, each one that lets an account other than this one,
-    /// SYSTEM and Administrators create, delete or change permissions there: why, one line each (fix check r2 N4).
-    /// Required: a probe that doesn't say is no answer.
+    /// SYSTEM and Administrators create, delete or change permissions there (fix check r2 N4), or that is a link (fix
+    /// check r3 N5): why, one line each. Required: a probe that doesn't say is no answer.
     pub open_to: Vec<String>,
 }
 
@@ -254,7 +254,7 @@ pub fn plan(name: &str, local: &Local, remote: &Remote) -> Result<Plan, String> 
     // administrator that may change the install path; an administrator gets past any file's access list anyway.
     if let Some(why) = remote.open_to.first() {
         return Err(format!(
-            "on {name}, {why}: only this account, SYSTEM and Administrators may (the panel's threat model); settle that there, then run panel add again"
+            "on {name}, {why}; the install path must be plain dirs up to the profile in which only this account, SYSTEM and Administrators may create, delete or change permissions (the panel's threat model); settle that there, then run panel add again"
         ));
     }
     let config = remote.ssh_config.clone().unwrap_or_default();
@@ -348,7 +348,7 @@ impl Plan {
         let mut out = vec![format!("{name}:")];
         // The plan refuses otherwise (fix check r2 N4); STAGE checks it again there.
         out.push(format!(
-            "  = {app}\\ and every dir above it up to {}: only this account, SYSTEM and Administrators may create, delete or change permissions (checked again before staging)",
+            "  = {app}\\ and every dir above it up to {}: plain dirs, no link among them, in which only this account, SYSTEM and Administrators may create, delete or change permissions (checked again before staging)",
             remote.home
         ));
         out.push(format!(
@@ -518,7 +518,7 @@ mod tests {
             "X:\\fixture-home\\AppData\\Local\\Programs\\lords-command\\backup-20261031-0900-1\\";
         assert!(said.contains(backup), "{backup} in {said}");
         // Fix check r2 N4: the dry run says who may change the install path, as the probe found it.
-        let path = "X:\\fixture-home\\AppData\\Local\\Programs\\lords-command\\ and every dir above it up to X:\\fixture-home: only this account, SYSTEM and Administrators may create, delete or change permissions";
+        let path = "X:\\fixture-home\\AppData\\Local\\Programs\\lords-command\\ and every dir above it up to X:\\fixture-home: plain dirs, no link among them, in which only this account, SYSTEM and Administrators may create, delete or change permissions";
         assert!(said.contains(path), "{path} in {said}");
     }
 
@@ -601,6 +601,13 @@ mod tests {
                 "BUILTIN\\Users (S-1-5-32-545)",
                 Box::new(|_, r| {
                     r.open_to = vec!["X:\\fixture-home\\AppData\\Local\\Programs lets BUILTIN\\Users (S-1-5-32-545) create, delete or change permissions there".into()]
+                }),
+            ),
+            // Fix check r3 N5: a link on the install path; what is behind it isn't checked, so it is refused.
+            (
+                "Programs is a link (a junction, symlink or mount point)",
+                Box::new(|_, r| {
+                    r.open_to = vec!["X:\\fixture-home\\AppData\\Local\\Programs is a link (a junction, symlink or mount point): the dir behind it is not checked".into()]
                 }),
             ),
         ];

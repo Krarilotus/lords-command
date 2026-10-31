@@ -207,6 +207,33 @@ fn an_install_path_another_account_may_change_is_named_and_refused() {
     assert!(!programs.join("lords-command").join("staging").exists(), "nothing made");
 }
 
+// Spec (fix check r3 N5, the Lords owner: a link among the install path's dirs hides the dir that really holds what is
+// below it, whose rights the walk never sees; it is refused, fail closed, without following it): with `Programs` a
+// junction (the review's case), the probe names that dir as a link, and STAGE refuses before it makes anything
+// behind it.
+#[test]
+fn an_install_path_through_a_link_is_named_and_refused() {
+    let home = profile();
+    let backing = home.path().join("backing");
+    std::fs::create_dir_all(backing.join("lords-command")).unwrap();
+    let link = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(home.path().join("Programs"))
+        .arg(&backing)
+        .output()
+        .unwrap();
+    assert!(link.status.success(), "{}", String::from_utf8_lossy(&link.stdout));
+    let (ok, said, _) = run(PROBE, 30, "none", home.path(), b"");
+    assert!(ok && said.contains("Programs is a link"), "{said}");
+    let (ok, said, _) = run(STAGE, 30, "staging", home.path(), b"");
+    assert!(!ok && said.contains("is a link"), "{said}");
+    assert_eq!(
+        std::fs::read_dir(backing.join("lords-command")).unwrap().count(),
+        0,
+        "nothing made behind it"
+    );
+}
+
 // Spec (review r1 R6: a step's arguments are data, never code): a run's id or a file's name that isn't a plain word
 // never reaches a command line.
 #[test]
