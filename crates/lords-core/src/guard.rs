@@ -853,50 +853,47 @@ pub fn child_parts(context: &str) -> Vec<String> {
         .collect()
 }
 
-/// How long a reader waits for a place whose `.lords` sync has moved aside to get its new one (`child_place`), and
-/// how often it looks.
-pub const CHILD_SWAP_WAIT: Duration = Duration::from_secs(2);
-const CHILD_SWAP_STEP: Duration = Duration::from_millis(20);
+/// How long a reader that passed a missing `.lords` waits for the apply lock (`child_text`): a running sync holds it
+/// until it is done; past that, the child gets nothing, with a note (a hook runs for at most a minute by default).
+pub const CHILD_LOCK_WAIT_SECS: u64 = 30;
 
 /// Hours after which an event's snapshot is stale: removed at any child start (`sweep_snapshots`).
 pub const CHILD_SNAPSHOT_HOURS: u64 = 1;
 
 /// The text of the child file the event's agent type takes in its place, or "" where there is none. The place is the
-/// nearest `.lords` at or above `cwd`, and the file is read with one open whose own answer says whether `.lords` was
-/// there (`fsguard::read_text_in`): sync never edits a child file in place (a whole `.lords` is renamed in), so a read
-/// is one generation, and "no file" is concluded only from a `.lords` that was there without it (repair 2 sol-loop
-/// r1, V1). A `.lords` sync has moved aside (between the two renames that publish the next one) is that place too: the
-/// reader waits for its new one, at most `CHILD_SWAP_WAIT`, and never walks on to an enclosing place meanwhile (fix
-/// check r1, FC1). It walks on only when, after a read found no `.lords`, no swap is under way and still none is there.
-fn child_text(ev: &Value, cwd: &Path) -> Result<String, String> {
-    use crate::fsguard::{InDir, Kind};
+/// nearest `.lords` at or above `cwd`; a file is read with one open whose own answer says whether `.lords` was there
+/// (`fsguard::read_text_in`): sync never edits a child file in place (a whole `.lords` is renamed in), so one read is
+/// one generation, and "no file" comes only from a `.lords` that was there without it (repair 2 sol-loop r1, V1).
+/// A `.lords` at `cwd` itself is decided at once. Past a missing one, which may be no place or a place between its two
+/// versions (fix check r1, FC1), the walk is decided under the apply lock, which every sync holds while it moves a
+/// `.lords` aside and puts the new one in: then no swap is under way, and an old `.lords` aside with no new one is a
+/// sync that stopped, so the child gets nothing rather than an enclosing place's start (repair 2 sol-loop r2, W1).
+fn child_text(ev: &Value, cwd: &Path, home: &Path) -> Result<String, String> {
+    use crate::fsguard::InDir;
     // Never the part beyond the place's file in place of a whole start (repair sol-loop r1, R4).
     let whole = ev["agent_type"].as_str().is_some_and(|t| NO_PLACE_FILE_AGENTS.contains(&t));
     let name = if whole { crate::sync::CHILD_WHOLE_FILE } else { crate::sync::CHILD_FILE };
+    let found = |r: InDir| match r {
+        InDir::Text(t) if t.contains(crate::compose::BEGIN) => Some(t),
+        InDir::Text(_) | InDir::NoFile => Some(String::new()),
+        InDir::NoDir => None,
+    };
+    let here = cwd.join(crate::sync::ROLE_DIR);
+    if let Some(t) = found(crate::fsguard::read_text_in(&here, name)?) {
+        return Ok(t);
+    }
+    let _lock = crate::sync::ApplyLock::take(home, CHILD_LOCK_WAIT_SECS)
+        .map_err(|e| format!("a sync is running, so the place can't be told ({e})"))?;
     for d in cwd.ancestors() {
         let dir = d.join(crate::sync::ROLE_DIR);
-        let until = std::time::Instant::now() + CHILD_SWAP_WAIT;
-        loop {
-            match crate::fsguard::read_text_in(&dir, name)? {
-                InDir::Text(t) if t.contains(crate::compose::BEGIN) => return Ok(t),
-                InDir::Text(_) | InDir::NoFile => return Ok(String::new()),
-                InDir::NoDir => {}
-            }
-            if !crate::fsguard::being_replaced(&dir)? {
-                // A swap may have ended since the read: read again; else no place here.
-                if crate::fsguard::kind(&dir)? == Kind::Dir {
-                    continue;
-                }
-                break;
-            }
-            if std::time::Instant::now() >= until {
-                return Err(format!(
-                    "{}: a sync is between two versions of it (its old one is aside) for more than {} s; sync again",
-                    dir.display(),
-                    CHILD_SWAP_WAIT.as_secs()
-                ));
-            }
-            std::thread::sleep(CHILD_SWAP_STEP);
+        if let Some(t) = found(crate::fsguard::read_text_in(&dir, name)?) {
+            return Ok(t);
+        }
+        if crate::fsguard::being_replaced(&dir)? {
+            return Err(format!(
+                "{}: its old version is aside with no new one, from a sync that stopped; sync again",
+                dir.display()
+            ));
         }
     }
     Ok(String::new())
@@ -920,7 +917,7 @@ fn child_snapshot(ev: &Value, cwd: &Path, home: &Path) -> Result<String, String>
     if let Some(t) = crate::fsguard::read_text(place.path())? {
         return Ok(t);
     }
-    let (text, failed) = match child_text(ev, cwd) {
+    let (text, failed) = match child_text(ev, cwd, home) {
         Ok(t) => (t, None),
         Err(e) => (String::new(), Some(e)),
     };
@@ -966,7 +963,7 @@ pub fn child_hook(input: &str, part: Option<usize>, home: &Path) -> Answer {
     }
     let Some(cwd) = ev["cwd"].as_str() else { return noted("the event names no cwd") };
     let text = match part {
-        None => child_text(&ev, Path::new(cwd)),
+        None => child_text(&ev, Path::new(cwd), home),
         Some(_) => {
             let text = child_snapshot(&ev, Path::new(cwd), home);
             sweep_snapshots(home);

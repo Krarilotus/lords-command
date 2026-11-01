@@ -318,7 +318,11 @@ fn a_child_never_falls_through_to_an_enclosing_place_mid_publication() {
     );
     assert!(o.stdout.is_empty(), "nothing, never OUTER: {o:?}");
     assert!(String::from_utf8_lossy(&o.stderr).contains("sync"), "the note says why: {o:?}");
-    // The new `.lords` comes in while the child waits: it gets that.
+    // The new `.lords` comes in while the child waits, as sync puts it in: under the apply lock, `<tool home>/apply.lock`
+    // (repair 2 sol-loop r2, W1: a reader that passed a missing `.lords` decides under that lock). It gets that.
+    let lock = home.join(".lords-command/apply.lock");
+    fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    fs::write(&lock, "pid 1\n").unwrap();
     let mut c = Command::new(env!("CARGO_BIN_EXE_lords"))
         .current_dir(&inner)
         .env("HOME", &home)
@@ -331,7 +335,11 @@ fn a_child_never_falls_through_to_an_enclosing_place_mid_publication() {
         .unwrap();
     c.stdin.take().unwrap().write_all(start(&inner, "Explore", "s1", "waits").as_bytes()).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(300));
-    fs::rename(&aside, inner.join(".lords")).unwrap();
+    // W1's witness: between two swaps the aside is gone and no `.lords` is there yet; the child mustn't walk on.
+    fs::rename(&aside, d.path().join("held-by-sync")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    fs::rename(d.path().join("held-by-sync"), inner.join(".lords")).unwrap();
+    fs::remove_file(&lock).unwrap();
     let got = context(&c.wait_with_output().unwrap()).unwrap_or_default();
     assert!(got.contains("INNER START.") && !got.contains("OUTER"), "{got}");
     let no_id = start(&inner, "Explore", "s1", "x").replace("\"agent_id\":\"x\",", "");
