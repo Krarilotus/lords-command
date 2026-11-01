@@ -1069,10 +1069,12 @@ pub fn role_hook(input: &str, env: &RoleEnv) -> Answer {
         Some(Ok(r)) => read_role(r),
         _ => Ok(None),
     };
-    let given = match given {
-        Ok(g) => g,
-        Err(e) => return noted(format!("the session's role record can't be read ({e})")),
-    };
+    // A record that can't be read is none: the start is given again rather than not at all (sol-loop r1 S3, C2).
+    let mut unread = None;
+    let given = given.unwrap_or_else(|e| {
+        unread = Some(format!("the session's role record can't be read ({e})"));
+        None
+    });
     let (role, lines) = match &launch {
         // A session given a role, or told it has none, hears nothing more until a prompt names another.
         None if given.is_some() => return quiet(),
@@ -1116,6 +1118,10 @@ pub fn role_hook(input: &str, env: &RoleEnv) -> Answer {
             sweep_dir(&env.home, "role");
             saved
         }
+    };
+    let note = match (unread, note) {
+        (Some(u), Some(n)) => Some(format!("{u}; {n}")),
+        (u, n) => u.or(n),
     };
     context_answer(&lines, note)
 }

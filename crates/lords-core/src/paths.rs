@@ -1,7 +1,8 @@
 //! `lords paths`: which T3-delegated agent paths start with every core line of their role (F10; design §5.2 L1: "a path
 //! that can't is marked incomplete and isn't used for work those rules govern"; design note
 //! Harness/notes/2026-11-02-lords-role-at-launch.md, C3, D7). One row per settings target whose harness runs the role
-//! guard, and per role. A reading that can't be made is a row marked incomplete, never complete.
+//! guard, and per role, from the starts installed in each declared checkout and workspace. A reading that can't be made
+//! is a row marked incomplete, never complete.
 
 use crate::adapters::{self, Adapter};
 use crate::stack::Stacks;
@@ -50,7 +51,7 @@ pub fn paths(stacks: &Stacks, ask: &Ask) -> Vec<Row> {
             Err(why) => row(false, path, why),
         });
     }
-    rows.extend(role_rows(stacks, &ask.home));
+    rows.extend(role_rows(stacks));
     rows
 }
 
@@ -127,36 +128,45 @@ fn find_codex() -> Option<PathBuf> {
     })
 }
 
-/// Per role but `product`: one row per place whose start for it is past what one hook gives, or one complete row.
-fn role_rows(stacks: &Stacks, home: &Path) -> Vec<Row> {
+/// Per role but `product`: one row per declared checkout or workspace dir whose installed start for it the guard can't
+/// give (missing, unreadable, or past what one hook gives; sol-loop r1 S1: what is delivered, not what would be
+/// composed), or one complete row.
+fn role_rows(stacks: &Stacks) -> Vec<Row> {
+    use crate::fsguard::InDir;
     let Some(private) = &stacks.private else { return Vec::new() };
-    let places: Vec<(String, &String)> = private
-        .manifest
-        .repos
-        .keys()
-        .map(|n| (format!("repo {n}"), n))
-        .chain(private.manifest.workspaces.keys().map(|n| (format!("workspace {n}"), n)))
-        .collect();
+    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+    for (name, repo) in &private.manifest.repos {
+        let label = |c: &String| (format!("repo {name} ({c})"), crate::config::expand_home(c));
+        dirs.extend(repo.checkouts.iter().map(label));
+    }
+    for (name, w) in &private.manifest.workspaces {
+        dirs.push((format!("workspace {name}"), crate::config::expand_home(&w.path)));
+    }
     let max = sync::CHILD_START_CHARS;
     let mut rows = Vec::new();
     for role in sync::declared_roles(stacks).iter().filter(|r| *r != crate::compose::PRODUCT_ROLE) {
-        let long: Vec<Row> = places
+        let file = sync::start_file(role);
+        let long: Vec<Row> = dirs
             .iter()
-            .filter_map(|(label, name)| {
-                let layers = sync::place_layers(stacks, name, true);
-                let start = crate::compose::ChildStart::Launched;
-                let text = sync::child_composed(stacks, layers, role, home, start).text;
-                let n = crate::guard::child_context(&text).chars().count();
-                (n > max).then(|| row(false, format!("T3-delegated as {role}, {label}"), format!(
-                    "its start is {n} characters, past the {max} one hook gives: such a session is told to read role-{role}.md instead"
-                )))
+            .filter_map(|(label, dir)| {
+                let why = match crate::fsguard::read_text_in(&dir.join(sync::ROLE_DIR), &file) {
+                    Ok(InDir::Text(t)) if t.contains(crate::compose::BEGIN) => {
+                        let n = crate::guard::child_context(&t).chars().count();
+                        (n > max).then(|| format!(
+                            "its start is {n} characters, past the {max} one hook gives: such a session is told to read role-{role}.md instead"
+                        ))?
+                    }
+                    Ok(_) => format!("no {file} there: sync the place"),
+                    Err(e) => format!("{file} can't be read ({e})"),
+                };
+                Some(row(false, format!("T3-delegated as {role}, {label}"), why))
             })
             .collect();
         if long.is_empty() {
             rows.push(row(
                 true,
                 format!("T3-delegated as {role}"),
-                format!("every place's start fits one hook ({max} characters)"),
+                format!("every place has its start, within one hook ({max} characters)"),
             ));
         }
         rows.extend(long);

@@ -109,6 +109,9 @@ fn the_role_guard_gives_the_named_roles_start_once_a_session() {
     assert!(both.contains("CODER START.") && !both.contains("REVIEWER START."), "{both}");
     assert_eq!(both.lines().count(), 2, "the start and one line: {both}");
     assert!(both.contains("reviewer"), "names T3's role it overrules: {both}");
+    // Sol-loop r1 S3: a record that can't be read (here a dir where the file goes) is no reason to give nothing.
+    fs::create_dir_all(p.tool_home().join("guard/role/s6")).unwrap();
+    assert_eq!(p.ask("s6", "Role: reviewer\n").as_deref(), Some("REVIEWER START."));
     for input in [
         serde_json::json!({"hook_event_name": "SessionStart", "session_id": "s5", "cwd": p.cwd(),
             "prompt": "Role: reviewer"})
@@ -210,9 +213,12 @@ fn stacks(d: &Path, claude_guards: &str, codex_guards: &str) -> [String; 4] {
         format!("name = \"priv\"\nvisibility = \"private\"\nroles = [\"orchestrator\", \"coder\", \"reviewer\", \"product\"]\n[repos.beta-core]\ncheckouts = ['{checkout}']\nworktrees = false\ndefault_role = \"coder\"\n[[targets]]\nname = \"balanced settings\"\nadapter = \"claude\"\nkind = \"settings\"\npath = \"~/.claude-balanced/settings.json\"\nguards = {claude_guards}\n[[targets]]\nname = \"codex hooks\"\nadapter = \"codex\"\nkind = \"settings\"\npath = \"~/.codex/hooks.json\"\nguards = {codex_guards}\n"),
     )
     .unwrap();
-    git(d, &private, &["init", "-q"]);
-    git(d, &private, &["add", "-A"]);
-    git(d, &private, &["commit", "-q", "-m", "start"]);
+    fs::write(d.join("checkout/README.md"), "a repo\n").unwrap();
+    for repo in [&private, &d.join("checkout")] {
+        git(d, repo, &["init", "-q"]);
+        git(d, repo, &["add", "-A"]);
+        git(d, repo, &["commit", "-q", "-m", "start"]);
+    }
     [
         "--public-stack".into(),
         public.display().to_string(),
@@ -256,6 +262,13 @@ fn sync_registers_the_role_guard_on_user_prompt_submit() {
     let stacks = stacks(d, "[\"role\"]", "[\"role\"]");
     let stacks: Vec<&str> = stacks.iter().map(String::as_str).collect();
     assert!(lords(d, &["guard", "install"], &[]).status.success());
+    // An earlier build's child hook, in the quoted-path form: still Lords' own, so sync takes it out (not wanted here).
+    let copy =
+        d.join("home/.lords-command/bin/lords-guard.exe").display().to_string().replace('\\', "/");
+    let tool_home = d.join("home/.lords-command").display().to_string().replace('\\', "/");
+    let old = format!("\"{copy}\" guard child --home \"{tool_home}\"");
+    let old = serde_json::json!({"hooks": {"SubagentStart": [{"hooks": [{"type": "command", "command": old}]}]}});
+    fs::write(d.join("home/.codex/hooks.json"), old.to_string()).unwrap();
     let o = lords(d, &[&["sync", "--user"][..], &stacks].concat(), &[]);
     assert_eq!(
         said(&o).matches("Lords hook added: the role guard (UserPromptSubmit)").count(),
@@ -269,16 +282,32 @@ fn sync_registers_the_role_guard_on_user_prompt_submit() {
     let read = |rel: &str| -> serde_json::Value {
         serde_json::from_str(&fs::read_to_string(d.join(rel)).unwrap()).unwrap()
     };
-    let copy =
-        d.join("home/.lords-command/bin/lords-guard.exe").display().to_string().replace('\\', "/");
-    let tool_home = d.join("home/.lords-command").display().to_string().replace('\\', "/");
     let hook = serde_json::json!({"type": "command", "command": copy, "args": ["guard", "role", "--home", tool_home], "timeout": 30});
     let v = read("home/.claude-balanced/settings.json");
     assert_eq!(v["hooks"]["UserPromptSubmit"], serde_json::json!([{"hooks": [hook]}]), "{v}");
-    let line = format!("\"{copy}\" guard role --home \"{tool_home}\"");
+    // On Windows Codex runs a hook's command with PowerShell (design note H9): PowerShell's call, literal paths.
+    let line = if cfg!(windows) {
+        format!("& '{copy}' guard role --home '{tool_home}'")
+    } else {
+        format!("\"{copy}\" guard role --home \"{tool_home}\"")
+    };
     let lords_hook = serde_json::json!({"type": "command", "command": line, "timeout": 30, "additionalContextLimit": 0});
     let v = read("home/.codex/hooks.json");
     assert_eq!(v["hooks"]["UserPromptSubmit"], serde_json::json!([{"hooks": [lords_hook]}]), "{v}");
+    assert!(v["hooks"]["SubagentStart"].as_array().is_none_or(Vec::is_empty), "{v}");
+    // Run as Codex runs it there, the line reaches the guard with its event (H8: the quoted-path form never did).
+    if cfg!(windows) {
+        let mut ps = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &line])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        ps.stdin.take().unwrap().write_all(br#"{"hook_event_name":"LordsGuardProbe"}"#).unwrap();
+        let o = ps.wait_with_output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "lords guard role 1", "{o:?}");
+    }
     let before = (read("home/.claude-balanced/settings.json"), read("home/.codex/hooks.json"));
     fs::copy(
         env!("CARGO_BIN_EXE_lords-old-guard-stub"),
@@ -326,7 +355,8 @@ fn row<'a>(rows: &'a [(String, String, String)], path: &str) -> &'a (String, Str
 // reading fails closed): `lords paths` rows each T3-delegated path complete or incomplete with its reason, exit 0 only
 // when all are complete: Claude's when its settings register the role guard; Codex's when they do and Codex's
 // `hooks/list` reports Lords' exact role command `trusted` (not when `untrusted`, nor when Codex can't be asked); and per
-// role, a start past one hook in a place is incomplete for that role there.
+// role, from the starts installed in each checkout (sol-loop r1 S1): one not there yet, or past one hook, is incomplete
+// for that role there.
 #[test]
 fn paths_marks_each_t3_delegated_path_complete_or_incomplete() {
     let d = TempDir::new().unwrap();
@@ -340,9 +370,10 @@ fn paths_marks_each_t3_delegated_path_complete_or_incomplete() {
     assert_eq!(row(&rows, "claude").0, "incomplete", "not registered yet: {rows:?}");
     assert!(row(&rows, "claude").2.contains("sync"), "{rows:?}");
     assert_eq!(row(&rows, "codex").0, "incomplete", "{rows:?}");
-    assert!(lords(d, &[&["sync", "--user", "--apply"][..], &stacks].concat(), &[])
-        .status
-        .success());
+    let coder = row(&rows, "coder");
+    assert!(coder.0 == "incomplete" && coder.2.contains("start-coder.md"), "not synced: {rows:?}");
+    let sync = || lords(d, &[&["sync", "--apply"][..], &stacks].concat(), &[]);
+    assert!(sync().status.success());
     let (code, rows) = paths(d, &stacks, stub, "trusted");
     assert_eq!(code, Some(0), "{rows:?}");
     assert!(rows.iter().all(|r| r.0 == "complete"), "{rows:?}");
@@ -373,10 +404,15 @@ fn paths_marks_each_t3_delegated_path_complete_or_incomplete() {
     fs::write(d.join("priv/repo/beta-core/rules/long.md"), rule).unwrap();
     git(d, &d.join("priv"), &["add", "-A"]);
     git(d, &d.join("priv"), &["commit", "-q", "-m", "a long reviewer rule"]);
+    assert!(sync().status.success());
     let (code, rows) = paths(d, &stacks, stub, "trusted");
     assert_eq!(code, Some(1), "{rows:?}");
     let reviewer = row(&rows, "reviewer");
     assert_eq!(reviewer.0, "incomplete", "{rows:?}");
     assert!(reviewer.1.contains("beta-core") && reviewer.2.contains("9500"), "{rows:?}");
     assert_eq!(row(&rows, "coder").0, "complete", "{rows:?}");
+    fs::remove_file(d.join("checkout/.lords/start-coder.md")).unwrap();
+    let (_, rows) = paths(d, &stacks, stub, "trusted");
+    let coder = row(&rows, "coder");
+    assert!(coder.0 == "incomplete" && coder.2.contains("start-coder.md"), "gone: {rows:?}");
 }

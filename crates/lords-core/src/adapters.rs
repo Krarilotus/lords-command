@@ -177,22 +177,34 @@ impl Adapter for Codex {
         &["child", "role"]
     }
 
-    /// A command line, and the whole context passed on (`additionalContextLimit` 0): no parts.
+    /// A command line, and the whole context passed on (`additionalContextLimit` 0): no parts. On Windows Codex runs it
+    /// with PowerShell, where a line starting with a quoted path is no command (design note 2026-11-02-lords-role-at-
+    /// launch, H8, H9): there it is PowerShell's call, `& 'exe' …`, each path a literal string.
     fn guard_hooks(&self, exe: &str, guard: &str, home: &str) -> Vec<serde_json::Value> {
+        let line = if cfg!(windows) {
+            let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
+            format!("& {} guard {guard} --home {}", lit(exe), lit(home))
+        } else {
+            format!("\"{exe}\" guard {guard} --home \"{home}\"")
+        };
         vec![serde_json::json!({
             "type": "command",
-            "command": format!("\"{exe}\" guard {guard} --home \"{home}\""),
+            "command": line,
             "timeout": crate::guard::CHILD_HOOK_TIMEOUT_SECS,
             "additionalContextLimit": 0,
         })]
     }
 
-    /// The guard's name: the word after `guard` (its options follow).
+    /// The guard's name: the word after `guard` (its options follow), in either form `guard_hooks` writes or wrote
+    /// (an earlier build's `"exe" guard …` too, so sync replaces it).
     fn guard_of(&self, hook: &serde_json::Value, exe: &str) -> Option<String> {
         let line = hook["command"].as_str()?.replace('\\', "/");
-        let prefix = format!("\"{exe}\" guard ");
-        let at = line.get(..prefix.len()).filter(|p| p.eq_ignore_ascii_case(&prefix))?;
-        Some(line[at.len()..].split_whitespace().next().unwrap_or("").to_string())
+        let quoted =
+            [format!("\"{exe}\" guard "), format!("& '{}' guard ", exe.replace('\'', "''"))];
+        let prefix = quoted
+            .iter()
+            .find(|p| line.get(..p.len()).is_some_and(|head| head.eq_ignore_ascii_case(p)))?;
+        Some(line[prefix.len()..].split_whitespace().next().unwrap_or("").to_string())
     }
 
     fn guard_note(&self) -> Option<&'static str> {

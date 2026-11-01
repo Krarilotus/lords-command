@@ -384,7 +384,13 @@ fn sync_registers_the_child_guard_on_subagent_start() {
     let v = read(&settings);
     assert_eq!(v["hooks"]["SubagentStart"], serde_json::json!([theirs, {"hooks": [hook]}]), "{v}");
     let v = read(&codex);
-    let line = format!("\"{copy}\" guard child --home \"{tool_home}\"");
+    // On Windows Codex runs a hook's command with PowerShell, where a line starting with a quoted path is no command
+    // (F10 design note 2026-11-02-lords-role-at-launch, H8, H9): PowerShell's call, literal paths.
+    let line = if cfg!(windows) {
+        format!("& '{copy}' guard child --home '{tool_home}'")
+    } else {
+        format!("\"{copy}\" guard child --home \"{tool_home}\"")
+    };
     let lords = serde_json::json!({"type": "command", "command": line, "timeout": 30, "additionalContextLimit": 0});
     assert_eq!(v, serde_json::json!({"hooks": {"SubagentStart": [{"hooks": [lords]}]}}), "{v}");
     fs::write(private.join("stack.toml"), manifest("[\"child\", \"rm\"]")).unwrap();

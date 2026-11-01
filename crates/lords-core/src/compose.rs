@@ -268,9 +268,12 @@ fn child_intro(role: &str, start: ChildStart) -> String {
         ChildStart::Whole => {
             format!("You start as a {role} here, a native subagent: this is your role's whole start.")
         }
-        ChildStart::Launched => format!(
-            "You start as a {role} here, the role named at launch. Besides the place's file you read, these bind you; its lines marked for other roles don't. Your role's whole start file is `role-{role}.md` in the place's `.lords` dir."
-        ),
+        ChildStart::Launched => {
+            let a = if role.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
+            format!(
+                "You start as {a} {role} here, the role named at launch. Besides the place's file you read, these bind you; its lines marked for other roles don't. Your role's whole start file is `role-{role}.md` in the place's `.lords` dir."
+            )
+        }
     }
 }
 
