@@ -8,7 +8,8 @@
 //! no `Origin`, `Referer` or `Sec-Fetch-*` header (every current browser sends one of them), and a POST only as
 //! `application/json` (which a page can't send to another site without a preflight, and the preflight's OPTIONS is
 //! refused). Each limit is checked before what it limits is read, and a request has one deadline from its accept to its
-//! last byte, however it trickles (review r1 R5).
+//! last byte, however it trickles (review r1 R5). The server answers one path itself, `/proof`: proof that it holds the
+//! token, for a nonce its client chose (embedded panel review r1 R1).
 
 use serde::Serialize;
 use std::io::{Read, Write};
@@ -78,6 +79,46 @@ impl Token {
         bool::from(self.0.as_bytes().ct_eq(other.as_bytes()))
     }
 }
+/// Where the server proves it holds its token (embedded panel review r1 R1: `lords panel add`'s route check believes
+/// only an answer nobody without the token can give): `GET /proof?nonce=<32 to 128 hex digits>`, token-checked as every
+/// request, answers `{"proof": proof(token, nonce)}`.
+pub const PROOF_PATH: &str = "/proof";
+
+/// HMAC-SHA256 (RFC 2104) of `message` under `key`, in lower-case hex.
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let pad = |with: u8| k.iter().map(|b| b ^ with).collect::<Vec<u8>>();
+    let inner = Sha256::new().chain_update(pad(0x36)).chain_update(message).finalize();
+    let outer = Sha256::new().chain_update(pad(0x5c)).chain_update(inner).finalize();
+    outer.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The server's proof that it holds `token`, for the client's `nonce`.
+pub fn proof(token: &Token, nonce: &str) -> String {
+    hmac_sha256(token.0.as_bytes(), format!("lords-panel proof {nonce}").as_bytes())
+}
+
+/// The answer at `PROOF_PATH`, to a request that carried the token.
+fn prove(token: &Token, request: &Request) -> Reply {
+    match request.param("nonce") {
+        Some(n)
+            if request.method == "GET"
+                && (32..=128).contains(&n.len())
+                && n.bytes().all(|b| b.is_ascii_hexdigit()) =>
+        {
+            Reply::json(&serde_json::json!({ "proof": proof(token, n) }))
+        }
+        _ => Reply::error(400, "a proof needs a nonce of 32 to 128 hex digits"),
+    }
+}
+
 /// Headers only a browser sends.
 const BROWSER_HEADERS: [&str; 6] =
     ["origin", "referer", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "sec-fetch-user"];
@@ -166,6 +207,7 @@ pub fn serve(
         std::thread::spawn(move || {
             let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
             let reply = match read_request(&mut stream, until, &token) {
+                Ok(request) if request.path == PROOF_PATH => prove(&token, &request),
                 Ok(request) => handle(&request),
                 Err(refused) => refused,
             };

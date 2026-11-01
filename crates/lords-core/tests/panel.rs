@@ -541,3 +541,56 @@ fn request_fields_never_steer_git() {
     assert!(matches!(s.remote.compose("nope", None), Err(Failure::Refused(_))));
     assert!(matches!(s.remote.compose("claude", Some("not-declared")), Err(Failure::Refused(_))));
 }
+
+// Spec (embedded panel review r1 R1, the Lords owner: `panel add`'s route check passes only on an answer that proves
+// it came from this PC's panel server; at the transport boundary, the server proves it holds its token): HMAC-SHA256
+// is RFC 2104's (RFC 4231's vectors, one with a key longer than a block); `GET /proof?nonce=` answers
+// HMAC-SHA256(token, "lords-panel proof " + nonce) for the nonce the client chose, which a server with another token
+// can't; without the token, 401 and nothing else, as every request; a nonce that isn't 32 to 128 hex digits, 400.
+#[test]
+fn the_server_proves_it_holds_its_token_for_a_nonce_the_client_chose() {
+    let vectors: [(&[u8], &[u8], &str); 3] = [
+        (
+            &[0x0b; 20],
+            b"Hi There",
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+        ),
+        (
+            b"Jefe",
+            b"what do ya want for nothing?",
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+        ),
+        (
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+        ),
+    ];
+    for (key, message, mac) in vectors {
+        assert_eq!(http::hmac_sha256(key, message), mac);
+    }
+    let s = served();
+    let nonce = "0f1e2d3c4b5a6978".repeat(2);
+    let ask = |nonce: &str, token: &str| {
+        let head = format!("GET /proof?nonce={nonce} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n", s.port);
+        raw(s.port, format!("{head}{token}\r\n").as_bytes())
+    };
+    let (status, text) = ask(&nonce, &with_token());
+    assert_eq!(status, 200, "{text}");
+    let body: serde_json::Value =
+        serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let mac = http::hmac_sha256(
+        token().secret().as_bytes(),
+        format!("lords-panel proof {nonce}").as_bytes(),
+    );
+    assert_eq!(body, serde_json::json!({ "proof": mac }));
+    assert_eq!(http::proof(&token(), &nonce), mac);
+    let other = Token::new(&"fedcba9876543210".repeat(2)).unwrap();
+    assert_ne!(http::proof(&other, &nonce), mac, "another token, another proof");
+    let (status, text) = ask(&nonce, "");
+    assert_eq!(status, 401, "{text}");
+    assert!(!text.contains(&mac), "{text}");
+    for bad in ["", "0f", &"0f".repeat(65), &"zz".repeat(16)] {
+        assert_eq!(ask(bad, &with_token()).0, 400, "{bad:?}");
+    }
+}

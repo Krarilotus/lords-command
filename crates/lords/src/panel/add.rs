@@ -33,6 +33,9 @@ pub struct Remote {
     /// SYSTEM and Administrators create, delete or change permissions there (fix check r2 N4), or that is a link (fix
     /// check r3 N5): why, one line each. Required: a probe that doesn't say is no answer.
     pub open_to: Vec<String>,
+    /// What is in the app dir's `staging\`: earlier runs' staging dirs, left behind (this PC runs one `panel add` at a
+    /// time, so none is a run still going). Required, as `open_to`.
+    pub earlier: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -71,6 +74,9 @@ pub enum Client {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub client: Client,
+    /// Earlier runs' staging dirs there: each run's install undone from its journal unless it finished or was undone,
+    /// then the dir removed, before this run changes anything (E12 R2).
+    pub earlier: Vec<String>,
     /// The panel's alias on the other PC, and the alias it copies.
     pub alias: String,
     pub base: String,
@@ -301,14 +307,26 @@ pub fn plan(name: &str, local: &Local, remote: &Remote, client: Client) -> Resul
                 forwards(b)
             ))
         }
-        None if remote.listening > 0 => {
-            return Err(format!("on {name}, 127.0.0.1:{LOCAL_PORT} is in use by something else"))
-        }
         None => Some(block),
     };
     // An embedded client's run replaces nothing a running window runs from.
     if remote.running > 0 && client == Client::Standalone {
         return Err(format!("lords-command runs on {name}; close it first (its exe is replaced)"));
+    }
+    // The route check needs the port for this run's own forward and believes no other listener there (embedded panel
+    // review r1 R1), so whatever holds it is refused before anything is written.
+    if remote.listening > 0 {
+        return Err(format!(
+            "on {name}, 127.0.0.1:{LOCAL_PORT} is in use (the panel's client there, overseer's Lords page or a window, or something else); the route check needs it for this run's own forward: close what holds it, then run again"
+        ));
+    }
+    // Earlier runs' staging dirs there, each undone and removed first (E12 R2); a name no run gives is its owner's.
+    for e in &remote.earlier {
+        if super::plain(e).is_err() {
+            return Err(format!(
+                "on {name}, staging\\{e} is no run's staging dir; settle it by hand, then run again"
+            ));
+        }
     }
     let comment = format!("lords-panel-{}", name.to_ascii_lowercase());
     let public = remote
@@ -336,6 +354,7 @@ pub fn plan(name: &str, local: &Local, remote: &Remote, client: Client) -> Resul
         .then(|| format!("api = http://127.0.0.1:{LOCAL_PORT}\r\ntunnel = {alias}\r\n"));
     Ok(Plan {
         client,
+        earlier: remote.earlier.clone(),
         base: base_name,
         alias,
         key,
@@ -363,6 +382,11 @@ impl Plan {
             "  = {app}\\: no link on any dir from it up to the drive's root; {home} directly in the OS profiles directory; from it up to {home}, only this account, SYSTEM and Administrators may create, delete or change permissions (checked again before staging)",
             home = remote.home
         ));
+        for e in &self.earlier {
+            out.push(format!(
+                "  ↶ {app}\\staging\\{e}\\: an earlier run's, left behind: its install undone from its journal unless it finished or was undone, then removed"
+            ));
+        }
         out.push(format!(
             "  + {app}\\staging\\{run}\\ (this run's own: what it sends, removed at its end)"
         ));
@@ -552,7 +576,6 @@ mod tests {
         r.keys = vec![PublicKey { name: "lords_panel_main.pub".into(), text: PUB.into() }];
         r.app = true;
         r.config_txt = Some("api = http://127.0.0.1:17879\r\n".into());
-        r.listening = 1;
         let mut l = local();
         l.sshd_config = SSHD.replace("8317", "8317 127.0.0.1:7879");
         l.authorized_keys.push_str(&authorized_line(PUB, "lords-panel-other").unwrap());
@@ -594,6 +617,7 @@ mod tests {
         );
         let on_our_port =
             format!("{BASE}Host something\r\n    LocalForward 127.0.0.1:17879 127.0.0.1:80\r\n");
+        let ours = format!("{BASE}\r\nHost lords-panel-main\r\n    HostName 127.0.0.1\r\n    Port 22220\r\n    User owner\r\n    IdentityFile ~/.ssh/lords_panel_main\r\n    IdentitiesOnly yes\r\n    UserKnownHostsFile ~/.ssh/bridge-known-hosts\r\n    LocalForward 127.0.0.1:17879 127.0.0.1:7879\r\n");
         type Change = Box<dyn Fn(&mut Local, &mut Remote)>;
         let cases: Vec<(&str, Change)> = vec![
             ("says otherwise", Box::new(move |_, r| r.ssh_config = Some(other_forward.clone()))),
@@ -605,7 +629,13 @@ mod tests {
             ("no OpenSSH client", Box::new(|_, r| r.ssh = false)),
             ("no bridge", Box::new(|_, r| r.ssh_config = None)),
             ("no bridge", Box::new(|_, r| r.ssh_config = Some(BASE.replace("7878", "7000")))),
-            ("in use by something else", Box::new(|_, r| r.listening = 1)),
+            ("127.0.0.1:17879 is in use", Box::new(|_, r| r.listening = 1)),
+            // Embedded panel review r1 R1: the route check needs the port for its own forward, so a client of the
+            // panel's alias holding it (overseer's Lords page, a window) is refused too, before anything is written.
+            (
+                "127.0.0.1:17879 is in use",
+                Box::new(move |_, r| (r.ssh_config, r.listening) = (Some(ours.clone()), 1)),
+            ),
             ("runs on Other", Box::new(|_, r| (r.app, r.running) = (true, 1))),
             ("no local forwards", Box::new(|l, _| l.sshd_config = SSHD.replace("local", "no"))),
             ("no PermitOpen", Box::new(|l, _| l.sshd_config = "Port 22223\r\n".into())),
@@ -707,5 +737,26 @@ mod tests {
         assert!(!said.join("\n").contains("backup-"), "{said:#?}");
         let refused = plan("Other", &local(), &r, Client::Standalone);
         assert!(refused.as_ref().is_err_and(|e| e.contains("runs on Other")), "{refused:?}");
+    }
+
+    // Spec (embedded panel review r1 R2, E12: an earlier run's staging dir left there, its install perhaps neither
+    // finished nor undone, is undone from its journal and removed before this run changes anything, and the dry run says
+    // so; a dir there whose name no run gives is refused, for its owner to settle): the plan carries each such run, in
+    // the order found, and the dry run names each, before this run's own staging dir.
+    #[test]
+    fn an_earlier_runs_staging_dir_is_named_and_undone_first() {
+        let mut r = remote();
+        r.earlier = vec!["2026-11-01-1793500796-63132".into(), "run-2".into()];
+        let p = plan("Other", &local(), &r, Client::Embedded).unwrap();
+        assert_eq!(p.earlier, r.earlier);
+        let said = p.describe("Other", &local(), &r, "20261101-0500-1");
+        let app = "X:\\fixture-home\\AppData\\Local\\Programs\\lords-command";
+        let first = format!("  ↶ {app}\\staging\\2026-11-01-1793500796-63132\\: an earlier run's, left behind: its install undone from its journal unless it finished or was undone, then removed");
+        let at = said.iter().position(|l| *l == first).unwrap_or_else(|| panic!("{said:#?}"));
+        let own = said.iter().position(|l| l.contains("staging\\20261101-0500-1\\")).unwrap();
+        assert!(at < own && said[at + 1].contains("staging\\run-2\\"), "{said:#?}");
+        r.earlier = vec!["not a run's".into()];
+        let refused = plan("Other", &local(), &r, Client::Embedded);
+        assert!(refused.as_ref().is_err_and(|e| e.contains("no run's")), "{refused:?}");
     }
 }

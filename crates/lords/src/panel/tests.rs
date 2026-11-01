@@ -19,29 +19,47 @@ fn run(
     home: &Path,
     stdin: &[u8],
 ) -> (bool, String, Duration) {
-    run_with(step, deadline, name, [home, home], home.parent(), None, stdin)
+    run_in(step, deadline, "run-1", name, home, &Instead::default(), stdin)
 }
 
-/// `run`, with `LOCALAPPDATA` and `USERPROFILE` as given, and the OS's profiles directory answered as `profiles`. The
-/// step reads it with `Get-ItemProperty` from HKLM; here a function of that name, which PowerShell finds before the
-/// cmdlet, answers instead (`-NoProfile` keeps any other out on the other PC). `None`: the registry answers.
-/// `ssh`: a dir whose `ssh.exe` the step runs instead of the OS's, and the step held after it starts each ssh until
-/// that ssh ends (a `Start-Process` function of the same kind), as if its powershell got no time meanwhile.
+/// What a test puts in place of what a step would call: PowerShell functions defined before the step, which
+/// PowerShell finds before the cmdlets of the same name (`-NoProfile` keeps any other out on the other PC), and the
+/// environment they read.
+#[derive(Default)]
+struct Instead {
+    functions: String,
+    env: Vec<(&'static str, String)>,
+}
+
+/// `run`, as the run `run`, with what the test puts `instead`.
+fn run_in(
+    step: &str,
+    deadline: u64,
+    run: &str,
+    name: &str,
+    home: &Path,
+    instead: &Instead,
+    stdin: &[u8],
+) -> (bool, String, Duration) {
+    run_with(step, deadline, run, name, [home, home], home.parent(), instead, stdin)
+}
+
+/// `run_in`, with `LOCALAPPDATA` and `USERPROFILE` as given, and the OS's profiles directory answered as `profiles`.
+/// The step reads it with `Get-ItemProperty` from HKLM; here a function of that name answers instead. `None`: the
+/// registry answers.
+#[allow(clippy::too_many_arguments)]
 fn run_with(
     step: &str,
     deadline: u64,
+    run: &str,
     name: &str,
     [local_app_data, profile]: [&Path; 2],
     profiles: Option<&Path>,
-    ssh: Option<&Path>,
+    instead: &Instead,
     stdin: &[u8],
 ) -> (bool, String, Duration) {
     let os = match profiles {
         Some(_) => "function Get-ItemProperty { [pscustomobject]@{ ProfilesDirectory = $env:TEST_PROFILES } }; ",
-        None => "",
-    };
-    let held = match ssh {
-        Some(_) => "function Start-Process { param($FilePath, $WindowStyle, [switch]$PassThru, $ArgumentList) $c = Microsoft.PowerShell.Management\\Start-Process -FilePath $FilePath -WindowStyle $WindowStyle -PassThru -ArgumentList $ArgumentList; if ($FilePath -eq 'ssh.exe') { $c.WaitForExit() }; $c }; ",
         None => "",
     };
     let start = Instant::now();
@@ -49,14 +67,13 @@ fn run_with(
     if let Some(dir) = profiles {
         command.env("TEST_PROFILES", dir);
     }
-    if let Some(dir) = ssh {
-        let path = std::env::var("PATH").unwrap_or_default();
-        command.env("PATH", format!("{};{path}", dir.display()));
+    for (name, value) in &instead.env {
+        command.env(name, value);
     }
     let mut child = command
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"])
-        .arg(format!("{os}{held}{step}"))
-        .args([deadline.to_string().as_str(), "run-1", name])
+        .arg(format!("{os}{}{step}", instead.functions))
+        .args([deadline.to_string().as_str(), run, name])
         .env("LOCALAPPDATA", local_app_data)
         .env("USERPROFILE", profile)
         // The Start menu's place: never the real one.
@@ -293,9 +310,27 @@ fn a_profile_reached_through_a_link_above_it_is_refused() {
     assert!(link.status.success(), "{}", String::from_utf8_lossy(&link.stdout));
     let owner = current.join("PanelOwner");
     let local = owner.join("AppData").join("Local");
-    let (ok, said, _) = run_with(PROBE, 30, "none", [&local, &owner], Some(&current), None, b"");
+    let (ok, said, _) = run_with(
+        PROBE,
+        30,
+        "run-1",
+        "none",
+        [&local, &owner],
+        Some(&current),
+        &Instead::default(),
+        b"",
+    );
     assert!(ok && said.contains("Current is a link"), "{said}");
-    let (ok, said, _) = run_with(STAGE, 30, "staging", [&local, &owner], Some(&current), None, b"");
+    let (ok, said, _) = run_with(
+        STAGE,
+        30,
+        "run-1",
+        "staging",
+        [&local, &owner],
+        Some(&current),
+        &Instead::default(),
+        b"",
+    );
     assert!(!ok && said.contains("is a link"), "{said}");
     let staging = app.iter().fold(real.clone(), |p, c| p.join(c)).join("staging");
     assert!(!staging.exists(), "nothing made behind it");
@@ -314,13 +349,31 @@ fn a_profile_outside_the_os_profiles_directory_is_refused() {
     std::fs::create_dir_all(&app).unwrap();
     let profiles = root.path().join("Users");
     std::fs::create_dir_all(&profiles).unwrap();
-    let (ok, said, _) = run_with(PROBE, 30, "none", [&local, &owner], Some(&profiles), None, b"");
+    let (ok, said, _) = run_with(
+        PROBE,
+        30,
+        "run-1",
+        "none",
+        [&local, &owner],
+        Some(&profiles),
+        &Instead::default(),
+        b"",
+    );
     assert!(ok && said.contains("not a profile in the OS profiles directory"), "{said}");
-    let (ok, said, _) =
-        run_with(STAGE, 30, "staging", [&local, &owner], Some(&profiles), None, b"");
+    let (ok, said, _) = run_with(
+        STAGE,
+        30,
+        "run-1",
+        "staging",
+        [&local, &owner],
+        Some(&profiles),
+        &Instead::default(),
+        b"",
+    );
     assert!(!ok && said.contains("not a profile in the OS profiles directory"), "{said}");
     assert!(!app.join("staging").exists(), "nothing made");
-    let (ok, said, _) = run_with(PROBE, 30, "none", [&local, &owner], None, None, b"");
+    let (ok, said, _) =
+        run_with(PROBE, 30, "run-1", "none", [&local, &owner], None, &Instead::default(), b"");
     let named =
         said.split("not a profile in the OS profiles directory ").nth(1).unwrap_or_default();
     let dir = named.split('"').next().unwrap_or_default().replace("\\\\", "\\");
@@ -350,6 +403,7 @@ const CONFIG_TXT: &str = "api = http://127.0.0.1:17879\r\ntunnel = lords-panel-m
 fn fixture_plan(client: Client, block: Option<&str>) -> Plan {
     Plan {
         client,
+        earlier: Vec::new(),
         alias: "lords-panel-main".into(),
         base: "fleet-panel-main".into(),
         key: "lords_panel_main".into(),
@@ -454,7 +508,8 @@ fn an_embedded_run_sends_only_what_its_client_reads() {
         (files.iter().map(|f| f.0).collect::<Vec<_>>(), params["embedded"].clone())
     };
     let (names, embedded) = sent(Client::Embedded);
-    assert_eq!(names, ["panel.json", "install.ps1", "check.ps1", "panel-token"]);
+    // E12 R2: undo.ps1 travels with every run, embedded and standalone.
+    assert_eq!(names, ["panel.json", "install.ps1", "undo.ps1", "check.ps1", "panel-token"]);
     assert_eq!(embedded, true);
     let refused = window_files(Client::Standalone, &exe).map(|_| ());
     assert!(
@@ -468,6 +523,7 @@ fn an_embedded_run_sends_only_what_its_client_reads() {
         [
             "panel.json",
             "install.ps1",
+            "undo.ps1",
             "check.ps1",
             "README.md",
             "LICENSE",
@@ -481,8 +537,9 @@ fn an_embedded_run_sends_only_what_its_client_reads() {
 // Spec (E2, E5.3 and E5.4, install.ps1 called directly: an embedded client's PC gets the alias, config.txt and the
 // token, owner-only, by the same steps as a standalone one, and no lords-command.exe, README.md, LICENSE, backup dir
 // or Start-menu entry, even were the window's files in the staging dir): on a PC with overseer's route and the
-// panel's key, the install backs ~/.ssh/config up and appends the alias, writes config.txt and places the token with
-// one entry, this account; then the app dir holds config.txt and the token alone, and the Start menu nothing.
+// panel's key, the install backs ~/.ssh/config up and appends the alias, places the token with one entry, this account,
+// then writes config.txt (E12 R2: config.txt last, so it never stands without its token); then the app dir holds
+// config.txt and the token alone, and the Start menu nothing.
 #[test]
 fn an_embedded_install_writes_only_what_its_client_reads() {
     let home = other_pc();
@@ -511,8 +568,8 @@ fn an_embedded_install_writes_only_what_its_client_reads() {
         [
             format!("backed up {}", ssh.join("config.before-lords-panel").display()),
             format!("added Host lords-panel-main to {}", ssh.join("config").display()),
-            format!("wrote {}", app.join("config.txt").display()),
             format!("placed {} (owner-only)", app.join("panel-token").display()),
+            format!("wrote {}", app.join("config.txt").display()),
         ]
     );
 }
@@ -619,14 +676,12 @@ fn a_standalone_install_still_installs_the_window_and_its_start_menu_entry() {
     assert_eq!(std::fs::read_to_string(app.join("config.txt")).unwrap(), "the owner's");
 }
 
-/// A stand-in for the panel's server behind a forward: on its own loopback port, `200` to a request carrying `token`
-/// in `Lords-Panel-Token`, `401` to any other; a connection that sends nothing (the check's look at the port) gets
-/// nothing. Serves until the test ends.
-fn forward_stand_in(token: &http::Token) -> u16 {
+/// An ordinary service on a loopback port of its own: `200` with `body` to any request, whatever it carries (a health
+/// endpoint). Serves until the test ends.
+fn answers_anything(body: &'static str) -> u16 {
     use std::io::Read;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let want = format!("lords-panel-token: {}", token.secret().to_ascii_lowercase());
     std::thread::spawn(move || {
         for mut c in listener.incoming().flatten() {
             let mut head = Vec::new();
@@ -637,38 +692,62 @@ fn forward_stand_in(token: &http::Token) -> u16 {
                     Ok(n) => head.extend_from_slice(&buf[..n]),
                 }
             }
-            if head.is_empty() {
-                continue;
-            }
-            let ok = String::from_utf8_lossy(&head).to_ascii_lowercase().contains(&want);
-            let status = if ok { "200 OK" } else { "401 Unauthorized" };
-            let answer =
-                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let answer = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
             let _ = c.write_all(answer.as_bytes());
         }
     });
     port
 }
 
-// Spec (check.ps1's invariant, sol-loop r1 S1: the route is checked through the forward on the panel's port; on a
-// re-run, a window or an embedded view of the same alias may hold that port already, and the check's own ssh then
-// fails its forward and ends; that is no failure of the route): with a forward that answers the token on the port,
-// and the check's ssh ended before the check first looks at the port (its powershell held until then), the check
-// passes through that forward; with nothing on the port, it fails, saying so.
+/// The panel's own server (`lords_core::http::serve`) with `token`, on a loopback port of its own; every request it
+/// takes gets `{}`.
+fn panel_server(token: &http::Token) -> u16 {
+    let listener = http::bind(0).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token = token.clone();
+    std::thread::spawn(move || {
+        http::serve(listener, http::Limits::default(), token, |_| {
+            http::Reply::json(&serde_json::json!({}))
+        })
+    });
+    port
+}
+
+/// A loopback port nothing listens on.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+/// The check's ssh, stood in for: `Start-Process ssh.exe …` starts a powershell running `$env:TEST_SSH` and gives that
+/// process, so what that "ssh" listens on is its own, as a real ssh's forward is.
+const SSH_STAND_IN: &str = "function Start-Process { param($FilePath, $WindowStyle, [switch]$PassThru, $ArgumentList) if ($FilePath -ne 'ssh.exe') { return Microsoft.PowerShell.Management\\Start-Process -FilePath $FilePath -WindowStyle $WindowStyle -PassThru -ArgumentList $ArgumentList }; Microsoft.PowerShell.Management\\Start-Process -FilePath powershell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-NonInteractive', '-Command', 'Invoke-Expression $env:TEST_SSH' }; ";
+
+/// A stood-in ssh whose forward works: it listens on 127.0.0.1:`port` and carries each connection to 127.0.0.1:`to`,
+/// until either side closes it.
+fn forwarding(port: u16, to: u16) -> String {
+    format!(
+        "$l = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, {port}); $l.Start(); while ($true) {{ $c = $l.AcceptTcpClient(); $u = [Net.Sockets.TcpClient]::new('127.0.0.1', {to}); $a = $c.GetStream(); $b = $u.GetStream(); [Threading.Tasks.Task[]]$both = @($a.CopyToAsync($b), $b.CopyToAsync($a)); [void][Threading.Tasks.Task]::WaitAny($both); $c.Close(); $u.Close() }}"
+    )
+}
+
+// Spec (embedded panel review r1 R1, the Lords owner: the route check passes only on an answer that proves it came
+// from this PC's panel server through this run's forward; any other responder on that port, an ssh that exited, or a
+// missing reading fails closed): check.ps1 itself, its ssh stood in for. Through the check's own forward to the
+// panel's server with the token: it passes. Through its own forward to an ordinary service answering 200 to anything,
+// or to a panel server with another token: it fails. Its ssh ended at once while an ordinary service holds the port
+// (the review's witness), or while nothing does: it fails. Its own forward to the panel's server, but the reading of
+// who listens on the port failing: it fails.
 #[test]
-fn the_route_check_goes_through_a_forward_already_on_its_port() {
+fn the_route_check_passes_only_on_the_panels_proof_through_its_own_forward() {
     let home = profile();
     let app = home.path().join("Programs").join("lords-command");
     std::fs::create_dir_all(&app).unwrap();
     let token = fixture_token('f');
     std::fs::write(app.join("panel-token"), token.secret()).unwrap();
-    // The check's ssh: one that ends at once, as one whose forward finds the port taken does.
-    let ssh = home.path().join("ssh-stand-in");
-    std::fs::create_dir_all(&ssh).unwrap();
-    let system = std::env::var("SystemRoot").unwrap();
-    std::fs::copy(Path::new(&system).join("System32").join("whoami.exe"), ssh.join("ssh.exe"))
-        .unwrap();
-    let check = |port: u16| {
+    let check = |port: u16, ssh: String, more: &str| {
         let (ok, said, _) = run(STAGE, 30, "staging", home.path(), b"");
         assert!(ok, "{said}");
         let params = serde_json::json!({ "alias": "lords-panel-main", "local_port": port });
@@ -678,15 +757,391 @@ fn the_route_check_goes_through_a_forward_already_on_its_port() {
             let (ok, said, _) = run(RECEIVE, 30, name, home.path(), &bytes);
             assert!(ok, "{name}: {said}");
         }
-        let h = home.path();
-        let (ok, said, _) = run_with(CHECK_STEP, 60, "check", [h, h], h.parent(), Some(&ssh), b"");
+        let instead =
+            Instead { functions: format!("{SSH_STAND_IN}{more}"), env: vec![("TEST_SSH", ssh)] };
+        let (ok, said, _) = run_in(CHECK_STEP, 60, "run-1", "check", home.path(), &instead, b"");
         let (cleaned, why, _) = run(CLEAN, 30, "staging", home.path(), b"");
         assert!(cleaned, "{why}");
         (ok, said)
     };
-    let (ok, said) = check(forward_stand_in(&token));
-    assert!(ok && said.contains("{\"ok\":true,\"status\":200}"), "{said}");
-    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let (ok, said) = check(free);
-    assert!(!ok && said.contains("didn't come up"), "{said}");
+    let server = panel_server(&token);
+    let port = free_port();
+    let (ok, said) = check(port, forwarding(port, server), "");
+    assert!(
+        ok && said.contains("\"ok\":true"),
+        "the panel's proof through its own forward: {said}"
+    );
+
+    let ordinary = answers_anything(r#"{"proof":"00"}"#);
+    let another = panel_server(&fixture_token('9'));
+    for (to, why) in [(ordinary, "without the panel's proof"), (another, "401")] {
+        let port = free_port();
+        let (ok, said) = check(port, forwarding(port, to), "");
+        assert!(!ok && said.contains(why), "{why}: {said}");
+    }
+    let held = answers_anything("{}");
+    let (ok, said) = check(held, "exit 255".into(), "");
+    let named = said.contains("ended") || said.contains("not this run's ssh");
+    assert!(!ok && named, "its ssh ended, another on the port: {said}");
+    let (ok, said) = check(free_port(), "exit 255".into(), "");
+    assert!(!ok && said.contains("ended"), "its ssh ended, nothing on the port: {said}");
+    let port = free_port();
+    let blind = "function Get-NetTCPConnection { throw 'no reading of the listeners here' }; ";
+    let (ok, said) = check(port, forwarding(port, server), blind);
+    assert!(!ok && said.contains("no reading of the listeners here"), "{said}");
+}
+
+/// Every file in `home`'s profile but the run's staging dir, by its path below `home`: its bytes; a shortcut only as
+/// being there (it names its own profile's paths).
+fn files_of(home: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(home: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let path = e.unwrap().path();
+            let rel = path.strip_prefix(home).unwrap().to_string_lossy().into_owned();
+            if rel.eq_ignore_ascii_case("Programs\\lords-command\\staging") {
+                continue;
+            }
+            if path.is_dir() {
+                walk(home, &path, out);
+            } else if rel.ends_with(".lnk") {
+                out.insert(rel, b"a shortcut".to_vec());
+            } else {
+                out.insert(rel, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(home, home, &mut out);
+    out
+}
+
+/// What differs between two `files_of`, for a failure's message.
+fn differs(
+    a: &std::collections::BTreeMap<String, Vec<u8>>,
+    b: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Vec<String> {
+    let keys: std::collections::BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+    keys.into_iter().filter(|k| a.get(*k) != b.get(*k)).cloned().collect()
+}
+
+/// ssh-keygen, stood in for: `Start-Process ssh-keygen.exe …` writes a stand-in key and its `.pub` (`$env:TEST_PUB`)
+/// where `-f` says, and ends with 0; anything else starts as it would.
+const KEYGEN_STAND_IN: &str = "function Start-Process { param($FilePath, [switch]$NoNewWindow, [switch]$PassThru, $ArgumentList, $WindowStyle) if ($FilePath -ne 'ssh-keygen.exe') { return Microsoft.PowerShell.Management\\Start-Process @PSBoundParameters }; $f = $ArgumentList[[array]::IndexOf($ArgumentList, '-f') + 1]; [IO.File]::WriteAllText($f, 'a stand-in key'); [IO.File]::WriteAllText($f + '.pub', $env:TEST_PUB); $ended = [pscustomobject]@{ ExitCode = 0 }; $ended | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {}; $ended }; ";
+
+/// The install's journal writer, stood in for: at its `$env:TEST_AT`th line, `kill` ends the step's whole process tree
+/// before the line is written (as its watchdog would), `written` writes the line and then does that (the change it
+/// names not made), and `error` fails there; `$env:TEST_FIRED` gets the line when it does. Every other line is
+/// written as it would be.
+const JOURNAL_STOPS: &str = "$global:lines = 0; function Add-Content { param($LiteralPath, $Value, $Encoding) $global:lines++; $at = $global:lines -eq [int]$env:TEST_AT; if ($at) { [IO.File]::WriteAllText($env:TEST_FIRED, [string]$Value) }; if ($at -and $env:TEST_HOW -eq 'kill') { taskkill /T /F /PID $PID | Out-Null; Start-Sleep -Seconds 30 }; if ($at -and $env:TEST_HOW -eq 'error') { throw 'an error injected here' }; Microsoft.PowerShell.Management\\Add-Content @PSBoundParameters; if ($at -and $env:TEST_HOW -eq 'written') { taskkill /T /F /PID $PID | Out-Null; Start-Sleep -Seconds 30 } }; ";
+
+/// A PC before a run (E12, R2's tests): its set-up, and the plan's client, alias block (`None`: there) and config.txt
+/// (`None`: there).
+struct Before {
+    client: Client,
+    block: Option<&'static str>,
+    config_txt: Option<&'static str>,
+    set_up: fn(&Path),
+}
+
+/// Overseer's route in `~/.ssh/config`, a profile's Start menu, and no key yet.
+fn fresh(home: &Path) {
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    std::fs::write(home.join(".ssh").join("config"), SSH_CONFIG).unwrap();
+    std::fs::create_dir_all(shortcut(home).parent().unwrap()).unwrap();
+}
+
+/// `fresh`, and a token left in the app dir without config.txt.
+fn token_alone(home: &Path) {
+    fresh(home);
+    let app = home.join("Programs").join("lords-command");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join("panel-token"), fixture_token('c').secret()).unwrap();
+}
+
+/// The standalone panel set up: key, alias, the window's files, config.txt, its token and Start-menu entry.
+fn standalone_there(home: &Path) {
+    fresh(home);
+    let ssh = home.join(".ssh");
+    std::fs::write(ssh.join("config"), format!("{SSH_CONFIG}{BLOCK}")).unwrap();
+    std::fs::write(ssh.join("lords_panel_main"), "the fixture's stand-in for the key").unwrap();
+    std::fs::write(ssh.join("lords_panel_main.pub"), PUBLIC).unwrap();
+    let app = home.join("Programs").join("lords-command");
+    std::fs::create_dir_all(&app).unwrap();
+    for (name, text) in [
+        ("lords-command.exe", "the installed window"),
+        ("README.md", "the installed README"),
+        ("LICENSE", "the installed LICENSE"),
+        (
+            "config.txt",
+            "api = http://127.0.0.1:17879\r\ntunnel = lords-panel-main\r\n# the owner's\r\n",
+        ),
+    ] {
+        std::fs::write(app.join(name), text).unwrap();
+    }
+    std::fs::write(app.join("panel-token"), fixture_token('c').secret()).unwrap();
+    std::fs::write(shortcut(home), "the installed shortcut").unwrap();
+}
+
+/// This run's staging dir for `before`, filled as STAGE and RECEIVE leave it, and the install run from it there,
+/// stopped at journal line `at` the way `how` says (`JOURNAL_STOPS`); `fired` gets that line. The install's status and
+/// what it said.
+fn install_from_staging(
+    home: &Path,
+    before: &Before,
+    stop: Option<(usize, &str, &Path)>,
+) -> (bool, String) {
+    let plan = Plan {
+        config_txt: before.config_txt.map(str::to_string),
+        ..fixture_plan(before.client, before.block)
+    };
+    let window = match before.client {
+        Client::Standalone => window_stand_ins(b"the window sent"),
+        Client::Embedded => Vec::new(),
+    };
+    let staging = home.join("Programs").join("lords-command").join("staging").join("run-1");
+    std::fs::create_dir_all(&staging).unwrap();
+    for (name, bytes, _) in payload(&plan, "run-1", window, &fixture_token('7')) {
+        std::fs::write(staging.join(name), bytes).unwrap();
+    }
+    let mut instead = Instead {
+        functions: KEYGEN_STAND_IN.to_string(),
+        env: vec![("TEST_PUB", PUBLIC.to_string())],
+    };
+    if let Some((at, how, fired)) = stop {
+        instead.functions.push_str(JOURNAL_STOPS);
+        instead.env.push(("TEST_AT", at.to_string()));
+        instead.env.push(("TEST_HOW", how.to_string()));
+        instead.env.push(("TEST_FIRED", fired.display().to_string()));
+    }
+    let (ok, said, _) = run_in(INSTALL_STEP, 60, "run-1", "install", home, &instead, b"");
+    (ok, said)
+}
+
+/// R2's matrix for one PC: the install stopped at each line of its journal, each way, then panel add's ROLLBACK step,
+/// then the staging dir removed (as CLEAN does): the PC's files byte for byte as before, or as a run nobody stopped
+/// leaves them (from the same start, in a profile of its own).
+fn stopped_at_every_line_it_is_as_it_was_or_complete(before: &Before) {
+    let reference = profile();
+    (before.set_up)(reference.path());
+    let start = files_of(reference.path());
+    let (ok, said) = install_from_staging(reference.path(), before, None);
+    assert!(ok, "a run nobody stops: {said}");
+    let complete = files_of(reference.path());
+    assert_ne!(complete, start);
+    let marks = tempfile::TempDir::new().unwrap();
+    for how in ["kill", "written", "error"] {
+        for at in 1.. {
+            let home = profile();
+            (before.set_up)(home.path());
+            let fired = marks.path().join(format!("{how}-{at}"));
+            let (ok, said) = install_from_staging(home.path(), before, Some((at, how, &fired)));
+            let Ok(line) = std::fs::read_to_string(&fired) else {
+                assert!(ok && at > 1, "{how}: the journal ends at line {}: {said}", at - 1);
+                assert_eq!(files_of(home.path()), complete, "{how}: no stop");
+                break;
+            };
+            assert!(!ok, "{how} at line {at} ({line}): the install failed: {said}");
+            let (ok, said, _) =
+                run_in(UNDO_STEP, 60, "run-1", "undo", home.path(), &Instead::default(), b"");
+            assert!(ok, "{how} at line {at} ({line}), ROLLBACK: {said}");
+            std::fs::remove_dir_all(home.path().join("Programs\\lords-command\\staging\\run-1"))
+                .unwrap();
+            let now = files_of(home.path());
+            assert!(
+                now == start || now == complete,
+                "{how} at line {at} ({line}): neither as before ({:?}) nor complete ({:?})",
+                differs(&now, &start),
+                differs(&now, &complete)
+            );
+        }
+    }
+}
+
+// Spec (embedded panel review r1 R2, the Lords owner: an --apply that fails at any step leaves the other PC as it was
+// before (from its backups) or completely set up, in both embedded and standalone mode; never a live config.txt
+// without its token, or the reverse; tested with a failure injected at each step), on a fresh PC, embedded.
+#[test]
+fn an_embedded_install_on_a_fresh_pc_stopped_anywhere_is_as_it_was_or_complete() {
+    stopped_at_every_line_it_is_as_it_was_or_complete(&Before {
+        client: Client::Embedded,
+        block: Some(BLOCK),
+        config_txt: Some(CONFIG_TXT),
+        set_up: fresh,
+    });
+}
+
+// Spec (as above), on a PC with a token left without config.txt, embedded.
+#[test]
+fn an_embedded_install_over_a_token_alone_stopped_anywhere_is_as_it_was_or_complete() {
+    stopped_at_every_line_it_is_as_it_was_or_complete(&Before {
+        client: Client::Embedded,
+        block: Some(BLOCK),
+        config_txt: Some(CONFIG_TXT),
+        set_up: token_alone,
+    });
+}
+
+// Spec (as above), on a PC with the standalone panel set up, embedded (E4: the window's files kept).
+#[test]
+fn an_embedded_install_over_the_standalone_one_stopped_anywhere_is_as_it_was_or_complete() {
+    stopped_at_every_line_it_is_as_it_was_or_complete(&Before {
+        client: Client::Embedded,
+        block: None,
+        config_txt: None,
+        set_up: standalone_there,
+    });
+}
+
+// Spec (as above), on a fresh PC, standalone.
+#[test]
+fn a_standalone_install_on_a_fresh_pc_stopped_anywhere_is_as_it_was_or_complete() {
+    stopped_at_every_line_it_is_as_it_was_or_complete(&Before {
+        client: Client::Standalone,
+        block: Some(BLOCK),
+        config_txt: Some(CONFIG_TXT),
+        set_up: fresh,
+    });
+}
+
+// Spec (as above), run again on a PC with the standalone panel set up, standalone (the window's files replaced, each
+// from its backup).
+#[test]
+fn a_standalone_install_run_again_stopped_anywhere_is_as_it_was_or_complete() {
+    stopped_at_every_line_it_is_as_it_was_or_complete(&Before {
+        client: Client::Standalone,
+        block: None,
+        config_txt: None,
+        set_up: standalone_there,
+    });
+}
+
+// Spec (embedded panel review r1 R2's witness, the Lords owner: never a live config.txt without its token): on a
+// fresh PC, the token's placement failing (its access list refused) fails the install, and after panel add's
+// ROLLBACK and CLEAN the PC is as it was: no config.txt, no token, no alias or key it made.
+#[test]
+fn a_failed_token_placement_leaves_the_pc_as_it_was() {
+    let home = other_pc();
+    let start = files_of(home.path());
+    let (ok, said, _) = run(STAGE, 30, "staging", home.path(), b"");
+    assert!(ok, "{said}");
+    let plan = fixture_plan(Client::Embedded, Some(BLOCK));
+    for (name, bytes, _) in payload(&plan, "run-1", Vec::new(), &fixture_token('b')) {
+        let (ok, said, _) = run(RECEIVE, 30, name, home.path(), &bytes);
+        assert!(ok, "{name}: {said}");
+    }
+    let refused = Instead {
+        functions: "function Set-Acl { throw 'the access list was refused' }; ".into(),
+        env: Vec::new(),
+    };
+    let (ok, said, _) = run_in(INSTALL_STEP, 60, "run-1", "install", home.path(), &refused, b"");
+    assert!(!ok && said.contains("the access list was refused"), "{said}");
+    let (ok, said, _) =
+        run_in(UNDO_STEP, 60, "run-1", "undo", home.path(), &Instead::default(), b"");
+    assert!(ok, "{said}");
+    let (ok, said, _) = run(CLEAN, 30, "staging", home.path(), b"");
+    assert!(ok, "{said}");
+    let now = files_of(home.path());
+    assert!(now == start, "as it was: {:?}", differs(&now, &start));
+}
+
+/// How a stand-in other PC fails `panel add`'s calls: not at all, the `n`th call before it reaches the PC, the `n`th
+/// after it ran there (its answer lost), or every call from the `n`th on (the connection gone).
+#[derive(Clone, Copy, Debug)]
+enum Fail {
+    No,
+    Before(usize),
+    After(usize),
+    From(usize),
+}
+
+/// The other PC, stood in for by this one: each step run here, in the profile `home`, failing as `fail` says.
+struct Here<'a> {
+    home: &'a Path,
+    fail: Fail,
+    calls: std::cell::Cell<usize>,
+}
+
+impl Other for Here<'_> {
+    fn step(
+        &self,
+        step: &str,
+        deadline: u64,
+        run: &str,
+        name: &str,
+        stdin: Option<Vec<u8>>,
+    ) -> Result<String, String> {
+        let n = self.calls.get() + 1;
+        self.calls.set(n);
+        match self.fail {
+            Fail::Before(k) if n == k => return Err(format!("call {n} lost before it ran")),
+            Fail::From(k) if n >= k => return Err(format!("call {n}: the connection is gone")),
+            _ => {}
+        }
+        let stdin = stdin.unwrap_or_default();
+        let (ok, said, _) =
+            run_in(step, deadline, run, name, self.home, &Instead::default(), &stdin);
+        if matches!(self.fail, Fail::After(k) if n == k) {
+            return Err(format!("call {n}'s answer lost"));
+        }
+        let last = said.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+        if ok {
+            Ok(last.to_string())
+        } else {
+            Err(said)
+        }
+    }
+}
+
+// Spec (E12 R2, the Lords owner: an --apply that fails at any step leaves the other PC as it was or completely set
+// up; tested with a failure injected at each step): panel add's part on the other PC (`install_there`: STAGE, each
+// file, INSTALL; on any failure ROLLBACK, then CLEAN) with each of its calls failing in turn, before it reaches the PC,
+// after it ran (its answer lost), or with the connection gone from it on: the PC is as it was or complete, and its
+// staging dir is gone, unless the connection went before ROLLBACK could run; then the next probe names that dir, and
+// the next run's undo of it (`undo_earlier`) leaves the PC as it was or complete, and no staging dir. Nothing on this
+// PC is run here: after INSTALL nothing changes the other PC.
+#[test]
+fn panel_adds_part_on_the_other_pc_leaves_it_as_it_was_or_complete_whatever_step_fails() {
+    let plan = fixture_plan(Client::Embedded, Some(BLOCK));
+    let files = || payload(&plan, "run-1", Vec::new(), &fixture_token('d'));
+    let reference = other_pc();
+    let start = files_of(reference.path());
+    let here = Here { home: reference.path(), fail: Fail::No, calls: Default::default() };
+    install_there(&here, "Other", "run-1", files()).unwrap();
+    let calls = here.calls.get();
+    let complete = files_of(reference.path());
+    let staging = |home: &Path| home.join("Programs\\lords-command\\staging\\run-1");
+    for k in 1..=calls + 2 {
+        for fail in [Fail::Before(k), Fail::After(k), Fail::From(k)] {
+            let home = other_pc();
+            let here = Here { home: home.path(), fail, calls: Default::default() };
+            let result = install_there(&here, "Other", "run-1", files());
+            let now = files_of(home.path());
+            assert!(
+                now == start || now == complete,
+                "{fail:?}: {result:?}: neither as before ({:?}) nor complete ({:?})",
+                differs(&now, &start),
+                differs(&now, &complete)
+            );
+            // A run that succeeds keeps its staging dir for the route check; panel add removes it after.
+            if result.is_ok() || !staging(home.path()).exists() {
+                continue;
+            }
+            let (ok, said, _) = run(PROBE, 30, "probe", home.path(), b"");
+            assert!(ok, "{said}");
+            let probed: Remote =
+                serde_json::from_str(said.lines().rev().find(|l| l.starts_with('{')).unwrap())
+                    .unwrap();
+            assert_eq!(probed.earlier, ["run-1"], "{fail:?}: the next probe names it");
+            let next = Here { home: home.path(), fail: Fail::No, calls: Default::default() };
+            undo_earlier(&next, "Other", "run-1").unwrap();
+            let now = files_of(home.path());
+            assert!(
+                now == start || now == complete,
+                "{fail:?}, then the next run's undo: {:?} / {:?}",
+                differs(&now, &start),
+                differs(&now, &complete)
+            );
+            assert!(!staging(home.path()).exists(), "{fail:?}: the next run removed it");
+        }
+    }
 }
