@@ -141,6 +141,7 @@ fn findings(stacks: &Stacks, public_rules: &Rules, probe_home: Option<&Path>) ->
     overlap::check(stacks, &mut out);
     skill_clashes(stacks, &mut out);
     temporaries(stacks, &crate::ops::today(), &mut out);
+    crate::core_lines::check(stacks, &mut out);
     privacy_of_entries(stacks, public_rules, &mut out);
     if let Some(home) = probe_home {
         privacy_hooks(stacks, home, &mut out);
@@ -222,15 +223,19 @@ fn declared(stacks: &Stacks, out: &mut Vec<Finding>) {
     let roles = crate::sync::declared_roles(stacks);
     for s in stacks.all() {
         let m = &s.manifest;
-        let repos = m.repos.iter().map(|(n, r)| (format!("repo {n}"), &r.default_role));
-        let workspaces =
-            m.workspaces.iter().map(|(n, w)| (format!("workspace {n}"), &w.default_role));
-        for (place, role) in repos.chain(workspaces) {
+        let repos =
+            m.repos.iter().map(|(n, r)| (format!("repo {n}: default_role"), &r.default_role));
+        let workspaces = m
+            .workspaces
+            .iter()
+            .map(|(n, w)| (format!("workspace {n}: default_role"), &w.default_role));
+        let child = std::iter::once((format!("{}: child_role", m.name), &m.child_role));
+        for (setting, role) in repos.chain(workspaces).chain(child) {
             let Some(role) = role else { continue };
             if !roles.contains(role) || role == crate::compose::PRODUCT_ROLE {
                 out.push(Finding::error(
                     "role-undeclared",
-                    format!("{place}: default_role `{role}` is no declared development role"),
+                    format!("{setting} `{role}` is no declared development role"),
                 ));
             }
         }

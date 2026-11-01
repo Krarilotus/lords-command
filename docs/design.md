@@ -96,6 +96,8 @@ it replaces.
 | `roles` | roles from the `roles` list in `stack.toml` (e.g. orchestrator, coder, reviewer) | absent: every role. A target that knows its reader's role (`roles` on the target) gets only entries for that role or every role; where the role is unknown, role-specific entries are labelled, and role-specific notes leave the memory index for one pointer line |
 | `scope` | global, `project:<p>`, `repo:<r>`, `path:<r>:<sub>` | must match the directory |
 | `status` | active, retired | retired needs `retired.date` and `retired.reason`, and `superseded_by` when there is a successor |
+| `start` | core, role, detail | how it reaches an agent at start (below, Core lines). Absent: its whole text, as before core lines |
+| `core` | a line, or a list of {line, roles} | its hard line, at most two sentences and 450 UTF-8 bytes; several lines each name their roles |
 | `visibility` | public, private | must match the stack |
 | `basis` | list of {quote, date, by} | the owner's words behind the entry, where there are any |
 | `evidence` | list of {summary, date, links} | the cases behind the entry (incidents, measurements); kept beside it, never composed, so the rule stays a short principle; links are checked |
@@ -106,6 +108,24 @@ it replaces.
 | `overrides`, `extends` | entry ids | see Layers |
 | `order` | integer | optional, for ordering within a section |
 | `links` | paths or ids | checked for dangling targets |
+
+**Core lines** (the Lords owner, 31 Oct, plan L8; design note `Harness/notes/2026-10-31-lords-core-lines-composer.md`).
+An agent starts with each binding entry's hard line, its id first, and opens the whole text, which stays authoritative,
+by id when a task touches it: `lords show <id>`, named once with its full path at the top of each composed file.
+- `start: core`: its lines reach every role it binds (`check` refuses a line set that leaves one out). `role`: each
+  line names its roles; the entry's other roles find it in the index. `detail`: no line, only the index. Intent takes
+  only `detail` and stays a title in the intent index; memory and a repo's own skills take neither field.
+- An entry with several lines (one per actor or trigger) stays one entry; each line traces to it by the same id.
+- Composition: a role's file carries the lines for that role, then the index of the rest (`- <id>: <title>`). A
+  place's file carries the lines for every development role, and the default role's lines labelled, in every
+  adapter's file alike unless the stack's `[place_files.<adapter>] default_role_lines = false` leaves them to the role
+  file for that adapter; another role's lines are in its role file. A skill's line stands in its index line, after
+  the skill's id; a skill every run has installed (global, no roles) is listed in the user-level file for its line. A
+  template is composed only once it has a class. An extension follows its parent only where the parent's form carries
+  it: an intent shown as a title carries only intents, so a rule extending it keeps its own line or text. An entry
+  with no class composes exactly as before.
+- A stack's `require_core = true` makes `check` refuse an entry of that stack with no class, or a `core`/`role` one
+  with no line (memory and a repo's own skills excepted), so a store can land its lines before the check holds them.
 
 The model is a graph: entries are nodes with stable ids, and every relation between them is a typed field
 (`overrides`, `extends`, `superseded_by`, `links`, `basis`), never a position in prose. So an RDF export (for the
@@ -221,6 +241,35 @@ them by reference like every other role's, and its role-files line names the def
 default role here"). The role-files line stays for briefed agents of the other roles. `lords sizes` and the size
 guard name the place, the adapter, its file and each section's bytes.
 
+**A native child's start file** (plan L6, an orchestrator's condition 3: children start with their own role's core). With a
+stack's `child_role` (the role a subagent a session starts itself has), each place's `.lords/` also holds `child.md`:
+what of that role the place's file doesn't carry (its lines and entries for only some development roles), after a line
+naming the role, and `child-whole.md`: the role's whole start without the notes, for a child that loads no place file
+(Claude Code's Explore and Plan, which load no `CLAUDE.md`). The `child` guard, a `SubagentStart` hook, gives the child
+the one its agent type needs: in Claude Code's settings and Codex's `~/.codex/hooks.json` (a settings target with
+`guards = ["child"]`; Codex runs it once reviewed under /hooks), one hook each (`guard child --home DIR`) with a 30 s
+deadline. Codex's passes the whole context on (`additionalContextLimit` 0). Probed 31 Oct: general-purpose and Codex
+children load the place's file and get `child.md`.
+
+*One read per child start.* A child's start event gets one generation of its start whole, or nothing. Claude Code
+fires `SubagentStart` again with the same agent id when a child resumes, and gives no id per firing, so the guard
+reads the start once, in one hook, for every agent type. Claude Code holds 10,000 characters per hook (past that a
+context becomes a file path and a preview), so a start is given only up to 9,500 characters, counted without the
+marker lines. Sync refuses a `child.md` past that, as it refuses a file past its harness's limit. It writes
+`child-whole.md` whatever its size; past 9,500 characters the guard gives it nowhere, with a one-line note: Explore and
+Plan then start as they would without Lords, which is every place today (14,276–19,626 characters on 1 Nov), until the
+corpus is condensed under one part. An earlier design gave Explore and Plan their whole start in three part hooks
+sharing a snapshot per start; with no id per firing, the snapshot's lifetime rested on time, and a resumed agent of
+that name or a wall-clock jump could mix two generations (design note R3, sol-loop Y1 and Y2). A reader never takes a
+place's `.lords` for gone while sync is between moving it aside (`..lords.lords-old-*`, `fsguard::being_replaced`) and
+putting the new one in: past a missing `.lords` it decides under the apply lock, waiting at most 15 s, and never walks
+on to an enclosing place meanwhile.
+
+*The guard copy's protocol.* Sync names the guard copy in a child hook only when the copy answers a probe, run with
+the hook's own arguments (`guard child --home DIR`, event `LordsGuardProbe`), with this build's child protocol
+(`lords guard child 4`). A copy from an earlier build is refused with the hooks kept as they are, and the refusal
+names `lords guard install`; sync never installs the copy itself.
+
 **New worktrees.** `lords hooks install --post-checkout` writes the repo's own `.git/hooks/post-checkout` (the
 common dir, so every worktree runs it). On a new worktree (old HEAD all zeros) it runs `lords sync --repo X --place
 <worktree> --apply` in the background, time-boxed, and only logs (`<common dir>/lords-post-checkout.log`); any
@@ -332,7 +381,11 @@ no directory listing decides what goes. What goes is what the ledger holds and t
   refuses and names the recovery: rename it back when `ledger.toml` is missing; otherwise the new one is in place,
   and the old one goes once checked.
 - **One writer.** Apply, adopt, set-aside, restore and hook installation (R3-09) take the apply lock before they
-  read the ledger.
+  read the ledger. The lock is `<tool home>/apply.lock`, held by an OS lock on its open file, so it ends with its
+  holder however that ends: a file whose OS lock is free and that holds this build's record (`lords-lock 2`) is a
+  dead holder's and is taken over at once. The file appears only whole and already locked (made beside, linked in);
+  an earlier build's file (`pid N`, held by its existence) is still waited for, and old and new builds exclude each
+  other.
 
 **Replacing a tool-owned path.** Sync builds the new version beside it, under a name unique to the run, created with
 `create_new`; it hashes what it built, not the source. It checks the old version still matches its ledger hash,
@@ -471,11 +524,13 @@ never writes memory back.
 | adapted or inherited entry without repo, commit, path and licence; inherited skill differs from its recorded source hash | error |
 | privacy findings (public stack: all classes; private stack: secret) | error |
 | deployed target drifted from a fresh composition | warning |
-| a place's file past 75 % of its adapter's limit on project files (the user-level file is outside it); past the limit, sync doesn't write it and fails | warning |
+| a place's file past 75 % of its adapter's limit on project files, or past the stack's `[place_files.<adapter>] warn_bytes` where it sets one (the user-level file is outside it); past the limit, sync doesn't write it and fails | warning |
 | an entry naming a topic or role its stack doesn't list | error |
 | near-duplicate text across entries (shingled similarity over normalised sentences) | candidate |
 | same topic, conflicting numbers or keywords, no relation named | candidate |
 | active entry links a retired one | warning |
+| a core line past 450 UTF-8 bytes or holding a line break; a line's role the entry doesn't bind; a class its lines don't hold (`core-line-long`, `core-line-break`, `core-roles`, `core-class`) | error |
+| with the stack's `require_core`, an entry with no class, or a `core` or `role` one with no line (`core-missing`) | error |
 
 ## Binaries
 

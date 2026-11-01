@@ -202,6 +202,9 @@ fn relative_paths_are_one_switch() {
             relative_to: relative.then(|| checkout.clone()),
             default_role: None,
             default_role_inline: false,
+            opener: None,
+            child: None,
+            default_role_lines: true,
         };
         lords_core::compose::compose(&f.stacks(), &ctx).text
     };

@@ -18,6 +18,7 @@ fn the_size_guard_names_the_adapter_and_the_sections() {
         limit: Some(32_768),
         sections: vec![("Rules".into(), 13_571), ("Memory".into(), 3_511)],
         enabled: true,
+        warn: None,
     };
     let d = s.describe();
     for part in [
