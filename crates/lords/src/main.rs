@@ -647,7 +647,15 @@ fn uninstall_place(a: &mut Args, dir: &Path, run: &mut PlaceRun) -> Result<bool,
 /// one checkout or worktree's (`uninstall_place`).
 fn cmd_uninstall(mut a: Args) -> Result<bool, String> {
     let json = a.flag("--json");
-    if let Some(dir) = a.value("--place")?.map(PathBuf::from) {
+    // A bad `--place` is a refusal too, which `--json` gives as its one object (sol-loop r1 S2).
+    let place = match a.value("--place") {
+        Err(e) if json => {
+            println!("{}", PlaceRun::default().json(2, Some(&e)));
+            return Err(e);
+        }
+        r => r?.map(PathBuf::from),
+    };
+    if let Some(dir) = place {
         let mut run = PlaceRun::default();
         let r = uninstall_place(&mut a, &dir, &mut run);
         let exit = match &r {
