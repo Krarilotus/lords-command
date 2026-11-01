@@ -19,22 +19,29 @@ fn run(
     home: &Path,
     stdin: &[u8],
 ) -> (bool, String, Duration) {
-    run_with(step, deadline, name, [home, home], home.parent(), stdin)
+    run_with(step, deadline, name, [home, home], home.parent(), None, stdin)
 }
 
 /// `run`, with `LOCALAPPDATA` and `USERPROFILE` as given, and the OS's profiles directory answered as `profiles`. The
 /// step reads it with `Get-ItemProperty` from HKLM; here a function of that name, which PowerShell finds before the
 /// cmdlet, answers instead (`-NoProfile` keeps any other out on the other PC). `None`: the registry answers.
+/// `ssh`: a dir whose `ssh.exe` the step runs instead of the OS's, and the step held after it starts each ssh until
+/// that ssh ends (a `Start-Process` function of the same kind), as if its powershell got no time meanwhile.
 fn run_with(
     step: &str,
     deadline: u64,
     name: &str,
     [local_app_data, profile]: [&Path; 2],
     profiles: Option<&Path>,
+    ssh: Option<&Path>,
     stdin: &[u8],
 ) -> (bool, String, Duration) {
     let os = match profiles {
         Some(_) => "function Get-ItemProperty { [pscustomobject]@{ ProfilesDirectory = $env:TEST_PROFILES } }; ",
+        None => "",
+    };
+    let held = match ssh {
+        Some(_) => "function Start-Process { param($FilePath, $WindowStyle, [switch]$PassThru, $ArgumentList) $c = Microsoft.PowerShell.Management\\Start-Process -FilePath $FilePath -WindowStyle $WindowStyle -PassThru -ArgumentList $ArgumentList; if ($FilePath -eq 'ssh.exe') { $c.WaitForExit() }; $c }; ",
         None => "",
     };
     let start = Instant::now();
@@ -42,9 +49,13 @@ fn run_with(
     if let Some(dir) = profiles {
         command.env("TEST_PROFILES", dir);
     }
+    if let Some(dir) = ssh {
+        let path = std::env::var("PATH").unwrap_or_default();
+        command.env("PATH", format!("{};{path}", dir.display()));
+    }
     let mut child = command
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"])
-        .arg(format!("{os}{step}"))
+        .arg(format!("{os}{held}{step}"))
         .args([deadline.to_string().as_str(), "run-1", name])
         .env("LOCALAPPDATA", local_app_data)
         .env("USERPROFILE", profile)
@@ -282,9 +293,9 @@ fn a_profile_reached_through_a_link_above_it_is_refused() {
     assert!(link.status.success(), "{}", String::from_utf8_lossy(&link.stdout));
     let owner = current.join("PanelOwner");
     let local = owner.join("AppData").join("Local");
-    let (ok, said, _) = run_with(PROBE, 30, "none", [&local, &owner], Some(&current), b"");
+    let (ok, said, _) = run_with(PROBE, 30, "none", [&local, &owner], Some(&current), None, b"");
     assert!(ok && said.contains("Current is a link"), "{said}");
-    let (ok, said, _) = run_with(STAGE, 30, "staging", [&local, &owner], Some(&current), b"");
+    let (ok, said, _) = run_with(STAGE, 30, "staging", [&local, &owner], Some(&current), None, b"");
     assert!(!ok && said.contains("is a link"), "{said}");
     let staging = app.iter().fold(real.clone(), |p, c| p.join(c)).join("staging");
     assert!(!staging.exists(), "nothing made behind it");
@@ -303,12 +314,13 @@ fn a_profile_outside_the_os_profiles_directory_is_refused() {
     std::fs::create_dir_all(&app).unwrap();
     let profiles = root.path().join("Users");
     std::fs::create_dir_all(&profiles).unwrap();
-    let (ok, said, _) = run_with(PROBE, 30, "none", [&local, &owner], Some(&profiles), b"");
+    let (ok, said, _) = run_with(PROBE, 30, "none", [&local, &owner], Some(&profiles), None, b"");
     assert!(ok && said.contains("not a profile in the OS profiles directory"), "{said}");
-    let (ok, said, _) = run_with(STAGE, 30, "staging", [&local, &owner], Some(&profiles), b"");
+    let (ok, said, _) =
+        run_with(STAGE, 30, "staging", [&local, &owner], Some(&profiles), None, b"");
     assert!(!ok && said.contains("not a profile in the OS profiles directory"), "{said}");
     assert!(!app.join("staging").exists(), "nothing made");
-    let (ok, said, _) = run_with(PROBE, 30, "none", [&local, &owner], None, b"");
+    let (ok, said, _) = run_with(PROBE, 30, "none", [&local, &owner], None, None, b"");
     let named =
         said.split("not a profile in the OS profiles directory ").nth(1).unwrap_or_default();
     let dir = named.split('"').next().unwrap_or_default().replace("\\\\", "\\");
@@ -605,4 +617,76 @@ fn a_standalone_install_still_installs_the_window_and_its_start_menu_entry() {
     assert_eq!(names(&backup), ["LICENSE", "README.md", "lords-command.exe"]);
     assert_eq!(std::fs::read(backup.join("lords-command.exe")).unwrap(), b"window 1");
     assert_eq!(std::fs::read_to_string(app.join("config.txt")).unwrap(), "the owner's");
+}
+
+/// A stand-in for the panel's server behind a forward: on its own loopback port, `200` to a request carrying `token`
+/// in `Lords-Panel-Token`, `401` to any other; a connection that sends nothing (the check's look at the port) gets
+/// nothing. Serves until the test ends.
+fn forward_stand_in(token: &http::Token) -> u16 {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let want = format!("lords-panel-token: {}", token.secret().to_ascii_lowercase());
+    std::thread::spawn(move || {
+        for mut c in listener.incoming().flatten() {
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match c.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            if head.is_empty() {
+                continue;
+            }
+            let ok = String::from_utf8_lossy(&head).to_ascii_lowercase().contains(&want);
+            let status = if ok { "200 OK" } else { "401 Unauthorized" };
+            let answer =
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = c.write_all(answer.as_bytes());
+        }
+    });
+    port
+}
+
+// Spec (check.ps1's invariant, sol-loop r1 S1: the route is checked through the forward on the panel's port; on a
+// re-run, a window or an embedded view of the same alias may hold that port already, and the check's own ssh then
+// fails its forward and ends; that is no failure of the route): with a forward that answers the token on the port,
+// and the check's ssh ended before the check first looks at the port (its powershell held until then), the check
+// passes through that forward; with nothing on the port, it fails, saying so.
+#[test]
+fn the_route_check_goes_through_a_forward_already_on_its_port() {
+    let home = profile();
+    let app = home.path().join("Programs").join("lords-command");
+    std::fs::create_dir_all(&app).unwrap();
+    let token = fixture_token('f');
+    std::fs::write(app.join("panel-token"), token.secret()).unwrap();
+    // The check's ssh: one that ends at once, as one whose forward finds the port taken does.
+    let ssh = home.path().join("ssh-stand-in");
+    std::fs::create_dir_all(&ssh).unwrap();
+    let system = std::env::var("SystemRoot").unwrap();
+    std::fs::copy(Path::new(&system).join("System32").join("whoami.exe"), ssh.join("ssh.exe"))
+        .unwrap();
+    let check = |port: u16| {
+        let (ok, said, _) = run(STAGE, 30, "staging", home.path(), b"");
+        assert!(ok, "{said}");
+        let params = serde_json::json!({ "alias": "lords-panel-main", "local_port": port });
+        for (name, bytes) in
+            [("panel.json", params.to_string().into_bytes()), ("check.ps1", CHECK.into())]
+        {
+            let (ok, said, _) = run(RECEIVE, 30, name, home.path(), &bytes);
+            assert!(ok, "{name}: {said}");
+        }
+        let h = home.path();
+        let (ok, said, _) = run_with(CHECK_STEP, 60, "check", [h, h], h.parent(), Some(&ssh), b"");
+        let (cleaned, why, _) = run(CLEAN, 30, "staging", home.path(), b"");
+        assert!(cleaned, "{why}");
+        (ok, said)
+    };
+    let (ok, said) = check(forward_stand_in(&token));
+    assert!(ok && said.contains("{\"ok\":true,\"status\":200}"), "{said}");
+    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (ok, said) = check(free);
+    assert!(!ok && said.contains("didn't come up"), "{said}");
 }
