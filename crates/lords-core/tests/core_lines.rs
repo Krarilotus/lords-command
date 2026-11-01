@@ -626,6 +626,35 @@ fn a_child_start_past_the_parts_delivered_is_refused() {
     assert!(p.over_limit, "the plan fails like an over-limit file");
 }
 
+// Spec (fix check r1, FC2: "Parts are cut only at line ends. Sync refuses a child start that holds a physical line longer
+// than a part, with a diagnostic naming the entry"; its witness): a helper rule with no class whose body is one line of
+// 12,000 characters (three parts with a cut inside the line; past a part whole) is refused: the role files aren't
+// written, the plan fails, and the note names the rule and the line's length.
+#[test]
+fn a_child_start_holding_a_line_longer_than_a_part_is_refused() {
+    let (f, checkout) = bare_place("child_role = \"helper\"\n");
+    f.write(
+        "priv/project/beta/rules/long.md",
+        &entry(
+            "rule.long",
+            "project:beta",
+            "private",
+            "roles: [helper]\n",
+            &format!("{}\n", "y".repeat(12_000)),
+        ),
+    );
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    let item =
+        p.items.iter().find(|i| i.path == checkout.join(".lords")).expect("the role files' item");
+    assert_eq!(item.action, lords_core::sync::Action::Conflict, "{:?}", item.notes);
+    assert!(
+        item.notes.iter().any(|n| n.contains("rule.long") && n.contains("12000")),
+        "names the entry and the line: {:?}",
+        item.notes
+    );
+    assert!(p.over_limit, "the plan fails");
+}
+
 // Spec (repair sol-loop r2, R2 still open, its witness): the refusal holds when the role files' item already has a
 // conflict of its own (a file someone changed in `.lords`), and in the install stage too, which skips that place: the
 // plan still fails.

@@ -96,7 +96,10 @@ fn a_child_with_no_place_file_gets_the_whole_start_in_parts() {
     fs::write(cwd.join(".lords/child-whole.md"), format!("{BEGIN}\n{}\n{END}\n", lines.join("\n")))
         .unwrap();
     fs::write(cwd.join(".lords/child.md"), format!("{BEGIN}\nONLY THE DELTA.\n{END}\n")).unwrap();
-    let with = |agent: &str| event(&cwd).replace("general-purpose", agent);
+    // Each scenario is its own event (its own agent id): one event's parts share one generation (fix check r1, FC1).
+    let with = |agent: &str| {
+        event(&cwd).replace("general-purpose", agent).replace("\"a1\"", &format!("\"{agent}-1\""))
+    };
     for agent in ["Explore", "Plan"] {
         let parts: Vec<Option<String>> = (1..=4)
             .map(|n| {
@@ -145,28 +148,197 @@ fn a_child_with_no_place_file_gets_the_whole_start_in_parts() {
     );
     let second = run(&home, &cwd, &["guard", "child", "--part", "2"], &event(&cwd));
     assert!(second.stdout.is_empty(), "nothing past the delta's one part");
-    // Repair sol-loop r1, R3: one line longer than a part is cut too, so no part passes the cap.
+    // Fix check r1, FC2: parts are cut only at line ends, so a start holding a line longer than a part is delivered
+    // nowhere, with a note (sync never writes one: see core_lines.rs).
     let long = format!("- rule.long: {}", "y".repeat(25_000));
-    fs::write(cwd.join(".lords/child-whole.md"), format!("{BEGIN}\n{long}\n{END}\n")).unwrap();
-    let parts: Vec<String> = (1..=4)
-        .filter_map(|n| {
-            context(&run(
-                &home,
-                &cwd,
-                &["guard", "child", "--part", &n.to_string()],
-                &with("Explore"),
-            ))
-        })
-        .collect();
-    let sizes: Vec<usize> = parts.iter().map(|p| p.chars().count()).collect();
-    assert!(sizes.iter().all(|n| *n < 10_000), "{sizes:?}");
-    let joined: String =
-        parts.iter().map(|p| p.split_once(":\n").map_or(p.as_str(), |(_, t)| t)).collect();
-    assert_eq!(joined, long, "the line whole, in order");
+    fs::write(cwd.join(".lords/child-whole.md"), format!("{BEGIN}\n- rule.a: A.\n{long}\n{END}\n"))
+        .unwrap();
+    let explore = |id: &str| with("Explore").replace("Explore-1", id);
+    for n in 1..=4 {
+        let o = run(&home, &cwd, &["guard", "child", "--part", &n.to_string()], &explore("long"));
+        assert!(o.stdout.is_empty(), "part {n}: nothing: {o:?}");
+        let note = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            note.contains("line") && note.contains("25"),
+            "part {n}: the note says why: {note}"
+        );
+    }
     // Repair sol-loop r1, R4: an Explore child never takes the delta for its whole start.
     fs::remove_file(cwd.join(".lords/child-whole.md")).unwrap();
-    let o = run(&home, &cwd, &["guard", "child", "--part", "1"], &with("Explore"));
+    let o = run(&home, &cwd, &["guard", "child", "--part", "1"], &explore("no-whole"));
     assert!(o.stdout.is_empty(), "no whole start, no delta in its place: {o:?}");
+}
+
+/// A `SubagentStart` event of `agent_type`, in `cwd`, with these ids.
+fn start(cwd: &Path, agent_type: &str, session: &str, agent: &str) -> String {
+    serde_json::json!({"hook_event_name": "SubagentStart", "session_id": session, "agent_id": agent,
+        "agent_type": agent_type, "cwd": cwd})
+    .to_string()
+}
+
+/// Parts 1 to 3 of one event's start, read in that order, each as the guard answers it.
+fn parts_of(home: &Path, cwd: &Path, ev: &str) -> Vec<String> {
+    (1..=3)
+        .filter_map(|n| context(&run(home, cwd, &["guard", "child", "--part", &n.to_string()], ev)))
+        .collect()
+}
+
+// Spec (fix check r1, FC1, the contract: "one child-start event delivers one complete generation of the child's start:
+// every part read for that event comes from the same published generation, whatever a concurrent `sync --apply` does
+// between the part reads"; its witness): a place synced with a helper start of three parts, `rule.m` in part 2. One
+// Explore event reads its part 1; `rule.a` shrinks and a real `lords sync --apply` publishes the next generation, in
+// which the unchanged `rule.m` sits in part 1; the event then reads its parts 2 and 3. It gets the first generation
+// whole, `rule.m` included. A new event gets the second generation.
+#[test]
+fn one_start_event_gets_one_generation_across_a_sync() {
+    let d = TempDir::new().unwrap();
+    let home = d.path().join("home");
+    let (public, private, checkout) =
+        (d.path().join("pub"), d.path().join("priv"), d.path().join("checkout"));
+    for dir in [&home, &public, &private, &checkout] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| {
+        let gitconfig = d.path().join("gitconfig");
+        // Built at run time, so the repo's own privacy check doesn't see an address in this source.
+        let email = ["test", "example.invalid"].join("@");
+        fs::write(&gitconfig, format!("[user]\n\tname = Test\n\temail = {email}\n")).unwrap();
+        let o = Command::new("git")
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "git {args:?}: {o:?}");
+    };
+    fs::write(checkout.join("README.md"), "a repo\n").unwrap();
+    git(&checkout, &["init", "-q"]);
+    git(&checkout, &["add", "-A"]);
+    git(&checkout, &["commit", "-q", "-m", "start"]);
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    fs::write(
+        private.join("stack.toml"),
+        format!(
+            "name = \"priv\"\nvisibility = \"private\"\nroles = [\"orchestrator\", \"coder\", \"helper\", \"product\"]\nchild_role = \"helper\"\n[projects.beta]\n[repos.beta-core]\nproject = \"beta\"\ncheckouts = ['{}']\nworktrees = false\ndefault_role = \"orchestrator\"\nadapters = [\"claude\"]\n",
+            checkout.display()
+        ),
+    )
+    .unwrap();
+    let rule = |slug: &str, lines: &[String]| {
+        let lines: Vec<String> = lines.iter().map(|l| format!("- line: \"{l}\"")).collect();
+        let text = format!(
+            "---\nid: rule.{slug}\nkind: rule\ntitle: rule.{slug}\naudience: [all]\nroles: [helper]\nscope: project:beta\nstatus: active\nvisibility: private\norigin:\n  type: own\nstart: core\ncore:\n{}\n---\nThe whole rule.\n",
+            lines.join("\n")
+        );
+        fs::create_dir_all(private.join("project/beta/rules")).unwrap();
+        fs::write(private.join(format!("project/beta/rules/{slug}.md")), text).unwrap();
+    };
+    let long = |n: usize, what: &str| -> Vec<String> {
+        (0..n).map(|i| format!("{what} {i:02} {}", "x".repeat(390))).collect()
+    };
+    rule("a", &long(25, "A"));
+    rule("m", &["Never publish the draft.".to_string()]);
+    rule("z", &long(30, "Z"));
+    git(&private, &["init", "-q"]);
+    git(&private, &["add", "-A"]);
+    git(&private, &["commit", "-q", "-m", "start"]);
+    let stacks =
+        ["--public-stack", public.to_str().unwrap(), "--private-stack", private.to_str().unwrap()];
+    let sync = || {
+        let o = run(
+            &home,
+            d.path(),
+            &[&["sync", "--repo", "beta-core", "--apply"][..], &stacks].concat(),
+            "",
+        );
+        assert!(o.status.success(), "sync: {o:?}");
+    };
+    sync();
+    let m = "- rule.m: Never publish the draft.";
+    let part_of_m = |parts: &[String]| parts.iter().position(|p| p.contains(m));
+    let first = parts_of(&home, &checkout, &start(&checkout, "Explore", "s1", "before"));
+    assert_eq!(
+        (first.len(), part_of_m(&first)),
+        (3, Some(1)),
+        "the first generation: three parts, rule.m in part 2"
+    );
+    let one = |n: usize| {
+        context(&run(
+            &home,
+            &checkout,
+            &["guard", "child", "--part", &n.to_string()],
+            &start(&checkout, "Explore", "s1", "event"),
+        ))
+        .unwrap_or_default()
+    };
+    let mut got = vec![one(1)];
+    rule("a", &long(20, "A"));
+    git(&private, &["commit", "-q", "-a", "-m", "a shorter rule.a"]);
+    sync();
+    let second = parts_of(&home, &checkout, &start(&checkout, "Explore", "s1", "after"));
+    assert_eq!(
+        (second.len(), part_of_m(&second)),
+        (3, Some(0)),
+        "the second generation: rule.m in part 1"
+    );
+    got.push(one(2));
+    got.push(one(3));
+    assert!(
+        part_of_m(&got).is_some(),
+        "rule.m reached the child: {:?}",
+        got.iter().map(String::len).collect::<Vec<_>>()
+    );
+    assert_eq!(got, first, "one generation, whole");
+}
+
+// Spec (fix check r1, FC1: "Publication also leaves readers no gap: no reader ever finds an enclosing place or nothing
+// because sync is between moving the old `.lords` aside and publishing the new one"; fsguard names the old one
+// `..lords.lords-old-*` beside it): a child in a place whose `.lords` is moved aside never gets the enclosing place's
+// start: it waits for the new `.lords` and gets that, and while none comes back it gets nothing, with a note. A `--part`
+// event naming no agent id can't share one generation across its parts and gets nothing, with a note.
+#[test]
+fn a_child_never_falls_through_to_an_enclosing_place_mid_publication() {
+    let d = TempDir::new().unwrap();
+    let home = d.path().join("home");
+    let (outer, inner) = (d.path().join("ws"), d.path().join("ws/repo"));
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(outer.join(".lords")).unwrap();
+    fs::write(outer.join(".lords/child-whole.md"), format!("{BEGIN}\nOUTER START.\n{END}\n"))
+        .unwrap();
+    let aside = inner.join("..lords.lords-old-1-2-3");
+    fs::create_dir_all(&aside).unwrap();
+    fs::write(aside.join("child-whole.md"), format!("{BEGIN}\nINNER START.\n{END}\n")).unwrap();
+    // While the aside stays: nothing, and never the enclosing place's start.
+    let o = run(
+        &home,
+        &inner,
+        &["guard", "child", "--part", "1"],
+        &start(&inner, "Explore", "s1", "stuck"),
+    );
+    assert!(o.stdout.is_empty(), "nothing, never OUTER: {o:?}");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("sync"), "the note says why: {o:?}");
+    // The new `.lords` comes in while the child waits: it gets that.
+    let mut c = Command::new(env!("CARGO_BIN_EXE_lords"))
+        .current_dir(&inner)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .args(["guard", "child", "--part", "1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(start(&inner, "Explore", "s1", "waits").as_bytes()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    fs::rename(&aside, inner.join(".lords")).unwrap();
+    let got = context(&c.wait_with_output().unwrap()).unwrap_or_default();
+    assert!(got.contains("INNER START.") && !got.contains("OUTER"), "{got}");
+    let no_id = start(&inner, "Explore", "s1", "x").replace("\"agent_id\":\"x\",", "");
+    assert!(!no_id.contains("agent_id"), "{no_id}");
+    let o = run(&home, &inner, &["guard", "child", "--part", "1"], &no_id);
+    assert!(o.stdout.is_empty(), "no agent id, no parts: {o:?}");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("agent id"), "{o:?}");
 }
 
 // Spec (the brief, slice 4: "through each provider's subagent-start hook"; the Codex probe, design note: Codex's child
