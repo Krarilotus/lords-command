@@ -268,6 +268,9 @@ fn child_intro(role: &str, start: ChildStart) -> String {
         ChildStart::Whole => {
             format!("You start as a {role} here, a native subagent: this is your role's whole start.")
         }
+        ChildStart::Launched => format!(
+            "You start as a {role} here, the role named at launch. Besides the place's file you read, these bind you; its lines marked for other roles don't. Your role's whole start file is `role-{role}.md` in the place's `.lords` dir."
+        ),
     }
 }
 
@@ -392,6 +395,16 @@ pub enum ChildStart {
     /// For a child that loads no place file (Claude Code's Explore and Plan): its role's whole start, as its role
     /// file has it, without the notes.
     Whole,
+    /// For a session whose launch names its role (a T3-delegated one; sync.rs `start_file`): what `Beyond` holds, after
+    /// a line naming the role as named at launch.
+    Launched,
+}
+
+impl ChildStart {
+    /// Whether the reader also loads the place's file, so the start leaves out what that file carries.
+    fn beside_place_file(self) -> bool {
+        matches!(self, ChildStart::Beyond | ChildStart::Launched)
+    }
 }
 
 impl Context {
@@ -586,9 +599,9 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
     // every development role (an entry with a class keeps its other parts, below; sol-loop r1, S2: a skill's line
     // for the child's role alone).
     let every_development = |roles: &[String]| development.iter().all(|r| roles.contains(r));
-    let beyond = ctx.child == Some(ChildStart::Beyond);
+    let beyond = ctx.child.is_some_and(ChildStart::beside_place_file);
     let live: Vec<&Entry> = match ctx.child {
-        Some(ChildStart::Beyond) => live
+        Some(ChildStart::Beyond | ChildStart::Launched) => live
             .into_iter()
             .filter(|e| !matches!(e.meta.kind, Kind::Intent | Kind::Memory))
             .filter(|e| e.meta.kind != Kind::Skill || by_parts(e))

@@ -112,13 +112,14 @@ impl Adapter for ClaudeCode {
     }
 
     fn guards(&self) -> &'static [&'static str] {
-        &["rm", "queue", "session", "turn", "child"]
+        &["rm", "queue", "session", "turn", "child", "role"]
     }
 
     /// A child's start goes in one hook, one read (fix check r2, FC1), with sync's tool home and the deadline the
-    /// guard's waits end inside (`guard::CHILD_HOOK_TIMEOUT_SECS`; fix check r2, FC5).
+    /// guard's waits end inside (`guard::CHILD_HOOK_TIMEOUT_SECS`; fix check r2, FC5); a launched session's role start
+    /// alike (F10).
     fn guard_hooks(&self, exe: &str, guard: &str, home: &str) -> Vec<serde_json::Value> {
-        if guard != "child" {
+        if guard != "child" && guard != "role" {
             return vec![
                 serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard] }),
             ];
@@ -170,9 +171,10 @@ impl Adapter for Codex {
     }
 
     /// Codex's hooks (`~/.codex/hooks.json`) run a command line; `child` is the guard a probe showed it runs (design
-    /// note 2026-10-31-lords-core-lines-composer, P2): the child took its context, once the hook was trusted.
+    /// note 2026-10-31-lords-core-lines-composer, P2): the child took its context, once the hook was trusted. `role`
+    /// too: its `UserPromptSubmit` event and context are Claude's (design note 2026-11-02-lords-role-at-launch, H3).
     fn guards(&self) -> &'static [&'static str] {
-        &["child"]
+        &["child", "role"]
     }
 
     /// A command line, and the whole context passed on (`additionalContextLimit` 0): no parts.
