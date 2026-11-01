@@ -464,6 +464,22 @@ fn sync_registers_the_child_guard_on_subagent_start() {
     assert!(shown.contains("/hooks"), "Codex's review is named: {o:?}");
     let o = run(&home, d.path(), &[&["sync", "--user", "--apply"][..], &stacks].concat(), "");
     assert!(o.status.success(), "{o:?}");
+    // Fix check r2, FC4: an older guard copy, one that passes the rm self-test but takes no `--home` (as `b0f5d93`'s and
+    // `742a9bd`'s), is refused with the step that fixes it, and both settings keep the hooks they have.
+    let before = (fs::read(&settings).unwrap(), fs::read(&codex).unwrap());
+    fs::copy(
+        env!("CARGO_BIN_EXE_lords-old-guard-stub"),
+        home.join(".lords-command/bin/lords-guard.exe"),
+    )
+    .unwrap();
+    let o = run(&home, d.path(), &[&["sync", "--user", "--apply"][..], &stacks].concat(), "");
+    assert!(!o.status.success(), "refused: {o:?}");
+    let said =
+        format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(said.contains("lords guard install"), "names the install: {said}");
+    assert_eq!((fs::read(&settings).unwrap(), fs::read(&codex).unwrap()), before, "the hooks stay");
+    let o = run(&home, d.path(), &["guard", "install"], "");
+    assert!(o.status.success(), "{o:?}");
     let read = |p: &Path| -> serde_json::Value {
         serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap()
     };
@@ -471,8 +487,9 @@ fn sync_registers_the_child_guard_on_subagent_start() {
         home.join(".lords-command/bin/lords-guard.exe").display().to_string().replace('\\', "/");
     // The tool home sync ran with, so the guard takes that home's apply lock and snapshots (repair 2 sol-loop r3, X1).
     let tool_home = home.join(".lords-command").display().to_string().replace('\\', "/");
-    // Claude Code: one hook per part (review r1, F1), each its own 10,000 characters.
-    let part = |n: &str| serde_json::json!({"type": "command", "command": copy, "args": ["guard", "child", "--part", n, "--home", tool_home]});
+    // Claude Code: one hook per part (review r1, F1), each its own 10,000 characters, with the deadline the guard's
+    // waits end inside (fix check r2, FC5).
+    let part = |n: &str| serde_json::json!({"type": "command", "command": copy, "args": ["guard", "child", "--part", n, "--home", tool_home], "timeout": 30});
     let theirs: serde_json::Value = serde_json::from_str(theirs).unwrap();
     let v = read(&settings);
     assert_eq!(
@@ -490,4 +507,143 @@ fn sync_registers_the_child_guard_on_subagent_start() {
     assert!(!o.status.success(), "{o:?}");
     assert!(String::from_utf8_lossy(&o.stderr).contains("runs no `rm` guard"), "{o:?}");
     assert_eq!(read(&codex), v, "nothing written");
+}
+
+/// A child file of these lines, between the marker lines, as sync writes one.
+fn child_file(lines: &[String]) -> String {
+    format!("{BEGIN}\n{}\n{END}\n", lines.join("\n"))
+}
+
+/// The start of fix check r2's witness: an intro, `n` long lines of `rule.a`, the unchanged `rule.m`, 30 long lines
+/// of `rule.z`. With 25 lines of `rule.a`, `rule.m` sits in part 2; with 20, in part 1.
+fn witness_start(n: usize) -> Vec<String> {
+    let long = |id: &str, i: usize| format!("- rule.{id}: {id} {i:02} {}", "x".repeat(390));
+    let mut lines = vec!["You start as a helper here.".to_string()];
+    lines.extend((0..n).map(|i| long("a", i)));
+    lines.push("- rule.m: Never publish the draft.".to_string());
+    lines.extend((0..30).map(|i| long("z", i)));
+    lines
+}
+
+/// Writes the snapshot an earlier build's guard left for this session and agent id, aged two hours.
+fn aged_snapshot(home: &Path, session: &str, agent: &str, text: &str) {
+    let dir = home.join(".lords-command/guard/child");
+    fs::create_dir_all(&dir).unwrap();
+    let key = lords_core::fsguard::sha(format!("{session}\n{agent}").as_bytes());
+    let file = dir.join(key);
+    fs::write(&file, text).unwrap();
+    let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    fs::File::options().write(true).open(&file).unwrap().set_modified(two_hours_ago).unwrap();
+}
+
+// Spec (fix check r2, FC1: "one child-start event delivers one complete generation of the child's start, or the
+// whole-event refusal"; Claude Code fires `SubagentStart` again on a resume with the same agent id; its witness, an aged
+// reused key with a boundary-moving sync, and the cached-empty variant): a resumable child (any agent type but Explore
+// and Plan) is served by one read: part 1 gives its place's `child.md` whole and parts 2 and 3 nothing, whatever an
+// earlier snapshot of its agent id says; a `child.md` that doesn't fit one part is given nowhere, with a note.
+#[test]
+fn a_resumed_child_gets_one_generation_whole_or_nothing() {
+    let d = TempDir::new().unwrap();
+    let home = d.path().join("home");
+    let place = d.path().join("repo");
+    fs::create_dir_all(place.join(".lords")).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let m = "- rule.m: Never publish the draft.";
+    let resume = |agent: &str| start(&place, "general-purpose", "s1", agent);
+    // The witness: its first run's snapshot (rule.m in part 2) aged; a sync moved rule.m into part 1.
+    aged_snapshot(&home, "s1", "a1", &child_file(&witness_start(25)));
+    fs::write(place.join(".lords/child.md"), child_file(&witness_start(20))).unwrap();
+    let got = parts_of(&home, &place, &resume("a1"));
+    assert!(
+        got.is_empty() || got.iter().any(|p| p.contains(m)),
+        "whole or nothing, never without rule.m: {got:?}"
+    );
+    assert!(got.is_empty(), "a start past one part is given nowhere to a resumable child: {got:?}");
+    // A start that fits one part: part 1 gives it whole, now, from one read; the aged snapshot says nothing.
+    let small = vec![
+        "You start as a helper here.".to_string(),
+        m.to_string(),
+        "- rule.n: Ask first.".to_string(),
+    ];
+    fs::write(place.join(".lords/child.md"), child_file(&small)).unwrap();
+    aged_snapshot(&home, "s1", "a2", &child_file(&witness_start(25)));
+    // The cached-empty variant: an aged empty snapshot from before `child_role` was set.
+    aged_snapshot(&home, "s1", "a3", "");
+    for agent in ["a2", "a3"] {
+        let got = parts_of(&home, &place, &resume(agent));
+        assert_eq!(
+            got,
+            vec![small.join("\n")],
+            "{agent}: the current start, whole, in part 1 only"
+        );
+    }
+}
+
+// Spec (fix check r2, FC1: "snapshot storage stays bounded"; "no reader ever deletes or replaces a snapshot another
+// part of its event may still read"; the design note R3: every part of an event runs within its 30 s hook timeout): an
+// Explore start sweeps the snapshots older than 10 minutes and keeps the younger ones.
+#[test]
+fn an_explore_start_sweeps_only_snapshots_no_part_can_still_read() {
+    let d = TempDir::new().unwrap();
+    let home = d.path().join("home");
+    let place = d.path().join("repo");
+    fs::create_dir_all(place.join(".lords")).unwrap();
+    fs::write(place.join(".lords/child-whole.md"), child_file(&["A start.".to_string()])).unwrap();
+    let dir = home.join(".lords-command/guard/child");
+    fs::create_dir_all(&dir).unwrap();
+    let aged = |name: &str, secs: u64| {
+        let f = dir.join(name);
+        fs::write(&f, "old").unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        fs::File::options().write(true).open(&f).unwrap().set_modified(when).unwrap();
+        f
+    };
+    let (old, young) = (aged("eleven-minutes", 660), aged("nine-minutes", 540));
+    let got = parts_of(&home, &place, &start(&place, "Explore", "s1", "fresh"));
+    assert_eq!(got, vec!["A start.".to_string()], "{got:?}");
+    assert!(!old.exists(), "a snapshot older than 10 minutes goes");
+    assert!(young.exists(), "a younger one stays: a part of its event may still read it");
+}
+
+// Spec (fix check r2, FC4: the guard copy sync names must take the command line sync writes; design note R3): asked
+// with exactly that command line and the probe event, the guard answers its child protocol.
+#[test]
+fn the_guard_answers_the_probe_with_its_child_protocol() {
+    let d = TempDir::new().unwrap();
+    let home = d.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let tool_home = d.path().join("tool-home");
+    let o = run(
+        &home,
+        d.path(),
+        &["guard", "child", "--part", "1", "--home", tool_home.to_str().unwrap()],
+        r#"{"hook_event_name":"LordsGuardProbe"}"#,
+    );
+    assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "lords guard child 3", "{o:?}");
+}
+
+// Spec (fix check r2, FC5: "No hook reader killed at any instant leaves sync or later readers blocked"; its witness, a
+// reader killed while it holds the apply lock): the lock file such a reader leaves (this build's record, its holder
+// gone) doesn't hold the next reader, which gets its start at once, nor its writer.
+#[test]
+fn a_dead_readers_lock_holds_no_one() {
+    let d = TempDir::new().unwrap();
+    let home = d.path().join("home");
+    let place = d.path().join("repo");
+    let below = place.join("src");
+    fs::create_dir_all(place.join(".lords")).unwrap();
+    fs::create_dir_all(&below).unwrap();
+    fs::write(place.join(".lords/child-whole.md"), child_file(&["THE START.".to_string()]))
+        .unwrap();
+    let lock = home.join(".lords-command/apply.lock");
+    fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    fs::write(&lock, "lords-lock 2 pid 4294967295\n").unwrap();
+    let t = std::time::Instant::now();
+    let got = parts_of(&home, &below, &start(&below, "Explore", "s1", "after-a-dead-reader"));
+    assert_eq!(got, vec!["THE START.".to_string()], "{got:?}");
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(10),
+        "at once, not after a wait: {:?}",
+        t.elapsed()
+    );
 }

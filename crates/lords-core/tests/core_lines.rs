@@ -655,6 +655,52 @@ fn a_child_start_holding_a_line_longer_than_a_part_is_refused() {
     assert!(p.over_limit, "the plan fails");
 }
 
+// Spec (fix check r2, FC1, design note R3: a resumable child is served by one read, so its start, `child.md`, must fit
+// one part): sync refuses a place whose `child.md` doesn't, naming the file, and the plan fails.
+#[test]
+fn a_child_md_past_one_part_is_refused() {
+    let (f, checkout) = bare_place("child_role = \"helper\"\n");
+    let lines: Vec<String> =
+        (0..30).map(|i| format!("- line: \"{i:02} {}\"", "x".repeat(390))).collect();
+    f.write(
+        "priv/project/beta/rules/long.md",
+        &entry(
+            "rule.long",
+            "project:beta",
+            "private",
+            &format!("roles: [helper]\nstart: core\ncore:\n{}\n", lines.join("\n")),
+            "Long.\n",
+        ),
+    );
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    let item =
+        p.items.iter().find(|i| i.path == checkout.join(".lords")).expect("the role files' item");
+    assert_eq!(item.action, lords_core::sync::Action::Conflict, "{:?}", item.notes);
+    assert!(
+        item.notes.iter().any(|n| n.contains("child.md") && n.contains("one part")),
+        "{:?}",
+        item.notes
+    );
+    assert!(p.over_limit, "the plan fails");
+}
+
+// Spec (fix check r2, FC5: "No hook reader killed at any instant leaves sync or later readers blocked … a killed sync
+// stops stranding the lock too"; the dead-owner regression): the apply lock a dead holder of this build leaves (its
+// record, no process holding it) doesn't stop the next apply, which goes on at once.
+#[test]
+fn a_dead_holders_lock_doesnt_stop_the_next_apply() {
+    let (f, _) = bare_place("");
+    f.write(
+        "priv/project/beta/rules/r.md",
+        &entry("rule.r", "project:beta", "private", "", "A rule.\n"),
+    );
+    f.write("lords-home/apply.lock", "lords-lock 2 pid 4294967295\n");
+    let t = std::time::Instant::now();
+    let applied = lords_core::sync::apply(&plan(&f.stacks(), &f.opts()).unwrap());
+    assert!(applied.is_ok(), "{applied:?}");
+    assert!(t.elapsed() < std::time::Duration::from_secs(10), "at once: {:?}", t.elapsed());
+}
+
 // Spec (repair 2 sol-loop r1, V1: a reader may never take a `.lords` moved aside for one without its file): reading a
 // file in a dir tells, by the one open, a dir that was there without the file from no dir at all.
 #[test]
