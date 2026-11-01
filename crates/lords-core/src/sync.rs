@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+mod place_uninstall;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Action {
@@ -32,6 +34,9 @@ pub enum Action {
     Refresh,
     /// A tool-owned path the stack no longer wants, still matching its ledger record: deleted, following nothing.
     Remove,
+    /// A tool-owned instruction file the owner has added text to, whose managed block still matches its ledger record
+    /// (`uninstall --place`): the block goes, every byte around it stays, and the record goes.
+    RemoveBlock,
     /// A ledger record whose path is gone already (its worktree removed, say): the record goes.
     Forget,
     /// A temporary entry that has ended: `--apply` retires it in its stack (with a commit) before writing.
@@ -301,7 +306,10 @@ impl Plan {
     /// Whether `apply` takes this plan, by its own refusal rules, and what it releases; or why not.
     pub fn applies(&self) -> Result<Releases, String> {
         let count = |a: Action| self.items.iter().filter(|i| i.action == a).count();
-        let r = Releases { removes: count(Action::Remove), forgets: count(Action::Forget) };
+        let r = Releases {
+            removes: count(Action::Remove) + count(Action::RemoveBlock),
+            forgets: count(Action::Forget),
+        };
         let conflicts: Vec<&Item> =
             self.items.iter().filter(|i| i.action == Action::Conflict).collect();
         if !conflicts.is_empty() {
@@ -2347,6 +2355,10 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
     if opts.home.as_os_str().is_empty() {
         return Err("no tool home given (Options.home): sync reads its ledger there".into());
     }
+    // One place's uninstall has its own planner: nothing is wanted there, and the ledger alone decides (PI-13).
+    if opts.uninstall && opts.place.is_some() {
+        return place_uninstall::plan(stacks, private, opts);
+    }
     let ledger = Ledger::load(&opts.home)?;
     let mut pl = Planner {
         undeliverable: false,
@@ -2558,7 +2570,10 @@ fn staged(plan: &mut Plan) {
     plan.notes.extend(notes);
     plan.items.retain(|i| {
         !all && !i.units.iter().any(|u| blocked.contains(u))
-            && !matches!(i.action, Action::RetireEntry | Action::Remove | Action::Forget)
+            && !matches!(
+                i.action,
+                Action::RetireEntry | Action::Remove | Action::RemoveBlock | Action::Forget
+            )
             && matches!(i.change(), Change::ToolOwned | Change::ExcludeEdit)
     });
 }
@@ -2749,7 +2764,7 @@ fn tool_current(item: &Item, ledger: &Ledger) -> Result<(), String> {
         {
             Err(stale(item, "something appeared"))
         }
-        Action::Update | Action::Refresh | Action::Remove => {
+        Action::Update | Action::Refresh | Action::Remove | Action::RemoveBlock => {
             let recorded = ledger.get(place.path()).map(|o| o.sha.clone());
             if recorded.is_none() || recorded != item.have {
                 return Err(stale(item, "its ledger record changed"));
@@ -2769,6 +2784,18 @@ fn tool_change(item: &Item, ledger: &mut Ledger) -> Result<(), String> {
         return Err(format!("{}: no place below a verified root", item.path.display()));
     };
     let path = place.path();
+    // Lords' block out of a file the owner added text to (one place's uninstall): the file is swapped only while it
+    // holds exactly what was planned, its attributes kept, and put back on any error; then the record goes. No backup:
+    // the bytes that go are the record's, and the owner's stay in the file.
+    if item.action == Action::RemoveBlock {
+        tool_current(item, ledger)?;
+        let (Some(was), Some(rest)) = (&item.current, &item.proposed) else {
+            return Err(format!("{}: a block removal planned without its texts", path.display()));
+        };
+        fsguard::replace_file_if(place, was.as_bytes(), rest.as_bytes())?;
+        ledger.forget(path);
+        return Ok(());
+    }
     let have = |p: &Path| -> Result<String, String> {
         Ok(match fsguard::kind(p)? {
             fsguard::Kind::Dir => fsguard::tree_sha(&fsguard::read_tree(p)?),
@@ -2799,9 +2826,12 @@ fn tool_change(item: &Item, ledger: &mut Ledger) -> Result<(), String> {
                 ));
             }
             let aside = fsguard::move_aside(place)?;
-            if Some(have(aside.path())?) != recorded {
-                aside.back()?;
-                return Err(stale(item, "it changed"));
+            // From here any failure puts the copy back at its path before returning (uninstall-place review r1,
+            // UP2-R1-01): a copy not shown to hold its record's bytes, an unreadable one included, never leaves it.
+            match have(aside.path()) {
+                Ok(h) if Some(&h) == recorded.as_ref() => {}
+                Ok(_) => return Err(aside.back_after(stale(item, "it changed"))),
+                Err(e) => return Err(aside.back_after(e)),
             }
             Some(aside)
         }
@@ -2818,21 +2848,29 @@ fn tool_change(item: &Item, ledger: &mut Ledger) -> Result<(), String> {
     let put = match put {
         Ok(p) => p,
         Err(e) => {
-            if let Some(aside) = &old {
-                aside.back()?;
-            }
-            return Err(e);
+            return Err(match &old {
+                Some(aside) => aside.back_after(e),
+                None => e,
+            })
         }
     };
     match put {
         Some(sha) => {
             let kind = if item.tree.is_some() { "dir" } else { "file" };
             ledger.record(place, kind, &sha, &item.scope);
+            // The new version holds the path now; the old one, shown to be the record's, only goes.
+            if let Some(aside) = old {
+                aside.delete()?;
+            }
         }
-        None => ledger.forget(path),
-    }
-    if let Some(aside) = old {
-        aside.delete()?;
+        None => {
+            // A removal's record goes once its copy is gone; a delete that stops part way puts back what is left,
+            // and the record stays.
+            if let Some(aside) = old {
+                aside.delete_or_back()?;
+            }
+            ledger.forget(path);
+        }
     }
     Ok(())
 }

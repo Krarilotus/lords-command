@@ -28,6 +28,8 @@ usage:
   lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--stage install] [--json] [--apply]
   lords sync --restore BACKUP_DIR   undo one apply's owner-file edits, each only while it holds what sync wrote
   lords uninstall [--user | --repo NAME] [--apply]   remove the tool's paths that still match its ledger
+  lords uninstall --repo NAME --place DIR [--apply] [--json]   one checkout or worktree's recorded copies
+    (a changed copy is kept with its record; exit 0 no record of the place remains, 1 one does, 2 refused or stopped)
   lords adopt [--list | PATH...]   record paths from before the ledger that hold exactly what sync writes there
   lords set-aside PATH... [--yes]   move paths that aren't the tool's into a new backup dir
   (sync, uninstall, adopt, set-aside: --home DIR, the tool's own dir; default ~/.lords-command)
@@ -515,8 +517,162 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     Ok(whole)
 }
 
-/// `lords uninstall`: removes every tool-owned path in scope that still matches its ledger record.
+/// One record of a place, as `uninstall --place` lists it.
+struct PlaceRow {
+    path: String,
+    action: &'static str,
+    note: String,
+}
+
+/// What `uninstall --place` found and did, for its text and its JSON (format 1).
+#[derive(Default)]
+struct PlaceRun {
+    repo: Option<String>,
+    place: Option<PathBuf>,
+    applied: bool,
+    planned: Vec<PlaceRow>,
+    /// What would remain (a dry run) or what the ledger still records after the apply; `None` when that couldn't be
+    /// read back.
+    remaining: Option<Vec<PlaceRow>>,
+}
+
+fn place_rows<'a>(items: impl IntoIterator<Item = &'a sync::Item>) -> Vec<PlaceRow> {
+    items
+        .into_iter()
+        .map(|i| PlaceRow {
+            path: i.path.display().to_string(),
+            action: match i.action {
+                sync::Action::Remove => "remove",
+                sync::Action::RemoveBlock => "remove-block",
+                sync::Action::Forget => "forget",
+                _ => "keep",
+            },
+            note: i.notes.join("; "),
+        })
+        .collect()
+}
+
+impl PlaceRun {
+    fn json(&self, exit: u8, error: Option<&String>) -> String {
+        let rows = |r: &[PlaceRow]| -> Vec<serde_json::Value> {
+            r.iter()
+                .map(|r| serde_json::json!({"path": r.path, "action": r.action, "note": r.note}))
+                .collect()
+        };
+        serde_json::to_string_pretty(&serde_json::json!({
+            "format": 1,
+            "repo": self.repo,
+            "place": self.place.as_ref().map(|p| p.display().to_string()),
+            "applied": self.applied,
+            "exit": exit,
+            "error": error,
+            "planned": rows(&self.planned),
+            "remaining": self.remaining.as_deref().map(rows),
+        }))
+        .unwrap_or_default()
+    }
+
+    fn print(&self) {
+        let Some(place) = &self.place else { return };
+        println!(
+            "repo {}, place {}: {} record(s) of it in the ledger",
+            self.repo.as_deref().unwrap_or_default(),
+            place.display(),
+            self.planned.len()
+        );
+        for r in &self.planned {
+            println!("  {:<12} {}\n               {}", r.action, r.path, r.note);
+        }
+        let head = if self.applied {
+            "applied; read back from the ledger"
+        } else {
+            "dry run: nothing changed (`--apply` acts); after it"
+        };
+        match &self.remaining {
+            None => println!("{head}: couldn't be read"),
+            Some(r) if r.is_empty() => println!("{head}: no record of the place remains"),
+            Some(r) => {
+                println!("{head}: {} record(s) of the place remain:", r.len());
+                for r in r {
+                    println!("  {:<12} {}\n               {}", r.action, r.path, r.note);
+                }
+            }
+        }
+    }
+}
+
+/// `lords uninstall --repo NAME --place DIR`: one checkout or worktree's records (design note
+/// 2026-11-01-lords-uninstall-place Q2). `Ok(true)` when no record of the place remains, `Ok(false)` while one does.
+fn uninstall_place(a: &mut Args, dir: &Path, run: &mut PlaceRun) -> Result<bool, String> {
+    let home = tool_home(a)?;
+    let apply = a.flag("--apply");
+    let user_only = a.flag("--user");
+    run.repo = a.value("--repo")?;
+    let p = paths(a)?;
+    a.done()?;
+    if run.repo.is_none() {
+        return Err("--place needs --repo (a checkout or worktree of that repo)".into());
+    }
+    let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    let opts = sync::Options {
+        repo: run.repo.clone(),
+        user_only,
+        place: Some(dir.to_path_buf()),
+        home,
+        uninstall: true,
+        ..sync::Options::default()
+    };
+    let plan = sync::plan(&stacks, &opts)?;
+    run.place = plan.roots.first().map(|r| r.path().to_path_buf());
+    run.planned = place_rows(&plan.items);
+    if !apply {
+        run.remaining =
+            Some(place_rows(plan.items.iter().filter(|i| i.action == sync::Action::Report)));
+        return Ok(run.remaining.as_ref().is_some_and(Vec::is_empty));
+    }
+    run.applied = true;
+    let done = sync::apply(&plan);
+    // The answer is what the ledger still records of the place, read back with a fresh plan: after an error too, so
+    // what went before it is known.
+    let after = sync::plan(&stacks, &opts);
+    if let Ok(after) = &after {
+        run.remaining = Some(place_rows(&after.items));
+    }
+    done?;
+    after.map_err(|e| format!("applied, but the place couldn't be read back: {e}"))?;
+    Ok(run.remaining.as_ref().is_some_and(Vec::is_empty))
+}
+
+/// `lords uninstall`: removes every tool-owned path in scope that still matches its ledger record; with `--place`,
+/// one checkout or worktree's (`uninstall_place`).
 fn cmd_uninstall(mut a: Args) -> Result<bool, String> {
+    let json = a.flag("--json");
+    // A bad `--place` is a refusal too, which `--json` gives as its one object (sol-loop r1 S2).
+    let place = match a.value("--place") {
+        Err(e) if json => {
+            println!("{}", PlaceRun::default().json(2, Some(&e)));
+            return Err(e);
+        }
+        r => r?.map(PathBuf::from),
+    };
+    if let Some(dir) = place {
+        let mut run = PlaceRun::default();
+        let r = uninstall_place(&mut a, &dir, &mut run);
+        let exit = match &r {
+            Ok(true) => 0,
+            Ok(false) => 1,
+            Err(_) => 2,
+        };
+        if json {
+            println!("{}", run.json(exit, r.as_ref().err()));
+        } else {
+            run.print();
+        }
+        return r;
+    }
+    if json {
+        return Err("--json goes with --place: it is one place's result".into());
+    }
     let home = tool_home(&mut a)?;
     let apply = a.flag("--apply");
     let user_only = a.flag("--user");

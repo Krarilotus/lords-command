@@ -1778,3 +1778,185 @@ fn sync_registers_the_session_and_turn_guards() {
         serde_json::json!([theirs, {"hooks": [lords("session")]}])
     );
 }
+
+/// A repo `r` declared in a private stack with one rule, and its worktree `wts/one`, synced by the CLI: each holds
+/// `CLAUDE.local.md` and `.lords`. Gives the repo, the worktree and the stack arguments every call here takes.
+fn synced_worktree(env: &Env) -> (PathBuf, PathBuf, Vec<String>) {
+    let d = env.dir.path();
+    let (public, private) = (d.join("pub"), d.join("priv"));
+    fs::create_dir_all(public.join("global/rules")).unwrap();
+    fs::create_dir_all(private.join("global/rules")).unwrap();
+    fs::write(
+        public.join("stack.toml"),
+        "name = \"pub\"\nvisibility = \"public\"\nroles = [\"coder\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        private.join("stack.toml"),
+        format!(
+            "name = \"priv\"\nvisibility = \"private\"\nroles = [\"coder\"]\n[repos.r]\ncheckouts = ['{}']\nworktree_roots = ['{}']\nadapters = [\"claude\"]\n",
+            d.join("repo").display(),
+            d.join("wts").display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        private.join("global/rules/r.md"),
+        "---\nid: rule.r\nkind: rule\ntitle: r\naudience: [all]\nroles: [coder]\nscope: global\nstatus: active\nvisibility: private\norigin:\n  type: own\n---\nTest before merging.\n",
+    )
+    .unwrap();
+    let repo = env.repo();
+    fs::write(repo.join("README.md"), "a repo\n").unwrap();
+    env.git(&repo, &["add", "-A"]);
+    assert!(env.git(&repo, &["commit", "-q", "-m", "start"]).status.success());
+    let wt = d.join("wts").join("one");
+    let o = env.git(&repo, &["worktree", "add", "-q", "-b", "one", wt.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", text(&o));
+    let stacks: Vec<String> = vec![
+        "--public-stack".into(),
+        public.to_string_lossy().into_owned(),
+        "--private-stack".into(),
+        private.to_string_lossy().into_owned(),
+    ];
+    let mut args = vec!["sync", "--repo", "r", "--apply"];
+    args.extend(stacks.iter().map(String::as_str));
+    let o = env.lords(&repo, &args);
+    assert!(o.status.success(), "{}", text(&o));
+    for c in [wt.join("CLAUDE.local.md"), wt.join(".lords")] {
+        assert!(c.exists(), "synced: {} ({})", c.display(), text(&o));
+    }
+    (repo, wt, stacks)
+}
+
+/// A JSON list of `uninstall --place`'s result as (path, action) pairs, paths compared as Windows compares them.
+fn listed(v: &serde_json::Value, list: &str) -> std::collections::BTreeSet<(String, String)> {
+    v[list]
+        .as_array()
+        .unwrap_or_else(|| panic!("no {list}: {v}"))
+        .iter()
+        .map(|r| (folded(r["path"].as_str().unwrap()), r["action"].as_str().unwrap().to_string()))
+        .collect()
+}
+
+fn folded(p: &str) -> String {
+    let p = p.replace('\\', "/");
+    if cfg!(windows) {
+        p.to_lowercase()
+    } else {
+        p
+    }
+}
+
+// Spec (design note Q2: "The dry run lists every exact path with what would happen to it. --json prints one object
+// (format 1) on stdout"; "Exit codes: 0: no record of the place remains (the dry run predicts it; after --apply it is
+// read back from the ledger); 1: some record of the place remains, each one named"; Q4's JSON): named relatively from
+// inside it, the worktree's dry run lists its two copies as removals, removes nothing, exit 0; with its role file
+// edited, the dry run names `.lords` as kept, exit 1; applied, `CLAUDE.local.md` goes and `.lords` stays with the
+// edit, exit 1, read back; with `.lords` deleted by hand, applied again its record is dropped, nothing remains, exit
+// 0. The text form names both paths.
+#[test]
+fn uninstall_place_lists_its_paths_and_exits_by_what_remains() {
+    let env = Env::new();
+    let (_repo, wt, stacks) = synced_worktree(&env);
+    let wt_text = wt.to_string_lossy().into_owned();
+    let run = |cwd: &Path, place: &str, apply: bool| -> (Option<i32>, serde_json::Value) {
+        let mut args = vec!["uninstall", "--repo", "r", "--place", place, "--json"];
+        if apply {
+            args.push("--apply");
+        }
+        args.extend(stacks.iter().map(String::as_str));
+        let o = env.lords(cwd, &args);
+        let v: serde_json::Value =
+            serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{e}: {}", text(&o)));
+        (o.status.code(), v)
+    };
+    let (file, lords) = (
+        folded(&wt.join("CLAUDE.local.md").to_string_lossy()),
+        folded(&wt.join(".lords").to_string_lossy()),
+    );
+    let pair = |p: &str, a: &str| (p.to_string(), a.to_string());
+
+    let (code, v) = run(&wt, ".", false);
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(
+        (v["format"].as_u64(), v["applied"].as_bool(), v["exit"].as_u64()),
+        (Some(1), Some(false), Some(0)),
+        "{v}"
+    );
+    assert!(v["error"].is_null(), "{v}");
+    assert_eq!(listed(&v, "planned"), [pair(&file, "remove"), pair(&lords, "remove")].into());
+    assert!(listed(&v, "remaining").is_empty(), "{v}");
+    assert!(
+        wt.join("CLAUDE.local.md").is_file() && wt.join(".lords").is_dir(),
+        "a dry run removes nothing"
+    );
+
+    let mut args = vec!["uninstall", "--repo", "r", "--place", wt_text.as_str()];
+    args.extend(stacks.iter().map(String::as_str));
+    let o = env.lords(&wt, &args);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    assert!(text(&o).contains("CLAUDE.local.md") && text(&o).contains(".lords"), "{}", text(&o));
+
+    fs::write(wt.join(".lords").join("role-coder.md"), "OWNER EDIT\n").unwrap();
+    let (code, v) = run(&wt, &wt_text, false);
+    assert_eq!(code, Some(1), "{v}");
+    assert_eq!(listed(&v, "remaining"), [pair(&lords, "keep")].into());
+
+    let (code, v) = run(&wt, &wt_text, true);
+    assert_eq!(code, Some(1), "{v}");
+    assert_eq!((v["applied"].as_bool(), v["exit"].as_u64()), (Some(true), Some(1)), "{v}");
+    assert_eq!(listed(&v, "remaining"), [pair(&lords, "keep")].into());
+    assert!(!wt.join("CLAUDE.local.md").exists());
+    assert_eq!(
+        fs::read_to_string(wt.join(".lords").join("role-coder.md")).unwrap(),
+        "OWNER EDIT\n"
+    );
+
+    fs::remove_dir_all(wt.join(".lords")).unwrap();
+    let (code, v) = run(&wt, &wt_text, true);
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(listed(&v, "planned"), [pair(&lords, "forget")].into());
+    assert!(listed(&v, "remaining").is_empty(), "{v}");
+}
+
+// Spec (design note Q2: "2: refused or stopped: bad arguments, <tree> not a declared place of NAME … A refusal
+// changes nothing"; Q4: "--json, one object on stdout, also for a refusal … place is null when the place was never
+// found … remaining is null when it isn't known"): `--place` without `--repo` is refused, exit 2; a plain dir under
+// the worktree root, with `--apply`, is refused with exit 2, its JSON giving the error, no place, nothing planned and
+// nothing known to remain, and the worktree's copies stay; `--place` with no value, with `--json`, is a bad argument
+// that still gives one JSON object with its error, exit 2 (sol-loop r1 S2).
+#[test]
+fn uninstall_place_refuses_what_is_no_place() {
+    let env = Env::new();
+    let (_repo, wt, stacks) = synced_worktree(&env);
+    let mut args = vec!["uninstall", "--place", wt.to_str().unwrap()];
+    args.extend(stacks.iter().map(String::as_str));
+    let o = env.lords(&wt, &args);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+
+    let plain = env.dir.path().join("wts").join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let mut args =
+        vec!["uninstall", "--repo", "r", "--place", plain.to_str().unwrap(), "--json", "--apply"];
+    args.extend(stacks.iter().map(String::as_str));
+    let o = env.lords(&wt, &args);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    let v: serde_json::Value =
+        serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{e}: {}", text(&o)));
+    assert_eq!(v["exit"].as_u64(), Some(2), "{v}");
+    assert!(v["error"].as_str().is_some_and(|e| !e.is_empty()), "{v}");
+    assert!(v["place"].is_null(), "{v}");
+    assert!(listed(&v, "planned").is_empty() && v["remaining"].is_null(), "{v}");
+    assert_eq!(v["applied"].as_bool(), Some(false), "{v}");
+    assert!(wt.join("CLAUDE.local.md").is_file() && wt.join(".lords").is_dir());
+
+    let mut args = vec!["uninstall", "--repo", "r", "--json"];
+    args.extend(stacks.iter().map(String::as_str));
+    args.push("--place");
+    let o = env.lords(&wt, &args);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    let v: serde_json::Value =
+        serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{e}: {}", text(&o)));
+    assert_eq!(v["exit"].as_u64(), Some(2), "{v}");
+    assert!(v["error"].as_str().is_some_and(|e| e.contains("--place")), "{v}");
+}

@@ -162,3 +162,21 @@ pub fn forge(home: &Path, root: &Path, parts: &[&str], kind: &str, scope: &str) 
     ));
     fs::write(&file, text).unwrap();
 }
+
+/// A dir link: a junction on Windows, a symlink elsewhere.
+pub fn dir_link(link: &Path, to: &Path) {
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    #[cfg(windows)]
+    {
+        let win = |p: &Path| p.to_string_lossy().replace('/', "\\");
+        let out = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(win(link))
+            .arg(win(to))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    #[cfg(not(windows))]
+    std::os::unix::fs::symlink(to, link).unwrap();
+}

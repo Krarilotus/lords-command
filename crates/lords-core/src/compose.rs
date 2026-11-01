@@ -1067,6 +1067,12 @@ pub fn place_block(current: &str, block: &str, replace: bool) -> Result<String, 
 
 /// The managed block currently in a file, if it has exactly one.
 pub fn current_block(text: &str) -> Option<&str> {
+    block_bounds(text).map(|(b, e)| &text[b..e])
+}
+
+/// Where a file's one managed block lies, as byte offsets: from its begin marker's line to the end of its end marker's
+/// line, that line's ending included. `None` without exactly one block.
+pub fn block_bounds(text: &str) -> Option<(usize, usize)> {
     let (b, e) = block_span(text).ok()??;
     let after = &text[e..];
     let nl = if after.starts_with("\r\n") {
@@ -1076,5 +1082,5 @@ pub fn current_block(text: &str) -> Option<&str> {
     } else {
         0
     };
-    Some(&text[b..e + nl])
+    Some((b, e + nl))
 }
