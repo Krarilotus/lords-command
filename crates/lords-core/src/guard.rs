@@ -902,6 +902,24 @@ pub fn child_hook(input: &str, home: &Path) -> Answer {
     Answer { stdout: out.to_string(), note: None }
 }
 
+// ---------------------------------------------------------------- role
+//
+// `role` (F10, design note Harness/notes/2026-11-02-lords-role-at-launch.md): a session T3 starts with `delegate_task`
+// reads only its place's file, which carries the place's default role. Its launch names its role in the prompt: the
+// brief's first line, or T3's `role` prefix.
+
+/// A role a session's launch names (`launch_role`): the role, and the one T3's prefix maps to, if it has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Launch {
+    pub role: String,
+    pub t3: Option<String>,
+}
+
+/// The role a session's first prompt names (not built yet: names none).
+pub fn launch_role(_prompt: &str) -> Option<Launch> {
+    None
+}
+
 /// What one prompt finds (`rules_found`): the line to say, if any, and the record to save.
 struct Found {
     line: Option<String>,
