@@ -14,3 +14,11 @@ serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Test support only: a guard copy from before this build's child protocol, for the readiness tests across guard
+# versions (tests/child.rs). Never packaged (tools/package.ps1 takes lords.exe and lords-command.exe).
+[[bin]]
+name = "lords-old-guard-stub"
+path = "tests/support/old_guard.rs"
+test = false
+doc = false

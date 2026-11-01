@@ -783,6 +783,125 @@ pub fn turn_hook(
     Answer { stdout: out.to_string(), note }
 }
 
+// ---------------------------------------------------------------- child
+//
+// `child` (plan L6, an orchestrator's condition 3: "Children start with their own role's core, not the parent's"), a
+// `SubagentStart` hook in Claude Code and in Codex: it gives a native child the start file sync wrote for the stack's
+// `child_role` in the child's place, `.lords/child.md`, as the child's context. One small read, no stack loaded.
+
+/// The agent types that load no place file (Claude Code's docs, sub-agents: "Explore and Plan start without your
+/// CLAUDE.md files"; probed 31 Oct, design note D4): they get the role's whole start, every other the part beyond the
+/// place's file.
+pub const NO_PLACE_FILE_AGENTS: [&str; 2] = ["Explore", "Plan"];
+
+/// A child file's text as context: without its marker lines, trimmed. Its size is counted in characters, as Claude
+/// Code measures a hook's context (`sync::CHILD_START_CHARS`).
+pub fn child_context(text: &str) -> String {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| *l != crate::compose::BEGIN && *l != crate::compose::END)
+        .collect();
+    lines.join("\n").trim().to_string()
+}
+
+/// The deadline sync registers on the child hook, Claude Code's and Codex's (fix check r2, FC5): every wait in the
+/// guard ends inside it.
+pub const CHILD_HOOK_TIMEOUT_SECS: u64 = 30;
+
+/// How long a reader that passed a missing `.lords` waits for the apply lock (`child_text`): a running sync holds it
+/// until it is done; past that, the child gets nothing, with a note. Half the hook's deadline, so the reads after it
+/// end inside it too.
+pub const CHILD_LOCK_WAIT_SECS: u64 = CHILD_HOOK_TIMEOUT_SECS / 2;
+
+/// The child protocol this guard speaks, which sync checks in the installed copy before it writes the child hook (fix
+/// check r2, FC4): 4 is `guard child --home DIR`, one read per start for every agent type, at most
+/// `sync::CHILD_START_CHARS` (the Lords owner's option 1, 1 Nov). 3, this round's first build, read some starts in
+/// parts; it was never installed.
+pub const CHILD_PROTOCOL: u32 = 4;
+
+/// The event sync's probe gives the child guard (`process::guard_child_protocol`), answered with the protocol.
+pub const CHILD_PROBE_EVENT: &str = "LordsGuardProbe";
+
+/// The text of the child file the event's agent type takes in its place, or "" where there is none. The place is the
+/// nearest `.lords` at or above `cwd`; a file is read with one open whose own answer says whether `.lords` was there
+/// (`fsguard::read_text_in`): sync never edits a child file in place (a whole `.lords` is renamed in), so one read is
+/// one generation, and "no file" comes only from a `.lords` that was there without it (repair 2 sol-loop r1, V1).
+/// A `.lords` at `cwd` itself is decided at once. Past a missing one, which may be no place or a place between its two
+/// versions (fix check r1, FC1), the walk is decided under the apply lock, which every sync holds while it moves a
+/// `.lords` aside and puts the new one in: then no swap is under way, and an old `.lords` aside with no new one is a
+/// sync that stopped, so the child gets nothing rather than an enclosing place's start (repair 2 sol-loop r2, W1).
+fn child_text(ev: &Value, cwd: &Path, home: &Path) -> Result<String, String> {
+    use crate::fsguard::InDir;
+    // Never the part beyond the place's file in place of a whole start (repair sol-loop r1, R4).
+    let whole = ev["agent_type"].as_str().is_some_and(|t| NO_PLACE_FILE_AGENTS.contains(&t));
+    let name = if whole { crate::sync::CHILD_WHOLE_FILE } else { crate::sync::CHILD_FILE };
+    let found = |r: InDir| match r {
+        InDir::Text(t) if t.contains(crate::compose::BEGIN) => Some(t),
+        InDir::Text(_) | InDir::NoFile => Some(String::new()),
+        InDir::NoDir => None,
+    };
+    let here = cwd.join(crate::sync::ROLE_DIR);
+    if let Some(t) = found(crate::fsguard::read_text_in(&here, name)?) {
+        return Ok(t);
+    }
+    let _lock = crate::sync::ApplyLock::take(home, CHILD_LOCK_WAIT_SECS)
+        .map_err(|e| format!("a sync is running, so the place can't be told ({e})"))?;
+    for d in cwd.ancestors() {
+        let dir = d.join(crate::sync::ROLE_DIR);
+        if let Some(t) = found(crate::fsguard::read_text_in(&dir, name)?) {
+            return Ok(t);
+        }
+        if crate::fsguard::being_replaced(&dir)? {
+            return Err(format!(
+                "{}: its old version is aside with no new one, from a sync that stopped; sync again",
+                dir.display()
+            ));
+        }
+    }
+    Ok(String::new())
+}
+
+/// The child guard's answer to one `SubagentStart` event: the child file its agent type takes in its place
+/// (`child-whole.md` for one that loads no place file, else `child.md`; the nearest `.lords` is the place, never an
+/// enclosing one), without its marker lines, as `additionalContext`, from one read. Claude Code fires the event again
+/// with the same agent id when a child resumes and gives no id per firing, so one read in one hook is the only
+/// delivery that is always one generation (fix check r2, FC1; the Lords owner's option 1, 1 Nov). Nothing where no
+/// place has one. A start longer than one hook delivers (`sync::CHILD_START_CHARS`) is given nowhere, with a note:
+/// sync refuses such a `child.md`, and Explore's and Plan's whole start waits for the corpus to fit. Never a block: a
+/// failure is a note and no context. The probe event (`CHILD_PROBE_EVENT`) is answered with `CHILD_PROTOCOL`.
+pub fn child_hook(input: &str, home: &Path) -> Answer {
+    let Ok(ev) = serde_json::from_str::<Value>(input) else {
+        return noted("the event can't be read");
+    };
+    if ev["hook_event_name"] == CHILD_PROBE_EVENT {
+        return Answer { stdout: format!("lords guard child {CHILD_PROTOCOL}"), note: None };
+    }
+    if ev["hook_event_name"] != "SubagentStart" {
+        return quiet();
+    }
+    let Some(cwd) = ev["cwd"].as_str() else { return noted("the event names no cwd") };
+    let text = match child_text(&ev, Path::new(cwd), home) {
+        Ok(t) => t,
+        Err(e) => return noted(format!("no start given ({e})")),
+    };
+    if text.is_empty() {
+        return quiet();
+    }
+    let context = child_context(&text);
+    let (n, max) = (context.chars().count(), crate::sync::CHILD_START_CHARS);
+    if n > max {
+        return noted(format!(
+            "no start given: it is {n} characters, past the {max} one hook gives a child"
+        ));
+    }
+    let out = json!({"hookSpecificOutput": {
+        "hookEventName": "SubagentStart",
+        "additionalContext": context,
+    }});
+    Answer { stdout: out.to_string(), note: None }
+}
+
 /// What one prompt finds (`rules_found`): the line to say, if any, and the record to save.
 struct Found {
     line: Option<String>,

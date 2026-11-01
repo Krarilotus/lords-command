@@ -22,6 +22,9 @@ fn global(audience: Vec<Audience>) -> Context {
         relative_to: None,
         default_role: None,
         default_role_inline: false,
+        opener: None,
+        child: None,
+        default_role_lines: true,
     }
 }
 
@@ -133,6 +136,9 @@ fn repo_layers_take_their_project_and_repo() {
             relative_to: None,
             default_role: None,
             default_role_inline: false,
+            opener: None,
+            child: None,
+            default_role_lines: true,
         },
     );
     assert_eq!(c.ids, ["rule.p", "fact.r", "fact.s"]);
@@ -149,6 +155,9 @@ fn repo_layers_take_their_project_and_repo() {
             relative_to: None,
             default_role: None,
             default_role_inline: false,
+            opener: None,
+            child: None,
+            default_role_lines: true,
         },
     );
     assert_eq!(c.ids, ["rule.g", "rule.p", "fact.r"]);
@@ -533,6 +542,9 @@ fn the_memory_index_goes_to_places_never_to_the_user_level() {
                 relative_to: None,
                 default_role: None,
                 default_role_inline: false,
+                opener: None,
+                child: None,
+                default_role_lines: true,
             },
         )
         .text
@@ -866,6 +878,9 @@ fn role_ctx(roles: Option<Vec<&str>>) -> Context {
         relative_to: None,
         default_role: None,
         default_role_inline: false,
+        opener: None,
+        child: None,
+        default_role_lines: true,
     }
 }
 
@@ -1092,6 +1107,9 @@ fn a_live_memory_store_is_indexed_by_its_own_index_file() {
             relative_to: None,
             default_role: None,
             default_role_inline: false,
+            opener: None,
+            child: None,
+            default_role_lines: true,
         },
     )
     .text;
@@ -1140,6 +1158,9 @@ fn a_live_store_is_named_from_its_declaration_without_imported_notes() {
                 relative_to: None,
                 default_role: None,
                 default_role_inline: false,
+                opener: None,
+                child: None,
+                default_role_lines: true,
             },
         )
         .text
@@ -1184,6 +1205,9 @@ fn a_live_store_is_named_from_its_declaration_without_imported_notes() {
                 relative_to: None,
                 default_role: None,
                 default_role_inline: false,
+                opener: None,
+                child: None,
+                default_role_lines: true,
             },
         )
         .text
@@ -1214,6 +1238,9 @@ fn composed_for(f: &Fixture, roles: Option<Vec<String>>) -> String {
             relative_to: None,
             default_role: None,
             default_role_inline: false,
+            opener: None,
+            child: None,
+            default_role_lines: true,
         },
     )
     .text

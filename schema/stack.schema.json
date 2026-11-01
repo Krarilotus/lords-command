@@ -78,7 +78,7 @@
           "own_text": { "enum": ["keep", "replace"], "default": "keep", "description": "instructions: keep the text outside the managed block, or replace the whole file with it" },
           "via": { "type": "string", "description": "instructions: the shared file that holds the composed text; this file gets only an include line" },
           "exclude": { "type": "array", "items": { "type": "string" }, "description": "settings: instruction files the harness must skip" },
-          "guards": { "type": "array", "items": { "enum": ["rm", "queue", "session", "turn"] }, "description": "settings: guards registered as the harness's hooks (Claude only): rm (PreToolUse, Bash), queue (Stop), session (SessionStart), turn (UserPromptSubmit)" }
+          "guards": { "type": "array", "items": { "enum": ["rm", "queue", "session", "turn", "child"] }, "description": "settings: guards registered as the harness's hooks: rm (PreToolUse, Bash), queue (Stop), session (SessionStart), turn (UserPromptSubmit), child (SubagentStart: a native child's start file, `child_role`). Claude Code runs all; Codex (`~/.codex/hooks.json`) runs child" }
         },
         "additionalProperties": false
       }
@@ -106,7 +106,21 @@
         "fleet_config": { "type": "string", "description": "private only: a fleet.toml whose host names count as private" }
       },
       "additionalProperties": false
-    }
+    },
+    "place_files": {
+      "type": "object",
+      "description": "per adapter id: how its place files are composed and measured",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "default_role_lines": { "type": "boolean", "default": true, "description": "whether the place's default role's lines for only some roles show in this adapter's place files, labelled, or stay in the role file" },
+          "warn_bytes": { "type": "integer", "minimum": 1, "description": "the warning line for this adapter's place files in `check`, in bytes, in place of 75 % of its limit; the limit itself stays a refusal" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "child_role": { "type": "string", "description": "the role a native subagent (one a session starts itself) starts as: each place's `.lords/child.md` carries that role's lines its place's file doesn't, which the `child` guard gives it" },
+    "require_core": { "type": "boolean", "default": false, "description": "`check` refuses an entry of this stack that has neither a core line nor `start: detail` (intent, memory and in-repo skills need none)" }
   },
   "additionalProperties": false
 }

@@ -185,6 +185,33 @@ pub struct Temporary {
     pub reason: String,
 }
 
+/// How an entry reaches an agent at start (design: Entry metadata): its core line for every role it binds, a line
+/// for only some of them (the others find it in the index), or only its index entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Start {
+    Core,
+    Role,
+    Detail,
+}
+
+/// An entry's core line: one for every role it binds, or several, each for its own roles.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Core {
+    One(String),
+    Lines(Vec<CoreLine>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreLine {
+    pub line: String,
+    /// The roles it is for; empty: every role the entry binds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
+}
+
 /// A case behind an entry: what happened, when, and where it is recorded. Kept beside the rule, never in the
 /// composed text (the rule stays a short principle).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +235,10 @@ pub struct Meta {
     pub roles: Vec<String>,
     pub scope: String,
     pub status: Status,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<Start>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core: Option<Core>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

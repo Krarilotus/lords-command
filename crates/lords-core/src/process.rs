@@ -91,14 +91,48 @@ pub(crate) fn git_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result
 /// Runs `<exe> guard --self-test` and requires it to print `ok` and exit 0 within 20 s: the copy a harness hook will
 /// run answers before sync names it (orchestrator, 30 Oct). A child past the deadline is killed.
 pub(crate) fn guard_self_test(guard_copy: &Path) -> Result<(), String> {
-    use std::io::Read;
+    let (status, out) = run_guard(guard_copy, &["guard", "--self-test"], b"", "guard self-test")?;
+    if status.success() && out.trim() == "ok" {
+        Ok(())
+    } else {
+        Err(format!("{}: guard self-test failed ({status}): {}", guard_copy.display(), out.trim()))
+    }
+}
+
+/// The child protocol of the guard copy (`guard::CHILD_PROTOCOL`), asked with exactly the arguments sync writes into
+/// the child hook (`guard child --home <home>`, Claude Code's and Codex's alike) and the probe event on stdin (fix
+/// check r2, FC4): `None` when it answers anything else, as a copy from before this protocol does (no child guard, no
+/// `--home`, or no answer to the probe).
+pub(crate) fn guard_child_protocol(guard_copy: &Path, home: &Path) -> Result<Option<u32>, String> {
+    let home = home.to_string_lossy();
+    let args = ["guard", "child", "--home", &home];
+    let probe = format!("{{\"hook_event_name\":\"{}\"}}", crate::guard::CHILD_PROBE_EVENT);
+    let (status, out) = run_guard(guard_copy, &args, probe.as_bytes(), "guard child probe")?;
+    let answer = out.trim().strip_prefix("lords guard child ").and_then(|n| n.parse().ok());
+    Ok(answer.filter(|_| status.success()))
+}
+
+/// Runs the guard copy with `args` and `stdin`, within 20 s: its exit status and stdout. A child past the deadline is
+/// killed.
+fn run_guard(
+    guard_copy: &Path,
+    args: &[&str],
+    stdin: &[u8],
+    what: &str,
+) -> Result<(std::process::ExitStatus, String), String> {
+    use std::io::{Read, Write};
     let mut child = Command::new(guard_copy)
-        .args(["guard", "--self-test"])
-        .stdin(std::process::Stdio::null())
+        .args(args)
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        // Never read, so never a full pipe that holds the child (an older copy's usage note goes there).
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("{}: {e}", guard_copy.display()))?;
+    // Written whole and closed before the wait: the guard reads its event to the end first.
+    if let Some(mut i) = child.stdin.take() {
+        let _ = i.write_all(stdin);
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     // Its output is read beside it, so a child that keeps the pipe open can't hold the sync past the deadline
     // (sol-loop r2, S14).
@@ -117,20 +151,16 @@ pub(crate) fn guard_self_test(guard_copy: &Path) -> Result<(), String> {
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("{}: guard self-test took over 20 s", guard_copy.display()));
+                return Err(format!("{}: {what} took over 20 s", guard_copy.display()));
             }
             None => std::thread::sleep(std::time::Duration::from_millis(20)),
         }
     };
     let left = deadline.saturating_duration_since(std::time::Instant::now());
-    let out = rx.recv_timeout(left).map_err(|_| {
-        format!("{}: guard self-test's output not closed within 20 s", guard_copy.display())
-    })?;
-    if status.success() && out.trim() == "ok" {
-        Ok(())
-    } else {
-        Err(format!("{}: guard self-test failed ({status}): {}", guard_copy.display(), out.trim()))
-    }
+    let out = rx
+        .recv_timeout(left)
+        .map_err(|_| format!("{}: {what}'s output not closed within 20 s", guard_copy.display()))?;
+    Ok((status, out))
 }
 
 /// Runs the T3 CLI (`t3_cli`, as `T3CODE_CLI_PATH` names it) with `args` and gives its stdout, or why not: it can't
