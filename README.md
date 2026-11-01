@@ -65,7 +65,14 @@ applies only on the stacks' PC.
 `lords panel add <alias> --bridge <dir>`, run on the stacks' PC, sets up a PC it reaches as `<alias>`: it prints the
 exact changes on both PCs (the other PC's key, made there, and its alias, a copy of overseer's; this PC's bridge
 permits the port; a task serves the panel at logon), and `--apply` carries them out, backing each file up first and
-checking the route last. Run again, it replaces the exe and keeps `config.txt`.
+checking the route last. Run again, it replaces the exe and keeps `config.txt`. With `--embedded`, for a PC whose
+panel is embedded in another app (overseer's Lords page reads `config.txt` and `panel-token` in
+`%LOCALAPPDATA%\Programs\lords-command\`), it sets up only those, the key and the alias: no `lords-command.exe`,
+README, LICENSE or Start-menu entry, and a window installed there before stays as it is. An `--apply` that fails
+leaves the other PC as it was or completely set up: each change there is journaled first and undone from its backups if
+the install doesn't finish, by that run or, if it lost the PC, by the next one, which the dry run names. The route
+check runs through a forward of its own and believes only the server's proof that it holds the token, so the panel's
+port on the other PC must be free: close the panel there (overseer's Lords page, the window) before running it.
 
 ## > hack
 

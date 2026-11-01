@@ -42,8 +42,9 @@ usage:
   lords guard child [--home DIR]   the SubagentStart hook: a native child starts with its role's start file in its place
   lords guard install [--home DIR]   install or update the guard copy the hooks run (sync never writes it)
   lords panel serve [--port N]   the window on another PC reads and edits these stacks through it (127.0.0.1:7879)
-  lords panel add ALIAS --bridge DIR [--apply]   set a PC this one reaches as ALIAS up for the panel; prints the
-    exact targets on both PCs, and with --apply carries them out (backups first, the route checked last)
+  lords panel add ALIAS --bridge DIR [--embedded] [--apply]   set a PC this one reaches as ALIAS up for the panel;
+    prints the exact targets on both PCs, and with --apply carries them out (backups first, the route checked last);
+    --embedded: for a client embedded in another app, no lords-command.exe, README, LICENSE or Start-menu entry
 
 stacks: --public-stack DIR, --private-stack DIR, else config.txt (beside the exe, or ~/.lords-command/),
 else the public stack is <this git repo>/stack.

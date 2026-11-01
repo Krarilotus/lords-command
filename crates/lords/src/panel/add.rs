@@ -33,6 +33,9 @@ pub struct Remote {
     /// SYSTEM and Administrators create, delete or change permissions there (fix check r2 N4), or that is a link (fix
     /// check r3 N5): why, one line each. Required: a probe that doesn't say is no answer.
     pub open_to: Vec<String>,
+    /// What is in the app dir's `staging\`: earlier runs' staging dirs, left behind (this PC runs one `panel add` at a
+    /// time, so none is a run still going). Required, as `open_to`.
+    pub earlier: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -58,9 +61,22 @@ pub struct Local {
     pub token: bool,
 }
 
+/// What the other PC shows the panel with: the standalone window (`lords-command.exe`, README.md, LICENSE and a
+/// Start-menu entry), or a client embedded in another app, which reads only config.txt and the token beside it
+/// (`--embedded`; design note 2026-11-01-lords-panel-embedded).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Client {
+    Standalone,
+    Embedded,
+}
+
 /// The changes, each `None` where it is there already.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
+    pub client: Client,
+    /// Earlier runs' staging dirs there: each run's install undone from its journal unless it finished or was undone,
+    /// then the dir removed, before this run changes anything (E12 R2).
+    pub earlier: Vec<String>,
     /// The panel's alias on the other PC, and the alias it copies.
     pub alias: String,
     pub base: String,
@@ -237,7 +253,7 @@ pub fn authorized_with(text: &str, line: &str) -> Result<Option<String>, String>
 }
 
 /// The plan for the PC this PC reaches as `name`, or why there is none.
-pub fn plan(name: &str, local: &Local, remote: &Remote) -> Result<Plan, String> {
+pub fn plan(name: &str, local: &Local, remote: &Remote, client: Client) -> Result<Plan, String> {
     if !remote.ssh || !remote.keygen {
         return Err(format!(
             "{name} has no OpenSSH client (ssh.exe and ssh-keygen.exe): add Windows' OpenSSH Client feature there first"
@@ -291,13 +307,26 @@ pub fn plan(name: &str, local: &Local, remote: &Remote) -> Result<Plan, String> 
                 forwards(b)
             ))
         }
-        None if remote.listening > 0 => {
-            return Err(format!("on {name}, 127.0.0.1:{LOCAL_PORT} is in use by something else"))
-        }
         None => Some(block),
     };
-    if remote.running > 0 {
+    // An embedded client's run replaces nothing a running window runs from.
+    if remote.running > 0 && client == Client::Standalone {
         return Err(format!("lords-command runs on {name}; close it first (its exe is replaced)"));
+    }
+    // The route check needs the port for this run's own forward and believes no other listener there (embedded panel
+    // review r1 R1), so whatever holds it is refused before anything is written.
+    if remote.listening > 0 {
+        return Err(format!(
+            "on {name}, 127.0.0.1:{LOCAL_PORT} is in use (the panel's client there, overseer's Lords page or a window, or something else); the route check needs it for this run's own forward: close what holds it, then run again"
+        ));
+    }
+    // Earlier runs' staging dirs there, each undone and removed first (E12 R2); a name no run gives is its owner's.
+    for e in &remote.earlier {
+        if super::plain(e).is_err() {
+            return Err(format!(
+                "on {name}, staging\\{e} is no run's staging dir; settle it by hand, then run again"
+            ));
+        }
     }
     let comment = format!("lords-panel-{}", name.to_ascii_lowercase());
     let public = remote
@@ -324,6 +353,8 @@ pub fn plan(name: &str, local: &Local, remote: &Remote) -> Result<Plan, String> 
         .is_none()
         .then(|| format!("api = http://127.0.0.1:{LOCAL_PORT}\r\ntunnel = {alias}\r\n"));
     Ok(Plan {
+        client,
+        earlier: remote.earlier.clone(),
         base: base_name,
         alias,
         key,
@@ -351,6 +382,11 @@ impl Plan {
             "  = {app}\\: no link on any dir from it up to the drive's root; {home} directly in the OS profiles directory; from it up to {home}, only this account, SYSTEM and Administrators may create, delete or change permissions (checked again before staging)",
             home = remote.home
         ));
+        for e in &self.earlier {
+            out.push(format!(
+                "  ↶ {app}\\staging\\{e}\\: an earlier run's, left behind: its install undone from its journal unless it finished or was undone, then removed"
+            ));
+        }
         out.push(format!(
             "  + {app}\\staging\\{run}\\ (this run's own: what it sends, removed at its end)"
         ));
@@ -368,11 +404,18 @@ impl Plan {
             ),
             None => format!("  = {ssh}\\config: Host {} is there", self.alias),
         });
-        // Every run names the backup dir: without the exe, a README or LICENSE may still be there (fix check r1 R7).
-        out.push(format!(
-            "  {} {app}\\: lords-command.exe, README.md, LICENSE; each one there backed up first into {app}\\backup-{run}\\ (made only then)",
-            if remote.app { "~" } else { "+" }
-        ));
+        // Every standalone run names the backup dir: without the exe, a README or LICENSE may still be there (fix check
+        // r1 R7). An embedded run neither installs nor removes the window's files, so it backs none up.
+        out.push(match (self.client, remote.app) {
+            (Client::Standalone, _) => format!(
+                "  {} {app}\\: lords-command.exe, README.md, LICENSE; each one there backed up first into {app}\\backup-{run}\\ (made only then)",
+                if remote.app { "~" } else { "+" }
+            ),
+            (Client::Embedded, true) => format!(
+                "  = {app}\\lords-command.exe there, kept as it is with its README.md, LICENSE and Start-menu entry (--embedded: none updated or removed)"
+            ),
+            (Client::Embedded, false) => "  = no lords-command.exe, README.md, LICENSE or Start-menu entry (--embedded: none installed)".into(),
+        });
         out.push(format!(
             "  + {app}\\panel-token: a copy of this PC's, owner-only (replaced, never backed up: a secret keeps no copies)"
         ));
@@ -383,10 +426,12 @@ impl Plan {
             ),
             None => format!("  = {app}\\config.txt (kept as it is)"),
         });
-        out.push(format!(
-            "  + {}\\Microsoft\\Windows\\Start Menu\\Programs\\lords-command.lnk (if not there)",
-            remote.app_data
-        ));
+        if self.client == Client::Standalone {
+            out.push(format!(
+                "  + {}\\Microsoft\\Windows\\Start Menu\\Programs\\lords-command.lnk (if not there)",
+                remote.app_data
+            ));
+        }
         out.push("this PC:".into());
         let home = local.home.display();
         out.push(format!(
@@ -488,7 +533,7 @@ mod tests {
     // ends), the key made there, PermitOpen with 7879 added, the task created and run.
     #[test]
     fn a_fresh_pc_gets_a_copy_of_overseers_route_and_every_target_is_an_addition() {
-        let p = plan("Other", &local(), &remote()).unwrap();
+        let p = plan("Other", &local(), &remote(), Client::Standalone).unwrap();
         assert_eq!(
             (p.alias.as_str(), p.key.as_str(), p.comment.as_str()),
             ("lords-panel-main", "lords_panel_main", "lords-panel-other")
@@ -531,12 +576,11 @@ mod tests {
         r.keys = vec![PublicKey { name: "lords_panel_main.pub".into(), text: PUB.into() }];
         r.app = true;
         r.config_txt = Some("api = http://127.0.0.1:17879\r\n".into());
-        r.listening = 1;
         let mut l = local();
         l.sshd_config = SSHD.replace("8317", "8317 127.0.0.1:7879");
         l.authorized_keys.push_str(&authorized_line(PUB, "lords-panel-other").unwrap());
         (l.task, l.served) = (true, true);
-        let p = plan("Other", &l, &r).unwrap();
+        let p = plan("Other", &l, &r, Client::Standalone).unwrap();
         assert_eq!(
             (p.block.as_ref(), p.sshd_config.as_ref(), p.config_txt.as_ref()),
             (None, None, None)
@@ -573,6 +617,7 @@ mod tests {
         );
         let on_our_port =
             format!("{BASE}Host something\r\n    LocalForward 127.0.0.1:17879 127.0.0.1:80\r\n");
+        let ours = format!("{BASE}\r\nHost lords-panel-main\r\n    HostName 127.0.0.1\r\n    Port 22220\r\n    User owner\r\n    IdentityFile ~/.ssh/lords_panel_main\r\n    IdentitiesOnly yes\r\n    UserKnownHostsFile ~/.ssh/bridge-known-hosts\r\n    LocalForward 127.0.0.1:17879 127.0.0.1:7879\r\n");
         type Change = Box<dyn Fn(&mut Local, &mut Remote)>;
         let cases: Vec<(&str, Change)> = vec![
             ("says otherwise", Box::new(move |_, r| r.ssh_config = Some(other_forward.clone()))),
@@ -584,7 +629,13 @@ mod tests {
             ("no OpenSSH client", Box::new(|_, r| r.ssh = false)),
             ("no bridge", Box::new(|_, r| r.ssh_config = None)),
             ("no bridge", Box::new(|_, r| r.ssh_config = Some(BASE.replace("7878", "7000")))),
-            ("in use by something else", Box::new(|_, r| r.listening = 1)),
+            ("127.0.0.1:17879 is in use", Box::new(|_, r| r.listening = 1)),
+            // Embedded panel review r1 R1: the route check needs the port for its own forward, so a client of the
+            // panel's alias holding it (overseer's Lords page, a window) is refused too, before anything is written.
+            (
+                "127.0.0.1:17879 is in use",
+                Box::new(move |_, r| (r.ssh_config, r.listening) = (Some(ours.clone()), 1)),
+            ),
             ("runs on Other", Box::new(|_, r| (r.app, r.running) = (true, 1))),
             ("no local forwards", Box::new(|l, _| l.sshd_config = SSHD.replace("local", "no"))),
             ("no PermitOpen", Box::new(|l, _| l.sshd_config = "Port 22223\r\n".into())),
@@ -614,7 +665,7 @@ mod tests {
         for (why, change) in &cases {
             let (mut l, mut r) = (local(), remote());
             change(&mut l, &mut r);
-            let refused = plan("Other", &l, &r);
+            let refused = plan("Other", &l, &r, Client::Standalone);
             assert!(refused.as_ref().is_err_and(|e| e.contains(why)), "{why}: {refused:?}");
         }
         // The panel's key there already, with other options here: refused too.
@@ -622,7 +673,9 @@ mod tests {
         r.keys = vec![PublicKey { name: "lords_panel_main.pub".into(), text: PUB.into() }];
         let mut l = local();
         l.authorized_keys.push_str(&format!("{PUB}\r\n"));
-        assert!(plan("Other", &l, &r).is_err_and(|e| e.contains("other options")));
+        assert!(
+            plan("Other", &l, &r, Client::Standalone).is_err_and(|e| e.contains("other options"))
+        );
         // A probe's answer that doesn't say who may change the install path is no answer (a missing reading fails
         // closed).
         let unsaid = r#"{"home":"X:\\h","local_app_data":"X:\\h\\L","app_data":"X:\\h\\R","ssh":true,"keygen":true,"app":false,"running":0,"listening":0}"#;
@@ -642,5 +695,68 @@ mod tests {
         for bad in ["", &private, "command=\"x\" ssh-ed25519 AAAA", "ssh-ed25519 AA\"AA"] {
             assert!(authorized_line(bad, "c").is_err(), "{bad}");
         }
+    }
+
+    // Spec (design note 2026-11-01-lords-panel-embedded E2: an embedded client's PC gets what that client reads, the
+    // key, the alias, the token and config.txt, and no lords-command.exe, README.md, LICENSE, backup dir for them or
+    // Start-menu entry; every other target, on both PCs, as a standalone run has it): the embedded plan is the
+    // standalone one but for its client, and its dry run is the standalone one without the window's two lines, with
+    // one line saying none of the window's files is installed.
+    #[test]
+    fn an_embedded_client_gets_every_target_but_the_windows_own() {
+        let (l, r) = (local(), remote());
+        let standalone = plan("Other", &l, &r, Client::Standalone).unwrap();
+        let embedded = plan("Other", &l, &r, Client::Embedded).unwrap();
+        assert_eq!(embedded, Plan { client: Client::Embedded, ..standalone.clone() });
+        let window = |line: &&String| line.contains("lords-command.exe") || line.contains(".lnk");
+        let run = "20261101-0500-1";
+        let (a, b) =
+            (standalone.describe("Other", &l, &r, run), embedded.describe("Other", &l, &r, run));
+        assert_eq!(a.iter().filter(window).count(), 2, "the exe's line and the shortcut's: {a:#?}");
+        assert_eq!(
+            b.iter().filter(window).collect::<Vec<_>>(),
+            ["  = no lords-command.exe, README.md, LICENSE or Start-menu entry (--embedded: none installed)"],
+        );
+        let rest =
+            |lines: &[String]| lines.iter().filter(|l| !window(l)).cloned().collect::<Vec<_>>();
+        assert_eq!(rest(&b), rest(&a));
+        assert!(!b.join("\n").contains("backup-"), "{b:#?}");
+    }
+
+    // Spec (E4, the choice for a PC with the standalone install: kept as it is, neither updated nor removed; a window
+    // running there is no refusal, as nothing it runs from is replaced): with the window installed and running there,
+    // the embedded plan is made and its dry run says the window is kept; a standalone run is still refused.
+    #[test]
+    fn an_embedded_run_keeps_a_standalone_install_and_its_running_window() {
+        let mut r = remote();
+        (r.app, r.running) = (true, 1);
+        let p = plan("Other", &local(), &r, Client::Embedded).unwrap();
+        let said = p.describe("Other", &local(), &r, "20261101-0500-1");
+        let kept = "  = X:\\fixture-home\\AppData\\Local\\Programs\\lords-command\\lords-command.exe there, kept as it is with its README.md, LICENSE and Start-menu entry (--embedded: none updated or removed)";
+        assert!(said.iter().any(|l| l == kept), "{said:#?}");
+        assert!(!said.join("\n").contains("backup-"), "{said:#?}");
+        let refused = plan("Other", &local(), &r, Client::Standalone);
+        assert!(refused.as_ref().is_err_and(|e| e.contains("runs on Other")), "{refused:?}");
+    }
+
+    // Spec (embedded panel review r1 R2, E12: an earlier run's staging dir left there, its install perhaps neither
+    // finished nor undone, is undone from its journal and removed before this run changes anything, and the dry run says
+    // so; a dir there whose name no run gives is refused, for its owner to settle): the plan carries each such run, in
+    // the order found, and the dry run names each, before this run's own staging dir.
+    #[test]
+    fn an_earlier_runs_staging_dir_is_named_and_undone_first() {
+        let mut r = remote();
+        r.earlier = vec!["2026-11-01-1793500796-63132".into(), "run-2".into()];
+        let p = plan("Other", &local(), &r, Client::Embedded).unwrap();
+        assert_eq!(p.earlier, r.earlier);
+        let said = p.describe("Other", &local(), &r, "20261101-0500-1");
+        let app = "X:\\fixture-home\\AppData\\Local\\Programs\\lords-command";
+        let first = format!("  ↶ {app}\\staging\\2026-11-01-1793500796-63132\\: an earlier run's, left behind: its install undone from its journal unless it finished or was undone, then removed");
+        let at = said.iter().position(|l| *l == first).unwrap_or_else(|| panic!("{said:#?}"));
+        let own = said.iter().position(|l| l.contains("staging\\20261101-0500-1\\")).unwrap();
+        assert!(at < own && said[at + 1].contains("staging\\run-2\\"), "{said:#?}");
+        r.earlier = vec!["not a run's".into()];
+        let refused = plan("Other", &local(), &r, Client::Embedded);
+        assert!(refused.as_ref().is_err_and(|e| e.contains("no run's")), "{refused:?}");
     }
 }
