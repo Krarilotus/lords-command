@@ -2,6 +2,8 @@
 name = "lords-command"
 visibility = "public"
 roles = ["orchestrator", "coder", "helper", "reviewer", "product"]
+# Every entry carries a core line or `start: detail` (A2, live 1 Nov).
+require_core = true
 topics = [
   "attribution", "git", "commits", "cleanup", "disk", "containers", "delegation", "review", "testing", "scope",
   "debugging", "evidence", "design", "performance", "documentation", "privacy", "security", "skills", "memory",
