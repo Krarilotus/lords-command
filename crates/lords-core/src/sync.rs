@@ -1323,7 +1323,7 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
             }
         }
     };
-    let hooks = match guard_hooks(guards, adapter, &value, guard.path()) {
+    let hooks = match guard_hooks(guards, adapter, &value, guard.path(), &pl.plan.home) {
         Ok(h) => h,
         Err(e) => return conflict(&t.name, &path, e),
     };
@@ -1442,11 +1442,13 @@ fn guard_hooks(
     adapter: &dyn Adapter,
     settings: &serde_json::Value,
     guard: &Path,
+    home: &Path,
 ) -> Result<Option<serde_json::Value>, String> {
     let current = settings.get("hooks").cloned().unwrap_or(serde_json::Value::Null);
     // Lords' hook: one that runs Lords' guard copy, the only command Lords writes (sol-loop r1, S1). A user's own hook,
     // whatever its args, is never Lords'.
     let exe = adapters::slashes(guard);
+    let home = adapters::slashes(home);
     let ours = |h: &serde_json::Value| adapter.guard_of(h, &exe).is_some();
     let lords_entry =
         |e: &serde_json::Value| e["hooks"].as_array().is_some_and(|hs| hs.iter().any(&ours));
@@ -1493,7 +1495,7 @@ fn guard_hooks(
         list.retain(|e| e["hooks"].as_array().is_none_or(|hs| !hs.is_empty()));
     }
     for (g, event, matcher) in wanted {
-        let hooks = adapter.guard_hooks(&exe, g);
+        let hooks = adapter.guard_hooks(&exe, g, &home);
         let entry = match matcher {
             Some(m) => serde_json::json!({ "matcher": m, "hooks": hooks }),
             None => serde_json::json!({ "hooks": hooks }),

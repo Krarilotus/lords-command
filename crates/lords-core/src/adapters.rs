@@ -64,7 +64,8 @@ pub trait Adapter: Sync {
     }
     /// The hook entries that run guard `guard` of Lords' copy `exe`: one, or for Claude Code's `child` one per part
     /// (each hook's context is capped on its own; review r1, F1).
-    fn guard_hooks(&self, exe: &str, guard: &str) -> Vec<serde_json::Value> {
+    /// `home`: the tool home sync runs with, which `child` takes (its apply lock and snapshots; repair 2 sol-loop r3, X1).
+    fn guard_hooks(&self, exe: &str, guard: &str, _home: &str) -> Vec<serde_json::Value> {
         vec![serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard] })]
     }
     /// The guard a hook entry runs, when it runs Lords' copy `exe` (`guard_hook`): a user's own hook, whatever its
@@ -117,7 +118,7 @@ impl Adapter for ClaudeCode {
 
     /// A child's start goes in `CHILD_PARTS` hooks, each its own 10,000 characters (code.claude.com/docs/en/hooks:
     /// "Claude Code measures each string on its own, even when several hooks run for the same event"; probed 31 Oct).
-    fn guard_hooks(&self, exe: &str, guard: &str) -> Vec<serde_json::Value> {
+    fn guard_hooks(&self, exe: &str, guard: &str, home: &str) -> Vec<serde_json::Value> {
         if guard != "child" {
             return vec![
                 serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard] }),
@@ -125,7 +126,7 @@ impl Adapter for ClaudeCode {
         }
         (1..=crate::sync::CHILD_PARTS)
             .map(|n| {
-                serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard, "--part", n.to_string()] })
+                serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard, "--part", n.to_string(), "--home", home] })
             })
             .collect()
     }
@@ -178,20 +179,21 @@ impl Adapter for Codex {
     }
 
     /// A command line, and the whole context passed on (`additionalContextLimit` 0): no parts.
-    fn guard_hooks(&self, exe: &str, guard: &str) -> Vec<serde_json::Value> {
+    fn guard_hooks(&self, exe: &str, guard: &str, home: &str) -> Vec<serde_json::Value> {
         vec![serde_json::json!({
             "type": "command",
-            "command": format!("\"{exe}\" guard {guard}"),
+            "command": format!("\"{exe}\" guard {guard} --home \"{home}\""),
             "timeout": 30,
             "additionalContextLimit": 0,
         })]
     }
 
+    /// The guard's name: the word after `guard` (its options follow).
     fn guard_of(&self, hook: &serde_json::Value, exe: &str) -> Option<String> {
         let line = hook["command"].as_str()?.replace('\\', "/");
         let prefix = format!("\"{exe}\" guard ");
         let at = line.get(..prefix.len()).filter(|p| p.eq_ignore_ascii_case(&prefix))?;
-        Some(line[at.len()..].trim().to_string())
+        Some(line[at.len()..].split_whitespace().next().unwrap_or("").to_string())
     }
 
     fn guard_note(&self) -> Option<&'static str> {

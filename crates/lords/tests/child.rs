@@ -320,14 +320,17 @@ fn a_child_never_falls_through_to_an_enclosing_place_mid_publication() {
     assert!(String::from_utf8_lossy(&o.stderr).contains("sync"), "the note says why: {o:?}");
     // The new `.lords` comes in while the child waits, as sync puts it in: under the apply lock, `<tool home>/apply.lock`
     // (repair 2 sol-loop r2, W1: a reader that passed a missing `.lords` decides under that lock). It gets that.
-    let lock = home.join(".lords-command/apply.lock");
-    fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    // A tool home other than the default, as `sync --home DIR` uses, named to the guard as sync's hooks name it
+    // (repair 2 sol-loop r3, X1): the child takes that home's lock.
+    let tool_home = d.path().join("other-home");
+    let lock = tool_home.join("apply.lock");
+    fs::create_dir_all(&tool_home).unwrap();
     fs::write(&lock, "pid 1\n").unwrap();
     let mut c = Command::new(env!("CARGO_BIN_EXE_lords"))
         .current_dir(&inner)
         .env("HOME", &home)
         .env("USERPROFILE", &home)
-        .args(["guard", "child", "--part", "1"])
+        .args(["guard", "child", "--part", "1", "--home", tool_home.to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -466,8 +469,10 @@ fn sync_registers_the_child_guard_on_subagent_start() {
     };
     let copy =
         home.join(".lords-command/bin/lords-guard.exe").display().to_string().replace('\\', "/");
+    // The tool home sync ran with, so the guard takes that home's apply lock and snapshots (repair 2 sol-loop r3, X1).
+    let tool_home = home.join(".lords-command").display().to_string().replace('\\', "/");
     // Claude Code: one hook per part (review r1, F1), each its own 10,000 characters.
-    let part = |n: &str| serde_json::json!({"type": "command", "command": copy, "args": ["guard", "child", "--part", n]});
+    let part = |n: &str| serde_json::json!({"type": "command", "command": copy, "args": ["guard", "child", "--part", n, "--home", tool_home]});
     let theirs: serde_json::Value = serde_json::from_str(theirs).unwrap();
     let v = read(&settings);
     assert_eq!(
@@ -476,7 +481,7 @@ fn sync_registers_the_child_guard_on_subagent_start() {
         "{v}"
     );
     let v = read(&codex);
-    let line = format!("\"{copy}\" guard child");
+    let line = format!("\"{copy}\" guard child --home \"{tool_home}\"");
     let lords = serde_json::json!({"type": "command", "command": line, "timeout": 30, "additionalContextLimit": 0});
     assert_eq!(v, serde_json::json!({"hooks": {"SubagentStart": [{"hooks": [lords]}]}}), "{v}");
     fs::write(private.join("stack.toml"), manifest("[\"child\", \"rm\"]")).unwrap();
