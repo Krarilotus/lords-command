@@ -1098,7 +1098,7 @@ fn a_failed_token_placement_leaves_the_pc_as_it_was() {
 }
 
 /// An install started on `home` for `before`, held at its journal line `line` (`hold`) on a thread of its own: the
-/// thread, once the install has reached that line.
+/// thread, once the install has reached that line (its own mark, in a dir of its own: sol-loop r2 S5).
 fn held_install(
     home: &Path,
     before: &Before,
@@ -1106,6 +1106,7 @@ fn held_install(
     marks: &Path,
 ) -> std::thread::JoinHandle<(bool, String, Duration)> {
     let fired = marks.join(format!("held-{line}"));
+    assert!(!fired.exists(), "a mark of this install's own");
     let instead = staged_install(home, before, Some((line, "hold", &fired)), "");
     let h = home.to_path_buf();
     let install =
@@ -1118,12 +1119,10 @@ fn held_install(
     install
 }
 
-// Spec (sol-loop S3 on cbc9b9b, R2's contract: panel add's ROLLBACK and CLEAN never race an install that still runs
-// there after panel add gave up on it, its ssh gone): with the install held at the journal line after the alias's (the
-// alias in, the token not yet), a ROLLBACK started meanwhile, and in a second run a CLEAN, end only after the install
-// has: the PC is then as it was or completely set up, never half of each.
-#[test]
-fn rollback_and_clean_wait_for_an_install_that_still_runs() {
+/// S3's case for `meanwhile` (`UNDO_STEP` or `CLEAN`): a fresh PC, its embedded install held at the journal line after
+/// the alias's (the alias in, the token not yet), `meanwhile` started then; after the install and a last CLEAN, the PC
+/// is as it was or as a run nobody held leaves it.
+fn while_an_install_still_runs(meanwhile: &str, name: &str) {
     let before = Before {
         client: Client::Embedded,
         block: Some(BLOCK),
@@ -1137,29 +1136,37 @@ fn rollback_and_clean_wait_for_an_install_that_still_runs() {
     let complete = files_of(reference.path());
     let marks = tempfile::TempDir::new().unwrap();
     let none = Instead::default();
-    let (undo, clean) = (&none, &none);
-    for meanwhile in ["ROLLBACK", "CLEAN"] {
-        let home = profile();
-        fresh(home.path());
-        let start = files_of(home.path());
-        let install = held_install(home.path(), &before, 6, marks.path());
-        let (ok, said, _) = match meanwhile {
-            "ROLLBACK" => run_in(UNDO_STEP, UNDO_DEADLINE, "run-1", "undo", home.path(), undo, b""),
-            _ => run_in(CLEAN, UNDO_DEADLINE, "run-1", "staging", home.path(), clean, b""),
-        };
-        assert!(ok, "{meanwhile}: {said}");
-        let (_, installed, _) = install.join().unwrap();
-        let (ok, said, _) =
-            run_in(CLEAN, UNDO_DEADLINE, "run-1", "staging", home.path(), clean, b"");
-        assert!(ok, "{said}");
-        let now = files_of(home.path());
-        assert!(
-            now == start || now == complete,
-            "{meanwhile} while the install ran ({installed}): neither as before ({:?}) nor complete ({:?})",
-            differs(&now, &start),
-            differs(&now, &complete)
-        );
-    }
+    let home = profile();
+    fresh(home.path());
+    let start = files_of(home.path());
+    let install = held_install(home.path(), &before, 6, marks.path());
+    let (ok, said, _) = run_in(meanwhile, UNDO_DEADLINE, "run-1", name, home.path(), &none, b"");
+    assert!(ok, "{name}: {said}");
+    let (_, installed, _) = install.join().unwrap();
+    let (ok, said, _) = run_in(CLEAN, UNDO_DEADLINE, "run-1", "staging", home.path(), &none, b"");
+    assert!(ok, "{said}");
+    let now = files_of(home.path());
+    assert!(
+        now == start || now == complete,
+        "{name} while the install ran ({installed}): neither as before ({:?}) nor complete ({:?})",
+        differs(&now, &start),
+        differs(&now, &complete)
+    );
+}
+
+// Spec (sol-loop S3 on cbc9b9b, R2's contract: panel add's ROLLBACK never races an install that still runs there after
+// panel add gave up on it, its ssh gone): a ROLLBACK started while the install is held ends only after the install
+// has, and the PC is then as it was or completely set up, never half of each.
+#[test]
+fn rollback_waits_for_an_install_that_still_runs() {
+    while_an_install_still_runs(UNDO_STEP, "undo");
+}
+
+// Spec (as above, for CLEAN): a CLEAN started while the install is held ends only after the install has, and the PC is
+// then as it was or completely set up.
+#[test]
+fn clean_waits_for_an_install_that_still_runs() {
+    while_an_install_still_runs(CLEAN, "staging");
 }
 
 // Spec (sol-loop S4 on cbc9b9b, R2's contract: a backup is a source to restore from only once it is whole): run again
