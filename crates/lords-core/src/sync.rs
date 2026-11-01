@@ -1419,8 +1419,8 @@ fn guard_event(name: &str) -> Option<(&'static str, Option<&'static str>)> {
 const GUARD_EVENTS: [&str; 5] =
     ["PreToolUse", "Stop", "SessionStart", "UserPromptSubmit", "SubagentStart"];
 
-/// The names of Lords' guard hooks (`guard <name>` run from `guard`) a settings `hooks` value holds, each once (a
-/// guard may run as several hooks, one per part).
+/// The names of Lords' guard hooks (`guard <name>` run from `guard`) a settings `hooks` value holds, each once (settings
+/// an earlier build of the child guard wrote hold it as three hooks, one per part).
 fn guard_names(hooks: &serde_json::Value, adapter: &dyn Adapter, guard: &Path) -> Vec<String> {
     let exe = adapters::slashes(guard);
     let mut names: Vec<String> = GUARD_EVENTS

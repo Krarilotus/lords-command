@@ -62,8 +62,7 @@ pub trait Adapter: Sync {
     fn guards(&self) -> &'static [&'static str] {
         &[]
     }
-    /// The hook entries that run guard `guard` of Lords' copy `exe`: one, or for Claude Code's `child` one per part
-    /// (each hook's context is capped on its own; review r1, F1).
+    /// The hook entries that run guard `guard` of Lords' copy `exe`: one.
     /// `home`: the tool home sync runs with, which `child` takes (its apply lock; repair 2 sol-loop r3, X1).
     fn guard_hooks(&self, exe: &str, guard: &str, _home: &str) -> Vec<serde_json::Value> {
         vec![serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard] })]
