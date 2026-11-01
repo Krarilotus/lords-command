@@ -1297,6 +1297,28 @@ impl Aside {
             _ => delete_file_at(&self.at),
         }
     }
+
+    /// Back where it was after `failed`, the error that stopped a change: that error; or, if it can't go back, both
+    /// errors and where the moved copy is now (uninstall-place review r1, UP2-R1-01).
+    pub fn back_after(&self, failed: String) -> String {
+        match self.back() {
+            Ok(()) => failed,
+            Err(back) => format!(
+                "{failed}; and it couldn't go back ({back}): it is at {}",
+                self.at.display()
+            ),
+        }
+    }
+
+    /// Gone; or, if that stops part way, what is left goes back where it was (`back_after`): a removal that can't
+    /// finish leaves its path holding what remains, never the copy beside it.
+    pub fn delete_or_back(self) -> Result<(), String> {
+        let gone = kind(&self.at).and_then(|k| match k {
+            Kind::Dir => delete_tree_at(&self.at),
+            _ => delete_file_at(&self.at),
+        });
+        gone.map_err(|e| self.back_after(e))
+    }
 }
 
 pub fn create_dir_all(p: &Contained) -> Result<(), String> {

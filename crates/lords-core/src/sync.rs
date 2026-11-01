@@ -2826,9 +2826,12 @@ fn tool_change(item: &Item, ledger: &mut Ledger) -> Result<(), String> {
                 ));
             }
             let aside = fsguard::move_aside(place)?;
-            if Some(have(aside.path())?) != recorded {
-                aside.back()?;
-                return Err(stale(item, "it changed"));
+            // From here any failure puts the copy back at its path before returning (uninstall-place review r1,
+            // UP2-R1-01): a copy not shown to hold its record's bytes, an unreadable one included, never leaves it.
+            match have(aside.path()) {
+                Ok(h) if Some(&h) == recorded.as_ref() => {}
+                Ok(_) => return Err(aside.back_after(stale(item, "it changed"))),
+                Err(e) => return Err(aside.back_after(e)),
             }
             Some(aside)
         }
@@ -2845,21 +2848,29 @@ fn tool_change(item: &Item, ledger: &mut Ledger) -> Result<(), String> {
     let put = match put {
         Ok(p) => p,
         Err(e) => {
-            if let Some(aside) = &old {
-                aside.back()?;
-            }
-            return Err(e);
+            return Err(match &old {
+                Some(aside) => aside.back_after(e),
+                None => e,
+            })
         }
     };
     match put {
         Some(sha) => {
             let kind = if item.tree.is_some() { "dir" } else { "file" };
             ledger.record(place, kind, &sha, &item.scope);
+            // The new version holds the path now; the old one, shown to be the record's, only goes.
+            if let Some(aside) = old {
+                aside.delete()?;
+            }
         }
-        None => ledger.forget(path),
-    }
-    if let Some(aside) = old {
-        aside.delete()?;
+        None => {
+            // A removal's record goes once its copy is gone; a delete that stops part way puts back what is left,
+            // and the record stays.
+            if let Some(aside) = old {
+                aside.delete_or_back()?;
+            }
+            ledger.forget(path);
+        }
     }
     Ok(())
 }
