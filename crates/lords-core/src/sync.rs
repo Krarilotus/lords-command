@@ -2136,13 +2136,14 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
                 }
             }
             let text = composed.text;
-            match crate::guard::child_parts(&crate::guard::child_context(&text)) {
-                Ok(parts) if parts.len() > CHILD_PARTS => undeliverable.push(format!(
-                    "{file} takes {} parts of {CHILD_PART_CHARS} characters, past the {CHILD_PARTS} Claude Code's child hooks deliver: not written, the old files stay",
-                    parts.len()
-                )),
-                // A line too long is named above.
-                Ok(_) | Err(_) => {}
+            // A line too long is named above.
+            if let Ok(context) = crate::guard::child_context(&text) {
+                let parts = crate::guard::child_parts(&context).len();
+                if parts > CHILD_PARTS {
+                    undeliverable.push(format!(
+                        "{file} takes {parts} parts of {CHILD_PART_CHARS} characters, past the {CHILD_PARTS} Claude Code's child hooks deliver: not written, the old files stay"
+                    ));
+                }
             }
             tree.insert(file.into(), text.into_bytes());
         }

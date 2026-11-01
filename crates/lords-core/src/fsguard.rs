@@ -192,6 +192,42 @@ pub fn read_text(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
+/// What reading a file in a dir found, decided by the one open (`read_text_in`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum InDir {
+    Text(String),
+    /// The dir was there and held no such file.
+    NoFile,
+    /// No dir was there (or no dir at that path).
+    NoDir,
+}
+
+/// The text of `dir`'s file `name`, read with one open, whose own answer tells a missing file from a missing dir: on
+/// Windows, "file not found" means the dir was there at that instant, "path not found" that it wasn't (fix check r1,
+/// FC1: a reader may never take a dir moved aside for one without the file). Elsewhere a missing dir is told by a look
+/// after the open. Anything that isn't UTF-8 is an error.
+pub fn read_text_in(dir: &Path, name: &str) -> Result<InDir, String> {
+    let path = dir.join(name);
+    check(&path)?;
+    match fs::read(&path) {
+        Ok(b) => String::from_utf8(b)
+            .map(InDir::Text)
+            .map_err(|_| format!("{}: not UTF-8 text (UTF-16 or binary?)", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(windows)]
+            {
+                // ERROR_PATH_NOT_FOUND: a dir on the way wasn't there.
+                Ok(if e.raw_os_error() == Some(3) { InDir::NoDir } else { InDir::NoFile })
+            }
+            #[cfg(not(windows))]
+            {
+                Ok(if kind(dir)? == Kind::Dir { InDir::NoFile } else { InDir::NoDir })
+            }
+        }
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
 /// A dir's contents, read without following anything: an error when a link is anywhere inside.
 pub fn read_tree(dir: &Path) -> Result<Tree, String> {
     check(dir)?;

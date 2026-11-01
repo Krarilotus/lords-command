@@ -655,6 +655,20 @@ fn a_child_start_holding_a_line_longer_than_a_part_is_refused() {
     assert!(p.over_limit, "the plan fails");
 }
 
+// Spec (repair 2 sol-loop r1, V1: a reader may never take a `.lords` moved aside for one without its file): reading a
+// file in a dir tells, by the one open, a dir that was there without the file from no dir at all.
+#[test]
+fn reading_in_a_dir_tells_a_missing_file_from_a_missing_dir() {
+    use lords_core::fsguard::{read_text_in, InDir};
+    let d = tempfile::TempDir::new().unwrap();
+    let dir = d.path().join(".lords");
+    assert_eq!(read_text_in(&dir, "child.md").unwrap(), InDir::NoDir);
+    std::fs::create_dir(&dir).unwrap();
+    assert_eq!(read_text_in(&dir, "child.md").unwrap(), InDir::NoFile);
+    std::fs::write(dir.join("child.md"), "text").unwrap();
+    assert_eq!(read_text_in(&dir, "child.md").unwrap(), InDir::Text("text".into()));
+}
+
 // Spec (repair sol-loop r2, R2 still open, its witness): the refusal holds when the role files' item already has a
 // conflict of its own (a file someone changed in `.lords`), and in the install stage too, which skips that place: the
 // plan still fails.

@@ -341,6 +341,65 @@ fn a_child_never_falls_through_to_an_enclosing_place_mid_publication() {
     assert!(String::from_utf8_lossy(&o.stderr).contains("agent id"), "{o:?}");
 }
 
+// Spec (fix check r1, FC1: one event gets one generation whole; repair 2 sol-loop r1, V1: a part that finds its place
+// mid-publication must not leave its event to later parts of another generation): an event whose first part waited
+// out a place whose `.lords` stayed aside gets nothing in every part, also once the new `.lords` is in; a new event
+// gets the new start whole.
+#[test]
+fn an_event_whose_first_part_failed_gets_nothing_in_any_part() {
+    let d = TempDir::new().unwrap();
+    let home = d.path().join("home");
+    let place = d.path().join("repo");
+    fs::create_dir_all(&home).unwrap();
+    let aside = place.join("..lords.lords-old-1-2-3");
+    fs::create_dir_all(&aside).unwrap();
+    let lines: Vec<String> = (0..300)
+        .map(|i| format!("- rule.r{i:03}: Line {i}, about as long as a core line is."))
+        .collect();
+    fs::write(aside.join("child-whole.md"), format!("{BEGIN}\n{}\n{END}\n", lines.join("\n")))
+        .unwrap();
+    let ev = start(&place, "Explore", "s1", "failed");
+    let o = run(&home, &place, &["guard", "child", "--part", "1"], &ev);
+    assert!(o.stdout.is_empty(), "part 1 waited and gave nothing: {o:?}");
+    fs::rename(&aside, place.join(".lords")).unwrap();
+    for n in ["2", "3"] {
+        let o = run(&home, &place, &["guard", "child", "--part", n], &ev);
+        assert!(
+            o.stdout.is_empty(),
+            "part {n} of the failed event: nothing, never another generation's part: {o:?}"
+        );
+    }
+    let fresh = parts_of(&home, &place, &start(&place, "Explore", "s1", "fresh"));
+    let got: Vec<&str> =
+        fresh.iter().flat_map(|p| p.lines()).filter(|l| l.starts_with("- rule.")).collect();
+    assert_eq!(got.len(), 300, "a new event gets the whole start");
+}
+
+// Spec (fix check r1, FC2: the guard delivers no child start holding a line longer than a part; repair 2 sol-loop r1,
+// V2, its witnesses): not without `--part` (Codex) either, and not when the whole start fits one part.
+#[test]
+fn a_start_with_a_line_past_a_part_is_delivered_nowhere() {
+    let d = TempDir::new().unwrap();
+    let home = d.path().join("home");
+    let place = d.path().join("repo");
+    fs::create_dir_all(place.join(".lords")).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let line = |n: usize| format!("- rule.long: {}", "y".repeat(n - "- rule.long: ".len()));
+    for (case, text, args) in [
+        ("whole, no --part", line(12_000), &["guard", "child"][..]),
+        ("one part's worth", line(9_469), &["guard", "child", "--part", "1"][..]),
+    ] {
+        fs::write(place.join(".lords/child-whole.md"), format!("{BEGIN}\n{text}\n{END}\n"))
+            .unwrap();
+        let o = run(&home, &place, args, &start(&place, "Explore", "s1", case));
+        assert!(o.stdout.is_empty(), "{case}: nothing: {o:?}");
+        assert!(
+            String::from_utf8_lossy(&o.stderr).contains("line"),
+            "{case}: the note says why: {o:?}"
+        );
+    }
+}
+
 // Spec (the brief, slice 4: "through each provider's subagent-start hook"; the Codex probe, design note: Codex's child
 // takes a command hook's context once the hook is trusted): with `guards = ["child"]` and the copy installed, sync
 // names the copy in one `SubagentStart` entry (`guard child`, no matcher, so every agent type), after the user's own,
