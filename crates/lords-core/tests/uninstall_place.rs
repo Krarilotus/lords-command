@@ -423,3 +423,152 @@ fn a_place_to_uninstall_needs_its_repo_and_nothing_else() {
     }
     assert!(copies(&a).iter().all(|c| c.exists()));
 }
+
+/// What a move aside left in `dir` (`.<name>.lords-old-…`, fsguard's name for it).
+fn asides(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".lords-old-"))
+        .collect()
+}
+
+/// `path` as an editor holds it after writing `text` into it: open with delete sharing (a rename passes) and no read
+/// sharing (a read fails), as the review's witness has it (`FileShare.Delete`).
+#[cfg(windows)]
+fn held_after_edit(path: &Path, text: &str) -> fs::File {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_DELETE: u32 = 0x4;
+    let mut h = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_DELETE)
+        .open(path)
+        .unwrap();
+    h.set_len(0).unwrap();
+    h.write_all(text.as_bytes()).unwrap();
+    h.flush().unwrap();
+    h
+}
+
+// Spec (review r1 UP2-R1-01; the Lords owner, 1 Nov: "any failure after a copy is moved aside, a read error included,
+// puts it back at its recorded path before returning. A changed or unreadable copy is never gone from its path. Fix
+// it at the shared removal layer … so plain uninstall gets it too"): a planned whole-file removal whose file an editor
+// then changes and holds without read sharing is refused at apply; the edited file is back at its path with its
+// record, and no aside is left beside it. The same through plain `uninstall --repo`.
+#[cfg(windows)]
+#[test]
+fn a_copy_that_cant_be_read_after_its_move_goes_back() {
+    for one_place in [true, false] {
+        let f = Fixture::new();
+        let [_, a, _, _] = synced(&f);
+        let file = a.join("CLAUDE.local.md");
+        let p = if one_place {
+            uninstall(&f, &a).unwrap()
+        } else {
+            plan(
+                &f.stacks(),
+                &Options { repo: Some("beta-core".into()), uninstall: true, ..f.opts() },
+            )
+            .unwrap()
+        };
+        assert_eq!(item(&p, &file).action, Action::Remove, "one place: {one_place}");
+        let held = held_after_edit(&file, "OWNER EDIT\n");
+        let r = apply(&p);
+        let left = asides(&a);
+        drop(held);
+        assert!(r.is_err(), "one place: {one_place}: {r:?}");
+        assert_eq!(
+            fs::read_to_string(&file).ok().as_deref(),
+            Some("OWNER EDIT\n"),
+            "one place: {one_place}: back at its path ({r:?})"
+        );
+        assert!(recorded(&f, &file), "one place: {one_place}: its record stays");
+        assert!(left.is_empty(), "one place: {one_place}: no aside left: {left:?}");
+    }
+}
+
+/// A deny entry for Everyone (`S-1-1-0`) on `path`, by icacls: `rights` such as `(RD)`; `None` takes every deny entry
+/// for Everyone off it again.
+#[cfg(windows)]
+fn deny(path: &Path, rights: Option<&str>) {
+    let mut c = std::process::Command::new("icacls");
+    c.arg(path.to_string_lossy().replace('/', "\\"));
+    match rights {
+        Some(r) => c.args(["/deny", &format!("*S-1-1-0:{r}")]),
+        None => c.args(["/remove:d", "*S-1-1-0"]),
+    };
+    let out = c.output().unwrap();
+    assert!(
+        out.status.success(),
+        "icacls {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// Takes the deny entries off `name` in `.lords` and in any aside of it, wherever apply left them, so the temp dir
+/// can go.
+#[cfg(windows)]
+fn undeny_in(a: &Path, left: &[String], names: &[&str]) {
+    for d in std::iter::once(a.join(".lords")).chain(left.iter().map(|n| a.join(n))) {
+        for n in names {
+            let p = if n.is_empty() { d.clone() } else { d.join(n) };
+            if p.exists() {
+                deny(&p, None);
+            }
+        }
+    }
+}
+
+// Spec (as above, and review r1: "Cover the shared directory verification-error branch too"): the same for a dir:
+// `.lords`, its role file changed after the plan and its data then unreadable (a deny entry, which a rename of the dir
+// doesn't open), is refused at apply and back at its path with the edit and its record, no aside left.
+#[cfg(windows)]
+#[test]
+fn a_dir_that_cant_be_read_after_its_move_goes_back() {
+    let f = Fixture::new();
+    let [_, a, _, _] = synced(&f);
+    let lords = a.join(".lords");
+    let role = lords.join("role-coder.md");
+    let p = uninstall(&f, &a).unwrap();
+    assert_eq!(item(&p, &lords).action, Action::Remove);
+    fs::write(&role, "OWNER EDIT\n").unwrap();
+    deny(&role, Some("(RD)"));
+    let r = apply(&p);
+    let left = asides(&a);
+    undeny_in(&a, &left, &["role-coder.md"]);
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(
+        fs::read_to_string(&role).ok().as_deref(),
+        Some("OWNER EDIT\n"),
+        "back at its path ({r:?}; asides {left:?})"
+    );
+    assert!(recorded(&f, &lords), "its record stays");
+    assert!(left.is_empty(), "no aside left: {left:?}");
+}
+
+// Spec (the Lords owner, 1 Nov: "any failure after a copy is moved aside … puts it back at its recorded path before
+// returning"): a removal of an unchanged `.lords` whose delete stops part way is refused at apply with what is left of
+// `.lords` back at its path and its record kept, no aside left beside it. Windows deletes a file with delete rights
+// on it or delete-child rights on its dir; both are denied for the role file, while the dir still renames and reads.
+#[cfg(windows)]
+#[test]
+fn a_removal_that_cant_finish_puts_back_what_is_left() {
+    let f = Fixture::new();
+    let [_, a, _, _] = synced(&f);
+    let lords = a.join(".lords");
+    let stuck = lords.join("role-coder.md");
+    let p = uninstall(&f, &a).unwrap();
+    assert_eq!(item(&p, &lords).action, Action::Remove, "its bytes are unchanged");
+    deny(&stuck, Some("(D)"));
+    deny(&lords, Some("(DC)"));
+    let r = apply(&p);
+    let left = asides(&a);
+    undeny_in(&a, &left, &["role-coder.md", ""]);
+    assert!(r.is_err(), "{r:?}");
+    assert!(stuck.is_file(), "what is left is back at its path ({r:?}; asides {left:?})");
+    assert!(recorded(&f, &lords), "its record stays");
+    assert!(left.is_empty(), "no aside left: {left:?}");
+}
