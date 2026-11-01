@@ -2,14 +2,15 @@
 //! own server, over std's TCP. One request per connection (`Connection: close`), bodies by `Content-Length` only, JSON
 //! both ways.
 //!
-//! The server listens on 127.0.0.1 alone, and answers only a request that carries the panel's token (review r1 R2:
-//! loopback is open to every local account, and to every account of the PC a forward runs on); without it, 401 and
-//! nothing else. Of the rest, only what no browser page can send: a `Host` of 127.0.0.1 (a rebound DNS name is refused),
-//! no `Origin`, `Referer` or `Sec-Fetch-*` header (every current browser sends one of them), and a POST only as
-//! `application/json` (which a page can't send to another site without a preflight, and the preflight's OPTIONS is
-//! refused). Each limit is checked before what it limits is read, and a request has one deadline from its accept to its
-//! last byte, however it trickles (review r1 R5). The server answers one path itself, `/proof`: proof that it holds the
-//! token, for a nonce its client chose (embedded panel review r1 R1).
+//! The server listens on 127.0.0.1 alone, and answers only a request that carries the panel's token, its proof aside
+//! (review r1 R2: loopback is open to every local account, and to every account of the PC a forward runs on); without
+//! it, 401 and nothing else. Of the rest, only what no browser page can send: a `Host` of 127.0.0.1 (a rebound DNS name
+//! is refused), no `Origin`, `Referer` or `Sec-Fetch-*` header (every current browser sends one of them), and a POST
+//! only as `application/json` (which a page can't send to another site without a preflight, and the preflight's
+//! OPTIONS is refused). Each limit is checked before what it limits is read, and a request has one deadline from its
+//! accept to its last byte, however it trickles (review r1 R5). The server answers one path itself, `/proof`: proof
+//! that it holds the token, for a nonce its client chose (embedded panel review r1 R1); that one asks no token, and
+//! shows nothing else.
 
 use serde::Serialize;
 use std::io::{Read, Write};
@@ -80,8 +81,9 @@ impl Token {
     }
 }
 /// Where the server proves it holds its token (embedded panel review r1 R1: `lords panel add`'s route check believes
-/// only an answer nobody without the token can give): `GET /proof?nonce=<32 to 128 hex digits>`, token-checked as every
-/// request, answers `{"proof": proof(token, nonce)}`.
+/// only an answer nobody without the token can give): `GET /proof?nonce=<32 to 128 hex digits>` answers
+/// `{"proof": proof(token, nonce)}`. It asks no token of the client (sol-loop S1 on cbc9b9b), so the client never shows
+/// the token to a server it hasn't checked; every other check of a request holds for it.
 pub const PROOF_PATH: &str = "/proof";
 
 /// HMAC-SHA256 (RFC 2104) of `message` under `key`, in lower-case hex.
@@ -320,9 +322,12 @@ pub fn read_request(
             _ => Err(bad(&format!("more than one {name}"))),
         }
     };
-    // Before anything else is read or said: without the token, once, 401 and nothing else.
+    // Before anything else is read or said: without the token, once, 401 and nothing else. But for the server's proof,
+    // which needs none (sol-loop S1 on cbc9b9b: a client that sent the token to an unproven server would hand it the
+    // key to the proof) and shows nothing but an HMAC of the client's nonce under it.
+    let proving = target.split_once('?').map_or(target, |(p, _)| p) == PROOF_PATH;
     let carried = all(&headers, &TOKEN_HEADER.to_ascii_lowercase());
-    if !matches!(carried[..], [t] if token.is(t)) {
+    if !proving && !matches!(carried[..], [t] if token.is(t)) {
         return Err(Reply { status: 401, body: Vec::new() });
     }
     if !one("host")?.is_some_and(loopback_host) {

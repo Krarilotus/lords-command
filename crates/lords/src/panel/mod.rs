@@ -77,7 +77,8 @@ const HERE: Duration = Duration::from_secs(20);
 /// owner placeholders, CREATOR OWNER and OWNER RIGHTS) create, delete, delete what it holds, or change its permissions
 /// or owner, as an entry or as its owner (fix check r2 N4: the panel's threat model; above the profile, a drive's root
 /// lets every user create, so no list rule goes there). A dir's attributes are read without following it, so a link to
-/// nothing counts too. Static: the
+/// nothing counts too. `Hold-Install` waits, up to past an install step's own deadline, for the lock that the run's
+/// install holds while it runs (sol-loop S3 on cbc9b9b), and gives it, held. Static: the
 /// literals are joined at compile time, and what changes per run (the deadline, the run's id, a file's name) comes in
 /// as arguments, each checked to be a plain word. No double quote and no `%` in any of it: cmd.exe, ssh's shell there,
 /// would read them.
@@ -115,6 +116,10 @@ macro_rules! step {
             "Security.Principal.SecurityIdentifier($who)).Translate([Security.Principal.NTAccount]).Value + ' (' + ",
             "$who + ')' } catch {}; return ($p + ' lets ' + $n + ' create, delete or change permissions there') } }; ",
             "if ($p -ieq $top) { return }; $p = Split-Path -Parent $p } }; ",
+            "function Hold-Install { $l = Join-Path $staging 'install.lock'; $until = (Get-Date).AddSeconds(90); ",
+            "while ($true) { try { return [IO.File]::Open($l, 'OpenOrCreate', 'ReadWrite', 'None') } ",
+            "catch [IO.IOException] { if ((Get-Date) -gt $until) { throw ('this run''s install still runs there: ' + ",
+            "$staging) }; Start-Sleep -Milliseconds 500 } } }; ",
             $body,
             " } finally { taskkill /T /F /PID $watch.Id 2>&1 | Out-Null } }"
         )
@@ -138,13 +143,18 @@ const STAGE: &str = step!("if (Test-Path -LiteralPath $staging) { throw ('this r
 /// this account (fix check r1 R2: the token's bytes arrive only there, owner-only from their first byte).
 const RECEIVE: &str = step!("Only-Mine $staging; $out = [IO.File]::Open((Join-Path $staging $name), 'CreateNew', 'Write'); try { [Console]::OpenStandardInput().CopyTo($out) } finally { $out.Close() }; 'received'");
 const INSTALL_STEP: &str = step!("& (Join-Path $staging 'install.ps1')");
-/// The run's install undone from its journal (E12 R2), by the run's own undo.ps1; a run whose install never began
-/// keeps no journal and has nothing to undo.
-const UNDO_STEP: &str = step!("if (Test-Path -LiteralPath (Join-Path $staging 'journal')) { & (Join-Path $staging 'undo.ps1') } else { 'nothing' }");
+/// The run's install undone from its journal (E12 R2), by the run's own undo.ps1, once that install has ended (it holds
+/// its lock while it runs: sol-loop S3); a run whose install never began has nothing to undo, and gets a journal that
+/// says so, so that an install arriving late won't begin.
+const UNDO_STEP: &str = step!("if (-not (Test-Path -LiteralPath $staging)) { 'nothing'; return }; $held = Hold-Install; try { $j = Join-Path $staging 'journal'; if (Test-Path -LiteralPath $j) { & (Join-Path $staging 'undo.ps1') } else { Add-Content -LiteralPath $j -Value 'undone' -Encoding UTF8; 'nothing' } } finally { $held.Close() }");
 const CHECK_STEP: &str = step!("& (Join-Path $staging 'check.ps1')");
 /// The run's staging dir, which that run made (STAGE refuses one that is there): only what a run created goes; one
-/// that isn't there (its STAGE failed before making it) is nothing to remove.
-const CLEAN: &str = step!("if (Test-Path -LiteralPath $staging) { Remove-Item -Recurse -Force -LiteralPath $staging }; 'cleaned'");
+/// that isn't there (its STAGE failed before making it) is nothing to remove. Once the run's install has ended, all but
+/// its lock goes while the lock is held (an install arriving late finds no script), then the rest.
+const CLEAN: &str = step!("if (Test-Path -LiteralPath $staging) { $held = Hold-Install; try { Get-ChildItem -Force -LiteralPath $staging | Where-Object { $_.Name -ne 'install.lock' } | Remove-Item -Recurse -Force } finally { $held.Close() }; Remove-Item -Recurse -Force -LiteralPath $staging }; 'cleaned'");
+/// How long the undo and clean steps may run: their wait for an install still running (`Hold-Install`, 90 s, past an
+/// install step's own deadline), and then their work.
+const UNDO_DEADLINE: u64 = 150;
 
 const INSTALL: &str = include_str!("install.ps1");
 const UNDO: &str = include_str!("undo.ps1");
@@ -207,8 +217,9 @@ fn remote(
     Ok(last)
 }
 
-fn probe(alias: &str, run: &str) -> Result<Remote, String> {
-    let line = remote(alias, PROBE, STEP, run, "probe", None)
+fn probe(other: &dyn Other, alias: &str, run: &str) -> Result<Remote, String> {
+    let line = other
+        .step(PROBE, STEP, run, "probe", None)
         .map_err(|e| format!("{alias} can't be read over ssh: {e}"))?;
     serde_json::from_str(line.trim_start_matches('\u{feff}')).map_err(|e| {
         format!("{alias}'s probe said `{}`: {e}", line.chars().take(80).collect::<String>())
@@ -320,7 +331,8 @@ fn add_pc(mut a: Args) -> Result<bool, String> {
     };
     let run = run_id();
     let local = read_local(&bridge, &home_dir)?;
-    let other = probe(&alias, &run)?;
+    let ssh = Ssh(&alias);
+    let other = probe(&ssh, &alias, &run)?;
     let plan = add::plan(&alias, &local, &other, client)?;
     for line in plan.describe(&alias, &local, &other, &run) {
         say!("{line}");
@@ -329,6 +341,7 @@ fn add_pc(mut a: Args) -> Result<bool, String> {
         say!("dry run: nothing written (`--apply` carries these out, in this order)");
         return Ok(true);
     }
+    let plan = plan_to_apply(&ssh, &alias, &local, &run, plan)?;
     // This run's own dir in the tool's home, made only where nothing is, and removed whole at the end: it holds only
     // what this run puts there (review r1 R7).
     let home = fsguard::Root::home(&home_dir)?;
@@ -395,13 +408,10 @@ fn carry_out(
     let token = panel::token(&local.home)?;
     let files = payload(plan, run, window, &token);
     let other = Ssh(alias);
-    for earlier in &plan.earlier {
-        undo_earlier(&other, alias, earlier)?;
-    }
     // 1. The other PC: this run's staging dir, each file into it over stdin, then installed from it.
     let installed = install_there(&other, alias, run, files)?;
     let finished = finish(alias, local, plan, dir, run, &installed, &exe, &token);
-    let cleaned = other.step(CLEAN, STEP, run, "staging", None);
+    let cleaned = other.step(CLEAN, UNDO_DEADLINE, run, "staging", None);
     let checked = finished?;
     cleaned.map_err(|e| format!("{e} (this run's staging dir stays on {alias})"))?;
     say!("{alias}: removed this run's staging dir");
@@ -473,24 +483,55 @@ fn install_there(
         Ok(installed) => return Ok(installed),
         Err(e) => e,
     };
-    let said = other.step(UNDO_STEP, STEP, run, "undo", None).map_err(|e| {
+    let said = other.step(UNDO_STEP, UNDO_DEADLINE, run, "undo", None).map_err(|e| {
         format!("{failed}; undoing it on {alias} failed too ({e}): this run's staging dir and its journal stay there, and the next panel add undoes them first")
     })?;
-    let cleaned = match other.step(CLEAN, STEP, run, "staging", None) {
+    let cleaned = match other.step(CLEAN, UNDO_DEADLINE, run, "staging", None) {
         Ok(_) => "its staging dir removed".to_string(),
         Err(e) => format!("its staging dir stays ({e}); the next panel add removes it"),
     };
     Err(format!("{failed}; on {alias}: {}, {cleaned}", undone(&said)))
 }
 
+/// The plan `--apply` carries out (sol-loop S2 on cbc9b9b): earlier runs' staging dirs on the other PC undone and
+/// removed first, then the PC read and planned again, and that plan said: what their undo takes back (an alias, a key)
+/// the first reading saw there. Without earlier runs, `first` itself.
+fn plan_to_apply(
+    other: &dyn Other,
+    alias: &str,
+    local: &Local,
+    run: &str,
+    first: Plan,
+) -> Result<Plan, String> {
+    if first.earlier.is_empty() {
+        return Ok(first);
+    }
+    for earlier in &first.earlier {
+        undo_earlier(other, alias, earlier)?;
+    }
+    let read = probe(other, alias, run)?;
+    let plan = add::plan(alias, local, &read, first.client)?;
+    if !plan.earlier.is_empty() {
+        return Err(format!(
+            "{alias}: earlier runs' staging dirs are there still: {:?}",
+            plan.earlier
+        ));
+    }
+    say!("{alias} read again, after the earlier runs were undone; carried out:");
+    for line in plan.describe(alias, local, &read, run) {
+        say!("{line}");
+    }
+    Ok(plan)
+}
+
 /// An earlier run's staging dir on the other PC (E12 R2): that run's install undone from its journal unless it
 /// finished or was undone, then the dir removed.
 fn undo_earlier(other: &dyn Other, alias: &str, run: &str) -> Result<(), String> {
     let said = other
-        .step(UNDO_STEP, STEP, run, "undo", None)
+        .step(UNDO_STEP, UNDO_DEADLINE, run, "undo", None)
         .map_err(|e| format!("undoing run {run}'s install on {alias}: {e}"))?;
     other
-        .step(CLEAN, STEP, run, "staging", None)
+        .step(CLEAN, UNDO_DEADLINE, run, "staging", None)
         .map_err(|e| format!("removing run {run}'s staging dir on {alias}: {e}"))?;
     say!("{alias}: run {run}'s staging dir: {}, then removed", undone(&said));
     Ok(())

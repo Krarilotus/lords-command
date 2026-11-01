@@ -702,6 +702,44 @@ fn answers_anything(body: &'static str) -> u16 {
     port
 }
 
+/// A service that knows the panel's protocol but not its token, on a loopback port of its own (sol-loop S1 on cbc9b9b):
+/// to `/proof?nonce=N` it answers the proof made from whatever token the request carries (none: the proof of an empty
+/// key).
+fn reflects_the_token() -> u16 {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut c in listener.incoming().flatten() {
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match c.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let nonce = head.split("nonce=").nth(1).unwrap_or("").split([' ', '&']).next();
+            let token = head
+                .lines()
+                .find_map(|l| l.strip_prefix("Lords-Panel-Token: "))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let message = format!("lords-panel proof {}", nonce.unwrap_or(""));
+            let body = serde_json::json!({ "proof": http::hmac_sha256(token.as_bytes(), message.as_bytes()) })
+                .to_string();
+            let answer = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = c.write_all(answer.as_bytes());
+        }
+    });
+    port
+}
+
 /// The panel's own server (`lords_core::http::serve`) with `token`, on a loopback port of its own; every request it
 /// takes gets `{}`.
 fn panel_server(token: &http::Token) -> u16 {
@@ -737,9 +775,10 @@ fn forwarding(port: u16, to: u16) -> String {
 // from this PC's panel server through this run's forward; any other responder on that port, an ssh that exited, or a
 // missing reading fails closed): check.ps1 itself, its ssh stood in for. Through the check's own forward to the
 // panel's server with the token: it passes. Through its own forward to an ordinary service answering 200 to anything,
-// or to a panel server with another token: it fails. Its ssh ended at once while an ordinary service holds the port
-// (the review's witness), or while nothing does: it fails. Its own forward to the panel's server, but the reading of
-// who listens on the port failing: it fails.
+// to a panel server with another token, or to a service that makes the proof from whatever token it is sent (sol-loop
+// S1 on cbc9b9b: the check sends none): it fails. Its ssh ended at once while an ordinary service holds the port (the
+// review's witness), or while nothing does: it fails. Its own forward to the panel's server, but the reading of who
+// listens on the port failing: it fails.
 #[test]
 fn the_route_check_passes_only_on_the_panels_proof_through_its_own_forward() {
     let home = profile();
@@ -774,10 +813,12 @@ fn the_route_check_passes_only_on_the_panels_proof_through_its_own_forward() {
 
     let ordinary = answers_anything(r#"{"proof":"00"}"#);
     let another = panel_server(&fixture_token('9'));
-    for (to, why) in [(ordinary, "without the panel's proof"), (another, "401")] {
+    let reflector = reflects_the_token();
+    for (to, who) in [(reflector, "reflector"), (ordinary, "ordinary"), (another, "another token")]
+    {
         let port = free_port();
         let (ok, said) = check(port, forwarding(port, to), "");
-        assert!(!ok && said.contains(why), "{why}: {said}");
+        assert!(!ok && said.contains("without the panel's proof"), "{who}: {said}");
     }
     let held = answers_anything("{}");
     let (ok, said) = check(held, "exit 255".into(), "");
@@ -830,9 +871,9 @@ const KEYGEN_STAND_IN: &str = "function Start-Process { param($FilePath, [switch
 
 /// The install's journal writer, stood in for: at its `$env:TEST_AT`th line, `kill` ends the step's whole process tree
 /// before the line is written (as its watchdog would), `written` writes the line and then does that (the change it
-/// names not made), and `error` fails there; `$env:TEST_FIRED` gets the line when it does. Every other line is
-/// written as it would be.
-const JOURNAL_STOPS: &str = "$global:lines = 0; function Add-Content { param($LiteralPath, $Value, $Encoding) $global:lines++; $at = $global:lines -eq [int]$env:TEST_AT; if ($at) { [IO.File]::WriteAllText($env:TEST_FIRED, [string]$Value) }; if ($at -and $env:TEST_HOW -eq 'kill') { taskkill /T /F /PID $PID | Out-Null; Start-Sleep -Seconds 30 }; if ($at -and $env:TEST_HOW -eq 'error') { throw 'an error injected here' }; Microsoft.PowerShell.Management\\Add-Content @PSBoundParameters; if ($at -and $env:TEST_HOW -eq 'written') { taskkill /T /F /PID $PID | Out-Null; Start-Sleep -Seconds 30 } }; ";
+/// names not made), `error` fails there, and `hold` waits 8 s there, then goes on (an install that runs on after panel
+/// add gave up on it); `$env:TEST_FIRED` gets the line when it does. Every other line is written as it would be.
+const JOURNAL_STOPS: &str = "$global:lines = 0; function Add-Content { param($LiteralPath, $Value, $Encoding) $global:lines++; $at = $global:lines -eq [int]$env:TEST_AT; if ($at) { [IO.File]::WriteAllText($env:TEST_FIRED, [string]$Value) }; if ($at -and $env:TEST_HOW -eq 'kill') { taskkill /T /F /PID $PID | Out-Null; Start-Sleep -Seconds 30 }; if ($at -and $env:TEST_HOW -eq 'error') { throw 'an error injected here' }; if ($at -and $env:TEST_HOW -eq 'hold') { Start-Sleep -Seconds 8 }; Microsoft.PowerShell.Management\\Add-Content @PSBoundParameters; if ($at -and $env:TEST_HOW -eq 'written') { taskkill /T /F /PID $PID | Out-Null; Start-Sleep -Seconds 30 } }; ";
 
 /// A PC before a run (E12, R2's tests): its set-up, and the plan's client, alias block (`None`: there) and config.txt
 /// (`None`: there).
@@ -890,6 +931,19 @@ fn install_from_staging(
     before: &Before,
     stop: Option<(usize, &str, &Path)>,
 ) -> (bool, String) {
+    let instead = staged_install(home, before, stop, "");
+    let (ok, said, _) = run_in(INSTALL_STEP, 60, "run-1", "install", home, &instead, b"");
+    (ok, said)
+}
+
+/// This run's staging dir for `before`, filled as STAGE and RECEIVE leave it, and what its install step is to run
+/// with: ssh-keygen stood in for, the journal stopped as `stop` says (`JOURNAL_STOPS`), and the functions `more`.
+fn staged_install(
+    home: &Path,
+    before: &Before,
+    stop: Option<(usize, &str, &Path)>,
+    more: &str,
+) -> Instead {
     let plan = Plan {
         config_txt: before.config_txt.map(str::to_string),
         ..fixture_plan(before.client, before.block)
@@ -904,7 +958,7 @@ fn install_from_staging(
         std::fs::write(staging.join(name), bytes).unwrap();
     }
     let mut instead = Instead {
-        functions: KEYGEN_STAND_IN.to_string(),
+        functions: format!("{KEYGEN_STAND_IN}{more}"),
         env: vec![("TEST_PUB", PUBLIC.to_string())],
     };
     if let Some((at, how, fired)) = stop {
@@ -913,8 +967,7 @@ fn install_from_staging(
         instead.env.push(("TEST_HOW", how.to_string()));
         instead.env.push(("TEST_FIRED", fired.display().to_string()));
     }
-    let (ok, said, _) = run_in(INSTALL_STEP, 60, "run-1", "install", home, &instead, b"");
-    (ok, said)
+    instead
 }
 
 /// R2's matrix for one PC: the install stopped at each line of its journal, each way, then panel add's ROLLBACK step,
@@ -1044,6 +1097,164 @@ fn a_failed_token_placement_leaves_the_pc_as_it_was() {
     assert!(now == start, "as it was: {:?}", differs(&now, &start));
 }
 
+/// An install started on `home` for `before`, held at its journal line `line` (`hold`) on a thread of its own: the
+/// thread, once the install has reached that line.
+fn held_install(
+    home: &Path,
+    before: &Before,
+    line: usize,
+    marks: &Path,
+) -> std::thread::JoinHandle<(bool, String, Duration)> {
+    let fired = marks.join(format!("held-{line}"));
+    let instead = staged_install(home, before, Some((line, "hold", &fired)), "");
+    let h = home.to_path_buf();
+    let install =
+        std::thread::spawn(move || run_in(INSTALL_STEP, 60, "run-1", "install", &h, &instead, b""));
+    let started = Instant::now();
+    while !fired.exists() {
+        assert!(started.elapsed() < Duration::from_secs(30), "the install reached line {line}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    install
+}
+
+// Spec (sol-loop S3 on cbc9b9b, R2's contract: panel add's ROLLBACK and CLEAN never race an install that still runs
+// there after panel add gave up on it, its ssh gone): with the install held at the journal line after the alias's (the
+// alias in, the token not yet), a ROLLBACK started meanwhile, and in a second run a CLEAN, end only after the install
+// has: the PC is then as it was or completely set up, never half of each.
+#[test]
+fn rollback_and_clean_wait_for_an_install_that_still_runs() {
+    let before = Before {
+        client: Client::Embedded,
+        block: Some(BLOCK),
+        config_txt: Some(CONFIG_TXT),
+        set_up: fresh,
+    };
+    let reference = profile();
+    fresh(reference.path());
+    let (ok, said) = install_from_staging(reference.path(), &before, None);
+    assert!(ok, "{said}");
+    let complete = files_of(reference.path());
+    let marks = tempfile::TempDir::new().unwrap();
+    let none = Instead::default();
+    let (undo, clean) = (&none, &none);
+    for meanwhile in ["ROLLBACK", "CLEAN"] {
+        let home = profile();
+        fresh(home.path());
+        let start = files_of(home.path());
+        let install = held_install(home.path(), &before, 6, marks.path());
+        let (ok, said, _) = match meanwhile {
+            "ROLLBACK" => run_in(UNDO_STEP, UNDO_DEADLINE, "run-1", "undo", home.path(), undo, b""),
+            _ => run_in(CLEAN, UNDO_DEADLINE, "run-1", "staging", home.path(), clean, b""),
+        };
+        assert!(ok, "{meanwhile}: {said}");
+        let (_, installed, _) = install.join().unwrap();
+        let (ok, said, _) =
+            run_in(CLEAN, UNDO_DEADLINE, "run-1", "staging", home.path(), clean, b"");
+        assert!(ok, "{said}");
+        let now = files_of(home.path());
+        assert!(
+            now == start || now == complete,
+            "{meanwhile} while the install ran ({installed}): neither as before ({:?}) nor complete ({:?})",
+            differs(&now, &start),
+            differs(&now, &complete)
+        );
+    }
+}
+
+// Spec (sol-loop S4 on cbc9b9b, R2's contract: a backup is a source to restore from only once it is whole): run again
+// on a PC with the standalone panel, the window's backup copy failing half written (the disk full), the install fails;
+// with panel add's ROLLBACK and CLEAN the PC is as it was: the window's exe whole, no half copy left behind.
+#[test]
+fn a_backup_that_failed_half_written_is_never_restored() {
+    let before = Before {
+        client: Client::Standalone,
+        block: None,
+        config_txt: None,
+        set_up: standalone_there,
+    };
+    let home = profile();
+    standalone_there(home.path());
+    let start = files_of(home.path());
+    let full = "function Copy-Item { param($LiteralPath, $Destination) if ([string]$Destination -like '*backup-*lords-command.exe') { [IO.File]::WriteAllText($Destination, 'half'); throw 'There is not enough space on the disk.' }; Microsoft.PowerShell.Management\\Copy-Item @PSBoundParameters }; ";
+    let instead = staged_install(home.path(), &before, None, full);
+    let (ok, said, _) = run_in(INSTALL_STEP, 60, "run-1", "install", home.path(), &instead, b"");
+    assert!(!ok && said.contains("not enough space"), "{said}");
+    let none = Instead::default();
+    let (ok, said, _) = run_in(UNDO_STEP, UNDO_DEADLINE, "run-1", "undo", home.path(), &none, b"");
+    assert!(ok, "{said}");
+    let (ok, said, _) = run_in(CLEAN, UNDO_DEADLINE, "run-1", "staging", home.path(), &none, b"");
+    assert!(ok, "{said}");
+    let now = files_of(home.path());
+    assert!(now == start, "as it was: {:?}", differs(&now, &start));
+}
+
+/// This PC's bridge, as `add::plan` needs it: overseer's port permitted, its listener running.
+fn bridge() -> Local {
+    Local {
+        bridge: "X:\\fixture-bridge".into(),
+        sshd_config: "AllowTcpForwarding local\r\nPermitOpen 127.0.0.1:7878\r\n".into(),
+        listener: Some(1),
+        home: "X:\\fixture-tool-home".into(),
+        token: true,
+        ..Local::default()
+    }
+}
+
+// Spec (sol-loop S2 on cbc9b9b, R2's contract: what an earlier run's undo takes back, the plan carried out doesn't take
+// for there): an earlier run's install killed at the line after the alias's (the alias in), its undo lost with the
+// connection; the next run's first reading sees that alias, so its first plan adds none. Its --apply undoes the earlier
+// run, reads the PC again and plans anew (`plan_to_apply`): the plan carried out adds the alias again, and the PC ends
+// with the alias, config.txt and the token.
+#[test]
+fn the_plan_carried_out_is_made_after_earlier_runs_are_undone() {
+    let home = profile();
+    // LOCALAPPDATA where Windows puts it in a profile: the plan holds it to that.
+    let app_data = home.path().join("AppData").join("Local");
+    std::fs::create_dir_all(&app_data).unwrap();
+    std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
+    std::fs::write(home.path().join(".ssh").join("config"), SSH_CONFIG).unwrap();
+    let marks = tempfile::TempDir::new().unwrap();
+    let killed = marks.path().join("killed");
+    let keygen = || Instead {
+        functions: KEYGEN_STAND_IN.to_string(),
+        env: vec![("TEST_PUB", PUBLIC.to_string())],
+    };
+    let at = |fail| {
+        let mut here = Here::new(home.path(), fail);
+        here.app_data = app_data.clone();
+        here.install = keygen();
+        here
+    };
+    let read = probe(&at(Fail::No), "Other", "run-1").unwrap();
+    let plan = add::plan("Other", &bridge(), &read, Client::Embedded).unwrap();
+    assert!(plan.block.is_some(), "{plan:?}");
+    // STAGE, five files, INSTALL: from the eighth call on (ROLLBACK), the connection is gone.
+    let mut earlier = at(Fail::From(8));
+    earlier.install.functions.push_str(JOURNAL_STOPS);
+    earlier.install.env.extend([
+        ("TEST_AT", "6".to_string()),
+        ("TEST_HOW", "kill".to_string()),
+        ("TEST_FIRED", killed.display().to_string()),
+    ]);
+    let files = |plan: &Plan, run: &str| payload(plan, run, Vec::new(), &fixture_token('a'));
+    assert!(install_there(&earlier, "Other", "run-1", files(&plan, "run-1")).is_err());
+    assert!(killed.exists(), "the earlier install was killed at its line 6");
+
+    let next = at(Fail::No);
+    let read = probe(&next, "Other", "run-2").unwrap();
+    let first = add::plan("Other", &bridge(), &read, Client::Embedded).unwrap();
+    assert!(first.block.is_none() && first.earlier == ["run-1"], "{first:?}");
+    let plan = plan_to_apply(&next, "Other", &bridge(), "run-2", first).unwrap();
+    assert!(plan.earlier.is_empty(), "{plan:?}");
+    let block = plan.block.clone().expect("the alias added again");
+    install_there(&next, "Other", "run-2", files(&plan, "run-2")).unwrap();
+    let config = std::fs::read_to_string(home.path().join(".ssh").join("config")).unwrap();
+    assert!(config.ends_with(&block), "{config}");
+    let app = app_data.join("Programs").join("lords-command");
+    assert!(app.join("config.txt").is_file() && app.join("panel-token").is_file());
+}
+
 /// How a stand-in other PC fails `panel add`'s calls: not at all, the `n`th call before it reaches the PC, the `n`th
 /// after it ran there (its answer lost), or every call from the `n`th on (the connection gone).
 #[derive(Clone, Copy, Debug)]
@@ -1054,11 +1265,21 @@ enum Fail {
     From(usize),
 }
 
-/// The other PC, stood in for by this one: each step run here, in the profile `home`, failing as `fail` says.
+/// The other PC, stood in for by this one: each step run here, in the profile `home` with `app_data` its
+/// `LOCALAPPDATA`, failing as `fail` says; its install step with what `install` puts in place.
 struct Here<'a> {
     home: &'a Path,
+    app_data: PathBuf,
     fail: Fail,
     calls: std::cell::Cell<usize>,
+    install: Instead,
+}
+
+impl<'a> Here<'a> {
+    fn new(home: &'a Path, fail: Fail) -> Here<'a> {
+        let app_data = home.to_path_buf();
+        Here { home, app_data, fail, calls: Default::default(), install: Instead::default() }
+    }
 }
 
 impl Other for Here<'_> {
@@ -1078,8 +1299,11 @@ impl Other for Here<'_> {
             _ => {}
         }
         let stdin = stdin.unwrap_or_default();
+        let nothing = Instead::default();
+        let instead = if step == INSTALL_STEP { &self.install } else { &nothing };
+        let places = [self.app_data.as_path(), self.home];
         let (ok, said, _) =
-            run_in(step, deadline, run, name, self.home, &Instead::default(), &stdin);
+            run_with(step, deadline, run, name, places, self.home.parent(), instead, &stdin);
         if matches!(self.fail, Fail::After(k) if n == k) {
             return Err(format!("call {n}'s answer lost"));
         }
@@ -1105,7 +1329,7 @@ fn panel_adds_part_on_the_other_pc_leaves_it_as_it_was_or_complete_whatever_step
     let files = || payload(&plan, "run-1", Vec::new(), &fixture_token('d'));
     let reference = other_pc();
     let start = files_of(reference.path());
-    let here = Here { home: reference.path(), fail: Fail::No, calls: Default::default() };
+    let here = Here::new(reference.path(), Fail::No);
     install_there(&here, "Other", "run-1", files()).unwrap();
     let calls = here.calls.get();
     let complete = files_of(reference.path());
@@ -1113,7 +1337,7 @@ fn panel_adds_part_on_the_other_pc_leaves_it_as_it_was_or_complete_whatever_step
     for k in 1..=calls + 2 {
         for fail in [Fail::Before(k), Fail::After(k), Fail::From(k)] {
             let home = other_pc();
-            let here = Here { home: home.path(), fail, calls: Default::default() };
+            let here = Here::new(home.path(), fail);
             let result = install_there(&here, "Other", "run-1", files());
             let now = files_of(home.path());
             assert!(
@@ -1132,7 +1356,7 @@ fn panel_adds_part_on_the_other_pc_leaves_it_as_it_was_or_complete_whatever_step
                 serde_json::from_str(said.lines().rev().find(|l| l.starts_with('{')).unwrap())
                     .unwrap();
             assert_eq!(probed.earlier, ["run-1"], "{fail:?}: the next probe names it");
-            let next = Here { home: home.path(), fail: Fail::No, calls: Default::default() };
+            let next = Here::new(home.path(), Fail::No);
             undo_earlier(&next, "Other", "run-1").unwrap();
             let now = files_of(home.path());
             assert!(

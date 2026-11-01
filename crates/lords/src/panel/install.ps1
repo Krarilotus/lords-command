@@ -4,7 +4,7 @@
 # no window, README, LICENSE or Start-menu entry, and leaves any that are here as they are.
 #
 # All or nothing (embedded panel review r1 R2). Before each change to a live file it writes a line to this run's
-# journal (journal, beside it): `made <path>`, or `replaced <path> <copy>`, the copy made first; a line may end with
+# journal (journal, beside it): `made <path>`, or `replaced <path> <copy>`, the copy made whole first; a line may end with
 # what this run wrote there (the ssh config), so that its undo leaves another's change alone. Each change is one move
 # into place. The client goes live last: with no token here, the token, then config.txt; with one, config.txt if it is
 # missing, then the token. The last move's source is named first (`final <name>`): once it is gone from this dir, the
@@ -16,11 +16,16 @@
 # what it did. No private key leaves this PC: the key is made here; only its .pub is printed.
 $ErrorActionPreference = 'Stop'
 $staging = $PSScriptRoot
+# Held while this runs and let go with its process, however that ends; panel add's undo and clean steps wait for it, so
+# none of them races an install that runs on after panel add lost it (sol-loop S3 on cbc9b9b). Taken, or refused,
+# first; and a journal there already means this run's install began (or was closed by an undo): it doesn't run twice.
+$held = [IO.File]::Open((Join-Path $staging 'install.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+$journal = Join-Path $staging 'journal'
+if (Test-Path -LiteralPath $journal) { throw 'this run''s install began already' }
 $p = Get-Content -Raw -LiteralPath (Join-Path $staging 'panel.json') | ConvertFrom-Json
 $app = Split-Path -Parent (Split-Path -Parent $staging)
 $ssh = Join-Path $env:USERPROFILE '.ssh'
 $embedded = $p.embedded -eq $true
-$journal = Join-Path $staging 'journal'
 $token = Join-Path $app 'panel-token'
 $conf = Join-Path $app 'config.txt'
 $done = @()
@@ -97,9 +102,11 @@ try {
                     Note "made`t$backups"
                     New-Item -ItemType Directory -Path $backups | Out-Null
                 }
+                # The copy is this run's until it is whole; only then is it the one to restore from (sol-loop S4).
                 $copy = Join-Path $backups $f
-                Note "replaced`t$to`t$copy"
+                Note "made`t$copy"
                 Copy-Item -LiteralPath $to -Destination $copy
+                Note "replaced`t$to`t$copy"
                 $done += "backed up $to into $backups"
             } else {
                 Note "made`t$to"

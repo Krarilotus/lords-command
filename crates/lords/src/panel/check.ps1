@@ -1,9 +1,9 @@
 # lords panel add, the last step on the PC that got the panel: the route checked headless, through this run's own
 # forward, and believed only on the panel server's proof (embedded panel review r1 R1). It runs ssh -N <alias>, waits
 # until the forward's port is listened on by that ssh alone (who listens is read, and a reading that fails stops it),
-# asks the server there for its proof over a fresh nonce, with the panel's token, and compares it with its own: only a
-# server that holds the token can make it. Another listener on the port, that ssh ended before the answer, or an answer
-# without the proof fails. It stops that ssh by its PID. It runs under its step's watchdog (panel add's runner), which
+# asks the server there for its proof over a fresh nonce, sending no token, and compares it with its own made from the
+# panel's token here: only a server that holds the token can make it. Another listener on the port, that ssh ended
+# before the answer, or an answer without the proof fails. It stops that ssh by its PID. It runs under its step's watchdog (panel add's runner), which
 # ends it and what it starts at the step's deadline; its own waits are shorter. Prints one line of JSON. It removes
 # nothing: this run's staging dir goes in a step of its own.
 $ErrorActionPreference = 'Stop'
@@ -31,8 +31,8 @@ try {
     $bytes = New-Object byte[] 16
     [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     $nonce = -join ($bytes | ForEach-Object { $_.ToString('x2') })
-    $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 8 -Headers @{ 'Lords-Panel-Token' = $token } `
-        -Uri "http://127.0.0.1:$port/proof?nonce=$nonce"
+    # No token goes with it: whatever answers there gets nothing to make the proof from (sol-loop S1 on cbc9b9b).
+    $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 8 -Uri "http://127.0.0.1:$port/proof?nonce=$nonce"
     $mac = New-Object System.Security.Cryptography.HMACSHA256 (, [Text.Encoding]::ASCII.GetBytes($token))
     $want = -join ($mac.ComputeHash([Text.Encoding]::ASCII.GetBytes("lords-panel proof $nonce")) |
         ForEach-Object { $_.ToString('x2') })

@@ -546,7 +546,9 @@ fn request_fields_never_steer_git() {
 // it came from this PC's panel server; at the transport boundary, the server proves it holds its token): HMAC-SHA256
 // is RFC 2104's (RFC 4231's vectors, one with a key longer than a block); `GET /proof?nonce=` answers
 // HMAC-SHA256(token, "lords-panel proof " + nonce) for the nonce the client chose, which a server with another token
-// can't; without the token, 401 and nothing else, as every request; a nonce that isn't 32 to 128 hex digits, 400.
+// can't; it asks no token of the client (sol-loop S1 on cbc9b9b: a client that sent it would hand any responder the
+// key to the proof), and shows nothing else: every other path still answers 401 without the token, and /proof keeps
+// the other checks (a browser's request refused); a nonce that isn't 32 to 128 hex digits, 400.
 #[test]
 fn the_server_proves_it_holds_its_token_for_a_nonce_the_client_chose() {
     let vectors: [(&[u8], &[u8], &str); 3] = [
@@ -575,22 +577,28 @@ fn the_server_proves_it_holds_its_token_for_a_nonce_the_client_chose() {
         let head = format!("GET /proof?nonce={nonce} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n", s.port);
         raw(s.port, format!("{head}{token}\r\n").as_bytes())
     };
-    let (status, text) = ask(&nonce, &with_token());
-    assert_eq!(status, 200, "{text}");
-    let body: serde_json::Value =
-        serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     let mac = http::hmac_sha256(
         token().secret().as_bytes(),
         format!("lords-panel proof {nonce}").as_bytes(),
     );
-    assert_eq!(body, serde_json::json!({ "proof": mac }));
+    for carried in ["".to_string(), with_token()] {
+        let (status, text) = ask(&nonce, &carried);
+        assert_eq!(status, 200, "{carried:?}: {text}");
+        let body: serde_json::Value =
+            serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body, serde_json::json!({ "proof": mac }));
+    }
     assert_eq!(http::proof(&token(), &nonce), mac);
     let other = Token::new(&"fedcba9876543210".repeat(2)).unwrap();
     assert_ne!(http::proof(&other, &nonce), mac, "another token, another proof");
-    let (status, text) = ask(&nonce, "");
-    assert_eq!(status, 401, "{text}");
-    assert!(!text.contains(&mac), "{text}");
+    let (status, _) = raw(s.port, b"GET /status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    assert_eq!(status, 401, "every other path still needs the token");
+    assert_eq!(
+        ask(&nonce, "Origin: http://example.test\r\n").0,
+        403,
+        "a browser's request, refused"
+    );
     for bad in ["", "0f", &"0f".repeat(65), &"zz".repeat(16)] {
-        assert_eq!(ask(bad, &with_token()).0, 400, "{bad:?}");
+        assert_eq!(ask(bad, "").0, 400, "{bad:?}");
     }
 }
