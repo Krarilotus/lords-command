@@ -1921,8 +1921,9 @@ fn uninstall_place_lists_its_paths_and_exits_by_what_remains() {
 
 // Spec (design note Q2: "2: refused or stopped: bad arguments, <tree> not a declared place of NAME … A refusal
 // changes nothing"; Q4: "--json, one object on stdout, also for a refusal … place is null when the place was never
-// found"): `--place` without `--repo` is refused, exit 2; a plain dir under the worktree root, with `--apply`, is
-// refused with exit 2, its JSON giving the error and no place, and the worktree's copies stay.
+// found … remaining is null when it isn't known"): `--place` without `--repo` is refused, exit 2; a plain dir under
+// the worktree root, with `--apply`, is refused with exit 2, its JSON giving the error, no place, nothing planned and
+// nothing known to remain, and the worktree's copies stay.
 #[test]
 fn uninstall_place_refuses_what_is_no_place() {
     let env = Env::new();
@@ -1944,6 +1945,7 @@ fn uninstall_place_refuses_what_is_no_place() {
     assert_eq!(v["exit"].as_u64(), Some(2), "{v}");
     assert!(v["error"].as_str().is_some_and(|e| !e.is_empty()), "{v}");
     assert!(v["place"].is_null(), "{v}");
-    assert!(listed(&v, "planned").is_empty() && listed(&v, "remaining").is_empty(), "{v}");
+    assert!(listed(&v, "planned").is_empty() && v["remaining"].is_null(), "{v}");
+    assert_eq!(v["applied"].as_bool(), Some(false), "{v}");
     assert!(wt.join("CLAUDE.local.md").is_file() && wt.join(".lords").is_dir());
 }
