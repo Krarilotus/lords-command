@@ -724,6 +724,27 @@ fn a_live_holders_lock_holds_and_ends_with_it() {
     assert_eq!(names, vec![std::ffi::OsString::from("apply.lock")], "no staging name left");
 }
 
+// Spec (repair 3 sol-loop r1, Y3: an earlier build holds the lock by the file's existence and writes its record after
+// making it; an OS lock a waiter takes on that file meanwhile fails the write on Windows and strands an empty file):
+// a waiter decides a file in an earlier build's form by its content alone and never contends for its OS lock. Here
+// another handle holds a shared lock on it, as a stand-in for its writer; the waiter still reads its holder.
+#[test]
+fn a_waiter_never_locks_an_earlier_builds_lock_file() {
+    use lords_core::fsguard::{try_lock, Part, Root, TryLock};
+    let d = tempfile::TempDir::new().unwrap();
+    let root = Root::home(d.path()).unwrap();
+    let lock = root.join(&[Part::new("apply.lock").unwrap()]);
+    std::fs::write(lock.path(), "pid 7\n").unwrap();
+    let writer = std::fs::File::open(lock.path()).unwrap();
+    writer.lock_shared().unwrap();
+    match try_lock(&lock, "pid 2").unwrap() {
+        TryLock::Busy(holder) => assert_eq!(holder, "pid 7", "decided by its content"),
+        TryLock::Held(_) => panic!("an earlier build's lock is never taken over"),
+    }
+    writer.unlock().unwrap();
+    assert_eq!(std::fs::read_to_string(lock.path()).unwrap(), "pid 7\n", "left as it was");
+}
+
 // Spec (repair 2 sol-loop r1, V1: a reader may never take a `.lords` moved aside for one without its file): reading a
 // file in a dir tells, by the one open, a dir that was there without the file from no dir at all.
 #[test]

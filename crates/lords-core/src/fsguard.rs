@@ -658,6 +658,19 @@ pub fn try_lock(p: &Contained, holder: &str) -> Result<TryLock, String> {
         }
         Err(e) => return Err(err(e)),
     };
+    let mut text = String::new();
+    match f.read_to_string(&mut text) {
+        Ok(_) => {}
+        Err(e) if locked_out(&e) => return Ok(TryLock::Busy("its holder is running".into())),
+        Err(e) => return Err(err(e)),
+    }
+    // Not this build's record: an earlier build's lock, held by the file's existence and perhaps still being written.
+    // Decided by its content alone, never by taking its OS lock, which on Windows would fail that build's write of its
+    // record and leave an empty file no one removes (repair 3 sol-loop r1, Y3). This build's files never change once
+    // linked in, so what was read is what is there.
+    if !text.starts_with(LOCK_RECORD) {
+        return Ok(TryLock::Busy(text.trim().to_string()));
+    }
     match f.try_lock() {
         Ok(()) => {}
         Err(fs::TryLockError::WouldBlock) => {
@@ -665,16 +678,27 @@ pub fn try_lock(p: &Contained, holder: &str) -> Result<TryLock, String> {
         }
         Err(fs::TryLockError::Error(e)) => return Err(err(e)),
     }
-    let mut text = String::new();
-    f.read_to_string(&mut text).map_err(err)?;
     // This lock's record and no holder: its holder died. Taken over only while the path still names this file (its
     // holder's release may have deleted it, and another made the next one).
     let same = handle_identity(&f).ok().zip(identity(path).ok()).is_some_and(|(a, b)| a == b);
-    if text.starts_with(LOCK_RECORD) && same {
+    if same {
         return Ok(TryLock::Held(Lock { file: f, path: path.clone() }));
     }
     let _ = f.unlock();
     Ok(TryLock::Busy(text.trim().to_string()))
+}
+
+/// Whether a read failed on another handle's OS lock over the bytes (Windows; elsewhere OS locks don't stop reads).
+fn locked_out(e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        e.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = e;
+        false
+    }
 }
 
 impl Drop for Lock {
