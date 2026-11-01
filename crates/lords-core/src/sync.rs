@@ -1816,7 +1816,7 @@ fn fold(name: &str) -> String {
 /// A repo's verified roots, the worktrees skipped for lying outside `worktree_roots`, and the stale ones noted.
 type Checkouts = (Vec<Root>, Vec<PathBuf>, Vec<String>);
 
-fn checkouts(repo: &stack::Repo) -> Result<Checkouts, String> {
+pub(crate) fn checkouts(repo: &stack::Repo) -> Result<Checkouts, String> {
     let roots: Vec<String> = repo.worktree_roots.iter().map(|r| norm(&expand_home(r))).collect();
     let inside = |p: &Path| {
         let p = norm(p);

@@ -415,4 +415,13 @@ fn paths_marks_each_t3_delegated_path_complete_or_incomplete() {
     let (_, rows) = paths(d, &stacks, stub, "trusted");
     let coder = row(&rows, "coder");
     assert!(coder.0 == "incomplete" && coder.2.contains("start-coder.md"), "gone: {rows:?}");
+    // Sol-loop r2 S1: a worktree sync writes for, as git lists it, is judged too; one without its starts is incomplete.
+    let manifest = fs::read_to_string(d.join("priv/stack.toml")).unwrap();
+    fs::write(d.join("priv/stack.toml"), manifest.replace("worktrees = false", "worktrees = true"))
+        .unwrap();
+    git(d, &d.join("priv"), &["commit", "-q", "-a", "-m", "worktrees"]);
+    git(d, &d.join("checkout"), &["worktree", "add", "-q", "../wt"]);
+    let (code, rows) = paths(d, &stacks, stub, "trusted");
+    let wt = rows.iter().find(|r| r.1.contains("as reviewer") && r.1.contains("/wt"));
+    assert!(code == Some(1) && wt.is_some_and(|r| r.0 == "incomplete"), "{rows:?}");
 }

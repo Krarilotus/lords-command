@@ -128,22 +128,32 @@ fn find_codex() -> Option<PathBuf> {
     })
 }
 
-/// Per role but `product`: one row per declared checkout or workspace dir whose installed start for it the guard can't
-/// give (missing, unreadable, or past what one hook gives; sol-loop r1 S1: what is delivered, not what would be
-/// composed), or one complete row.
+/// Per role but `product`: one row per checkout, worktree or workspace dir sync writes for whose installed start for it
+/// the guard can't give (missing, unreadable, or past what one hook gives; sol-loop r1 S1: what is delivered, not what
+/// would be composed), or one complete row. The checkouts and worktrees are sync's own (`sync::checkouts`, r2 S1); a
+/// repo whose can't be listed is a row of its own, incomplete.
 fn role_rows(stacks: &Stacks) -> Vec<Row> {
     use crate::fsguard::InDir;
     let Some(private) = &stacks.private else { return Vec::new() };
+    let mut rows = Vec::new();
     let mut dirs: Vec<(String, PathBuf)> = Vec::new();
     for (name, repo) in &private.manifest.repos {
-        let label = |c: &String| (format!("repo {name} ({c})"), crate::config::expand_home(c));
-        dirs.extend(repo.checkouts.iter().map(label));
+        match sync::checkouts(repo) {
+            Ok((roots, _, _)) => dirs.extend(roots.iter().map(|r| {
+                let p = r.path().to_path_buf();
+                (format!("repo {name} ({})", crate::adapters::slashes(&p)), p)
+            })),
+            Err(e) => rows.push(row(
+                false,
+                format!("T3-delegated, repo {name}"),
+                format!("its checkouts can't be listed ({e})"),
+            )),
+        }
     }
     for (name, w) in &private.manifest.workspaces {
         dirs.push((format!("workspace {name}"), crate::config::expand_home(&w.path)));
     }
     let max = sync::CHILD_START_CHARS;
-    let mut rows = Vec::new();
     for role in sync::declared_roles(stacks).iter().filter(|r| *r != crate::compose::PRODUCT_ROLE) {
         let file = sync::start_file(role);
         let long: Vec<Row> = dirs
