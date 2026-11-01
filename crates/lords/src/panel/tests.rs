@@ -1,6 +1,6 @@
 //! `lords panel add`'s remote steps, run here: the same PowerShell the other PC runs, in a local powershell with its
-//! `LOCALAPPDATA` and `USERPROFILE` in a temp dir of the test's own, and the OS's profiles directory (HKLM, which a
-//! test can't change) answered by the test. What ssh adds (the transport, the other PC's shell) is not run here.
+//! `LOCALAPPDATA`, `USERPROFILE` and `APPDATA` in a temp dir of the test's own, and the OS's profiles directory (HKLM,
+//! which a test can't change) answered by the test. What ssh adds (the transport, the other PC's shell) is not run here.
 
 // Tests are outside the filesystem and process boundary (fsguard.rs): their fixtures write their own temp dirs.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -48,6 +48,8 @@ fn run_with(
         .args([deadline.to_string().as_str(), "run-1", name])
         .env("LOCALAPPDATA", local_app_data)
         .env("USERPROFILE", profile)
+        // The Start menu's place: never the real one.
+        .env("APPDATA", roaming(profile))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -60,6 +62,11 @@ fn run_with(
     let said =
         format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     (out.status.success(), said, start.elapsed())
+}
+
+/// The `APPDATA` a step gets in `profile`.
+fn roaming(profile: &Path) -> PathBuf {
+    profile.join("AppData").join("Roaming")
 }
 
 fn alive(pid: u32) -> bool {
@@ -317,4 +324,285 @@ fn only_plain_words_become_a_steps_arguments() {
         assert!(step_command(QUICK, 30, bad, "name").is_err(), "{bad:?}");
     }
     assert!(step_command(QUICK, 30, "2026-10-31-1793-12", "lords-command.exe").is_ok());
+}
+
+/// The other PC's `~/.ssh/config` as the fixtures have it (overseer's route), the panel's alias a plan appends to it,
+/// the panel key's `.pub`, and the config.txt a plan writes where there is none.
+const SSH_CONFIG: &str = "Host fleet-panel-main\r\n    HostName 127.0.0.1\r\n    IdentityFile ~/.ssh/fleet_panel_main\r\n    LocalForward 127.0.0.1:17878 127.0.0.1:7878\r\n";
+const BLOCK: &str = "Host lords-panel-main\r\n    HostName 127.0.0.1\r\n    IdentityFile ~/.ssh/lords_panel_main\r\n    LocalForward 127.0.0.1:17879 127.0.0.1:7879\r\n";
+const PUBLIC: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample0123456789abcdefABCDEF lords-panel-other";
+const CONFIG_TXT: &str = "api = http://127.0.0.1:17879\r\ntunnel = lords-panel-main\r\n";
+
+/// A plan for a PC with overseer's route, as `add::plan` makes one; `block`: the alias to append (`None`: it is there).
+fn fixture_plan(client: Client, block: Option<&str>) -> Plan {
+    Plan {
+        client,
+        alias: "lords-panel-main".into(),
+        base: "fleet-panel-main".into(),
+        key: "lords_panel_main".into(),
+        comment: "lords-panel-other".into(),
+        public: Some(PUBLIC.into()),
+        block: block.map(str::to_string),
+        config_before: SSH_CONFIG.into(),
+        sshd_config: None,
+        config_txt: Some(CONFIG_TXT.into()),
+        create_task: false,
+        run_task: false,
+    }
+}
+
+/// A fixture token, built at run time so the repo's own privacy check doesn't take this source for one.
+fn fixture_token(digit: char) -> http::Token {
+    http::Token::new(&digit.to_string().repeat(64)).unwrap()
+}
+
+/// Stand-ins for the window's three files.
+fn window_stand_ins(exe: &[u8]) -> Vec<Sent> {
+    vec![
+        ("README.md", b"the README sent".to_vec(), STEP),
+        ("LICENSE", b"the LICENSE sent".to_vec(), STEP),
+        ("lords-command.exe", exe.to_vec(), STEP),
+    ]
+}
+
+/// A profile (`profile()`) as the other PC's is before `panel add`: overseer's route in `~/.ssh/config`, and the
+/// panel's key there already, so the install makes none (no ssh-keygen runs here).
+fn other_pc() -> tempfile::TempDir {
+    let home = profile();
+    let ssh = home.path().join(".ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    std::fs::write(ssh.join("config"), SSH_CONFIG).unwrap();
+    std::fs::write(ssh.join("lords_panel_main"), "the fixture's stand-in for the key").unwrap();
+    std::fs::write(ssh.join("lords_panel_main.pub"), PUBLIC).unwrap();
+    home
+}
+
+/// Sends `files` into this run's staging dir and installs from it on the PC whose profile is `home`, as `panel add
+/// --apply` does (ssh aside); then removes the run's staging dir. The install's status and what it said.
+fn install(home: &Path, files: Vec<Sent>) -> (bool, String) {
+    let (ok, said, _) = run(STAGE, 30, "staging", home, b"");
+    assert!(ok, "{said}");
+    for (name, bytes, _) in files {
+        let (ok, said, _) = run(RECEIVE, 30, name, home, &bytes);
+        assert!(ok, "{name}: {said}");
+    }
+    let (ok, said, _) = run(INSTALL_STEP, 60, "install", home, b"");
+    let (cleaned, why, _) = run(CLEAN, 30, "staging", home, b"");
+    assert!(cleaned, "{why}");
+    (ok, said)
+}
+
+/// What the install says it did (its line of JSON).
+fn done(said: &str) -> Vec<String> {
+    let line = said.lines().find(|l| l.trim_start().starts_with('{'));
+    let line = line.unwrap_or_else(|| panic!("no JSON: {said}"));
+    let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    v["done"].as_array().unwrap().iter().map(|d| d.as_str().unwrap().to_string()).collect()
+}
+
+/// The names in `dir`, sorted.
+fn names(dir: &Path) -> Vec<String> {
+    let mut all: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    all.sort();
+    all
+}
+
+/// The Start-menu entry's place in `home`'s profile.
+fn shortcut(home: &Path) -> PathBuf {
+    roaming(home).join("Microsoft\\Windows\\Start Menu\\Programs\\lords-command.lnk")
+}
+
+/// A child process, ended with the test however the test ends.
+struct Running(std::process::Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+// Spec (design note 2026-11-01-lords-panel-embedded E2: an embedded run sends the other PC no lords-command.exe,
+// README.md or LICENSE, and needs no lords-command.exe beside this lords.exe; panel.json tells install.ps1 which client
+// it sets up; a standalone run sends today's seven files in today's order, and is refused before anything without the
+// window's exe): what each run sends, by name, in order.
+#[test]
+fn an_embedded_run_sends_only_what_its_client_reads() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let exe = dir.path().join("lords.exe");
+    let token = fixture_token('a');
+    let sent = |client: Client| {
+        let window = window_files(client, &exe).unwrap();
+        let files = payload(&fixture_plan(client, Some(BLOCK)), "run-1", window, &token);
+        let params: serde_json::Value = serde_json::from_slice(&files[0].1).unwrap();
+        (files.iter().map(|f| f.0).collect::<Vec<_>>(), params["embedded"].clone())
+    };
+    let (names, embedded) = sent(Client::Embedded);
+    assert_eq!(names, ["panel.json", "install.ps1", "check.ps1", "panel-token"]);
+    assert_eq!(embedded, true);
+    let refused = window_files(Client::Standalone, &exe).map(|_| ());
+    assert!(
+        refused.as_ref().is_err_and(|e| e.contains("no lords-command.exe beside")),
+        "{refused:?}"
+    );
+    std::fs::write(dir.path().join("lords-command.exe"), b"the window").unwrap();
+    let (names, embedded) = sent(Client::Standalone);
+    assert_eq!(
+        names,
+        [
+            "panel.json",
+            "install.ps1",
+            "check.ps1",
+            "README.md",
+            "LICENSE",
+            "lords-command.exe",
+            "panel-token"
+        ]
+    );
+    assert_eq!(embedded, false);
+}
+
+// Spec (E2, E5.3 and E5.4, install.ps1 called directly: an embedded client's PC gets the alias, config.txt and the
+// token, owner-only, by the same steps as a standalone one, and no lords-command.exe, README.md, LICENSE, backup dir
+// or Start-menu entry, even were the window's files in the staging dir): on a PC with overseer's route and the
+// panel's key, the install backs ~/.ssh/config up and appends the alias, writes config.txt and places the token with
+// one entry, this account; then the app dir holds config.txt and the token alone, and the Start menu nothing.
+#[test]
+fn an_embedded_install_writes_only_what_its_client_reads() {
+    let home = other_pc();
+    // A profile's Start menu is there (powershell itself makes APPDATA at its start, so its being there says nothing).
+    let menu = shortcut(home.path()).parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&menu).unwrap();
+    let token = fixture_token('b');
+    let plan = fixture_plan(Client::Embedded, Some(BLOCK));
+    let (ok, said) = install(home.path(), payload(&plan, "run-1", window_stand_ins(b"x"), &token));
+    assert!(ok, "{said}");
+    let app = home.path().join("Programs").join("lords-command");
+    let ssh = home.path().join(".ssh");
+    assert_eq!(names(&app), ["config.txt", "panel-token", "staging"]);
+    assert!(names(&app.join("staging")).is_empty(), "the run's staging dir is gone");
+    assert_eq!(std::fs::read_to_string(app.join("config.txt")).unwrap(), CONFIG_TXT);
+    assert_eq!(std::fs::read_to_string(app.join("panel-token")).unwrap(), token.secret());
+    assert_eq!(entries(&app.join("panel-token")), [format!("{}:(f)", me())]);
+    assert_eq!(
+        std::fs::read_to_string(ssh.join("config")).unwrap(),
+        format!("{SSH_CONFIG}{BLOCK}")
+    );
+    assert_eq!(std::fs::read_to_string(ssh.join("config.before-lords-panel")).unwrap(), SSH_CONFIG);
+    assert!(names(&menu).is_empty(), "no Start-menu entry: {:?}", names(&menu));
+    assert_eq!(
+        done(&said),
+        [
+            format!("backed up {}", ssh.join("config.before-lords-panel").display()),
+            format!("added Host lords-panel-main to {}", ssh.join("config").display()),
+            format!("wrote {}", app.join("config.txt").display()),
+            format!("placed {} (owner-only)", app.join("panel-token").display()),
+        ]
+    );
+}
+
+// Spec (E4, the choice for a PC with the standalone install: kept as it is, never updated or removed; a window running
+// there is no refusal for an embedded run, as nothing it runs from is replaced; a standalone run is refused as
+// today): with the window installed and running from the app dir, the alias there and config.txt the owner's, a
+// standalone install is refused and changes nothing; an embedded one leaves the window's files, the Start-menu entry,
+// config.txt and ~/.ssh byte for byte, makes no backup dir, and replaces only the token, owner-only.
+#[test]
+fn an_embedded_install_keeps_a_standalone_install_and_its_running_window() {
+    let home = other_pc();
+    let ssh = home.path().join(".ssh");
+    std::fs::write(ssh.join("config"), format!("{SSH_CONFIG}{BLOCK}")).unwrap();
+    let app = home.path().join("Programs").join("lords-command");
+    std::fs::create_dir_all(&app).unwrap();
+    // The window: a copy of ping, so a process runs from the app dir under the window's name.
+    let window = app.join("lords-command.exe");
+    let system = std::env::var("SystemRoot").unwrap();
+    std::fs::copy(Path::new(&system).join("System32").join("PING.EXE"), &window).unwrap();
+    let mine = format!("{CONFIG_TXT}# the owner's own line\r\n");
+    std::fs::write(app.join("config.txt"), &mine).unwrap();
+    std::fs::write(app.join("README.md"), "the installed README").unwrap();
+    std::fs::write(app.join("LICENSE"), "the installed LICENSE").unwrap();
+    std::fs::write(app.join("panel-token"), fixture_token('c').secret()).unwrap();
+    let lnk = shortcut(home.path());
+    std::fs::create_dir_all(lnk.parent().unwrap()).unwrap();
+    std::fs::write(&lnk, "the installed shortcut").unwrap();
+    let kept: Vec<(PathBuf, Vec<u8>)> =
+        [&window, &app.join("README.md"), &app.join("LICENSE"), &app.join("config.txt"), &lnk]
+            .into_iter()
+            .chain([&ssh.join("config"), &ssh.join("lords_panel_main.pub")])
+            .map(|p| (p.clone(), std::fs::read(p).unwrap()))
+            .collect();
+    let running = Running(
+        Command::new(&window)
+            .args(["-n", "120", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+
+    let token = fixture_token('d');
+    let standalone = fixture_plan(Client::Standalone, None);
+    let (ok, said) =
+        install(home.path(), payload(&standalone, "run-1", window_stand_ins(b"new"), &token));
+    assert!(!ok && said.contains("lords-command runs here"), "{said}");
+    assert_eq!(
+        std::fs::read_to_string(app.join("panel-token")).unwrap(),
+        fixture_token('c').secret()
+    );
+
+    let embedded = fixture_plan(Client::Embedded, None);
+    let (ok, said) =
+        install(home.path(), payload(&embedded, "run-1", window_stand_ins(b"new"), &token));
+    assert!(ok, "{said}");
+    let mut running = running;
+    assert!(running.0.try_wait().unwrap().is_none(), "the window ran through the install");
+    drop(running);
+    for (path, bytes) in &kept {
+        assert_eq!(&std::fs::read(path).unwrap(), bytes, "{} as it was", path.display());
+    }
+    assert_eq!(
+        names(&app),
+        ["LICENSE", "README.md", "config.txt", "lords-command.exe", "panel-token", "staging"]
+    );
+    assert_eq!(names(&ssh), ["config", "lords_panel_main", "lords_panel_main.pub"]);
+    assert_eq!(std::fs::read_to_string(app.join("panel-token")).unwrap(), token.secret());
+    assert_eq!(entries(&app.join("panel-token")), [format!("{}:(f)", me())]);
+    assert_eq!(done(&said), [format!("placed {} (owner-only)", app.join("panel-token").display())]);
+}
+
+// Spec (E2: without --embedded nothing changes; proposal P3 steps 7 and 8, review r1 R7): a standalone install puts
+// the window's three files in the app dir and makes the Start-menu entry; run again, it backs each file up into the
+// run's backup dir before it replaces it, and keeps config.txt.
+#[test]
+fn a_standalone_install_still_installs_the_window_and_its_start_menu_entry() {
+    let home = other_pc();
+    let app = home.path().join("Programs").join("lords-command");
+    let lnk = shortcut(home.path());
+    // A profile's Start menu is there; the test's isn't until made.
+    std::fs::create_dir_all(lnk.parent().unwrap()).unwrap();
+    let token = fixture_token('e');
+    let first = fixture_plan(Client::Standalone, Some(BLOCK));
+    let (ok, said) =
+        install(home.path(), payload(&first, "run-1", window_stand_ins(b"window 1"), &token));
+    assert!(ok, "{said}");
+    assert_eq!(
+        names(&app),
+        ["LICENSE", "README.md", "config.txt", "lords-command.exe", "panel-token", "staging"]
+    );
+    assert_eq!(std::fs::read(app.join("lords-command.exe")).unwrap(), b"window 1");
+    assert!(lnk.is_file(), "{said}");
+
+    std::fs::write(app.join("config.txt"), "the owner's").unwrap();
+    let again = fixture_plan(Client::Standalone, None);
+    let (ok, said) =
+        install(home.path(), payload(&again, "run-1", window_stand_ins(b"window 2"), &token));
+    assert!(ok, "{said}");
+    assert_eq!(std::fs::read(app.join("lords-command.exe")).unwrap(), b"window 2");
+    let backup = app.join("backup-run-1");
+    assert_eq!(names(&backup), ["LICENSE", "README.md", "lords-command.exe"]);
+    assert_eq!(std::fs::read(backup.join("lords-command.exe")).unwrap(), b"window 1");
+    assert_eq!(std::fs::read_to_string(app.join("config.txt")).unwrap(), "the owner's");
 }

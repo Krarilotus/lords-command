@@ -17,14 +17,14 @@ macro_rules! say {
 }
 
 use crate::Args;
-use add::{Local, Plan, Remote, LOCAL_PORT, SERVER_PORT, TASK};
+use add::{Client, Local, Plan, Remote, LOCAL_PORT, SERVER_PORT, TASK};
 use lords_core::fsguard::{self, Contained, Part};
 use lords_core::{http, panel, process, sync};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const USAGE: &str =
-    "usage: lords panel serve [--port N] | lords panel add ALIAS --bridge DIR [--apply]";
+    "usage: lords panel serve [--port N] | lords panel add ALIAS --bridge DIR [--embedded] [--apply]";
 
 pub fn cmd(mut a: Args) -> Result<bool, String> {
     match a.positional().as_deref() {
@@ -282,9 +282,11 @@ fn run_id() -> String {
     format!("{}-{secs}-{}", lords_core::ops::today(), process::id())
 }
 
-/// `lords panel add ALIAS --bridge DIR [--apply]`.
+/// `lords panel add ALIAS --bridge DIR [--embedded] [--apply]`.
 fn add_pc(mut a: Args) -> Result<bool, String> {
     let apply = a.flag("--apply");
+    // Before `--bridge`'s value, so `--bridge --embedded` can't take the flag for the dir.
+    let client = if a.flag("--embedded") { Client::Embedded } else { Client::Standalone };
     let bridge = a.value("--bridge")?.map(PathBuf::from).ok_or(
         "panel add needs --bridge DIR: this PC's SSH bridge (its sshd_config, authorized_keys, status.json, sshd.exe)",
     )?;
@@ -296,7 +298,7 @@ fn add_pc(mut a: Args) -> Result<bool, String> {
     let run = run_id();
     let local = read_local(&bridge, &home_dir)?;
     let other = probe(&alias, &run)?;
-    let plan = add::plan(&alias, &local, &other)?;
+    let plan = add::plan(&alias, &local, &other, client)?;
     for line in plan.describe(&alias, &local, &other, &run) {
         say!("{line}");
     }
@@ -362,6 +364,35 @@ fn carry_out(
     run: &str,
 ) -> Result<bool, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let window = window_files(plan.client, &exe)?;
+    if exe.to_string_lossy().contains('\'') {
+        return Err(format!("{}: a path with `'` can't go in the task's command", exe.display()));
+    }
+    // The panel's token, made here once if there is none yet; a copy goes to the other PC over ssh, from memory.
+    let token = panel::token(&local.home)?;
+    let files = payload(plan, run, window, &token);
+    // 1. The other PC: this run's staging dir, each file into it over stdin, then installed from it (the key made
+    // there, the alias added, each installed file backed up first), the route checked; the staging dir removed at the
+    // end, whatever happened.
+    remote(alias, STAGE, STEP, run, "staging", None)?;
+    say!("{alias}: made this run's staging dir");
+    let sent = send_and_install(alias, local, plan, dir, run, files, &exe, &token);
+    let cleaned = remote(alias, CLEAN, STEP, run, "staging", None);
+    let checked = sent?;
+    cleaned.map_err(|e| format!("{e} (this run's staging dir stays on {alias})"))?;
+    say!("{alias}: removed this run's staging dir");
+    Ok(checked)
+}
+
+/// One file a run sends into its staging dir there: its name, its bytes, and its step's deadline.
+type Sent = (&'static str, Vec<u8>, u64);
+
+/// The standalone window's files, which a run sends for it alone: README.md, LICENSE, and `lords-command.exe` from
+/// beside this `lords.exe` (`exe`), which must be there. An embedded client gets none of them.
+fn window_files(client: Client, exe: &Path) -> Result<Vec<Sent>, String> {
+    if client == Client::Embedded {
+        return Ok(Vec::new());
+    }
     let window = exe.with_file_name("lords-command.exe");
     if fsguard::kind(&window)? != fsguard::Kind::File {
         return Err(format!(
@@ -369,22 +400,30 @@ fn carry_out(
             window.display()
         ));
     }
-    if exe.to_string_lossy().contains('\'') {
-        return Err(format!("{}: a path with `'` can't go in the task's command", exe.display()));
-    }
-    // The panel's token, made here once if there is none yet; a copy goes to the other PC over ssh, from memory.
-    let token = panel::token(&local.home)?;
-    // 1. The other PC: this run's staging dir, each file into it over stdin, then installed from it (the key made
-    // there, the alias added, each installed file backed up first), the route checked; the staging dir removed at the
-    // end, whatever happened.
-    remote(alias, STAGE, STEP, run, "staging", None)?;
-    say!("{alias}: made this run's staging dir");
-    let sent = send_and_install(alias, local, plan, dir, run, &window, &exe, &token);
-    let cleaned = remote(alias, CLEAN, STEP, run, "staging", None);
-    let checked = sent?;
-    cleaned.map_err(|e| format!("{e} (this run's staging dir stays on {alias})"))?;
-    say!("{alias}: removed this run's staging dir");
-    Ok(checked)
+    let bytes = fsguard::read_bytes(&window).map_err(|e| format!("{}: {e}", window.display()))?;
+    Ok(vec![
+        ("README.md", README.as_bytes().to_vec(), STEP),
+        ("LICENSE", LICENSE.as_bytes().to_vec(), STEP),
+        ("lords-command.exe", bytes, SEND_EXE),
+    ])
+}
+
+/// What a run sends, in this order: its parameters (`panel.json`, whose `embedded` tells install.ps1 to leave the
+/// window's files and Start-menu entry alone), the two scripts, the window's files (`window`), the token last.
+fn payload(plan: &Plan, run: &str, window: Vec<Sent>, token: &http::Token) -> Vec<Sent> {
+    let params = serde_json::json!({
+        "run": run, "alias": plan.alias, "key": plan.key, "comment": plan.comment, "block": plan.block,
+        "config_before": plan.config_before, "config_txt": plan.config_txt, "local_port": LOCAL_PORT,
+        "embedded": plan.client == Client::Embedded,
+    });
+    let mut files = vec![
+        ("panel.json", params.to_string().into_bytes(), STEP),
+        ("install.ps1", INSTALL.as_bytes().to_vec(), STEP),
+        ("check.ps1", CHECK.as_bytes().to_vec(), STEP),
+    ];
+    files.extend(window);
+    files.push((panel::TOKEN_FILE, token.secret().as_bytes().to_vec(), STEP));
+    files
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -394,25 +433,10 @@ fn send_and_install(
     plan: &Plan,
     dir: &Contained,
     run: &str,
-    window: &Path,
+    files: Vec<Sent>,
     exe: &Path,
     token: &http::Token,
 ) -> Result<bool, String> {
-    let params = serde_json::json!({
-        "run": run, "alias": plan.alias, "key": plan.key, "comment": plan.comment, "block": plan.block,
-        "config_before": plan.config_before, "config_txt": plan.config_txt, "local_port": LOCAL_PORT,
-    });
-    let exe_bytes =
-        fsguard::read_bytes(window).map_err(|e| format!("{}: {e}", window.display()))?;
-    let files: [(&str, Vec<u8>, u64); 7] = [
-        ("panel.json", params.to_string().into_bytes(), STEP),
-        ("install.ps1", INSTALL.as_bytes().to_vec(), STEP),
-        ("check.ps1", CHECK.as_bytes().to_vec(), STEP),
-        ("README.md", README.as_bytes().to_vec(), STEP),
-        ("LICENSE", LICENSE.as_bytes().to_vec(), STEP),
-        ("lords-command.exe", exe_bytes, SEND_EXE),
-        (panel::TOKEN_FILE, token.secret().as_bytes().to_vec(), STEP),
-    ];
     for (name, bytes, deadline) in files {
         remote(alias, RECEIVE, deadline, run, name, Some(bytes))?;
     }

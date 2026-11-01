@@ -1,20 +1,25 @@
 # lords panel add, on the PC that gets the panel: installs it from this run's staging dir (this script's own dir,
 # staging\<run> beside the app's files), as panel.json beside it says, and adds the panel's key and SSH alias. Every
 # installed file it replaces is backed up first, into backup-<run> of this run's own; the token's copy gets an
-# owner-only access list before it takes its place, and is never backed up (a secret keeps no copies). It runs under
-# its step's watchdog (panel add's runner), which ends it and what it starts at the step's deadline. Prints one line
-# of JSON: the key's .pub and what it did. No private key leaves this PC: the key is made here; only its .pub is
-# printed.
+# owner-only access list before it takes its place, and is never backed up (a secret keeps no copies). For a client
+# embedded in another app (panel.json's `embedded`), which reads only config.txt and the token here, it installs no
+# window, README, LICENSE or Start-menu entry, and leaves any that are here as they are. It runs under its step's
+# watchdog (panel add's runner), which ends it and what it starts at the step's deadline. Prints one line of JSON: the
+# key's .pub and what it did. No private key leaves this PC: the key is made here; only its .pub is printed.
 $ErrorActionPreference = 'Stop'
 $staging = $PSScriptRoot
 $p = Get-Content -Raw -LiteralPath (Join-Path $staging 'panel.json') | ConvertFrom-Json
 $app = Split-Path -Parent (Split-Path -Parent $staging)
 $ssh = Join-Path $env:USERPROFILE '.ssh'
+$embedded = $p.embedded -eq $true
 $done = @()
 
-# The app first: refused while a panel runs from here, before anything else changes.
-$open = @(Get-Process lords-command -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$app\*" })
-if ($open.Count) { throw 'lords-command runs here; close it, then run panel add again' }
+# The app first: refused while a panel runs from here, before anything else changes. An embedded client's run
+# replaces nothing it runs from.
+if (-not $embedded) {
+    $open = @(Get-Process lords-command -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$app\*" })
+    if ($open.Count) { throw 'lords-command runs here; close it, then run panel add again' }
+}
 
 # The key, made here.
 $key = Join-Path $ssh $p.key
@@ -42,20 +47,24 @@ if ($p.block) {
     $done += "added Host $($p.alias) to $cfg"
 }
 
-# The files: each one there backed up before it is replaced; config.txt written only where there is none.
-$backups = Join-Path $app ('backup-' + $p.run)
-foreach ($f in 'lords-command.exe', 'README.md', 'LICENSE') {
-    $to = Join-Path $app $f
-    if (Test-Path -LiteralPath $to) {
-        if (-not (Test-Path -LiteralPath $backups)) {
-            New-Item -ItemType Directory -Path $backups | Out-Null
+# The window's files (a standalone client's alone): each one there backed up before it is replaced.
+if (-not $embedded) {
+    $backups = Join-Path $app ('backup-' + $p.run)
+    foreach ($f in 'lords-command.exe', 'README.md', 'LICENSE') {
+        $to = Join-Path $app $f
+        if (Test-Path -LiteralPath $to) {
+            if (-not (Test-Path -LiteralPath $backups)) {
+                New-Item -ItemType Directory -Path $backups | Out-Null
+            }
+            Copy-Item -LiteralPath $to -Destination (Join-Path $backups $f)
+            $done += "backed up $to into $backups"
         }
-        Copy-Item -LiteralPath $to -Destination (Join-Path $backups $f)
-        $done += "backed up $to into $backups"
+        Move-Item -Force -LiteralPath (Join-Path $staging $f) -Destination $to
+        $done += "installed $to"
     }
-    Move-Item -Force -LiteralPath (Join-Path $staging $f) -Destination $to
-    $done += "installed $to"
 }
+
+# config.txt: written only where there is none.
 $conf = Join-Path $app 'config.txt'
 if ($p.config_txt -and -not (Test-Path -LiteralPath $conf)) {
     [IO.File]::WriteAllText($conf, $p.config_txt)
@@ -73,9 +82,9 @@ Set-Acl -LiteralPath $staged -AclObject $acl
 Move-Item -Force -LiteralPath $staged -Destination (Join-Path $app 'panel-token')
 $done += "placed $(Join-Path $app 'panel-token') (owner-only)"
 
-# The Start-menu entry.
+# The Start-menu entry (a standalone client's alone).
 $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\lords-command.lnk'
-if (-not (Test-Path -LiteralPath $lnk)) {
+if (-not $embedded -and -not (Test-Path -LiteralPath $lnk)) {
     $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
     $s.TargetPath = Join-Path $app 'lords-command.exe'
     $s.WorkingDirectory = $app
