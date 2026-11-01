@@ -6,6 +6,7 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: detail
 visibility: public
 basis:
 - quote: "Our own design … I don't have to adapt my structure to someone else's artificial boundaries."

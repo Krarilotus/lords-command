@@ -6,6 +6,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "Commit through normal hooks, never skip them or repoint their path, and never force-stop a running hook; stop committers only between commits, then compare the last commit with its log. Reset an unhooked commit only where history policy permits; otherwise revert it with a new commit, commit the change again through hooks, and tell the repo's owner."
 visibility: public
 evidence:
 - summary: Force-stopped committers let git commit without its hooks; stopping only between commits and comparing the last commit with the committer's log caught them.

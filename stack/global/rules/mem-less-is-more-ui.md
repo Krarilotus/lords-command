@@ -6,6 +6,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "Every screen word must help the user: no explanatory paragraphs, system labels, eyebrow labels, slogans, rhetorical questions or repeated text; when in doubt, cut it. Extend existing views rather than redesigning for decoration, and check outputs against this before showing them."
 visibility: public
 basis:
 - quote: "the UI must speak for itself — a slick version"

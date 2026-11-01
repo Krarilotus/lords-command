@@ -6,6 +6,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "Say \"passes\", \"fixed\", \"no loss\" or \"done\" only with command, exit code and log/job id from this turn or cited by id; code claims name file/line and anything not run is \"not run\". Submission is not execution, execution is not a passing result, and a planned item is not a delivered one."
 visibility: public
 origin:
   type: own

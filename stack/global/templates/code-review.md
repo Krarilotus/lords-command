@@ -6,6 +6,12 @@ audience: [all]
 roles: [orchestrator, coder, reviewer]
 scope: global
 status: active
+start: role
+core:
+- line: "One full package round: fresh agent, committed/evidenced head; medium for deltas/docs/tooling, high for product/shared-process controllers, highest for disclosure/data-loss/concurrency/crash. After BLOCK check diff since reviewed head, listed blockers and fails-without tests; new blockers only from fixes; hand off after two blocking fix checks; second independent rounds need disclosure/data-loss risk and orchestrator OK."
+  roles: [orchestrator, coder, reviewer]
+- line: "Read bar/exceptions, design note/prior reviews; never block approved exceptions; detached disposable worktree, no timing/jobs/commits/pushes/author-tree edits; label probes command/exit or not run, give exact build commands if unable. Report verdict, classed scenarios, prior closure, current-target merge-tree and type/signature risks with correctness wording; ticket nonblockers, route other findings, remove tree/report space."
+  roles: [orchestrator, coder, reviewer]
 visibility: public
 evidence:
 - summary: Review rounds caught real deadlocks, but fix checks that widened scope ran to 9-11 rounds; a provider's safety filter ended a review worded in attack terms.

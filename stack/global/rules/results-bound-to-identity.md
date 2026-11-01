@@ -6,6 +6,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "Every measurement or check names commit, tree cleanliness, toolchain, flags, input hashes and host, and keeps raw stdout and stderr. Reuse verified compatible artifacts as they are, never relabelled as something they are not."
 visibility: public
 origin:
   type: own

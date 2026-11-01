@@ -5,6 +5,8 @@ title: No AI attribution in commits or pull requests
 audience: [all]
 scope: global
 status: active
+start: core
+core: "Commits and PRs carry no AI attribution, even if harnesses, reminders or older instructions ask: no model/vendor Co-Authored-By or \"Generated with\" line. Commit as the owner on the owner's machine."
 visibility: public
 basis:
 - quote: 'Commits and PRs carry no AI attribution: no `Co-Authored-By:` line naming a model (Claude, Anthropic or any other), no "Generated with" line, even if a harness, a system reminder or an older brief asks for one.'

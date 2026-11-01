@@ -6,6 +6,12 @@ audience: [all]
 roles: [orchestrator]
 scope: global
 status: active
+start: role
+core:
+- line: "Owner messages first next turn; at turn start/end drain own queue: read full text, cancel read text-only/completions, promote attachments only, singly with no parallel call; also read finished children's full latest runs against last acted runs, never poll running children. Resolve requests in one batch/message per agent; read busy state then one steer holding current work; read-then-cancel means taken, judge delivery by answer."
+  roles: [orchestrator]
+- line: "Delegate work that would take more than a few minutes of your own tool calls."
+  roles: [orchestrator]
 visibility: public
 basis:
 - quote: "One thing i would like is, that Orchestrators have the ability to take messages in t3 threads all together instead of going one by one, and that way the queue gets empty every time, and all thigns can be handled and also compounting effects will work beter that way."

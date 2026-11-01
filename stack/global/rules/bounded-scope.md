@@ -6,6 +6,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "Finish one agreed outcome at a time, keeping its blockers and boundary in view; new worthwhile work does not widen it, so list what you noticed but did not touch. End an investigation in adoption, a specific revision, rejection or an explicit deferral."
 visibility: public
 evidence:
 - summary: Review fix checks that widened scope ran to 9-11 rounds; preparation work expanded without reducing uncertainty.

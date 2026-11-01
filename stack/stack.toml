@@ -5,7 +5,7 @@ roles = ["orchestrator", "coder", "helper", "reviewer", "product"]
 topics = [
   "attribution", "git", "commits", "cleanup", "disk", "containers", "delegation", "review", "testing", "scope",
   "debugging", "evidence", "design", "performance", "documentation", "privacy", "security", "skills", "memory",
-  "prompts", "research", "notes", "process", "status", "reporting", "owner-decisions",
+  "prompts", "research", "notes", "process", "status", "reporting", "owner-decisions", "tools",
   # an entry a manifest or `check` should enforce mechanically, once a check exists for it
   "check-candidate",
 ]

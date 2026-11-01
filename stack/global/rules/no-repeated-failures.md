@@ -6,6 +6,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "Do not rerun a failed job, gate, proof, hook or review until its raw output is kept and its cause named and fixed, without generalising beyond it; one small bounded repair in your task is fine. A second same-cause failure stops retries and goes with evidence to the cause's owner; never weaken a guard, skip a check or invent evidence to keep moving."
 visibility: public
 basis:
 - quote: 'not running the same tasks and gates in loops that failed previously'

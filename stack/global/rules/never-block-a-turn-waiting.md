@@ -6,6 +6,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "Never wait inside a turn with a foreground sleep or poll loop; run the wait in the background and end the turn. Never edit a script that a running background task executes; write a new file."
 visibility: public
 evidence:
 - summary: Agents in foreground poll loops could not receive the orchestrator's messages for hours.

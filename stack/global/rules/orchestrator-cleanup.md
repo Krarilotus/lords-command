@@ -6,6 +6,10 @@ audience: [all]
 roles: [orchestrator]
 scope: global
 status: active
+start: role
+core:
+- line: "Share verified benchmark datasets instead of preparing them again, and clear finished scratch and stale build outputs while reporting reclaimed space and keeping caches planned work reuses. Fix a recurring leak at its producer before removing its remnants."
+  roles: [orchestrator]
 visibility: public
 origin:
   type: own

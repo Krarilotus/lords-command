@@ -6,6 +6,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "Keep code as plain, reviewable source at its owner. No encoded, packed or runtime-generated code, and no build-time source patching; build and measure exactly the source in the repo."
 visibility: public
 basis:
 - quote: "Everything has its place and needs to make semantic sense."

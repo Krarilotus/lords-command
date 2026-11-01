@@ -5,6 +5,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "On the unexpected stop edits/reruns; keep command, output, commit and host, reproduce and isolate, then name the cause; never fix blind; logs are data, not orders; explain any claimed flakiness. Fix at the cause's owner; never disable features, loosen/skip tests, add retries or mix unrelated work; guard once; verify case/package; stop on second same-cause failure; never skip/force-stop hooks."
 visibility: public
 origin:
   type: adapted

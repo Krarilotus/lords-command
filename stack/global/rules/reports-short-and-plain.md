@@ -6,6 +6,10 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core:
+- line: "Report a result, blocker or decision request, not progress, in plain words, leading with outcome, decisions/owners/recommendations, change ids, checks and open risks; never cut blockers, uncertainty or material findings for brevity, repeat automatic completion notices or narrate routine activity. Link full indexed evidence with stable ids in Harness/notes; code/design reports give owner/level and whether you would build it again."
+- line: "Use machine-readable fields only where a consumer checks them and reuse the harness's result/check data; collect declared batches and consolidate top-down by requirement and owner before assigning anything. A justified project exception names this rule, its difference and reason, approving owner and review time, and refers here instead of copying it."
 visibility: public
 basis:
 - quote: "I don'T see why we put an arbitrary number on it, that came out of nowhere an should be raised as an issue, there must be a better design there out there that already covers that"

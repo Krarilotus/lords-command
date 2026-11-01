@@ -6,6 +6,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "For investigations of more than one try, keep one line per hypothesis: thought, test, result and status. Keep disproven ones; read before the next try; when hard, record the next angle and keep going."
 visibility: public
 origin:
   type: own

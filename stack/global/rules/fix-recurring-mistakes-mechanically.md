@@ -6,6 +6,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "Fix recurring mistakes at the strongest available level: architecture, then types, then a checked file or lint, then a test, and prose last. Propose the mechanical form."
 visibility: public
 origin:
   type: own

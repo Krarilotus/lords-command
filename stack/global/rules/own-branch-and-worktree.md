@@ -6,6 +6,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "Work in your own branch and worktree. Never modify another agent's worktree or branch, and never reset a shared checkout."
 visibility: public
 origin:
   type: own

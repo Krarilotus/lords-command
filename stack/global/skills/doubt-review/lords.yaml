@@ -5,6 +5,10 @@ audience: [all]
 roles: [orchestrator, coder]
 scope: global
 status: active
+start: role
+core:
+- line: "Only orchestrators/package leads: before accepting non-trivial decisions, fixes or claims, get fresh artifact/contract-only review, never claim/reasoning; mechanical changes, clear owner instructions and one-line fixes are exempt. Fix real findings, clarify/re-run unclear contracts, explain rejections; stop at trivial findings, three rounds or owner's word; record it; if unable to spawn, use the orchestrator."
+  roles: [orchestrator, coder]
 visibility: public
 origin:
   type: adapted

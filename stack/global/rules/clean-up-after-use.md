@@ -6,6 +6,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "Stop unused owned containers; remove disposable container resources after final use and worktree build outputs when its phase ends. Keep images, data and caches that planned work reuses."
 visibility: public
 evidence:
 - summary: One job leaked 275 GB of per-process test stores on a shared host; disk overflow recurred several times.

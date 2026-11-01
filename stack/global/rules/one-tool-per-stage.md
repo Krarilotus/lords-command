@@ -6,6 +6,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "Use the project's owning tool for each change stage. Do not write a private pipeline, launcher, pass stamp or policy workaround beside it."
 visibility: public
 evidence:
 - summary: Per-agent pipeline scripts, private launchers and duplicate deploy tools each re-solved the same stage and diverged.

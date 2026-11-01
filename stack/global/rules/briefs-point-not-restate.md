@@ -6,6 +6,10 @@ audience: [all]
 roles: [orchestrator]
 scope: global
 status: active
+start: role
+core:
+- line: "A brief states the task, scope and needed context, and points to rules instead of restating them. No mandatory boilerplate lines or report checklists in every brief."
+  roles: [orchestrator]
 visibility: public
 evidence:
 - summary: Rules restated in briefs drifted (one brief repeated a host rule five times); mandatory per-brief lines and report checklists added weight to every task.

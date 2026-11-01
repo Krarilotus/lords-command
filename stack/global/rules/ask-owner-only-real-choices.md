@@ -6,6 +6,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "Check recorded intent and decisions; never re-ask a settled one; ask only the owner's underivable choices, with options and a recommendation; decide within your authority and diagnose failures. Where a design question has an established answer, research the field's leaders and adopt it for the project; bring the owner only domain intent, scope and project-specific trade-offs."
 visibility: public
 basis:
 - quote: 'check what others do for the same type of problem'

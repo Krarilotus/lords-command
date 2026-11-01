@@ -5,6 +5,8 @@ title: Delete only what you created, by its recorded path
 audience: [all]
 scope: global
 status: active
+start: core
+core: "Record each path or resource you create and delete only those; if unsure, list it, and a wider cleanup needs the owner's word. Give each task a private temp root and never use a glob or pattern delete in shared locations such as /tmp, %TEMP%, home directories or shared caches."
 visibility: public
 basis:
 - quote: "make sure it won't happen again and take extra caution with such things"

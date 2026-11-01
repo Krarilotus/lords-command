@@ -5,6 +5,10 @@ audience: [all]
 roles: [orchestrator, coder, helper]
 scope: global
 status: active
+start: role
+core:
+- line: "Before editing state what changes and what stays out; touch only task needs, search and reuse at the owner, do not grow files over ~600 lines unless they own the change, and report untouched findings. Check and commit one minimal slice at a time, separate refactors from behaviour changes, and if scope grows stop and ask the orchestrator once with a concrete proposal, never widening silently."
+  roles: [orchestrator, coder, helper]
 visibility: public
 origin:
   type: adapted

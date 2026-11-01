@@ -5,6 +5,7 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: detail
 visibility: public
 origin:
   type: inherited

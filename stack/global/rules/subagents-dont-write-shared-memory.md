@@ -6,6 +6,10 @@ audience: [all]
 roles: [coder, helper, reviewer]
 scope: global
 status: active
+start: role
+core:
+- line: "Don't write to the shared memory or rule store. Put a lesson in your report; the orchestrator decides where it lives."
+  roles: [coder, helper, reviewer]
 visibility: public
 evidence:
 - summary: A subagent wrote its own role into the shared memory directory, which then taught other agents a stale ownership.

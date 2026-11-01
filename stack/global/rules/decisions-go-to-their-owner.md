@@ -6,6 +6,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "Send decisions, questions and findings straight to their owner in its thread and take answers directly; never relay or ask a third agent to relay; consult the owner table, then ask your lead only if it names no owner. Choices within your lead's task go to it; other owners decide theirs; report results to whoever tasked you; reading threads and speaking up with evidence never transfer authority."
 visibility: public
 basis:
 - quote: "They shoudl target the correct owners of correct decisions, if they have to say sth about thigns they can and interfere or even check up on thigns and other threads themselves."

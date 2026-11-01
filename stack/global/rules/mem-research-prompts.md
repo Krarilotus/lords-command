@@ -6,6 +6,10 @@ audience: [all]
 roles: [orchestrator, coder, helper]
 scope: global
 status: active
+start: role
+core:
+- line: "Where the state of the art is uncertain, write one or two neutral, self-contained deep-research prompts for the owner around the problem and neighbouring fields, with named sources mapped to claims. Paste each drafted prompt or relay in chat in its own code block, with a one-line file location and no report-language line; keep out-of-scope findings and flag challenges to committed designs."
+  roles: [orchestrator, coder, helper]
 visibility: public
 basis:
 - quote: "when there is big uncertainty about industry standards, we shouldn't assume it, thats kinda like a rule as well, we should then have 1-2 research tasks setup in markdown codeblocks to spin off"

@@ -6,6 +6,8 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
+start: core
+core: "Write and edit files with the harness's editor tools, not through shell redirection."
 visibility: public
 origin:
   type: own

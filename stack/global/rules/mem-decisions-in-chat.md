@@ -6,6 +6,10 @@ audience: [all]
 roles: [orchestrator]
 scope: global
 status: active
+start: role
+core:
+- line: "Present decisions in chat as self-contained numbered items with reasons, options and recommendations, without forward references; never require reading a file to decide, since links are optional background. Fold interdependent design decisions into one proposal explaining how the parts work together, with recommendations as defaults, and ask only questions that change the overall direction."
+  roles: [orchestrator]
 visibility: public
 basis:
 - quote: "I want to only decide line by line offered to me through you in chat … I can't be bothered to check different documents all over the place, that's for your organization with the subagents."
