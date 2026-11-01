@@ -105,6 +105,9 @@ pub struct Item {
     /// A settings item whose hooks will name the guard copy: apply checks it is there and answers before it writes.
     #[serde(skip)]
     pub(crate) names_guard: Option<Contained>,
+    /// Among them the child guard: apply checks the copy speaks this build's child protocol too (fix check r2, FC4).
+    #[serde(skip)]
+    pub(crate) names_child_guard: bool,
 }
 
 /// An item as plans show it (`--json`, the app): a redacted item without its texts.
@@ -242,6 +245,7 @@ impl Item {
             conflict: ConflictKind::Other,
             redacted: false,
             names_guard: None,
+            names_child_guard: false,
         }
     }
 
@@ -345,6 +349,27 @@ fn guard_ready(place: &Contained) -> Result<(), String> {
         None => Err("guard not installed: run `lords guard install`".into()),
         Some(_) => crate::process::guard_self_test(place.path())
             .map_err(|e| format!("guard not ready ({e}): run `lords guard install`")),
+    }
+}
+
+/// Whether the guard copy speaks this build's child protocol (fix check r2, FC4): asked with the very command line the
+/// child hooks run (`process::guard_child_protocol`), so sync never names a copy in a hook whose arguments it refuses
+/// or whose answer is another protocol's. Checked when planning and again when applying. Read only.
+fn guard_speaks_child(place: &Contained, home: &Path) -> Result<(), String> {
+    let want = crate::guard::CHILD_PROTOCOL;
+    let have = crate::process::guard_child_protocol(place.path(), home)
+        .map_err(|e| format!("the guard copy's child protocol can't be told ({e})"));
+    match have {
+        Ok(Some(n)) if n == want => Ok(()),
+        Ok(Some(n)) => Err(format!(
+            "the guard copy speaks child protocol {n}, this build's hooks need {want}: run `lords guard install`, then sync again; the hooks stay as they are"
+        )),
+        Ok(None) => Err(format!(
+            "the guard copy is from an earlier build and refuses the child hooks this build writes (protocol {want}): run `lords guard install`, then sync again; the hooks stay as they are"
+        )),
+        Err(e) => Err(format!(
+            "{e}: run `lords guard install`, then sync again; the hooks stay as they are"
+        )),
     }
 }
 
@@ -1323,6 +1348,14 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
             }
         }
     };
+    // A copy that answers but refuses this build's child hooks is refused, with the hooks it has kept (fix check r2,
+    // FC4): taking them out would leave the harness without the guards that still work.
+    let child = guards.iter().any(|g| g == "child");
+    if child {
+        if let Err(e) = guard_speaks_child(&guard, &pl.plan.home) {
+            return conflict(&t.name, &path, e);
+        }
+    }
     let hooks = match guard_hooks(guards, adapter, &value, guard.path(), &pl.plan.home) {
         Ok(h) => h,
         Err(e) => return conflict(&t.name, &path, e),
@@ -1355,6 +1388,7 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
     item.redacted = true;
     item.notes.extend(not_ready);
     item.names_guard = (!guards.is_empty()).then(|| guard.clone());
+    item.names_child_guard = child;
     let names = |h: &serde_json::Value| guard_names(h, adapter, guard.path());
     let changed = hooks.as_ref().map(|h| (names(&before_hooks), names(h)));
     if let (Some((before, after)), Some(why)) = (&changed, adapter.guard_note()) {
@@ -2145,6 +2179,12 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
                     undeliverable.push(format!(
                         "{file} takes {parts} parts of {CHILD_PART_CHARS} characters, past the {CHILD_PARTS} Claude Code's child hooks deliver: not written, the old files stay"
                     ));
+                } else if parts > 1 && start == compose::ChildStart::Beyond {
+                    // Its agents may start again with the same agent id, so their start is one read (fix check r2,
+                    // FC1; `guard::child_hook`).
+                    undeliverable.push(format!(
+                        "{file} takes {parts} parts of {CHILD_PART_CHARS} characters, and a child that may start again with its agent id is given its start in one read, one part: not written, the old files stay"
+                    ));
                 }
             }
             tree.insert(file.into(), text.into_bytes());
@@ -2550,8 +2590,10 @@ fn staged(plan: &mut Plan) {
 // ---------------------------------------------------------------- apply
 
 /// One writer of the ledger at a time on this machine (a user's sync, a post-checkout hook's, a hook
-/// installation): a lock file in the tool's home, waited for up to `secs` seconds.
-pub(crate) struct ApplyLock(Contained);
+/// installation), and the readers that must not see one mid-swap (the child guard): `apply.lock` in the tool's home,
+/// held by an OS lock that ends with its holder however it ends (`fsguard::Lock`; fix check r2, FC5), waited for up to
+/// `secs` seconds, the deadline checked before each attempt. Released when dropped.
+pub(crate) struct ApplyLock(#[allow(dead_code)] fsguard::Lock);
 
 impl ApplyLock {
     pub(crate) fn take(home: &Path, secs: u64) -> Result<ApplyLock, String> {
@@ -2559,29 +2601,21 @@ impl ApplyLock {
         root.create()?;
         let lock = root.join(&[Part::new("apply.lock")?]);
         let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        let step = std::time::Duration::from_millis(200);
         loop {
-            match fsguard::create_file(&lock, format!("pid {}\n", crate::process::id()).as_bytes())
-            {
-                Ok(()) => return Ok(ApplyLock(lock)),
-                Err(_) if lock.path().exists() && std::time::Instant::now() < until => {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
+            match fsguard::try_lock(&lock, &format!("pid {}", crate::process::id()))? {
+                fsguard::TryLock::Held(l) => return Ok(ApplyLock(l)),
+                fsguard::TryLock::Busy(_) if std::time::Instant::now() + step < until => {
+                    std::thread::sleep(step);
                 }
-                Err(_) if lock.path().exists() => {
+                fsguard::TryLock::Busy(holder) => {
                     return Err(format!(
-                        "another apply holds {} ({}); if none is running, delete that file",
+                        "another apply holds {} ({holder}); this build's lock ends with its holder, so one in an earlier build's form (\"pid N\") is that build's: if none is running, delete that file",
                         lock.path().display(),
-                        read_lossy(lock.path()).unwrap_or_default().trim()
                     ))
                 }
-                Err(e) => return Err(e),
             }
         }
-    }
-}
-
-impl Drop for ApplyLock {
-    fn drop(&mut self) {
-        let _ = fsguard::delete_file(&self.0);
     }
 }
 
@@ -2878,8 +2912,12 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
             ));
         }
     }
-    for g in changing.iter().filter_map(|i| i.names_guard.as_ref()) {
+    for i in &changing {
+        let Some(g) = &i.names_guard else { continue };
         guard_ready(g).map_err(|e| format!("{e} (nothing was changed)"))?;
+        if i.names_child_guard {
+            guard_speaks_child(g, &plan.home).map_err(|e| format!("{e} (nothing was changed)"))?;
+        }
     }
     let mut run = Run::new(&plan.home)?;
     let mut applied = Applied::default();

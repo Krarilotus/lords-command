@@ -185,7 +185,9 @@ fn parts_of(home: &Path, cwd: &Path, ev: &str) -> Vec<String> {
 
 // Spec (fix check r1, FC1, the contract: "one child-start event delivers one complete generation of the child's start:
 // every part read for that event comes from the same published generation, whatever a concurrent `sync --apply` does
-// between the part reads"; its witness): a place synced with a helper start of three parts, `rule.m` in part 2. One
+// between the part reads"; its witness): a place synced with a helper start of three parts, `rule.m` in part 2 (the
+// long rules bind every role, so only the whole start, Explore's, takes parts: fix check r2, FC1, keeps the start of
+// a child that may start again to one part). One
 // Explore event reads its part 1; `rule.a` shrinks and a real `lords sync --apply` publishes the next generation, in
 // which the unchanged `rule.m` sits in part 1; the event then reads its parts 2 and 3. It gets the first generation
 // whole, `rule.m` included. A new event gets the second generation.
@@ -226,9 +228,10 @@ fn one_start_event_gets_one_generation_across_a_sync() {
     )
     .unwrap();
     let rule = |slug: &str, lines: &[String]| {
+        let roles = if slug == "m" { "roles: [helper]\n" } else { "" };
         let lines: Vec<String> = lines.iter().map(|l| format!("- line: \"{l}\"")).collect();
         let text = format!(
-            "---\nid: rule.{slug}\nkind: rule\ntitle: rule.{slug}\naudience: [all]\nroles: [helper]\nscope: project:beta\nstatus: active\nvisibility: private\norigin:\n  type: own\nstart: core\ncore:\n{}\n---\nThe whole rule.\n",
+            "---\nid: rule.{slug}\nkind: rule\ntitle: rule.{slug}\naudience: [all]\n{roles}scope: project:beta\nstatus: active\nvisibility: private\norigin:\n  type: own\nstart: core\ncore:\n{}\n---\nThe whole rule.\n",
             lines.join("\n")
         );
         fs::create_dir_all(private.join("project/beta/rules")).unwrap();

@@ -117,7 +117,8 @@ impl Adapter for ClaudeCode {
     }
 
     /// A child's start goes in `CHILD_PARTS` hooks, each its own 10,000 characters (code.claude.com/docs/en/hooks:
-    /// "Claude Code measures each string on its own, even when several hooks run for the same event"; probed 31 Oct).
+    /// "Claude Code measures each string on its own, even when several hooks run for the same event"; probed 31 Oct),
+    /// each with the deadline the guard's waits end inside (`guard::CHILD_HOOK_TIMEOUT_SECS`; fix check r2, FC5).
     fn guard_hooks(&self, exe: &str, guard: &str, home: &str) -> Vec<serde_json::Value> {
         if guard != "child" {
             return vec![
@@ -126,7 +127,7 @@ impl Adapter for ClaudeCode {
         }
         (1..=crate::sync::CHILD_PARTS)
             .map(|n| {
-                serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard, "--part", n.to_string(), "--home", home] })
+                serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard, "--part", n.to_string(), "--home", home], "timeout": crate::guard::CHILD_HOOK_TIMEOUT_SECS })
             })
             .collect()
     }
@@ -183,7 +184,7 @@ impl Adapter for Codex {
         vec![serde_json::json!({
             "type": "command",
             "command": format!("\"{exe}\" guard {guard} --home \"{home}\""),
-            "timeout": 30,
+            "timeout": crate::guard::CHILD_HOOK_TIMEOUT_SECS,
             "additionalContextLimit": 0,
         })]
     }

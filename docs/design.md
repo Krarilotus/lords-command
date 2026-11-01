@@ -248,19 +248,33 @@ naming the role, and `child-whole.md`: the role's whole start without the notes,
 (Claude Code's Explore and Plan, which load no `CLAUDE.md`). The `child` guard, a `SubagentStart` hook, gives the child
 the one its agent type needs: in Claude Code's settings and Codex's `~/.codex/hooks.json` (a settings target with
 `guards = ["child"]`; Codex runs it once reviewed under /hooks). Claude Code holds 10,000 characters per hook, each
-hook's measured on its own, so Lords registers three hooks there (`guard child --part N`), each giving one part of at
-most 9,500 characters, cut only at line ends. Sync refuses a start that needs more than three parts, or that holds a
-line longer than a part, naming its entry, as it refuses a file past its harness's limit. Codex takes the whole in one
-hook (`additionalContextLimit` 0). Probed 31 Oct: general-purpose and Codex children load the place's file and get
+hook's measured on its own, so Lords registers three hooks there (`guard child --part N --home DIR`), each giving one
+part of at most 9,500 characters, cut only at line ends, each with a 30 s deadline (Codex's hook has the same). Sync
+refuses `child-whole.md` past three parts, `child.md` past one (below), and a start that holds a line longer than a
+part, naming its entry, as it refuses a file past its harness's limit. Codex takes the whole in one hook
+(`additionalContextLimit` 0). Probed 31 Oct: general-purpose and Codex children load the place's file and get
 `child.md`; Explore and Plan get `child-whole.md` in three parts and quote its shared and own lines.
 
-*One generation per child start.* The three part processes of one start read at their own times, and a sync may
-publish between them. So the first to arrive reads the child file once and publishes it as the event's snapshot,
-`<tool home>/guard/child/<sha256 of session and agent id>`, written whole and linked in (which fails if another part
-got there first); every part splits that one text. No place or no file is a snapshot too; snapshots go after an hour; a
-`--part` event naming no session or agent id gets nothing. A reader never takes a place's `.lords` for gone while
-sync is between moving it aside (`..lords.lords-old-*`, `fsguard::being_replaced`) and putting the new one in: it
-waits for the new one, at most 2 s, and never walks on to an enclosing place meanwhile.
+*One generation per child start.* A child's start event delivers one generation of its start whole, or nothing. Claude
+Code fires `SubagentStart` again with the same agent id when a child resumes, and gives no id per firing; each part
+hook is its own process, run within the hook's deadline. So:
+- every agent type but Explore and Plan is given its start in one read, by part 1, of a `child.md` that fits one part;
+  parts 2 and 3 read nothing;
+- Explore and Plan, which Claude Code starts only once (no agent id to resume), take `child-whole.md` in parts from
+  one snapshot per start, `<tool home>/guard/child/<sha256 of session and agent id>`: the first part to arrive reads
+  the file once and publishes the text whole (linked in, which fails if another part got there first), and every part
+  splits that one text. No place or no file is a snapshot too. The part that makes a snapshot removes those older
+  than 10 minutes, long past their parts' deadline. A `--part` event naming no session or agent id gets nothing.
+
+A user-defined agent named Explore or Plan would take the snapshot path and could be resumed; Lords doesn't tell it
+apart (design note R3). A reader never takes a place's `.lords` for gone while sync is between moving it aside
+(`..lords.lords-old-*`, `fsguard::being_replaced`) and putting the new one in: past a missing `.lords` it decides
+under the apply lock, waiting at most 15 s, and never walks on to an enclosing place meanwhile.
+
+*The guard copy's protocol.* Sync names the guard copy in a child hook only when the copy answers a probe, run with
+the hooks' own command line (`guard child --part 1 --home DIR`, event `LordsGuardProbe`), with this build's child
+protocol (`lords guard child 3`). A copy from an earlier build is refused with the hooks kept as they are, and the
+refusal names `lords guard install`; sync never installs the copy itself.
 
 **New worktrees.** `lords hooks install --post-checkout` writes the repo's own `.git/hooks/post-checkout` (the
 common dir, so every worktree runs it). On a new worktree (old HEAD all zeros) it runs `lords sync --repo X --place
@@ -373,7 +387,11 @@ no directory listing decides what goes. What goes is what the ledger holds and t
   refuses and names the recovery: rename it back when `ledger.toml` is missing; otherwise the new one is in place,
   and the old one goes once checked.
 - **One writer.** Apply, adopt, set-aside, restore and hook installation (R3-09) take the apply lock before they
-  read the ledger.
+  read the ledger. The lock is `<tool home>/apply.lock`, held by an OS lock on its open file, so it ends with its
+  holder however that ends: a file whose OS lock is free and that holds this build's record (`lords-lock 2`) is a
+  dead holder's and is taken over at once. The file appears only whole and already locked (made beside, linked in);
+  an earlier build's file (`pid N`, held by its existence) is still waited for, and old and new builds exclude each
+  other.
 
 **Replacing a tool-owned path.** Sync builds the new version beside it, under a name unique to the run, created with
 `create_new`; it hashes what it built, not the source. It checks the old version still matches its ledger hash,

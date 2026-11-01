@@ -701,6 +701,29 @@ fn a_dead_holders_lock_doesnt_stop_the_next_apply() {
     assert!(t.elapsed() < std::time::Duration::from_secs(10), "at once: {:?}", t.elapsed());
 }
 
+// Spec (fix check r2, FC5: the lock that now ends with its holder still excludes): while one holds the lock no other
+// takes it, from another handle as another process would; once it lets go, the next takes it, and none is left.
+#[test]
+fn a_live_holders_lock_holds_and_ends_with_it() {
+    use lords_core::fsguard::{try_lock, Part, Root, TryLock};
+    let d = tempfile::TempDir::new().unwrap();
+    let root = Root::home(d.path()).unwrap();
+    let lock = root.join(&[Part::new("apply.lock").unwrap()]);
+    let TryLock::Held(first) = try_lock(&lock, "pid 1").unwrap() else { panic!("free at first") };
+    assert!(
+        matches!(try_lock(&lock, "pid 2").unwrap(), TryLock::Busy(_)),
+        "held while its holder runs"
+    );
+    drop(first);
+    assert!(!lock.path().exists(), "let go, it is gone");
+    let TryLock::Held(_second) = try_lock(&lock, "pid 2").unwrap() else {
+        panic!("free once let go")
+    };
+    let names: Vec<_> =
+        std::fs::read_dir(d.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("apply.lock")], "no staging name left");
+}
+
 // Spec (repair 2 sol-loop r1, V1: a reader may never take a `.lords` moved aside for one without its file): reading a
 // file in a dir tells, by the one open, a dir that was there without the file from no dir at all.
 #[test]

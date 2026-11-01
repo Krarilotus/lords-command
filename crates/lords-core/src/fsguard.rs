@@ -597,6 +597,120 @@ fn set_attrs(path: &Path, a: &Attrs) -> Result<(), String> {
     Ok(())
 }
 
+/// The record a `Lock` writes in its file, first: a file holding it whose OS lock is free has no holder left.
+pub const LOCK_RECORD: &str = "lords-lock 2";
+
+/// A lock held by an OS lock on its file's open handle (std's `File::lock`), so it ends when its holder does, however
+/// that ends: a process killed while it holds one leaves a file no one holds (fix check r2, FC5). The file appears at
+/// its path only whole and already locked (made beside it, then linked in, which fails if a file is there), so the
+/// path never names a file without its record or before its maker holds it; builds before this one hold the lock by
+/// the file's existence alone and wait while it is there, so old and new binaries still exclude each other. Dropping
+/// it deletes the file, then lets the OS lock go.
+pub struct Lock {
+    file: fs::File,
+    path: PathBuf,
+}
+
+/// One attempt at a `Lock` (`try_lock`).
+pub enum TryLock {
+    Held(Lock),
+    /// Someone holds it: what its file says of its holder, where that can be read.
+    Busy(String),
+}
+
+/// One attempt to take the lock at `p`, recording `holder` in it when it makes the file. When the file is there, it is
+/// held if its OS lock is taken; if its OS lock is free, it holds this lock's record (`LOCK_RECORD`) and the path still
+/// names it, its holder died and the lock is taken over as it is (never rewritten, so no instant leaves it without its
+/// record); a file in an older build's form (no OS lock) is that build's holder, waited for as before.
+pub fn try_lock(p: &Contained, holder: &str) -> Result<TryLock, String> {
+    use std::io::{Read, Write};
+    let path = &p.path;
+    check(path)?;
+    let err = |e: std::io::Error| format!("{}: {e}", path.display());
+    let mut f = match fs::OpenOptions::new().read(true).write(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let staged = beside(path, "new")?;
+            let mut f = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&staged)
+                .map_err(|e| format!("{}: {e}", staged.display()))?;
+            let made = f
+                .lock()
+                .and_then(|()| f.write_all(format!("{LOCK_RECORD} {holder}\n").as_bytes()))
+                .and_then(|()| f.sync_all())
+                .and_then(|()| link_in(&staged, path));
+            // The staging name is this attempt's own and never read: a leftover is harmless, as `put_file`'s.
+            let _ = fs::remove_file(&staged);
+            return match made {
+                Ok(()) => Ok(TryLock::Held(Lock { file: f, path: path.clone() })),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Ok(TryLock::Busy(String::new()))
+                }
+                Err(e) => Err(err(e)),
+            };
+        }
+        // Being deleted by its holder's release (Windows: delete pending).
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(TryLock::Busy(String::new()))
+        }
+        Err(e) => return Err(err(e)),
+    };
+    match f.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
+            return Ok(TryLock::Busy("its holder is running".into()))
+        }
+        Err(fs::TryLockError::Error(e)) => return Err(err(e)),
+    }
+    let mut text = String::new();
+    f.read_to_string(&mut text).map_err(err)?;
+    // This lock's record and no holder: its holder died. Taken over only while the path still names this file (its
+    // holder's release may have deleted it, and another made the next one).
+    let same = handle_identity(&f).ok().zip(identity(path).ok()).is_some_and(|(a, b)| a == b);
+    if text.starts_with(LOCK_RECORD) && same {
+        return Ok(TryLock::Held(Lock { file: f, path: path.clone() }));
+    }
+    let _ = f.unlock();
+    Ok(TryLock::Busy(text.trim().to_string()))
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // Deleted while held, so no one takes it between: on Windows it goes when this handle closes, right after.
+        let _ = fs::remove_file(&self.path);
+        let _ = self.file.unlock();
+    }
+}
+
+#[cfg(windows)]
+fn handle_identity(f: &fs::File) -> Result<(u32, u64), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value of that plain C struct.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is open for the call (`f` lives across it) and `info` is a valid place to write to.
+    let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok((
+        info.dwVolumeSerialNumber,
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+
+#[cfg(unix)]
+fn handle_identity(f: &fs::File) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::MetadataExt;
+    let m = f.metadata().map_err(|e| e.to_string())?;
+    Ok((m.dev(), m.ino()))
+}
+
 /// Whether two paths name one file or dir, by the filesystem's identity of it (volume and file id), not by
 /// spelling (Sol review r3, R3-04). Both must exist.
 pub fn same_file(a: &Path, b: &Path) -> Result<bool, String> {

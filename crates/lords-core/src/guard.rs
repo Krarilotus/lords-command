@@ -853,12 +853,27 @@ pub fn child_parts(context: &str) -> Vec<String> {
         .collect()
 }
 
-/// How long a reader that passed a missing `.lords` waits for the apply lock (`child_text`): a running sync holds it
-/// until it is done; past that, the child gets nothing, with a note (a hook runs for at most a minute by default).
-pub const CHILD_LOCK_WAIT_SECS: u64 = 30;
+/// The deadline sync registers on every child hook, Claude Code's and Codex's (fix check r2, FC5): every part of one
+/// event runs within it, and every wait in the guard ends inside it.
+pub const CHILD_HOOK_TIMEOUT_SECS: u64 = 30;
 
-/// Hours after which an event's snapshot is stale: removed at any child start (`sweep_snapshots`).
-pub const CHILD_SNAPSHOT_HOURS: u64 = 1;
+/// How long a reader that passed a missing `.lords` waits for the apply lock (`child_text`): a running sync holds it
+/// until it is done; past that, the child gets nothing, with a note. Half the hook's deadline, so the reads after it
+/// end inside it too.
+pub const CHILD_LOCK_WAIT_SECS: u64 = CHILD_HOOK_TIMEOUT_SECS / 2;
+
+/// Seconds after which an Explore or Plan snapshot has no reader left: every part of its event ran within
+/// `CHILD_HOOK_TIMEOUT_SECS` of it, and their agent id never recurs (one-shot). The part that makes a snapshot sweeps
+/// the older ones (`sweep_snapshots`).
+pub const CHILD_SNAPSHOT_SECS: u64 = 600;
+
+/// The child protocol this guard speaks, which sync checks in the installed copy before it writes child hooks (fix
+/// check r2, FC4): 3 is `--part N --home DIR`, one read for every agent type but Explore and Plan, and one snapshot per
+/// Explore or Plan start.
+pub const CHILD_PROTOCOL: u32 = 3;
+
+/// The event sync's probe gives the child guard (`process::guard_child_protocol`), answered with the protocol.
+pub const CHILD_PROBE_EVENT: &str = "LordsGuardProbe";
 
 /// The text of the child file the event's agent type takes in its place, or "" where there is none. The place is the
 /// nearest `.lords` at or above `cwd`; a file is read with one open whose own answer says whether `.lords` was there
@@ -899,13 +914,14 @@ fn child_text(ev: &Value, cwd: &Path, home: &Path) -> Result<String, String> {
     Ok(String::new())
 }
 
-/// One event's snapshot of its child file (fix check r1, FC1): the first part process of the event to arrive reads
-/// the file and publishes the text at `<tool home>/guard/child/<sha256 of session and agent id>`, written whole beside
-/// and linked in, which fails if another got there first; every part then reads that one text, so all parts of the
-/// event come from one generation, whatever sync publishes between them. "" (no place, no file) is a snapshot too, and
-/// so is a part's failure to read, so no later part of the event delivers what the first didn't (repair 2 sol-loop r1,
-/// V1).
-fn child_snapshot(ev: &Value, cwd: &Path, home: &Path) -> Result<String, String> {
+/// One Explore or Plan event's snapshot of its whole start (fix check r1, FC1): the first part process of the event to
+/// arrive reads the file and publishes the text at `<tool home>/guard/child/<sha256 of session and agent id>`, written
+/// whole beside and linked in, which fails if another got there first; every part then reads that one text, so all
+/// parts of the event come from one generation, whatever sync publishes between them. "" (no place, no file) is a
+/// snapshot too, and so is a part's failure to read, so no later part of the event delivers what the first didn't
+/// (repair 2 sol-loop r1, V1). The key is the event's because those agents are one-shot: their agent id never recurs
+/// (fix check r2, FC1). With the text, whether this part made it (and so sweeps).
+fn child_snapshot(ev: &Value, cwd: &Path, home: &Path) -> Result<(String, bool), String> {
     let (Some(session), Some(agent)) = (ev["session_id"].as_str(), ev["agent_id"].as_str()) else {
         return Err(
             "the event names no session or agent id, so its parts can't share one version".into()
@@ -915,7 +931,7 @@ fn child_snapshot(ev: &Value, cwd: &Path, home: &Path) -> Result<String, String>
     let dir = Root::home(home)?.join(&[Part::new("guard")?, Part::new("child")?]);
     let place = dir.child(Part::new(&key)?);
     if let Some(t) = crate::fsguard::read_text(place.path())? {
-        return Ok(t);
+        return Ok((t, false));
     }
     let (text, failed) = match child_text(ev, cwd, home) {
         Ok(t) => (t, None),
@@ -923,20 +939,21 @@ fn child_snapshot(ev: &Value, cwd: &Path, home: &Path) -> Result<String, String>
     };
     crate::fsguard::create_dir_all(&dir)?;
     match crate::fsguard::put_file(&place, text.as_bytes()) {
-        Ok(()) => failed.map_or(Ok(text), Err),
+        Ok(()) => failed.map_or(Ok((text, true)), Err),
         // Another part of this event published first: its text is the event's.
-        Err(e) => crate::fsguard::read_text(place.path())?.ok_or(e),
+        Err(e) => crate::fsguard::read_text(place.path())?.map(|t| (t, false)).ok_or(e),
     }
 }
 
-/// Removes every event snapshot older than `CHILD_SNAPSHOT_HOURS`. Best effort: a snapshot left is only a small file.
+/// Removes every snapshot (and staging leftover) older than `CHILD_SNAPSHOT_SECS`: none has a reader left. Best effort:
+/// a snapshot left is only a small file.
 fn sweep_snapshots(home: &Path) {
     let Ok(dir) =
         Root::home(home).and_then(|r| Ok(r.join(&[Part::new("guard")?, Part::new("child")?])))
     else {
         return;
     };
-    let max = Duration::from_secs(CHILD_SNAPSHOT_HOURS * 3600);
+    let max = Duration::from_secs(CHILD_SNAPSHOT_SECS);
     for p in crate::fsguard::list_dir(dir.path()).unwrap_or_default() {
         let stale = crate::fsguard::modified(&p)
             .ok()
@@ -951,24 +968,35 @@ fn sweep_snapshots(home: &Path) {
 
 /// The child guard's answer to one `SubagentStart` event: the child file its agent type takes in its place
 /// (`child-whole.md` for one that loads no place file, else `child.md`; the nearest `.lords` is the place, never an
-/// enclosing one), without its marker lines, as `additionalContext`. With `part` (Claude Code holds 10,000 characters
-/// per hook; review r1, F1), only that part of the event's snapshot (`child_snapshot`), and nothing past the last.
-/// Nothing where no place has one. Never a block: a failure is a note and no context.
+/// enclosing one), without its marker lines, as `additionalContext`. Nothing where no place has one. Never a block: a
+/// failure is a note and no context. With `part` (Claude Code holds 10,000 characters per hook; review r1, F1):
+/// - Explore and Plan: that part of the event's snapshot (`child_snapshot`), nothing past the last;
+/// - every other agent type, which Claude Code may start again with the same agent id (a resume, a teammate's message):
+///   one read per event, by part 1, of a start that must fit one part; parts 2 and 3 read nothing (fix check r2, FC1).
+///
+/// The probe event (`CHILD_PROBE_EVENT`) is answered with `CHILD_PROTOCOL`.
 pub fn child_hook(input: &str, part: Option<usize>, home: &Path) -> Answer {
     let Ok(ev) = serde_json::from_str::<Value>(input) else {
         return noted("the event can't be read");
     };
+    if ev["hook_event_name"] == CHILD_PROBE_EVENT {
+        return Answer { stdout: format!("lords guard child {CHILD_PROTOCOL}"), note: None };
+    }
     if ev["hook_event_name"] != "SubagentStart" {
         return quiet();
     }
     let Some(cwd) = ev["cwd"].as_str() else { return noted("the event names no cwd") };
+    let whole = ev["agent_type"].as_str().is_some_and(|t| NO_PLACE_FILE_AGENTS.contains(&t));
     let text = match part {
         None => child_text(&ev, Path::new(cwd), home),
-        Some(_) => {
-            let text = child_snapshot(&ev, Path::new(cwd), home);
-            sweep_snapshots(home);
+        Some(n) if !whole && n != 1 => return quiet(),
+        Some(_) if !whole => child_text(&ev, Path::new(cwd), home),
+        Some(_) => child_snapshot(&ev, Path::new(cwd), home).map(|(text, made)| {
+            if made {
+                sweep_snapshots(home);
+            }
             text
-        }
+        }),
     };
     let text = match text {
         Ok(t) => t,
@@ -983,6 +1011,15 @@ pub fn child_hook(input: &str, part: Option<usize>, home: &Path) -> Answer {
     };
     let context = match part {
         None => context,
+        Some(_) if !whole => {
+            let n = child_parts(&context).len();
+            if n > 1 {
+                return noted(format!(
+                    "no start given: it takes {n} parts, and a child that may start again with its agent id is given its start in one read, one part (sync refuses such a start)"
+                ));
+            }
+            context
+        }
         Some(n) => match child_parts(&context).into_iter().nth(n.wrapping_sub(1)) {
             Some(p) => p,
             None => return quiet(),
