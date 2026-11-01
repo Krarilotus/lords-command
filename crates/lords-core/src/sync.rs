@@ -1919,16 +1919,14 @@ pub fn child_composed(
 }
 
 /// The most a `SubagentStart` hook's context may hold in characters before Claude Code saves it to a file and gives
-/// the child only a preview, which it isn't asked to read (code.claude.com/docs/en/hooks: 10,000, no setting). Each
-/// hook's context is measured on its own, so a child's start goes in parts of at most `CHILD_PART_CHARS`.
+/// the child only a preview, which it isn't asked to read (code.claude.com/docs/en/hooks: 10,000, no setting).
 pub const CHILD_CONTEXT_MAX_CHARS: usize = 10_000;
 
-/// The most one part of a child's start holds, its "part N of M" line included: under the cap, with room to spare.
-pub const CHILD_PART_CHARS: usize = 9_500;
-
-/// The parts Claude Code's `child` guard hooks deliver: one hook each (`guard child --part N`), so at most this many
-/// times `CHILD_PART_CHARS` (28,500 characters; the largest whole start measured on 31 Oct: about 19,500).
-pub const CHILD_PARTS: usize = 3;
+/// The most a child's start holds: what one hook gives in one read, under the cap with room to spare (one read per
+/// start for every agent type: fix check r2, FC1, the Lords owner's option 1 of 1 Nov). A `child.md` past it is
+/// refused; a `child-whole.md` past it is written and given nowhere, with a note (`guard::child_hook`), until the
+/// corpus fits.
+pub const CHILD_START_CHARS: usize = 9_500;
 
 fn place_scope(place: &Place, adapter: Option<&dyn Adapter>) -> String {
     place_scope_of(place.workspace, &place.name, adapter)
@@ -2147,45 +2145,23 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
             tree.insert(role_file(role), c.text.clone().into_bytes());
         }
     }
-    // A native child's start files, for the `child` guard (plan L6, an orchestrator's condition 3; review r1, F1). One
-    // a child's hooks can't deliver whole is refused like a file past its harness's limit (repair sol-loop r1, R2).
+    // A native child's start files, for the `child` guard (plan L6, an orchestrator's condition 3; review r1, F1). A
+    // `child.md` one hook can't give in one read is refused like a file past its harness's limit (repair sol-loop r1,
+    // R2; fix check r2, FC1). A `child-whole.md` past it is written and given nowhere, with the guard's note, until the
+    // corpus fits (the Lords owner's option 1, 1 Nov): today every place's is.
     let mut undeliverable = Vec::new();
     if let Some(role) = child_role(pl.stacks) {
         for (file, start) in [
             (CHILD_FILE, compose::ChildStart::Beyond),
             (CHILD_WHOLE_FILE, compose::ChildStart::Whole),
         ] {
-            let composed =
-                child_composed(pl.stacks, place.layers(true), role, &pl.plan.home, start);
-            // Parts are cut only at line ends, so a line longer than a part refuses the start, naming its entry (fix
-            // check r1, FC2); `sources` maps the composed text's lines to their entries.
-            for (i, line) in composed.text.lines().enumerate() {
-                let n = line.chars().count();
-                if n > crate::guard::CHILD_LINE_MAX_CHARS {
-                    let id =
-                        composed.sources.iter().find(|s| s.line == i + 1).map(|s| s.id.as_str());
-                    undeliverable.push(format!(
-                        "{file}: a line of {} is {n} characters, past the {} a part of a child's start holds whole: not written, the old files stay",
-                        id.unwrap_or("its own text"),
-                        crate::guard::CHILD_LINE_MAX_CHARS
-                    ));
-                }
-            }
-            let text = composed.text;
-            // A line too long is named above.
-            if let Ok(context) = crate::guard::child_context(&text) {
-                let parts = crate::guard::child_parts(&context).len();
-                if parts > CHILD_PARTS {
-                    undeliverable.push(format!(
-                        "{file} takes {parts} parts of {CHILD_PART_CHARS} characters, past the {CHILD_PARTS} Claude Code's child hooks deliver: not written, the old files stay"
-                    ));
-                } else if parts > 1 && start == compose::ChildStart::Beyond {
-                    // Its agents may start again with the same agent id, so their start is one read (fix check r2,
-                    // FC1; `guard::child_hook`).
-                    undeliverable.push(format!(
-                        "{file} takes {parts} parts of {CHILD_PART_CHARS} characters, and a child that may start again with its agent id is given its start in one read, one part: not written, the old files stay"
-                    ));
-                }
+            let text =
+                child_composed(pl.stacks, place.layers(true), role, &pl.plan.home, start).text;
+            let n = crate::guard::child_context(&text).chars().count();
+            if n > CHILD_START_CHARS && start == compose::ChildStart::Beyond {
+                undeliverable.push(format!(
+                    "{file} is {n} characters, past the {CHILD_START_CHARS} one hook gives a child in one read, one part: not written, the old files stay"
+                ));
             }
             tree.insert(file.into(), text.into_bytes());
         }

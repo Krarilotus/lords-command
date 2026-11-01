@@ -99,12 +99,13 @@ pub(crate) fn guard_self_test(guard_copy: &Path) -> Result<(), String> {
     }
 }
 
-/// The child protocol of the guard copy (`guard::CHILD_PROTOCOL`), asked with exactly the command line sync writes into
-/// Claude Code's child hooks (`guard child --part 1 --home <home>`) and the probe event on stdin (fix check r2, FC4):
-/// `None` when it answers anything else, as a copy from before this protocol does (no child guard, or no `--home`).
+/// The child protocol of the guard copy (`guard::CHILD_PROTOCOL`), asked with exactly the arguments sync writes into
+/// the child hook (`guard child --home <home>`, Claude Code's and Codex's alike) and the probe event on stdin (fix
+/// check r2, FC4): `None` when it answers anything else, as a copy from before this protocol does (no child guard, no
+/// `--home`, or no answer to the probe).
 pub(crate) fn guard_child_protocol(guard_copy: &Path, home: &Path) -> Result<Option<u32>, String> {
     let home = home.to_string_lossy();
-    let args = ["guard", "child", "--part", "1", "--home", &home];
+    let args = ["guard", "child", "--home", &home];
     let probe = format!("{{\"hook_event_name\":\"{}\"}}", crate::guard::CHILD_PROBE_EVENT);
     let (status, out) = run_guard(guard_copy, &args, probe.as_bytes(), "guard child probe")?;
     let answer = out.trim().strip_prefix("lords guard child ").and_then(|n| n.parse().ok());

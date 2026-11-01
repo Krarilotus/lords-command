@@ -600,63 +600,10 @@ fn a_skill_line_left_to_a_role_file_is_counted_there() {
     );
 }
 
-// Spec (repair sol-loop r1, R2, its witness; the invariant: nothing that binds a child is dropped): a child's whole
-// start that needs more parts than Claude Code's child hooks deliver is refused like a file past its harness's limit:
-// the role files aren't written, and the plan says why.
-#[test]
-fn a_child_start_past_the_parts_delivered_is_refused() {
-    let (f, checkout) = bare_place("child_role = \"helper\"\n");
-    let lines: Vec<String> =
-        (0..80).map(|i| format!("- line: \"{i:02} {}\"", "x".repeat(400))).collect();
-    f.write(
-        "priv/project/beta/rules/long.md",
-        &entry(
-            "rule.long",
-            "project:beta",
-            "private",
-            &format!("roles: [helper]\nstart: core\ncore:\n{}\n", lines.join("\n")),
-            "Long.\n",
-        ),
-    );
-    let p = plan(&f.stacks(), &f.opts()).unwrap();
-    let item =
-        p.items.iter().find(|i| i.path == checkout.join(".lords")).expect("the role files' item");
-    assert_eq!(item.action, lords_core::sync::Action::Conflict, "{:?}", item.notes);
-    assert!(item.notes.iter().any(|n| n.contains("parts")), "{:?}", item.notes);
-    assert!(p.over_limit, "the plan fails like an over-limit file");
-}
-
-// Spec (fix check r1, FC2: "Parts are cut only at line ends. Sync refuses a child start that holds a physical line longer
-// than a part, with a diagnostic naming the entry"; its witness): a helper rule with no class whose body is one line of
-// 12,000 characters (three parts with a cut inside the line; past a part whole) is refused: the role files aren't
-// written, the plan fails, and the note names the rule and the line's length.
-#[test]
-fn a_child_start_holding_a_line_longer_than_a_part_is_refused() {
-    let (f, checkout) = bare_place("child_role = \"helper\"\n");
-    f.write(
-        "priv/project/beta/rules/long.md",
-        &entry(
-            "rule.long",
-            "project:beta",
-            "private",
-            "roles: [helper]\n",
-            &format!("{}\n", "y".repeat(12_000)),
-        ),
-    );
-    let p = plan(&f.stacks(), &f.opts()).unwrap();
-    let item =
-        p.items.iter().find(|i| i.path == checkout.join(".lords")).expect("the role files' item");
-    assert_eq!(item.action, lords_core::sync::Action::Conflict, "{:?}", item.notes);
-    assert!(
-        item.notes.iter().any(|n| n.contains("rule.long") && n.contains("12000")),
-        "names the entry and the line: {:?}",
-        item.notes
-    );
-    assert!(p.over_limit, "the plan fails");
-}
-
-// Spec (fix check r2, FC1, design note R3: a resumable child is served by one read, so its start, `child.md`, must fit
-// one part): sync refuses a place whose `child.md` doesn't, naming the file, and the plan fails.
+// Spec (fix check r2, FC1, and the Lords owner's option 1, 1 Nov: every child is given its start in one read of one
+// hook, at most 9,500 characters; repair sol-loop r1, R2: nothing that binds a child is dropped): sync refuses a place
+// whose `child.md` doesn't fit, naming the file, like a file past its harness's limit: the role files aren't written,
+// and the plan fails.
 #[test]
 fn a_child_md_past_one_part_is_refused() {
     let (f, checkout) = bare_place("child_role = \"helper\"\n");
@@ -682,6 +629,35 @@ fn a_child_md_past_one_part_is_refused() {
         item.notes
     );
     assert!(p.over_limit, "the plan fails");
+}
+
+// Spec (the Lords owner's option 1, 1 Nov: "Explore and Plan get nothing, with a one-line note, wherever their start is
+// longer than one part"; "the condensation pass later brings their start under one part"): a `child-whole.md` past one
+// hook's 9,500 characters doesn't refuse the place: sync writes it whole (the guard gives it nowhere), and the plan
+// holds.
+#[test]
+fn a_child_whole_md_past_one_part_is_still_written() {
+    let (f, checkout) = bare_place("child_role = \"helper\"\n");
+    let lines: Vec<String> =
+        (0..30).map(|i| format!("- line: \"{i:02} {}\"", "x".repeat(390))).collect();
+    f.write(
+        "priv/project/beta/rules/long.md",
+        &entry(
+            "rule.long",
+            "project:beta",
+            "private",
+            &format!("start: core\ncore:\n{}\n", lines.join("\n")),
+            "Long.\n",
+        ),
+    );
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    let item =
+        p.items.iter().find(|i| i.path == checkout.join(".lords")).expect("the role files' item");
+    assert_ne!(item.action, lords_core::sync::Action::Conflict, "{:?}", item.notes);
+    let whole = planned_in(&p, &checkout.join(".lords"), "child-whole.md");
+    let n = lords_core::guard::child_context(&whole).chars().count();
+    assert!(n > 9_500 && whole.contains("29 xxx"), "written whole, {n} characters");
+    assert!(!p.over_limit, "the plan holds");
 }
 
 // Spec (fix check r2, FC5: "No hook reader killed at any instant leaves sync or later readers blocked … a killed sync

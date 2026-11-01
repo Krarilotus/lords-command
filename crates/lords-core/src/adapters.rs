@@ -64,7 +64,7 @@ pub trait Adapter: Sync {
     }
     /// The hook entries that run guard `guard` of Lords' copy `exe`: one, or for Claude Code's `child` one per part
     /// (each hook's context is capped on its own; review r1, F1).
-    /// `home`: the tool home sync runs with, which `child` takes (its apply lock and snapshots; repair 2 sol-loop r3, X1).
+    /// `home`: the tool home sync runs with, which `child` takes (its apply lock; repair 2 sol-loop r3, X1).
     fn guard_hooks(&self, exe: &str, guard: &str, _home: &str) -> Vec<serde_json::Value> {
         vec![serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard] })]
     }
@@ -116,20 +116,17 @@ impl Adapter for ClaudeCode {
         &["rm", "queue", "session", "turn", "child"]
     }
 
-    /// A child's start goes in `CHILD_PARTS` hooks, each its own 10,000 characters (code.claude.com/docs/en/hooks:
-    /// "Claude Code measures each string on its own, even when several hooks run for the same event"; probed 31 Oct),
-    /// each with the deadline the guard's waits end inside (`guard::CHILD_HOOK_TIMEOUT_SECS`; fix check r2, FC5).
+    /// A child's start goes in one hook, one read (fix check r2, FC1), with sync's tool home and the deadline the
+    /// guard's waits end inside (`guard::CHILD_HOOK_TIMEOUT_SECS`; fix check r2, FC5).
     fn guard_hooks(&self, exe: &str, guard: &str, home: &str) -> Vec<serde_json::Value> {
         if guard != "child" {
             return vec![
                 serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard] }),
             ];
         }
-        (1..=crate::sync::CHILD_PARTS)
-            .map(|n| {
-                serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard, "--part", n.to_string(), "--home", home], "timeout": crate::guard::CHILD_HOOK_TIMEOUT_SECS })
-            })
-            .collect()
+        vec![
+            serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard, "--home", home], "timeout": crate::guard::CHILD_HOOK_TIMEOUT_SECS }),
+        ]
     }
 
     fn repo_skills_dir(&self) -> Option<&'static str> {

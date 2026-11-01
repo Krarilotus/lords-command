@@ -39,7 +39,7 @@ usage:
   lords guard queue [--deadline-ms N]   Claude's Stop hook: holds a turn's end while items may wait in its T3 queue
   lords guard session   Claude's SessionStart hook: records the Lords files the session reads
   lords guard turn   Claude's UserPromptSubmit hook: the clock, and the Lords files changed since the session started
-  lords guard child [--part N] [--home DIR]   the SubagentStart hook: a native child starts with its role's start file in its place
+  lords guard child [--home DIR]   the SubagentStart hook: a native child starts with its role's start file in its place
   lords guard install [--home DIR]   install or update the guard copy the hooks run (sync never writes it)
   lords panel serve [--port N]   the window on another PC reads and edits these stacks through it (127.0.0.1:7879)
   lords panel add ALIAS --bridge DIR [--apply]   set a PC this one reaches as ALIAS up for the panel; prints the
@@ -220,21 +220,13 @@ fn guard_rules(which: &str, a: Args) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `lords guard child [--part N] [--home DIR]`: the `SubagentStart` hook (Claude Code, Codex) that gives a native child
-/// its place's start file (guard.rs), with `--part` only its Nth part. `--home`: the tool home sync ran with, whose
-/// apply lock and snapshots it takes (sync names it in the hooks it writes; default ~/.lords-command). Reads the event
-/// on stdin; like the other guards it never fails: every problem is a note on stderr and exit 0.
+/// `lords guard child [--home DIR]`: the `SubagentStart` hook (Claude Code, Codex) that gives a native child its
+/// place's start file (guard.rs), in one read. `--home`: the tool home sync ran with, whose apply lock it takes (sync
+/// names it in the hook it writes; default ~/.lords-command). Reads the event on stdin; like the other guards it never
+/// fails: every problem is a note on stderr and exit 0.
 fn guard_child(mut a: Args) -> ExitCode {
     let note = |line: &str| say_err(&format!("lords guard child: {line}"));
-    let usage = "usage `lords guard child [--part N] [--home DIR]` (event on stdin)";
-    let part = match a.value("--part").map(|v| v.map(|n| n.parse::<usize>())) {
-        Ok(None) => None,
-        Ok(Some(Ok(n))) => Some(n),
-        _ => {
-            note(usage);
-            return ExitCode::SUCCESS;
-        }
-    };
+    let usage = "usage `lords guard child [--home DIR]` (event on stdin)";
     let home = match a.value("--home") {
         Ok(h) => h.map(PathBuf::from),
         Err(_) => {
@@ -253,7 +245,7 @@ fn guard_child(mut a: Args) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
-    // The tool home holds each event's snapshot and sync's apply lock (guard.rs `child_snapshot`, `child_text`).
+    // The tool home holds sync's apply lock (guard.rs `child_text`).
     let home = match home.map(Ok).unwrap_or_else(lords_core::sync::default_home) {
         Ok(h) => h,
         Err(e) => {
@@ -261,7 +253,7 @@ fn guard_child(mut a: Args) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
-    let answer = lords_core::guard::child_hook(&input, part, &home);
+    let answer = lords_core::guard::child_hook(&input, &home);
     if let Some(n) = answer.note {
         note(&n);
     }
