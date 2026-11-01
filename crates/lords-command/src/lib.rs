@@ -1164,6 +1164,9 @@ impl App {
                             ("↻", AMBER, "replace the tool's dir with its new version")
                         }
                         Action::Remove => ("⌫", AMBER, "remove the tool's path (no longer wanted)"),
+                        Action::RemoveBlock => {
+                            ("⌫", AMBER, "remove the tool's block (the owner's text stays)")
+                        }
                         Action::Forget => ("·", dim(TEXT), "drop a ledger record"),
                         Action::RetireEntry => {
                             ("⌛", AMBER, "an expired temporary entry: retired in its stack")

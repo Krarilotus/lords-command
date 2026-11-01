@@ -32,6 +32,9 @@ pub enum Action {
     Refresh,
     /// A tool-owned path the stack no longer wants, still matching its ledger record: deleted, following nothing.
     Remove,
+    /// A tool-owned instruction file the owner has added text to, whose managed block still matches its ledger record
+    /// (`uninstall --place`): the block goes, every byte around it stays, and the record goes.
+    RemoveBlock,
     /// A ledger record whose path is gone already (its worktree removed, say): the record goes.
     Forget,
     /// A temporary entry that has ended: `--apply` retires it in its stack (with a commit) before writing.
