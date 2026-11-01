@@ -1923,7 +1923,8 @@ fn uninstall_place_lists_its_paths_and_exits_by_what_remains() {
 // changes nothing"; Q4: "--json, one object on stdout, also for a refusal … place is null when the place was never
 // found … remaining is null when it isn't known"): `--place` without `--repo` is refused, exit 2; a plain dir under
 // the worktree root, with `--apply`, is refused with exit 2, its JSON giving the error, no place, nothing planned and
-// nothing known to remain, and the worktree's copies stay.
+// nothing known to remain, and the worktree's copies stay; `--place` with no value, with `--json`, is a bad argument
+// that still gives one JSON object with its error, exit 2 (sol-loop r1 S2).
 #[test]
 fn uninstall_place_refuses_what_is_no_place() {
     let env = Env::new();
@@ -1948,4 +1949,14 @@ fn uninstall_place_refuses_what_is_no_place() {
     assert!(listed(&v, "planned").is_empty() && v["remaining"].is_null(), "{v}");
     assert_eq!(v["applied"].as_bool(), Some(false), "{v}");
     assert!(wt.join("CLAUDE.local.md").is_file() && wt.join(".lords").is_dir());
+
+    let mut args = vec!["uninstall", "--repo", "r", "--json"];
+    args.extend(stacks.iter().map(String::as_str));
+    args.push("--place");
+    let o = env.lords(&wt, &args);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    let v: serde_json::Value =
+        serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{e}: {}", text(&o)));
+    assert_eq!(v["exit"].as_u64(), Some(2), "{v}");
+    assert!(v["error"].as_str().is_some_and(|e| e.contains("--place")), "{v}");
 }
