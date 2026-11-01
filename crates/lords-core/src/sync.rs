@@ -2119,13 +2119,30 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
             (CHILD_FILE, compose::ChildStart::Beyond),
             (CHILD_WHOLE_FILE, compose::ChildStart::Whole),
         ] {
-            let text =
-                child_composed(pl.stacks, place.layers(true), role, &pl.plan.home, start).text;
-            let parts = crate::guard::child_parts(&crate::guard::child_context(&text)).len();
-            if parts > CHILD_PARTS {
-                undeliverable.push(format!(
-                    "{file} takes {parts} parts of {CHILD_PART_CHARS} characters, past the {CHILD_PARTS} Claude Code's child hooks deliver: not written, the old files stay"
-                ));
+            let composed =
+                child_composed(pl.stacks, place.layers(true), role, &pl.plan.home, start);
+            // Parts are cut only at line ends, so a line longer than a part refuses the start, naming its entry (fix
+            // check r1, FC2); `sources` maps the composed text's lines to their entries.
+            for (i, line) in composed.text.lines().enumerate() {
+                let n = line.chars().count();
+                if n > crate::guard::CHILD_LINE_MAX_CHARS {
+                    let id =
+                        composed.sources.iter().find(|s| s.line == i + 1).map(|s| s.id.as_str());
+                    undeliverable.push(format!(
+                        "{file}: a line of {} is {n} characters, past the {} a part of a child's start holds whole: not written, the old files stay",
+                        id.unwrap_or("its own text"),
+                        crate::guard::CHILD_LINE_MAX_CHARS
+                    ));
+                }
+            }
+            let text = composed.text;
+            match crate::guard::child_parts(&crate::guard::child_context(&text)) {
+                Ok(parts) if parts.len() > CHILD_PARTS => undeliverable.push(format!(
+                    "{file} takes {} parts of {CHILD_PART_CHARS} characters, past the {CHILD_PARTS} Claude Code's child hooks deliver: not written, the old files stay",
+                    parts.len()
+                )),
+                // A line too long is named above.
+                Ok(_) | Err(_) => {}
             }
             tree.insert(file.into(), text.into_bytes());
         }

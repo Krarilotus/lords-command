@@ -804,54 +804,156 @@ pub fn child_context(text: &str) -> String {
     lines.join("\n").trim().to_string()
 }
 
-/// A child's start in parts, cut at line ends, each with its "part N of M" line at most `CHILD_PART_CHARS`
-/// characters; one part, unlabelled, when it fits in one. A line longer than a part is cut too, at a character, so no
-/// part passes the cap (repair sol-loop r1, R3).
-pub fn child_parts(context: &str) -> Vec<String> {
+/// The most characters one line of a child's start may hold: a part's, less its "part N of M" line. A line longer
+/// than that can't be delivered whole in one part, and parts are cut only at line ends (fix check r1, FC2).
+pub const CHILD_LINE_MAX_CHARS: usize = crate::sync::CHILD_PART_CHARS - 32;
+
+/// A child's start in parts, cut only at line ends, each with its "part N of M" line at most `CHILD_PART_CHARS`
+/// characters; one part, unlabelled, when it fits in one. Refused, with the line's number and length, when a line is
+/// longer than `CHILD_LINE_MAX_CHARS` (sync refuses such a start; fix check r1, FC2).
+pub fn child_parts(context: &str) -> Result<Vec<String>, String> {
     let max = crate::sync::CHILD_PART_CHARS;
     if context.chars().count() <= max {
-        return vec![context.to_string()];
+        return Ok(vec![context.to_string()]);
     }
-    // Room for the label: "Lords start, part NN of NN:\n".
-    let room = max - 32;
+    let room = CHILD_LINE_MAX_CHARS;
     let mut parts: Vec<String> = Vec::new();
     let mut part = String::new();
-    let pieces = context.lines().flat_map(|line| {
-        let chars: Vec<char> = line.chars().collect();
-        let chunks: Vec<String> = if chars.is_empty() {
-            vec![String::new()]
-        } else {
-            chars.chunks(room).map(|c| c.iter().collect()).collect()
-        };
-        let n = chunks.len();
-        // A cut line's pieces join without a line break between them.
-        chunks.into_iter().enumerate().map(move |(i, c)| (c, i + 1 < n))
-    });
-    let mut glued = false;
-    for (piece, continues) in pieces {
-        let sep = usize::from(!part.is_empty() && !glued);
-        if !part.is_empty() && part.chars().count() + sep + piece.chars().count() > room {
-            parts.push(std::mem::take(&mut part));
-        } else if sep == 1 {
-            part.push('\n');
+    let mut size = 0;
+    for (i, line) in context.lines().enumerate() {
+        let n = line.chars().count();
+        if n > room {
+            return Err(format!(
+                "line {} is {n} characters, past the {room} a part holds whole, and parts are cut only at line ends",
+                i + 1
+            ));
         }
-        part.push_str(&piece);
-        glued = continues;
+        if !part.is_empty() && size + 1 + n > room {
+            parts.push(std::mem::take(&mut part));
+            size = 0;
+        }
+        if !part.is_empty() {
+            part.push('\n');
+            size += 1;
+        }
+        part.push_str(line);
+        size += n;
     }
     parts.push(part);
     let n = parts.len();
-    parts
+    Ok(parts
         .into_iter()
         .enumerate()
         .map(|(i, p)| format!("Lords start, part {} of {n}:\n{p}", i + 1))
-        .collect()
+        .collect())
 }
 
-/// The child guard's answer to one `SubagentStart` event: the nearest place's child file at or above the event's cwd
-/// (`child-whole.md` for an agent type that loads no place file, else `child.md`), without its marker lines, as
-/// `additionalContext`; with `part`, only that part of it (`child_parts`; review r1, F1: Claude Code holds 10,000
-/// characters per hook), and nothing past the last. Nothing where no place has one. Never a block.
-pub fn child_hook(input: &str, part: Option<usize>) -> Answer {
+/// How long a reader waits for a place whose `.lords` sync has moved aside to get its new one (`child_place`), and
+/// how often it looks.
+pub const CHILD_SWAP_WAIT: Duration = Duration::from_secs(2);
+const CHILD_SWAP_STEP: Duration = Duration::from_millis(20);
+
+/// Hours after which an event's snapshot is stale: removed at any child start (`sweep_snapshots`).
+pub const CHILD_SNAPSHOT_HOURS: u64 = 1;
+
+/// The child's place: the nearest `.lords` dir at or above `cwd`. A dir whose `.lords` sync has moved aside (it is
+/// between the two renames that publish the next one) is that place too: the reader waits for its new `.lords`, at most
+/// `CHILD_SWAP_WAIT`, and never walks on to an enclosing place meanwhile (fix check r1, FC1). `None`: no place.
+fn child_place(cwd: &Path) -> Result<Option<PathBuf>, String> {
+    use crate::fsguard::Kind;
+    for d in cwd.ancestors() {
+        let dir = d.join(crate::sync::ROLE_DIR);
+        let until = std::time::Instant::now() + CHILD_SWAP_WAIT;
+        loop {
+            if crate::fsguard::kind(&dir)? == Kind::Dir {
+                return Ok(Some(dir));
+            }
+            if !crate::fsguard::being_replaced(&dir)? {
+                // The swap may have ended between the two looks: look once more before walking on.
+                if crate::fsguard::kind(&dir)? == Kind::Dir {
+                    return Ok(Some(dir));
+                }
+                break;
+            }
+            if std::time::Instant::now() >= until {
+                return Err(format!(
+                    "{}: a sync is between two versions of it (its old one is aside) for more than {} s; sync again",
+                    dir.display(),
+                    CHILD_SWAP_WAIT.as_secs()
+                ));
+            }
+            std::thread::sleep(CHILD_SWAP_STEP);
+        }
+    }
+    Ok(None)
+}
+
+/// The text of the child file the event's agent type takes in its place, read once (sync never edits it in place: a
+/// whole `.lords` is renamed in, so one read is one generation), or "" where there is none.
+fn child_text(ev: &Value, cwd: &Path) -> Result<String, String> {
+    // Never the part beyond the place's file in place of a whole start (repair sol-loop r1, R4).
+    let whole = ev["agent_type"].as_str().is_some_and(|t| NO_PLACE_FILE_AGENTS.contains(&t));
+    let name = if whole { crate::sync::CHILD_WHOLE_FILE } else { crate::sync::CHILD_FILE };
+    let Some(dir) = child_place(cwd)? else { return Ok(String::new()) };
+    let file = dir.join(name);
+    match crate::fsguard::read_text(&file) {
+        Ok(Some(t)) if t.contains(crate::compose::BEGIN) => Ok(t),
+        Ok(_) => Ok(String::new()),
+        Err(e) => Err(format!("{}: {e}", file.display())),
+    }
+}
+
+/// One event's snapshot of its child file (fix check r1, FC1): the first part process of the event to arrive reads
+/// the file and publishes the text at `<tool home>/guard/child/<sha256 of session and agent id>`, written whole beside
+/// and linked in, which fails if another got there first; every part then reads that one text, so all parts of the
+/// event come from one generation, whatever sync publishes between them. "" (no place, no file) is a snapshot too.
+fn child_snapshot(ev: &Value, cwd: &Path, home: &Path) -> Result<String, String> {
+    let (Some(session), Some(agent)) = (ev["session_id"].as_str(), ev["agent_id"].as_str()) else {
+        return Err(
+            "the event names no session or agent id, so its parts can't share one version".into()
+        );
+    };
+    let key = crate::fsguard::sha(format!("{session}\n{agent}").as_bytes());
+    let dir = Root::home(home)?.join(&[Part::new("guard")?, Part::new("child")?]);
+    let place = dir.child(Part::new(&key)?);
+    if let Some(t) = crate::fsguard::read_text(place.path())? {
+        return Ok(t);
+    }
+    let text = child_text(ev, cwd)?;
+    crate::fsguard::create_dir_all(&dir)?;
+    match crate::fsguard::put_file(&place, text.as_bytes()) {
+        Ok(()) => Ok(text),
+        // Another part of this event published first: its text is the event's.
+        Err(e) => crate::fsguard::read_text(place.path())?.ok_or(e),
+    }
+}
+
+/// Removes every event snapshot older than `CHILD_SNAPSHOT_HOURS`. Best effort: a snapshot left is only a small file.
+fn sweep_snapshots(home: &Path) {
+    let Ok(dir) =
+        Root::home(home).and_then(|r| Ok(r.join(&[Part::new("guard")?, Part::new("child")?])))
+    else {
+        return;
+    };
+    let max = Duration::from_secs(CHILD_SNAPSHOT_HOURS * 3600);
+    for p in crate::fsguard::list_dir(dir.path()).unwrap_or_default() {
+        let stale = crate::fsguard::modified(&p)
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > max);
+        let name = p.file_name().and_then(|n| n.to_str()).and_then(|n| Part::new(n).ok());
+        if let (true, Some(name)) = (stale, name) {
+            let _ = crate::fsguard::delete_file(&dir.child(name));
+        }
+    }
+}
+
+/// The child guard's answer to one `SubagentStart` event: the child file its agent type takes in its place
+/// (`child-whole.md` for one that loads no place file, else `child.md`; the nearest `.lords` is the place, never an
+/// enclosing one), without its marker lines, as `additionalContext`. With `part` (Claude Code holds 10,000 characters
+/// per hook; review r1, F1), only that part of the event's snapshot (`child_snapshot`), and nothing past the last.
+/// Nothing where no place has one. Never a block: a failure is a note and no context.
+pub fn child_hook(input: &str, part: Option<usize>, home: &Path) -> Answer {
     let Ok(ev) = serde_json::from_str::<Value>(input) else {
         return noted("the event can't be read");
     };
@@ -859,39 +961,37 @@ pub fn child_hook(input: &str, part: Option<usize>) -> Answer {
         return quiet();
     }
     let Some(cwd) = ev["cwd"].as_str() else { return noted("the event names no cwd") };
-    // Never the part beyond the place's file in place of a whole start (repair sol-loop r1, R4).
-    let whole = ev["agent_type"].as_str().is_some_and(|t| NO_PLACE_FILE_AGENTS.contains(&t));
-    let name = if whole { crate::sync::CHILD_WHOLE_FILE } else { crate::sync::CHILD_FILE };
-    // The nearest role dir is the child's place: its file, or nothing, never an enclosing place's (a repo's checkout
-    // can lie inside a workspace that is a place too).
-    for d in Path::new(cwd).ancestors() {
-        let dir = d.join(crate::sync::ROLE_DIR);
-        match crate::fsguard::kind(&dir) {
-            Ok(crate::fsguard::Kind::Dir) => {}
-            Ok(_) => continue,
-            Err(e) => return noted(format!("{}: {e}", dir.display())),
+    let text = match part {
+        None => child_text(&ev, Path::new(cwd)),
+        Some(_) => {
+            let text = child_snapshot(&ev, Path::new(cwd), home);
+            sweep_snapshots(home);
+            text
         }
-        let file = dir.join(name);
-        let text = match crate::fsguard::read_text(&file) {
-            Ok(Some(t)) if t.contains(crate::compose::BEGIN) => t,
-            Ok(_) => return quiet(),
-            Err(e) => return noted(format!("{}: {e}", file.display())),
-        };
-        let context = child_context(&text);
-        let context = match part {
-            None => context,
-            Some(n) => match child_parts(&context).into_iter().nth(n.wrapping_sub(1)) {
+    };
+    let text = match text {
+        Ok(t) => t,
+        Err(e) => return noted(format!("no start given ({e})")),
+    };
+    if text.is_empty() {
+        return quiet();
+    }
+    let context = child_context(&text);
+    let context = match part {
+        None => context,
+        Some(n) => match child_parts(&context) {
+            Ok(parts) => match parts.into_iter().nth(n.wrapping_sub(1)) {
                 Some(p) => p,
                 None => return quiet(),
             },
-        };
-        let out = json!({"hookSpecificOutput": {
-            "hookEventName": "SubagentStart",
-            "additionalContext": context,
-        }});
-        return Answer { stdout: out.to_string(), note: None };
-    }
-    quiet()
+            Err(e) => return noted(format!("no start given: {e}")),
+        },
+    };
+    let out = json!({"hookSpecificOutput": {
+        "hookEventName": "SubagentStart",
+        "additionalContext": context,
+    }});
+    Answer { stdout: out.to_string(), note: None }
 }
 
 /// What one prompt finds (`rules_found`): the line to say, if any, and the record to save.

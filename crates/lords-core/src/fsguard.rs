@@ -242,6 +242,18 @@ fn beside(path: &Path, what: &str) -> Result<PathBuf, String> {
     Ok(dir.join(format!(".{name}.lords-{what}-{}-{nanos}-{n}", crate::process::id())))
 }
 
+/// Whether a replacement of `path` is under way: its old version is moved aside (`beside(path, "old")`, as
+/// `move_aside` names it) while the new one isn't in yet. A reader that finds `path` missing then knows it is between
+/// two versions, not gone (fix check r1, FC1).
+pub fn being_replaced(path: &Path) -> Result<bool, String> {
+    check(path)?;
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return Ok(false) };
+    let prefix = format!(".{}.lords-old-", name.to_string_lossy());
+    Ok(list_dir(dir)?
+        .iter()
+        .any(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&prefix))))
+}
+
 fn create_dir_all_at(dir: &Path) -> Result<(), String> {
     check(dir)?;
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;

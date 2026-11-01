@@ -244,7 +244,15 @@ fn guard_child(mut a: Args) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
-    let answer = lords_core::guard::child_hook(&input, part);
+    // The tool home holds each event's snapshot, so all its parts come from one version (guard.rs `child_snapshot`).
+    let home = match lords_core::sync::default_home() {
+        Ok(h) => h,
+        Err(e) => {
+            note(&format!("no start given ({e})"));
+            return ExitCode::SUCCESS;
+        }
+    };
+    let answer = lords_core::guard::child_hook(&input, part, &home);
     if let Some(n) = answer.note {
         note(&n);
     }

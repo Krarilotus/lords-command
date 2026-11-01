@@ -249,9 +249,18 @@ naming the role, and `child-whole.md`: the role's whole start without the notes,
 the one its agent type needs: in Claude Code's settings and Codex's `~/.codex/hooks.json` (a settings target with
 `guards = ["child"]`; Codex runs it once reviewed under /hooks). Claude Code holds 10,000 characters per hook, each
 hook's measured on its own, so Lords registers three hooks there (`guard child --part N`), each giving one part of at
-most 9,500 characters, cut at line ends; sync notes a start that needs more than three. Codex takes the whole in one
+most 9,500 characters, cut only at line ends. Sync refuses a start that needs more than three parts, or that holds a
+line longer than a part, naming its entry, as it refuses a file past its harness's limit. Codex takes the whole in one
 hook (`additionalContextLimit` 0). Probed 31 Oct: general-purpose and Codex children load the place's file and get
 `child.md`; Explore and Plan get `child-whole.md` in three parts and quote its shared and own lines.
+
+*One generation per child start.* The three part processes of one start read at their own times, and a sync may
+publish between them. So the first to arrive reads the child file once and publishes it as the event's snapshot,
+`<tool home>/guard/child/<sha256 of session and agent id>`, written whole and linked in (which fails if another part
+got there first); every part splits that one text. No place or no file is a snapshot too; snapshots go after an hour; a
+`--part` event naming no session or agent id gets nothing. A reader never takes a place's `.lords` for gone while
+sync is between moving it aside (`..lords.lords-old-*`, `fsguard::being_replaced`) and putting the new one in: it
+waits for the new one, at most 2 s, and never walks on to an enclosing place meanwhile.
 
 **New worktrees.** `lords hooks install --post-checkout` writes the repo's own `.git/hooks/post-checkout` (the
 common dir, so every worktree runs it). On a new worktree (old HEAD all zeros) it runs `lords sync --repo X --place
