@@ -108,7 +108,16 @@ impl Place {
         let ev = json!({"hook_event_name": "SessionStart", "session_id": session, "source": source, "cwd": cwd,
             "transcript_path": self.path("t.jsonl")});
         let a = session_hook(&ev.to_string(), &self.env());
-        assert!(a.stdout.is_empty(), "SessionStart adds nothing: {a:?}");
+        if source != "compact" {
+            assert!(a.stdout.is_empty(), "SessionStart adds nothing: {a:?}");
+            return;
+        }
+        // F10 (the Lords owner, after fix check r1): after a compaction, in a place, one fixed line: re-read your
+        // role's file in the place's `.lords`, no role guessed.
+        let v: Value = serde_json::from_str(&a.stdout).unwrap_or_else(|e| panic!("{e}: {a:?}"));
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart", "{a:?}");
+        let line = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default();
+        assert!(line.lines().count() == 1 && line.contains(".lords"), "{line}");
     }
 
     /// The context one prompt gets, as its lines; the answer is checked to be context only, never a block.

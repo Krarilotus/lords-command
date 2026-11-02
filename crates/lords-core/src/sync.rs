@@ -113,6 +113,10 @@ pub struct Item {
     /// Among them the child guard: apply checks the copy speaks this build's child protocol too (fix check r2, FC4).
     #[serde(skip)]
     pub(crate) names_child_guard: bool,
+    /// And the role guard, for this adapter: apply checks the copy speaks this build's role protocol (F10, design
+    /// note D6).
+    #[serde(skip)]
+    pub(crate) names_role_guard: Option<&'static str>,
 }
 
 /// An item as plans show it (`--json`, the app): a redacted item without its texts.
@@ -251,6 +255,7 @@ impl Item {
             redacted: false,
             names_guard: None,
             names_child_guard: false,
+            names_role_guard: None,
         }
     }
 
@@ -361,19 +366,39 @@ fn guard_ready(place: &Contained) -> Result<(), String> {
 }
 
 /// Whether the guard copy speaks this build's child protocol (fix check r2, FC4): asked with the very command line the
-/// child hooks run (`process::guard_child_protocol`), so sync never names a copy in a hook whose arguments it refuses
+/// child hooks run (`process::guard_protocol`), so sync never names a copy in a hook whose arguments it refuses
 /// or whose answer is another protocol's. Checked when planning and again when applying. Read only.
 fn guard_speaks_child(place: &Contained, home: &Path) -> Result<(), String> {
-    let want = crate::guard::CHILD_PROTOCOL;
-    let have = crate::process::guard_child_protocol(place.path(), home)
-        .map_err(|e| format!("the guard copy's child protocol can't be told ({e})"));
+    guard_speaks(place, home, "child", &[], crate::guard::CHILD_PROTOCOL)
+}
+
+/// Whether the guard copy speaks this build's role protocol, asked as `guard_speaks_child` asks, with the role hook's
+/// harness as `adapter`'s hook names it (design note D6; F10-R1-03).
+pub(crate) fn guard_speaks_role(
+    place: &Contained,
+    home: &Path,
+    adapter: &str,
+) -> Result<(), String> {
+    guard_speaks(place, home, "role", &["--adapter", adapter], crate::guard::ROLE_PROTOCOL)
+}
+
+/// Whether the guard copy answers protocol `want` of guard `which` (`process::guard_protocol`).
+fn guard_speaks(
+    place: &Contained,
+    home: &Path,
+    which: &str,
+    extra: &[&str],
+    want: u32,
+) -> Result<(), String> {
+    let have = crate::process::guard_protocol(place.path(), which, home, extra)
+        .map_err(|e| format!("the guard copy's {which} protocol can't be told ({e})"));
     match have {
         Ok(Some(n)) if n == want => Ok(()),
         Ok(Some(n)) => Err(format!(
-            "the guard copy speaks child protocol {n}, this build's hooks need {want}: run `lords guard install`, then sync again; the hooks stay as they are"
+            "the guard copy speaks {which} protocol {n}, this build's hooks need {want}: run `lords guard install`, then sync again; the hooks stay as they are"
         )),
         Ok(None) => Err(format!(
-            "the guard copy is from an earlier build and refuses the child hooks this build writes (protocol {want}): run `lords guard install`, then sync again; the hooks stay as they are"
+            "the guard copy is from an earlier build and refuses the {which} hooks this build writes (protocol {want}): run `lords guard install`, then sync again; the hooks stay as they are"
         )),
         Err(e) => Err(format!(
             "{e}: run `lords guard install`, then sync again; the hooks stay as they are"
@@ -1364,6 +1389,12 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
             return conflict(&t.name, &path, e);
         }
     }
+    let role = guards.iter().any(|g| g == "role").then(|| adapter.id());
+    if let Some(id) = role {
+        if let Err(e) = guard_speaks_role(&guard, &pl.plan.home, id) {
+            return conflict(&t.name, &path, e);
+        }
+    }
     let hooks = match guard_hooks(guards, adapter, &value, guard.path(), &pl.plan.home) {
         Ok(h) => h,
         Err(e) => return conflict(&t.name, &path, e),
@@ -1397,6 +1428,7 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
     item.notes.extend(not_ready);
     item.names_guard = (!guards.is_empty()).then(|| guard.clone());
     item.names_child_guard = child;
+    item.names_role_guard = role;
     let names = |h: &serde_json::Value| guard_names(h, adapter, guard.path());
     let changed = hooks.as_ref().map(|h| (names(&before_hooks), names(h)));
     if let (Some((before, after)), Some(why)) = (&changed, adapter.guard_note()) {
@@ -1419,6 +1451,8 @@ fn guard_event(name: &str) -> Option<(&'static str, Option<&'static str>)> {
         "turn" => Some(("UserPromptSubmit", None)),
         // Every agent type: a native child of any kind starts as the stack's `child_role`.
         "child" => Some(("SubagentStart", None)),
+        // A session whose launch names its role (F10).
+        "role" => Some(("UserPromptSubmit", None)),
         _ => None,
     }
 }
@@ -1429,7 +1463,11 @@ const GUARD_EVENTS: [&str; 5] =
 
 /// The names of Lords' guard hooks (`guard <name>` run from `guard`) a settings `hooks` value holds, each once (settings
 /// an earlier build of the child guard wrote hold it as three hooks, one per part).
-fn guard_names(hooks: &serde_json::Value, adapter: &dyn Adapter, guard: &Path) -> Vec<String> {
+pub(crate) fn guard_names(
+    hooks: &serde_json::Value,
+    adapter: &dyn Adapter,
+    guard: &Path,
+) -> Vec<String> {
     let exe = adapters::slashes(guard);
     let mut names: Vec<String> = GUARD_EVENTS
         .iter()
@@ -1502,8 +1540,9 @@ fn guard_hooks(
     }
     let mut wanted = Vec::new();
     for g in guards {
-        let (event, matcher) = guard_event(g)
-            .ok_or_else(|| format!("no guard `{g}`; there are: rm, queue, session, turn, child"))?;
+        let (event, matcher) = guard_event(g).ok_or_else(|| {
+            format!("no guard `{g}`; there are: rm, queue, session, turn, child, role")
+        })?;
         if !adapter.guards().contains(&g.as_str()) {
             return Err(format!(
                 "adapter {} runs no `{g}` guard (it runs: {})",
@@ -1789,7 +1828,7 @@ fn fold(name: &str) -> String {
 /// A repo's verified roots, the worktrees skipped for lying outside `worktree_roots`, and the stale ones noted.
 type Checkouts = (Vec<Root>, Vec<PathBuf>, Vec<String>);
 
-fn checkouts(repo: &stack::Repo) -> Result<Checkouts, String> {
+pub(crate) fn checkouts(repo: &stack::Repo) -> Result<Checkouts, String> {
     let roots: Vec<String> = repo.worktree_roots.iter().map(|r| norm(&expand_home(r))).collect();
     let inside = |p: &Path| {
         let p = norm(p);
@@ -1875,6 +1914,11 @@ pub fn role_file(role: &str) -> String {
 /// and for one that loads none.
 pub const CHILD_FILE: &str = "child.md";
 pub const CHILD_WHOLE_FILE: &str = "child-whole.md";
+
+/// The start a session gets whose launch names `role` (`ChildStart::Launched`; the `role` guard gives it).
+pub fn start_file(role: &str) -> String {
+    format!("start-{role}.md")
+}
 
 /// Everything someone in `role` follows in a place, standing alone: every global entry for the role, the project,
 /// the place, and the memory index; for every agent family (lines for only some are labelled).
@@ -2174,6 +2218,21 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
             tree.insert(file.into(), text.into_bytes());
         }
     }
+    // A start per role for a session whose launch names it (F10; the `role` guard gives it). One past what one hook
+    // gives is written all the same: the guard then points the session at its role file, and the plan says so.
+    let mut long_starts = Vec::new();
+    for role in declared_roles(pl.stacks).iter().filter(|r| *r != compose::PRODUCT_ROLE) {
+        let start = compose::ChildStart::Launched;
+        let text = child_composed(pl.stacks, place.layers(true), role, &pl.plan.home, start).text;
+        let file = start_file(role);
+        let n = crate::guard::child_context(&text).chars().count();
+        if n > CHILD_START_CHARS {
+            long_starts.push(format!(
+                "{file} is {n} characters, past the {CHILD_START_CHARS} one hook gives: a session named {role} at launch is told to read role-{role}.md instead"
+            ));
+        }
+        tree.insert(file, text.into_bytes());
+    }
     tree.insert(".gitignore".into(), b"*\n".to_vec());
     pl.undeliverable |= !undeliverable.is_empty();
     let tree = std::sync::Arc::new(tree);
@@ -2193,6 +2252,7 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
             }
             item.notes.splice(0..0, undeliverable.iter().cloned());
         }
+        item.notes.extend(long_starts.iter().cloned());
         pl.plan.items.push(item);
     }
     for (ex, checkout, files) in excludes {
@@ -2931,6 +2991,10 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
         guard_ready(g).map_err(|e| format!("{e} (nothing was changed)"))?;
         if i.names_child_guard {
             guard_speaks_child(g, &plan.home).map_err(|e| format!("{e} (nothing was changed)"))?;
+        }
+        if let Some(id) = i.names_role_guard {
+            guard_speaks_role(g, &plan.home, id)
+                .map_err(|e| format!("{e} (nothing was changed)"))?;
         }
     }
     let mut run = Run::new(&plan.home)?;

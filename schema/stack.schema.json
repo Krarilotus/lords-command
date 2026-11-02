@@ -78,7 +78,7 @@
           "own_text": { "enum": ["keep", "replace"], "default": "keep", "description": "instructions: keep the text outside the managed block, or replace the whole file with it" },
           "via": { "type": "string", "description": "instructions: the shared file that holds the composed text; this file gets only an include line" },
           "exclude": { "type": "array", "items": { "type": "string" }, "description": "settings: instruction files the harness must skip" },
-          "guards": { "type": "array", "items": { "enum": ["rm", "queue", "session", "turn", "child"] }, "description": "settings: guards registered as the harness's hooks: rm (PreToolUse, Bash), queue (Stop), session (SessionStart), turn (UserPromptSubmit), child (SubagentStart: a native child's start file, `child_role`). Claude Code runs all; Codex (`~/.codex/hooks.json`) runs child" }
+          "guards": { "type": "array", "items": { "enum": ["rm", "queue", "session", "turn", "child", "role"] }, "description": "settings: guards registered as the harness's hooks: rm (PreToolUse, Bash), queue (Stop), session (SessionStart), turn (UserPromptSubmit), child (SubagentStart: a native child's start file, `child_role`), role (UserPromptSubmit: the start of the role a session's launch names, `.lords/start-<role>.md`). Claude Code runs all; Codex (`~/.codex/hooks.json`) runs child and role" }
         },
         "additionalProperties": false
       }

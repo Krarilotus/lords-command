@@ -112,19 +112,24 @@ impl Adapter for ClaudeCode {
     }
 
     fn guards(&self) -> &'static [&'static str] {
-        &["rm", "queue", "session", "turn", "child"]
+        &["rm", "queue", "session", "turn", "child", "role"]
     }
 
     /// A child's start goes in one hook, one read (fix check r2, FC1), with sync's tool home and the deadline the
-    /// guard's waits end inside (`guard::CHILD_HOOK_TIMEOUT_SECS`; fix check r2, FC5).
+    /// guard's waits end inside (`guard::CHILD_HOOK_TIMEOUT_SECS`; fix check r2, FC5); a launched session's role start
+    /// alike (F10), naming its harness, whose place file the start goes beside (F10-R1-03).
     fn guard_hooks(&self, exe: &str, guard: &str, home: &str) -> Vec<serde_json::Value> {
-        if guard != "child" {
+        if guard != "child" && guard != "role" {
             return vec![
                 serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard] }),
             ];
         }
+        let mut args = vec!["guard", guard, "--home", home];
+        if guard == "role" {
+            args.extend(["--adapter", self.id()]);
+        }
         vec![
-            serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard, "--home", home], "timeout": crate::guard::CHILD_HOOK_TIMEOUT_SECS }),
+            serde_json::json!({ "type": "command", "command": exe, "args": args, "timeout": crate::guard::CHILD_HOOK_TIMEOUT_SECS }),
         ]
     }
 
@@ -170,27 +175,44 @@ impl Adapter for Codex {
     }
 
     /// Codex's hooks (`~/.codex/hooks.json`) run a command line; `child` is the guard a probe showed it runs (design
-    /// note 2026-10-31-lords-core-lines-composer, P2): the child took its context, once the hook was trusted.
+    /// note 2026-10-31-lords-core-lines-composer, P2): the child took its context, once the hook was trusted. `role`
+    /// too: its `UserPromptSubmit` event and context are Claude's (design note 2026-11-02-lords-role-at-launch, H3).
     fn guards(&self) -> &'static [&'static str] {
-        &["child"]
+        &["child", "role"]
     }
 
-    /// A command line, and the whole context passed on (`additionalContextLimit` 0): no parts.
+    /// A command line, and the whole context passed on (`additionalContextLimit` 0): no parts. On Windows Codex runs it
+    /// with PowerShell, where a line starting with a quoted path is no command (design note 2026-11-02-lords-role-at-
+    /// launch, H8, H9): there it is PowerShell's call, `& 'exe' …`, each path a literal string.
     fn guard_hooks(&self, exe: &str, guard: &str, home: &str) -> Vec<serde_json::Value> {
+        let mut line = if cfg!(windows) {
+            let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
+            format!("& {} guard {guard} --home {}", lit(exe), lit(home))
+        } else {
+            format!("\"{exe}\" guard {guard} --home \"{home}\"")
+        };
+        // The role hook names its harness, whose place file the start goes beside (F10-R1-03).
+        if guard == "role" {
+            line.push_str(" --adapter codex");
+        }
         vec![serde_json::json!({
             "type": "command",
-            "command": format!("\"{exe}\" guard {guard} --home \"{home}\""),
+            "command": line,
             "timeout": crate::guard::CHILD_HOOK_TIMEOUT_SECS,
             "additionalContextLimit": 0,
         })]
     }
 
-    /// The guard's name: the word after `guard` (its options follow).
+    /// The guard's name: the word after `guard` (its options follow), in either form `guard_hooks` writes or wrote
+    /// (an earlier build's `"exe" guard …` too, so sync replaces it).
     fn guard_of(&self, hook: &serde_json::Value, exe: &str) -> Option<String> {
         let line = hook["command"].as_str()?.replace('\\', "/");
-        let prefix = format!("\"{exe}\" guard ");
-        let at = line.get(..prefix.len()).filter(|p| p.eq_ignore_ascii_case(&prefix))?;
-        Some(line[at.len()..].split_whitespace().next().unwrap_or("").to_string())
+        let quoted =
+            [format!("\"{exe}\" guard "), format!("& '{}' guard ", exe.replace('\'', "''"))];
+        let prefix = quoted
+            .iter()
+            .find(|p| line.get(..p.len()).is_some_and(|head| head.eq_ignore_ascii_case(p)))?;
+        Some(line[prefix.len()..].split_whitespace().next().unwrap_or("").to_string())
     }
 
     fn guard_note(&self) -> Option<&'static str> {

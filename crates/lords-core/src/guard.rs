@@ -1,6 +1,7 @@
 //! Guards a harness runs as hooks (owner, 30 Oct 2026): `rm` before an agent's tool call, answering at once instead
 //! of leaving the call to stop on an approval prompt nobody sees; `queue` when an agent's turn would end; `session`
-//! and `turn` when a session and a prompt start (below). A Claude child in full-access mode sat about 30
+//! and `turn` when a session and a prompt start; `child` when a native child starts; `role` when a prompt names the
+//! session's role at its launch (below). A Claude child in full-access mode sat about 30
 //! minutes on Claude Code's "dangerous rm on a possibly-empty variable path" prompt for `rm -f $OUT/$id.json`; its
 //! parent saw only "running".
 //!
@@ -721,7 +722,9 @@ fn session_of(ev: &Value) -> Result<(&str, &Path), String> {
 /// new id; review r1, R1) Claude reloads its own files, so they are recorded anew, while the files the agent read
 /// itself keep the hash recorded before: a change to one of them is still named. With no record from before, nothing
 /// is known of those, so the session stays unrecorded and its next prompt is told (sol-loop r1, S1). Then stale
-/// records go (`sweep_records`). Any failure is a note; the session goes on.
+/// records go (`sweep_records`). On `compact`, in a place, it gives one fixed line, its only output: re-read your role's
+/// file in that place's `.lords` (F10, the Lords owner after fix check r1: no role is guessed). Any failure is a note;
+/// the session goes on.
 pub fn session_hook(input: &str, env: &RulesEnv) -> Answer {
     let Ok(ev) = serde_json::from_str::<Value>(input) else {
         return noted("the event can't be read");
@@ -740,10 +743,28 @@ pub fn session_hook(input: &str, env: &RulesEnv) -> Answer {
         write_record(&place, cwd, &files)
     });
     sweep_records(&env.home);
-    match recorded {
+    let mut answer = match recorded {
         Ok(()) => quiet(),
         Err(e) => noted(format!("the session's files aren't recorded ({e})")),
+    };
+    // The nearest `.lords` at or above the cwd, a dir, found without reading any file in it (F10-SR-02).
+    let place = || {
+        let lords =
+            Path::new(ev["cwd"].as_str()?).ancestors().map(|d| d.join(crate::sync::ROLE_DIR));
+        lords.into_iter().find(|l| matches!(crate::fsguard::kind(l), Ok(crate::fsguard::Kind::Dir)))
+    };
+    if let Some(lords) = (ev["source"] == "compact").then(place).flatten() {
+        let line = format!(
+            "Lords: after the compaction, if your launch named a role, re-read your role's file `role-<role>.md` in `{}` now; it binds you.",
+            lords.display()
+        );
+        answer.stdout = json!({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": line,
+        }})
+        .to_string();
     }
+    answer
 }
 
 /// The turn guard's answer to one `UserPromptSubmit` event: context of the clock line and, only when a file the
@@ -820,7 +841,7 @@ pub const CHILD_LOCK_WAIT_SECS: u64 = CHILD_HOOK_TIMEOUT_SECS / 2;
 /// parts; it was never installed.
 pub const CHILD_PROTOCOL: u32 = 4;
 
-/// The event sync's probe gives the child guard (`process::guard_child_protocol`), answered with the protocol.
+/// The event sync's probe gives the child and role guards (`process::guard_protocol`), answered with the protocol.
 pub const CHILD_PROBE_EVENT: &str = "LordsGuardProbe";
 
 /// The text of the child file the event's agent type takes in its place, or "" where there is none. The place is the
@@ -832,10 +853,16 @@ pub const CHILD_PROBE_EVENT: &str = "LordsGuardProbe";
 /// `.lords` aside and puts the new one in: then no swap is under way, and an old `.lords` aside with no new one is a
 /// sync that stopped, so the child gets nothing rather than an enclosing place's start (repair 2 sol-loop r2, W1).
 fn child_text(ev: &Value, cwd: &Path, home: &Path) -> Result<String, String> {
-    use crate::fsguard::InDir;
     // Never the part beyond the place's file in place of a whole start (repair sol-loop r1, R4).
     let whole = ev["agent_type"].as_str().is_some_and(|t| NO_PLACE_FILE_AGENTS.contains(&t));
     let name = if whole { crate::sync::CHILD_WHOLE_FILE } else { crate::sync::CHILD_FILE };
+    Ok(place_file(cwd, home, name)?.map(|(_, t)| t).unwrap_or_default())
+}
+
+/// File `name` of the place `cwd` lies in, read as `child_text` says: the place's `.lords` dir and the file's text, ""
+/// where that dir holds no such file (or one without Lords' marker); `None` where `cwd` lies in no place.
+fn place_file(cwd: &Path, home: &Path, name: &str) -> Result<Option<(PathBuf, String)>, String> {
+    use crate::fsguard::InDir;
     let found = |r: InDir| match r {
         InDir::Text(t) if t.contains(crate::compose::BEGIN) => Some(t),
         InDir::Text(_) | InDir::NoFile => Some(String::new()),
@@ -843,14 +870,14 @@ fn child_text(ev: &Value, cwd: &Path, home: &Path) -> Result<String, String> {
     };
     let here = cwd.join(crate::sync::ROLE_DIR);
     if let Some(t) = found(crate::fsguard::read_text_in(&here, name)?) {
-        return Ok(t);
+        return Ok(Some((here, t)));
     }
     let _lock = crate::sync::ApplyLock::take(home, CHILD_LOCK_WAIT_SECS)
         .map_err(|e| format!("a sync is running, so the place can't be told ({e})"))?;
     for d in cwd.ancestors() {
         let dir = d.join(crate::sync::ROLE_DIR);
         if let Some(t) = found(crate::fsguard::read_text_in(&dir, name)?) {
-            return Ok(t);
+            return Ok(Some((dir, t)));
         }
         if crate::fsguard::being_replaced(&dir)? {
             return Err(format!(
@@ -859,7 +886,7 @@ fn child_text(ev: &Value, cwd: &Path, home: &Path) -> Result<String, String> {
             ));
         }
     }
-    Ok(String::new())
+    Ok(None)
 }
 
 /// The child guard's answer to one `SubagentStart` event: the child file its agent type takes in its place
@@ -898,6 +925,159 @@ pub fn child_hook(input: &str, home: &Path) -> Answer {
     let out = json!({"hookSpecificOutput": {
         "hookEventName": "SubagentStart",
         "additionalContext": context,
+    }});
+    Answer { stdout: out.to_string(), note: None }
+}
+
+// ---------------------------------------------------------------- role
+//
+// `role` (F10, design note Harness/notes/2026-11-02-lords-role-at-launch.md): a session T3 starts with `delegate_task`
+// reads only its place's file, which carries the place's default role. Its launch names its role in the prompt: the
+// brief's first line, or T3's `role` prefix.
+
+/// A role a session's launch names (`launch_role`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Launch {
+    pub role: String,
+}
+
+/// T3's `delegate_task` prefix (t3code `OrchestratorMcpService.ts` `taskPrompt`, installed build of 31 Oct): `Act as the
+/// ${role} sub-agent for this task.`, then a blank line and the task; none for `general` or no role.
+const T3_PREFIX: (&str, &str) = ("Act as the ", " sub-agent for this task.");
+
+/// T3's roles that name a Lords role (design note D1, provisional: the Lords owner to confirm). `design`, `test` and
+/// `general` name none.
+const T3_ROLES: [(&str, &str); 3] =
+    [("implementation", "coder"), ("review", "reviewer"), ("research", "helper")];
+
+/// The role a session's launch names (design note D1, revised after review r1, F10-R1-01: the launcher's signal wins).
+/// Where the prompt opens with T3's prefix, the prefix alone decides: the Lords role its role maps to, or none. Without
+/// it, the first word after `Role:` on the prompt's first line, the brief's own (a heading mark, Markdown emphasis and
+/// backticks around it ignored, never a quote mark), lower-cased. Either starts at column 0 of the first line: an
+/// indented or later line is quoted text, never a signal (F10-SR-01). A word that can't be a role's file name
+/// (`role_word`) names nothing.
+pub fn launch_role(prompt: &str) -> Option<Launch> {
+    let first = prompt.trim_start_matches('\u{feff}').lines().next()?;
+    if first.starts_with(char::is_whitespace) {
+        return None;
+    }
+    if let Some(word) =
+        first.trim_end().strip_prefix(T3_PREFIX.0).and_then(|r| r.strip_suffix(T3_PREFIX.1))
+    {
+        let role = T3_ROLES.iter().find(|(t, _)| *t == word)?.1.to_string();
+        return Some(Launch { role });
+    }
+    let l = first.trim_start_matches(|c: char| c.is_whitespace() || "#*_".contains(c));
+    let rest = l.get(..5).filter(|p| p.eq_ignore_ascii_case("role:")).map(|_| &l[5..])?;
+    let rest = rest.trim_start_matches(|c: char| c.is_whitespace() || "*_`".contains(c));
+    let word: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    role_word(&word).then_some(Launch { role: word })
+}
+
+/// Whether `w` can name a role's files: a lower-case letter, then up to 31 letters, digits, `_` or `-`.
+fn role_word(w: &str) -> bool {
+    w.len() <= 32
+        && w.starts_with(|c: char| c.is_ascii_lowercase())
+        && w.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// The role protocol this guard speaks, which sync checks in the installed copy before it writes a role hook (design
+/// note D6): 1 is `guard role --home DIR` on `UserPromptSubmit`, the starts `.lords/start-<role>.md`.
+pub const ROLE_PROTOCOL: u32 = 1;
+
+/// Where the role guard looks: the tool home (sync's apply lock), and the harness it runs for (`--adapter`, as sync
+/// writes it), whose place file the start goes beside (F10-R1-03).
+pub struct RoleEnv {
+    pub home: PathBuf,
+    pub adapter: Option<String>,
+}
+
+/// Whether the start of `role` can be given for harness `adapter` (none named: not checked) from a place's `.lords` dir
+/// `lords`, whose `start-<role>.md` reads `start` ("" where there is none): the start without its marker lines, or why
+/// not. The one decision the role guard and `lords paths` share (F10-FC1-02): the start is there with Lords' marker,
+/// the harness's place file beside `.lords` is there with Lords' marker, as it carries the lines the start leaves out
+/// (F10-R1-03), and the start fits one hook.
+pub fn deliverable(
+    lords: &Path,
+    start: &str,
+    role: &str,
+    adapter: Option<&str>,
+) -> Result<String, String> {
+    if !start.contains(crate::compose::BEGIN) {
+        return Err(format!("no {} here", crate::sync::start_file(role)));
+    }
+    if let Some(id) = adapter {
+        let place = crate::adapters::get(id)
+            .map(|a| a.repo_file())
+            .ok_or_else(|| format!("no harness `{id}` is known"))?;
+        match crate::fsguard::read_text(&lords.parent().unwrap_or(lords).join(place)) {
+            Ok(Some(t)) if t.contains(crate::compose::BEGIN) => {}
+            Ok(_) => {
+                return Err(format!(
+                    "no Lords {place} here, which carries what the start leaves out"
+                ))
+            }
+            Err(e) => return Err(format!("its {place} can't be read: {e}")),
+        }
+    }
+    let text = child_context(start);
+    let (n, max) = (text.chars().count(), crate::sync::CHILD_START_CHARS);
+    if n > max {
+        return Err(format!("it is {n} characters, past the {max} one hook gives"));
+    }
+    Ok(text)
+}
+
+/// What a prompt naming `role` in `cwd` is given (design note C1, C2): the start, where `deliverable` says it can be;
+/// else one line saying why not and which file to read, whatever failed (F10-R1-04). `None` where `cwd` lies in no
+/// place.
+fn role_lines(cwd: &Path, home: &Path, role: &str, adapter: Option<&str>) -> Option<String> {
+    let file = crate::sync::role_file(role);
+    let not_given = |why: String, at: String| {
+        format!("Lords: your role's start ({role}) isn't given here ({why}): read `{at}` now; it binds you.")
+    };
+    match place_file(cwd, home, &crate::sync::start_file(role)) {
+        Ok(None) => None,
+        Ok(Some((lords, text))) => Some(
+            deliverable(&lords, &text, role, adapter)
+                .unwrap_or_else(|why| not_given(why, lords.join(&file).display().to_string())),
+        ),
+        Err(e) => Some(not_given(
+            format!("it can't be read: {e}"),
+            format!("{file}` in this place's `{}` dir", crate::sync::ROLE_DIR),
+        )),
+    }
+}
+
+/// The role guard's answer to one `UserPromptSubmit` event (design note D3), Claude Code's and Codex's alike. Stateless
+/// (the Lords owner after fix check r1): a prompt carrying the launcher's signal (`launch_role`) gets that role's start,
+/// or the line saying why not (`role_lines`), every time; any other prompt gets nothing. The launcher owns the role, so
+/// a later prompt carrying a signal is the launcher's again. Never a block. The probe event is answered with
+/// `ROLE_PROTOCOL`.
+pub fn role_hook(input: &str, env: &RoleEnv) -> Answer {
+    let Ok(ev) = serde_json::from_str::<Value>(input) else {
+        return noted("the event can't be read");
+    };
+    if ev["hook_event_name"] == CHILD_PROBE_EVENT {
+        return Answer { stdout: format!("lords guard role {ROLE_PROTOCOL}"), note: None };
+    }
+    if ev["hook_event_name"] != "UserPromptSubmit" {
+        return quiet();
+    }
+    let Some(launch) = launch_role(ev["prompt"].as_str().unwrap_or("")) else { return quiet() };
+    let Some(cwd) = ev["cwd"].as_str().map(Path::new) else {
+        return noted("the event names no cwd");
+    };
+    let Some(lines) = role_lines(cwd, &env.home, &launch.role, env.adapter.as_deref()) else {
+        return quiet();
+    };
+    let out = json!({"hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": lines,
     }});
     Answer { stdout: out.to_string(), note: None }
 }

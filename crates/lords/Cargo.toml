@@ -22,3 +22,10 @@ name = "lords-old-guard-stub"
 path = "tests/support/old_guard.rs"
 test = false
 doc = false
+
+# Test support only: `codex app-server` answering `hooks/list` as `lords paths` asks it (tests/role.rs). Never packaged.
+[[bin]]
+name = "lords-codex-stub"
+path = "tests/support/codex_stub.rs"
+test = false
+doc = false

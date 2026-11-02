@@ -19,6 +19,7 @@ pub mod model;
 pub mod ops;
 pub mod overlap;
 pub mod panel;
+pub mod paths;
 pub mod privacy;
 pub mod process;
 pub mod schema;

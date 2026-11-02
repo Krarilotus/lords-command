@@ -37,11 +37,14 @@ usage:
   lords compose [--repo NAME [--role ROLE | --child | --child-whole]] [--adapter ID] [--json]   what a harness reads there, with sources
   lords show ID   an entry's whole text, which its core line stands for at start (without frontmatter)
   lords sizes [--json]   every file sync writes, by section; fails past the warning line
+  lords paths [--json] [--codex PATH] [--deadline-ms N]   which T3-delegated sessions start with their role's lines;
+    exit 1 when one doesn't (Codex: asks its app-server whether it trusts Lords' hook)
   lords guard rm   Claude's PreToolUse hook: refuses an `rm` whose path holds a variable not written as quoted ${VAR:?}
   lords guard queue [--deadline-ms N]   Claude's Stop hook: holds a turn's end while items may wait in its T3 queue
   lords guard session   Claude's SessionStart hook: records the Lords files the session reads
   lords guard turn   Claude's UserPromptSubmit hook: the clock, and the Lords files changed since the session started
   lords guard child [--home DIR]   the SubagentStart hook: a native child starts with its role's start file in its place
+  lords guard role [--home DIR] [--adapter ID]   the UserPromptSubmit hook: a session gets the start of the role its launch names
   lords guard install [--home DIR]   install or update the guard copy the hooks run (sync never writes it)
   lords panel serve [--port N]   the window on another PC reads and edits these stacks through it (127.0.0.1:7879)
   lords panel add ALIAS --bridge DIR [--embedded] [--apply]   set a PC this one reaches as ALIAS up for the panel;
@@ -141,6 +144,7 @@ fn cmd_guard(mut a: Args) -> ExitCode {
         say("       lords guard queue [--deadline-ms N]   (Claude Code's Stop hook; the event on stdin)");
         say("       lords guard session | turn   (Claude Code's SessionStart and UserPromptSubmit hooks)");
         say("       lords guard child   (the SubagentStart hook: a native child's start file)");
+        say("       lords guard role   (the UserPromptSubmit hook: the start of the role a launch names)");
         return ExitCode::SUCCESS;
     }
     if a.flag("--self-test") {
@@ -159,8 +163,8 @@ fn cmd_guard(mut a: Args) -> ExitCode {
     if let Some(w @ ("session" | "turn")) = which.as_deref() {
         return guard_rules(w, a);
     }
-    if which.as_deref() == Some("child") {
-        return guard_child(a);
+    if let Some(w @ ("child" | "role")) = which.as_deref() {
+        return guard_child(w, a);
     }
     if which.as_deref() != Some("rm") || a.done().is_err() {
         note("usage `lords guard rm` (event on stdin)");
@@ -224,21 +228,39 @@ fn guard_rules(which: &str, a: Args) -> ExitCode {
 }
 
 /// `lords guard child [--home DIR]`: the `SubagentStart` hook (Claude Code, Codex) that gives a native child its
-/// place's start file (guard.rs), in one read. `--home`: the tool home sync ran with, whose apply lock it takes (sync
-/// names it in the hook it writes; default ~/.lords-command). Reads the event on stdin; like the other guards it never
-/// fails: every problem is a note on stderr and exit 0.
-fn guard_child(mut a: Args) -> ExitCode {
-    let note = |line: &str| say_err(&format!("lords guard child: {line}"));
-    let usage = "usage `lords guard child [--home DIR]` (event on stdin)";
+/// place's start file (guard.rs), in one read. `lords guard role [--home DIR] [--adapter ID]`: the `UserPromptSubmit`
+/// hook that gives a prompt carrying the launcher's role signal that role's start (guard.rs, `role_hook`); `--adapter`
+/// names its harness. `--home`: the tool home sync ran with, whose apply lock it takes (sync names it in the hook it writes;
+/// default ~/.lords-command). Reads the event on stdin; like the other guards it never fails: every problem is a note
+/// on stderr and exit 0.
+fn guard_child(which: &str, mut a: Args) -> ExitCode {
+    let note = |line: &str| say_err(&format!("lords guard {which}: {line}"));
+    let usage = if which == "role" {
+        "usage `lords guard role [--home DIR] [--adapter ID]` (event on stdin)".to_string()
+    } else {
+        format!("usage `lords guard {which} [--home DIR]` (event on stdin)")
+    };
     let home = match a.value("--home") {
         Ok(h) => h.map(PathBuf::from),
         Err(_) => {
-            note(usage);
+            note(&usage);
             return ExitCode::SUCCESS;
         }
     };
+    // The harness the role hook runs for, whose place file its start goes beside (F10-R1-03).
+    let adapter = if which != "role" {
+        None
+    } else {
+        match a.value("--adapter") {
+            Ok(id) => id,
+            Err(_) => {
+                note(&usage);
+                return ExitCode::SUCCESS;
+            }
+        }
+    };
     if a.done().is_err() {
-        note(usage);
+        note(&usage);
         return ExitCode::SUCCESS;
     }
     let input = match std::io::read_to_string(std::io::stdin()) {
@@ -256,7 +278,12 @@ fn guard_child(mut a: Args) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
-    let answer = lords_core::guard::child_hook(&input, &home);
+    let answer = if which == "role" {
+        let env = lords_core::guard::RoleEnv { home, adapter };
+        lords_core::guard::role_hook(&input, &env)
+    } else {
+        lords_core::guard::child_hook(&input, &home)
+    };
     if let Some(n) = answer.note {
         note(&n);
     }
@@ -1130,6 +1157,36 @@ fn cmd_sizes(mut a: Args) -> Result<bool, String> {
     Ok(!over)
 }
 
+/// `lords paths [--json] [--codex PATH] [--deadline-ms N] [--home DIR]`: which T3-delegated paths start with every core
+/// line of their role (paths.rs). Exit 0 when every row is complete, 1 when one isn't.
+fn cmd_paths(mut a: Args) -> Result<bool, String> {
+    let json = a.flag("--json");
+    let codex = a.value("--codex")?.map(PathBuf::from);
+    let deadline = match a.value("--deadline-ms")? {
+        None => lords_core::paths::CODEX_DEADLINE,
+        Some(ms) => std::time::Duration::from_millis(
+            ms.parse().map_err(|_| "--deadline-ms takes a number of milliseconds")?,
+        ),
+    };
+    let home = match a.value("--home")? {
+        Some(h) => PathBuf::from(h),
+        None => sync::default_home()?,
+    };
+    let p = paths(&mut a)?;
+    a.done()?;
+    let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    let ask = lords_core::paths::Ask { home, codex, deadline };
+    let rows = lords_core::paths::paths(&stacks, &ask);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows).unwrap_or_default());
+    } else {
+        for r in &rows {
+            println!("{:<10}  {}: {}", r.state, r.path, r.why);
+        }
+    }
+    Ok(rows.iter().all(|r| r.state == "complete"))
+}
+
 /// `lords show <id>`: the whole text on stdout; a refusal (no such entry, two of them, retired or ended) on stderr,
 /// exit 1.
 fn cmd_show(mut a: Args) -> Result<bool, String> {
@@ -1185,6 +1242,7 @@ fn main() -> ExitCode {
         "adopt" => cmd_adopt(a),
         "set-aside" => cmd_set_aside(a),
         "sizes" => cmd_sizes(a),
+        "paths" => cmd_paths(a),
         "panel" => panel::cmd(a),
         other => Err(format!("unknown command `{other}`\n\n{USAGE}")),
     };

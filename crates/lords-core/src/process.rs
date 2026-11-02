@@ -5,6 +5,7 @@
 //! for its self-test before sync installs it, and the T3 CLI, which the queue guard asks about its thread (it
 //! reads; its process tree ends with the guard's). The panel's push is `git` too, bounded by a deadline that ends its
 //! whole tree (`bounded`), and the window on another PC runs `ssh -N` for its forward while it is open (`Tunnel`).
+//! `lords paths` asks Codex's app-server which hooks it trusts (`codex_ask`; it reads), bounded the same way.
 
 // The door: the one place the resolved boundary lints allow (clippy.toml).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -99,17 +100,103 @@ pub(crate) fn guard_self_test(guard_copy: &Path) -> Result<(), String> {
     }
 }
 
-/// The child protocol of the guard copy (`guard::CHILD_PROTOCOL`), asked with exactly the arguments sync writes into
-/// the child hook (`guard child --home <home>`, Claude Code's and Codex's alike) and the probe event on stdin (fix
-/// check r2, FC4): `None` when it answers anything else, as a copy from before this protocol does (no child guard, no
-/// `--home`, or no answer to the probe).
-pub(crate) fn guard_child_protocol(guard_copy: &Path, home: &Path) -> Result<Option<u32>, String> {
+/// The protocol of guard `which` (`child`, `role`) in the guard copy (`guard::CHILD_PROTOCOL`, `guard::ROLE_PROTOCOL`),
+/// asked with exactly the arguments sync writes into its hook (`guard <which> --home <home>`, Claude Code's and Codex's
+/// alike) and the probe event on stdin (fix check r2, FC4): `None` when it answers anything else, as a copy from before
+/// that protocol does (no such guard, no `--home`, or no answer to the probe). `extra`: the hook's further arguments
+/// (the role hook's `--adapter ID`).
+pub(crate) fn guard_protocol(
+    guard_copy: &Path,
+    which: &str,
+    home: &Path,
+    extra: &[&str],
+) -> Result<Option<u32>, String> {
     let home = home.to_string_lossy();
-    let args = ["guard", "child", "--home", &home];
+    let mut args = vec!["guard", which, "--home", &home];
+    args.extend(extra);
     let probe = format!("{{\"hook_event_name\":\"{}\"}}", crate::guard::CHILD_PROBE_EVENT);
-    let (status, out) = run_guard(guard_copy, &args, probe.as_bytes(), "guard child probe")?;
-    let answer = out.trim().strip_prefix("lords guard child ").and_then(|n| n.parse().ok());
+    let what = format!("guard {which} probe");
+    let (status, out) = run_guard(guard_copy, &args, probe.as_bytes(), &what)?;
+    let prefix = format!("lords guard {which} ");
+    let answer = out.trim().strip_prefix(&prefix).and_then(|n| n.parse().ok());
     Ok(answer.filter(|_| status.success()))
+}
+
+/// Asks `codex app-server` (Codex's own JSON-RPC over stdio) one question, with `codex_home` as its `CODEX_HOME`: it
+/// writes `requests`, one per line, keeps stdin open (the server ends at the end of its input without answering; probe
+/// H5, design note 2026-11-02-lords-role-at-launch), and gives the first line whose `id` is `id`, or why not: it can't
+/// start, it ends first, or `deadline` passes (rule.remote-calls-have-deadlines). The server is in a job of its own
+/// that kills every process in it when this returns, however it returns (`tree::Tree`).
+pub fn codex_ask(
+    codex: &Path,
+    codex_home: &Path,
+    requests: &[String],
+    id: u64,
+    deadline: Duration,
+) -> Result<serde_json::Value, String> {
+    use std::io::{BufRead, Write};
+    use std::process::Stdio;
+    let started = Instant::now();
+    let mut c = Command::new(codex);
+    c.arg("app-server")
+        .env("CODEX_HOME", codex_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = c.spawn().map_err(|e| format!("{}: {e}", codex.display()))?;
+    let tree = match tree::Tree::holding(&child) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
+    let mut stdin = child.stdin.take();
+    if let Some(pipe) = stdin.as_mut() {
+        for r in requests {
+            let _ = writeln!(pipe, "{r}");
+        }
+        let _ = pipe.flush();
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stdout = child.stdout.take();
+    std::thread::spawn(move || {
+        for line in stdout.into_iter().flat_map(|o| std::io::BufReader::new(o).lines()) {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let answer = loop {
+        let left = deadline.saturating_sub(started.elapsed());
+        match rx.recv_timeout(left) {
+            Ok(line) => {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                if v["id"].as_u64() == Some(id) {
+                    break Ok(v);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                break Err(format!("no answer within its deadline ({} ms)", deadline.as_millis()))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break Err("it ended without answering".to_string())
+            }
+        }
+    };
+    drop(stdin);
+    drop(tree);
+    let _ = child.kill();
+    let _ = child.wait();
+    answer
 }
 
 /// Runs the guard copy with `args` and `stdin`, within 20 s: its exit status and stdout. A child past the deadline is

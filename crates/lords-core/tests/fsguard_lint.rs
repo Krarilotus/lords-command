@@ -95,8 +95,8 @@ fn extensions_allowed(d: Door) -> &'static [&'static str] {
 
 /// The child processes a source may start: `git`, the file manager, the staged guard copy's self-test
 /// (`guard_copy`), the queue guard's T3 CLI (`t3_cli`), the panel's tunnel and `lords panel add`'s remote steps
-/// (`ssh`), its task for `lords panel serve` (`schtasks`) and its test of the bridge's sshd config (`sshd_exe`), all
-/// in process.rs.
+/// (`ssh`), its task for `lords panel serve` (`schtasks`), its test of the bridge's sshd config (`sshd_exe`) and `lords
+/// paths`'s question to Codex's app-server (`codex`), all in process.rs.
 fn programs_allowed(d: Door) -> &'static [&'static str] {
     match d {
         Door::Process => &[
@@ -108,6 +108,7 @@ fn programs_allowed(d: Door) -> &'static [&'static str] {
             "\"ssh\"",
             "\"schtasks\"",
             "sshd_exe",
+            "codex",
         ],
         _ => &[],
     }
