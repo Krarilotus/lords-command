@@ -360,9 +360,9 @@ fn quoted(p: &Path) -> String {
 /// A post-checkout hook that writes a new worktree's place files (orchestrator, 25 Oct). It never fails or slows
 /// the checkout: it acts only when the old HEAD is all zeros (`git worktree add`), runs sync in the background
 /// under a time limit, and only logs (to `<git common dir>/lords-post-checkout.log`); a hook that was here before
-/// runs first, and its exit status is the hook's. It answers the install's probe first, and does nothing else then
-/// (`probe_lines`; D14, design note H5).
-pub fn post_checkout_script(lords_exe: &Path, args: &SyncArgs, home: &Path) -> String {
+/// runs first, and its exit status is the hook's. It answers the install's probe first, with `label`
+/// (`probe_label`), and does nothing else then (`probe_lines`; D14, design note H5).
+pub fn post_checkout_script(lords_exe: &Path, args: &SyncArgs, home: &Path, label: &str) -> String {
     let mut stacks = String::new();
     if let Some(p) = &args.public_stack {
         stacks.push_str(&format!(" --public-stack {}", quoted(p)));
@@ -401,8 +401,14 @@ exit $status
 "#,
         exe = quoted(lords_exe),
         repo = quoted(Path::new(&args.repo)),
-        probe = probe_lines(home, "post-checkout"),
+        probe = probe_lines(home, label),
     )
+}
+
+/// What the post-checkout hook in hooks dir `dir` answers a probe with: its name and 16 hex digits of the dir's
+/// ledger key, so each repo's hook answers for its own dir alone (sol-loop r1, S2).
+fn probe_label(dir: &Path) -> String {
+    format!("post-checkout-{}", &fsguard::sha(crate::ledger::key(dir).as_bytes())[..16])
 }
 
 /// Installs the post-checkout hook in the repo's own hooks dir (the common dir, so every worktree has it); `home`
@@ -423,10 +429,11 @@ pub fn install_post_checkout(
     let hook = dir.join(&[Part::new("post-checkout")?]);
     let chained = dir.join(&[Part::new(CHAINED)?]);
     let mut backup = None;
-    let mut was_ours = None;
+    // The tool's earlier hook, aside until the new one is proven (sol-loop r1, S1).
+    let mut earlier = None;
     if fsguard::kind(hook.path())? != fsguard::Kind::Missing {
         if ours(&ledger, hook.path())? {
-            was_ours = fsguard::read(hook.path())?;
+            earlier = Some(fsguard::move_aside(&hook)?);
         } else {
             if fsguard::kind(chained.path())? != fsguard::Kind::Missing {
                 return Err(format!(
@@ -440,26 +447,23 @@ pub fn install_post_checkout(
         }
     }
     let scope = format!("hooks:{}", crate::ledger::key(dir.path()));
-    let text = post_checkout_script(lords_exe, args, home);
+    let label = probe_label(dir.path());
+    let text = post_checkout_script(lords_exe, args, home, &label);
     let proof = put_hook(&mut ledger, &hook, &text, &scope)
-        .and_then(|()| post_checkout_reaches_new_worktree(repo, home));
+        .and_then(|()| post_checkout_reaches_new_worktree(repo, home, &label));
     if let Err(why) = proof {
-        // As it was (H4): the tool's earlier hook back; or this one gone and the owner's moved back to its name, where
-        // nothing is overwritten; the ledger isn't saved.
-        let undone = match &was_ours {
-            Some(bytes) => {
-                fsguard::put_file(&hook, bytes).and_then(|()| fsguard::make_executable(&hook))
-            }
-            None => fsguard::kind(hook.path())
-                .and_then(|k| match k {
-                    fsguard::Kind::Missing => Ok(()),
-                    _ => fsguard::delete_file(&hook),
-                })
-                .and_then(|()| match backup {
-                    Some(_) => fsguard::move_to(&chained, &hook),
-                    None => Ok(()),
-                }),
-        };
+        // As it was (H4): this hook gone, then the tool's earlier one or the owner's back at its name, where nothing is
+        // overwritten; the ledger isn't saved.
+        let undone = fsguard::kind(hook.path())
+            .and_then(|k| match k {
+                fsguard::Kind::Missing => Ok(()),
+                _ => fsguard::delete_file(&hook),
+            })
+            .and_then(|()| match (&earlier, &backup) {
+                (Some(aside), _) => aside.back(),
+                (None, Some(_)) => fsguard::move_to(&chained, &hook),
+                (None, None) => Ok(()),
+            });
         let refused = refusal(repo, &dir, &why);
         return Err(match undone {
             Ok(()) => refused,
@@ -467,6 +471,9 @@ pub fn install_post_checkout(
         });
     }
     ledger.save(home)?;
+    if let Some(aside) = earlier {
+        aside.delete()?;
+    }
     Ok(Installed {
         hook: hook.path().to_path_buf(),
         backup,
@@ -485,8 +492,10 @@ fn hooks_path(repo: &Path) -> Option<(String, String)> {
 /// Whether a new worktree's post-checkout reaches the tool's hook, found out by running it as `git worktree add` would
 /// (H1): `git hook run post-checkout` in an empty stand-in for the new worktree (the repo's common dir as its git dir),
 /// so whatever lies between, a hooks path, a dispatcher, a path relative to the worktree, a skip, is run, never read.
-/// The hook answers a nonce whose file is made in `home` just before; the nonce file and the stand-in go after.
-fn post_checkout_reaches_new_worktree(repo: &Path, home: &Path) -> Result<(), String> {
+/// The hook answers a nonce whose file is made in `home` just before, with `label`, which names the hooks dir it was
+/// installed in, so another repo's Lords hook can't answer for it (sol-loop r1, S2); the nonce file and the stand-in go
+/// after.
+fn post_checkout_reaches_new_worktree(repo: &Path, home: &Path, label: &str) -> Result<(), String> {
     let common = git::run(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
     let n = nonce();
     let state = Root::home(home)?.join(&[Part::new("state")?]);
@@ -505,7 +514,7 @@ fn post_checkout_reaches_new_worktree(repo: &Path, home: &Path) -> Result<(), St
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        if out.status.success() && said.contains(&probe_answer(&n, "post-checkout")) {
+        if out.status.success() && said.contains(&probe_answer(&n, label)) {
             Ok(())
         } else {
             Err(format!(
