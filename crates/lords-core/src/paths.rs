@@ -11,12 +11,13 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// One path and whether it delivers its role's lines.
+/// One path and whether it delivers its role's lines; `in_use`: whether its place is in use (`in_use`, D15).
 #[derive(Debug, Serialize)]
 pub struct Row {
     pub state: &'static str,
     pub path: String,
     pub why: String,
+    pub in_use: bool,
 }
 
 /// Where `paths` looks: the tool home (the guard copy, the hooks' command line), the Codex it asks, and how long it
@@ -31,7 +32,44 @@ pub struct Ask {
 pub const CODEX_DEADLINE: Duration = Duration::from_secs(20);
 
 fn row(complete: bool, path: String, why: impl Into<String>) -> Row {
-    Row { state: if complete { "complete" } else { "incomplete" }, path, why: why.into() }
+    let state = if complete { "complete" } else { "incomplete" };
+    Row { state, path, why: why.into(), in_use: true }
+}
+
+/// How recently a worktree's git files must have changed for it to be in use (D15; design note
+/// 2026-11-02-lords-hooks-dispatcher, P1: on 2 Nov this kept 47 of 126 places, at a gap from 2.9 to 6.9 days).
+pub const IN_USE: Duration = Duration::from_secs(3 * 86_400);
+
+/// Whether the worktree at `dir` is in use (P1): its HEAD, its index or its branch's loose ref changed within `IN_USE`.
+/// A git dir or HEAD that can't be read is in use, so an unknown is never hidden; an index or loose ref that isn't
+/// there (none yet, or a packed ref) gives no sign.
+fn worktree_in_use(dir: &Path) -> bool {
+    use crate::fsguard::{self, Kind};
+    let dot = dir.join(".git");
+    let git_dir = match fsguard::kind(&dot) {
+        Ok(Kind::Dir) => dot,
+        Ok(Kind::File) => match fsguard::read_string(&dot) {
+            Ok(t) => match t.trim().strip_prefix("gitdir:") {
+                Some(g) => dir.join(g.trim()),
+                None => return true,
+            },
+            Err(_) => return true,
+        },
+        _ => return true,
+    };
+    let Ok(head) = fsguard::read_string(git_dir.join("HEAD")) else { return true };
+    let common = match fsguard::read_string(git_dir.join("commondir")) {
+        Ok(c) => git_dir.join(c.trim()),
+        Err(_) => git_dir.clone(),
+    };
+    let mut files = vec![git_dir.join("HEAD"), git_dir.join("index")];
+    if let Some(branch) = head.trim().strip_prefix("ref: ") {
+        files.push(common.join(branch));
+    }
+    files.iter().any(|f| match fsguard::modified(f) {
+        Ok(t) => t.elapsed().map_or(true, |age| age <= IN_USE),
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    })
 }
 
 /// Every row (module doc).
@@ -153,12 +191,20 @@ fn role_rows(stacks: &Stacks) -> Vec<Row> {
     use crate::fsguard::InDir;
     let Some(private) = &stacks.private else { return Vec::new() };
     let mut rows = Vec::new();
-    let mut dirs: Vec<(String, PathBuf, &[String])> = Vec::new();
+    // Each place: its label, dir, adapters, and whether it is in use (a declared checkout or a workspace always is).
+    let mut dirs: Vec<(String, PathBuf, &[String], bool)> = Vec::new();
     for (name, repo) in &private.manifest.repos {
+        let declared: Vec<String> = repo
+            .checkouts
+            .iter()
+            .map(|c| crate::ledger::key(&crate::config::expand_home(c)))
+            .collect();
         match sync::checkouts(repo) {
             Ok((roots, _, _)) => dirs.extend(roots.iter().map(|r| {
                 let p = r.path().to_path_buf();
-                (format!("repo {name} ({})", crate::adapters::slashes(&p)), p, &repo.adapters[..])
+                let in_use = declared.contains(&crate::ledger::key(&p)) || worktree_in_use(&p);
+                let label = format!("repo {name} ({})", crate::adapters::slashes(&p));
+                (label, p, &repo.adapters[..], in_use)
             })),
             Err(e) => rows.push(row(
                 false,
@@ -169,22 +215,25 @@ fn role_rows(stacks: &Stacks) -> Vec<Row> {
     }
     for (name, w) in &private.manifest.workspaces {
         let dir = crate::config::expand_home(&w.path);
-        dirs.push((format!("workspace {name}"), dir, &w.adapters[..]));
+        dirs.push((format!("workspace {name}"), dir, &w.adapters[..], true));
     }
     for role in sync::declared_roles(stacks).iter().filter(|r| *r != crate::compose::PRODUCT_ROLE) {
         let file = sync::start_file(role);
         let mut refused = Vec::new();
-        for (label, dir, ids) in &dirs {
+        for (label, dir, ids, in_use) in &dirs {
             let lords = dir.join(sync::ROLE_DIR);
             let start = match crate::fsguard::read_text_in(&lords, &file) {
                 Ok(InDir::Text(t)) => t,
                 Ok(_) => String::new(),
                 Err(e) => {
-                    refused.push(row(
-                        false,
-                        format!("T3-delegated as {role}, {label}"),
-                        format!("{file} can't be read ({e})"),
-                    ));
+                    refused.push(Row {
+                        in_use: *in_use,
+                        ..row(
+                            false,
+                            format!("T3-delegated as {role}, {label}"),
+                            format!("{file} can't be read ({e})"),
+                        )
+                    });
                     continue;
                 }
             };
@@ -192,7 +241,10 @@ fn role_rows(stacks: &Stacks) -> Vec<Row> {
             for a in adapters::ALL.iter().copied().filter(|a| has(*a)) {
                 if let Err(why) = crate::guard::deliverable(&lords, &start, role, Some(a.id())) {
                     let path = format!("T3-delegated as {role} via {}, {label}", a.repo_file());
-                    refused.push(row(false, path, format!("{why}: sync the place")));
+                    refused.push(Row {
+                        in_use: *in_use,
+                        ..row(false, path, format!("{why}: sync the place"))
+                    });
                 }
             }
         }

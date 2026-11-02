@@ -37,8 +37,9 @@ usage:
   lords compose [--repo NAME [--role ROLE | --child | --child-whole]] [--adapter ID] [--json]   what a harness reads there, with sources
   lords show ID   an entry's whole text, which its core line stands for at start (without frontmatter)
   lords sizes [--json]   every file sync writes, by section; fails past the warning line
-  lords paths [--json] [--codex PATH] [--deadline-ms N]   which T3-delegated sessions start with their role's lines;
-    exit 1 when one doesn't (Codex: asks its app-server whether it trusts Lords' hook)
+  lords paths [--all] [--json] [--codex PATH] [--deadline-ms N]   which T3-delegated sessions start with their role's lines;
+    exit 1 when one doesn't (Codex: asks its app-server whether it trusts Lords' hook); places not in use are one
+    line unless --all
   lords guard rm   Claude's PreToolUse hook: refuses an `rm` whose path holds a variable not written as quoted ${VAR:?},
     and a git call that would skip or repoint its hooks
   lords guard queue [--deadline-ms N]   Claude's Stop hook: holds a turn's end while items may wait in its T3 queue
@@ -1091,8 +1092,11 @@ fn cmd_hooks(mut a: Args) -> Result<bool, String> {
         if let Some(b) = r.backup {
             println!("the hook that was there runs first, from {}", b.display());
         }
-        if let Some(g) = r.global_hooks_path {
-            println!("note: global core.hooksPath = {g}; its dispatcher must run .git/hooks/post-checkout for this to take effect");
+        match r.via {
+            Some(p) => println!(
+                "checked: a new worktree's post-checkout reaches it through core.hooksPath = {p}"
+            ),
+            None => println!("checked: a new worktree's post-checkout reaches it"),
         }
         return Ok(true);
     }
@@ -1197,10 +1201,12 @@ fn cmd_sizes(mut a: Args) -> Result<bool, String> {
     Ok(!over)
 }
 
-/// `lords paths [--json] [--codex PATH] [--deadline-ms N] [--home DIR]`: which T3-delegated paths start with every core
-/// line of their role (paths.rs). Exit 0 when every row is complete, 1 when one isn't.
+/// `lords paths [--all] [--json] [--codex PATH] [--deadline-ms N] [--home DIR]`: which T3-delegated paths start with
+/// every core line of their role (paths.rs). The rows of places not in use are one count line unless `--all`; `--json`
+/// has every row, with `in_use` (D15). Exit 0 when every row is complete, shown or not, 1 when one isn't.
 fn cmd_paths(mut a: Args) -> Result<bool, String> {
     let json = a.flag("--json");
+    let all = a.flag("--all");
     let codex = a.value("--codex")?.map(PathBuf::from);
     let deadline = match a.value("--deadline-ms")? {
         None => lords_core::paths::CODEX_DEADLINE,
@@ -1220,8 +1226,17 @@ fn cmd_paths(mut a: Args) -> Result<bool, String> {
     if json {
         println!("{}", serde_json::to_string_pretty(&rows).unwrap_or_default());
     } else {
-        for r in &rows {
+        let (shown, folded): (Vec<_>, Vec<_>) = rows.iter().partition(|r| all || r.in_use);
+        for r in &shown {
             println!("{:<10}  {}: {}", r.state, r.path, r.why);
+        }
+        if !folded.is_empty() {
+            let incomplete = folded.iter().filter(|r| r.state != "complete").count();
+            println!(
+                "{} rows of places not in use (no HEAD, index or branch change in {} days), {incomplete} incomplete: --all lists them",
+                folded.len(),
+                lords_core::paths::IN_USE.as_secs() / 86_400
+            );
         }
     }
     Ok(rows.iter().all(|r| r.state == "complete"))

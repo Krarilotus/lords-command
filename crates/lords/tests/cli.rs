@@ -826,6 +826,7 @@ fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
         let hooks_path = config(&env, &repo, "core.hooksPath");
         let o = install_post_checkout(&env, &repo, &stacks);
         let out = text(&o);
+        eprintln!("{name}: {out}");
         assert!(!o.status.success(), "{name}: must be refused: {out}");
         assert!(out.contains(says) && out.contains("post-checkout"), "{name}: {out}");
         assert_eq!(listing(&hooks), before, "{name}: the hooks dir is as it was");
