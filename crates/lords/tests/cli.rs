@@ -762,7 +762,9 @@ fn the_post_checkout_install_goes_through_a_global_dispatcher_and_a_previous_hoo
 // record of a hook, `core.hooksPath` unchanged.
 // - The real dispatcher, `previousHooksPath = .githooks` (relative, tracked hooks in the tree): "relative".
 // - The real dispatcher, `skipPreviousHook = post-checkout`: "skipPreviousHook".
-// - The real dispatcher, `previousHooksPath` absolute elsewhere: that dir is named.
+// - The real dispatcher, `previousHooksPath` absolute elsewhere: "not to this repo's own hooks dir". Elsewhere is
+//   another repo's hooks dir with Lords' post-checkout installed (same tool home), which answers probes too: only an
+//   answer bound to this repo's hooks dir tells them apart (sol-loop r1, S2).
 // - A local hooks path whose post-checkout runs nothing: "local".
 // - A global hooks path without a post-checkout (today this one installed, with a note): "global".
 #[test]
@@ -772,8 +774,7 @@ fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
     let d = env.dir.path();
     let guard = real_dispatcher(&d.join("guard"));
     let guard = guard.to_str().unwrap();
-    let elsewhere = d.join("elsewhere");
-    fs::create_dir_all(&elsewhere).unwrap();
+    let elsewhere = other_repo_with_lords_hook(&env);
     let silent = d.join("silent");
     fs::create_dir_all(&silent).unwrap();
     fs::write(silent.join("post-checkout"), "#!/bin/sh\nexit 0\n").unwrap();
@@ -792,6 +793,7 @@ fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
     };
     let before = listing(&hooks);
     let ledger = d.join("home/.lords-command/state/ledger.toml");
+    let recorded = fs::read(&ledger).unwrap();
 
     type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a str);
     let cases: [Case; 5] = [
@@ -811,7 +813,7 @@ fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
                 ("core.hooksPath", guard),
                 ("attributionGuard.previousHooksPath", elsewhere.to_str().unwrap()),
             ],
-            "elsewhere",
+            "not to this repo's own hooks dir",
         ),
         ("local", vec![("core.hooksPath", silent.to_str().unwrap())], "local"),
         ("global", vec![("--global core.hooksPath", empty.to_str().unwrap())], "global"),
@@ -830,10 +832,7 @@ fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
         assert!(!o.status.success(), "{name}: must be refused: {out}");
         assert!(out.contains(says) && out.contains("post-checkout"), "{name}: {out}");
         assert_eq!(listing(&hooks), before, "{name}: the hooks dir is as it was");
-        assert!(
-            !fs::read_to_string(&ledger).unwrap_or_default().contains("post-checkout"),
-            "{name}: no ledger record"
-        );
+        assert_eq!(fs::read(&ledger).unwrap(), recorded, "{name}: the ledger is as it was");
         assert_eq!(config(&env, &repo, "core.hooksPath"), hooks_path, "{name}");
         for (k, _) in &settings {
             let mut args = vec!["config", "--unset-all"];
@@ -841,6 +840,81 @@ fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
             assert!(env.git(&repo, &args).status.success(), "{name}: git {args:?}");
         }
     }
+}
+
+/// Another repo, `other` (one commit), declared in a stack of its own (`pub2`, `priv2`) and given Lords' post-checkout
+/// in the same tool home; its hooks dir.
+fn other_repo_with_lords_hook(env: &Env) -> PathBuf {
+    let d = env.dir.path();
+    let other = d.join("other");
+    fs::create_dir_all(&other).unwrap();
+    assert!(env.git(&other, &["init", "-q"]).status.success());
+    fs::write(other.join("README.md"), "another repo\n").unwrap();
+    env.git(&other, &["add", "-A"]);
+    assert!(env.git(&other, &["commit", "-q", "-m", "start"]).status.success());
+    let stacks = copied_stacks(env, "2");
+    let manifest = format!(
+        "name = \"priv\"\nvisibility = \"private\"\nroles = [\"coder\"]\n[repos.o]\ncheckouts = ['{}']\nadapters = [\"claude\"]\n",
+        other.display()
+    );
+    fs::write(d.join("priv2/stack.toml"), manifest).unwrap();
+    let o = install_post_checkout(env, &other, &stacks);
+    assert!(o.status.success(), "{}", text(&o));
+    other.join(".git/hooks")
+}
+
+/// The stacks `post_checkout_repo` made, copied to `pub<n>` and `priv<n>`; their args.
+fn copied_stacks(env: &Env, n: &str) -> [String; 4] {
+    let d = env.dir.path();
+    for f in ["pub/stack.toml", "priv/stack.toml", "priv/global/rules/r.md", "pub/global/rules"] {
+        let to = d.join(f.replacen("pub", &format!("pub{n}"), 1).replacen(
+            "priv",
+            &format!("priv{n}"),
+            1,
+        ));
+        if d.join(f).is_dir() {
+            fs::create_dir_all(&to).unwrap();
+        } else {
+            fs::create_dir_all(to.parent().unwrap()).unwrap();
+            fs::copy(d.join(f), &to).unwrap();
+        }
+    }
+    let arg = |s: &str| d.join(format!("{s}{n}")).display().to_string();
+    ["--public-stack".into(), arg("pub"), "--private-stack".into(), arg("priv")]
+}
+
+// Spec (sol-loop r1, S1; design note H4: a refused install leaves the hooks dir as it was): a re-install refused by
+// its probe (a local hooks path that runs nothing, set after the first install) keeps the tool's earlier hook, byte
+// for byte, though the new one would differ (the stacks are named at other paths), and the ledger as it was.
+#[test]
+fn a_refused_reinstall_keeps_the_tools_earlier_hook() {
+    let env = Env::new();
+    let (repo, _wts, stacks) = post_checkout_repo(&env);
+    let o = install_post_checkout(&env, &repo, &stacks);
+    assert!(o.status.success(), "{}", text(&o));
+    let d = env.dir.path();
+    let hooks = repo.join(".git/hooks");
+    let ledger = d.join("home/.lords-command/state/ledger.toml");
+    let names = |dir: &Path| -> Vec<String> {
+        let mut v: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    let before = (names(&hooks), fs::read(hooks.join("post-checkout")).unwrap());
+    let recorded = fs::read(&ledger).unwrap();
+    let silent = d.join("silent");
+    fs::create_dir_all(&silent).unwrap();
+    fs::write(silent.join("post-checkout"), "#!/bin/sh\nexit 0\n").unwrap();
+    env.git(&repo, &["config", "core.hooksPath", silent.to_str().unwrap()]);
+
+    let o = install_post_checkout(&env, &repo, &copied_stacks(&env, "2"));
+    assert!(!o.status.success() && !text(&o).contains("back failed"), "{}", text(&o));
+    assert_eq!((names(&hooks), fs::read(hooks.join("post-checkout")).unwrap()), before);
+    assert_eq!(fs::read(&ledger).unwrap(), recorded);
 }
 
 /// A nonce as `lords check` makes them: 32 hex digits.
