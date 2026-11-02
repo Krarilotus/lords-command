@@ -224,6 +224,9 @@ fn a_placeholder_the_write_keeps_passes() {
     // A second copy of a kept line is added text (sol-loop r1, S4); a copy in code doesn't use up the kept one (r2, S6).
     assert!(write(&note, &format!("{old}stamp HH:MM\n")).is_some());
     assert_eq!(write(&note, &format!("```\nstamp HH:MM\n```\n{old}")), None);
+    // …nor does a kept copy in code exempt the same line added as prose (sol-loop r3, S8).
+    let code = d.file("c.md", Some("```\nstamp HH:MM\n```\n"));
+    assert!(write(&code, "```\nstamp HH:MM\n```\nstamp HH:MM\n").is_some());
     assert_eq!(edit(&note, "stamp HH:MM\n", "stamp HH:MM\nadded 13:05\n"), None);
     // A fence the edit doesn't touch still holds its lines as code.
     let fenced = d.file("f.md", Some("```\nold\n```\n"));
