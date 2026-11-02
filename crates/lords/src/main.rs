@@ -46,6 +46,8 @@ usage:
   lords guard turn   Claude's UserPromptSubmit hook: the clock, and the Lords files changed since the session started
   lords guard child [--home DIR]   the SubagentStart hook: a native child starts with its role's start file in its place
   lords guard role [--home DIR] [--adapter ID]   the UserPromptSubmit hook: a session gets the start of the role its launch names
+  lords guard time   the PreToolUse hook on editor writes to Markdown and text files and on T3 messages: refuses a
+    placeholder clock time; reminds of one more than 5 minutes after the clock not marked as a plan
   lords guard install [--home DIR]   install or update the guard copy the hooks run (sync never writes it)
   lords panel serve [--port N]   the window on another PC reads and edits these stacks through it (127.0.0.1:7879)
   lords panel add ALIAS --bridge DIR [--embedded] [--apply]   set a PC this one reaches as ALIAS up for the panel;
@@ -147,6 +149,7 @@ fn cmd_guard(mut a: Args) -> ExitCode {
         say("       lords guard session | turn   (Claude Code's SessionStart and UserPromptSubmit hooks)");
         say("       lords guard child   (the SubagentStart hook: a native child's start file)");
         say("       lords guard role   (the UserPromptSubmit hook: the start of the role a launch names)");
+        say("       lords guard time   (the PreToolUse hook on editor writes and T3 messages: clock times)");
         return ExitCode::SUCCESS;
     }
     if a.flag("--self-test") {
@@ -155,6 +158,11 @@ fn cmd_guard(mut a: Args) -> ExitCode {
             let event = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": c}});
             lords_core::guard::rm_hook(&event.to_string()).contains("\"deny\"")
         });
+        let time = serde_json::json!({"tool_name": "mcp__t3-code__t3_thread_send", "tool_input": {"message": "14:xx"}});
+        let (now, zone) = lords_core::guard::system_clock();
+        let ok = ok
+            && lords_core::time_guard::time_hook(&time.to_string(), now, zone.as_ref())
+                .contains("\"deny\"");
         say(if ok { "ok" } else { "the guard let its witness through" });
         return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
     }
@@ -171,6 +179,9 @@ fn cmd_guard(mut a: Args) -> ExitCode {
     if let Some(w @ ("child" | "role")) = which.as_deref() {
         return guard_child(w, a);
     }
+    if which.as_deref() == Some("time") {
+        return guard_time(a);
+    }
     if which.as_deref() != Some("rm") || a.done().is_err() {
         note("usage `lords guard rm` (event on stdin)");
         return ExitCode::SUCCESS;
@@ -183,6 +194,30 @@ fn cmd_guard(mut a: Args) -> ExitCode {
         }
     };
     let out = lords_core::guard::rm_hook(&input);
+    if !out.is_empty() {
+        say(&out);
+    }
+    ExitCode::SUCCESS
+}
+
+/// `lords guard time`: the `PreToolUse` hook on editor writes and T3 messages (time_guard.rs). Reads the event on stdin
+/// and the system clock, and prints a denial or nothing; like the other guards it never fails: every problem is a note
+/// on stderr and exit 0.
+fn guard_time(a: Args) -> ExitCode {
+    let note = |line: &str| say_err(&format!("lords guard time: {line}; this call is let through"));
+    if a.done().is_err() {
+        note("usage `lords guard time` (event on stdin)");
+        return ExitCode::SUCCESS;
+    }
+    let input = match std::io::read_to_string(std::io::stdin()) {
+        Ok(i) => i,
+        Err(e) => {
+            note(&format!("the event can't be read ({e})"));
+            return ExitCode::SUCCESS;
+        }
+    };
+    let (now, zone) = lords_core::guard::system_clock();
+    let out = lords_core::time_guard::time_hook(&input, now, zone.as_ref());
     if !out.is_empty() {
         say(&out);
     }

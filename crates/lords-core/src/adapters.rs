@@ -112,7 +112,7 @@ impl Adapter for ClaudeCode {
     }
 
     fn guards(&self) -> &'static [&'static str] {
-        &["rm", "queue", "session", "turn", "child", "role"]
+        &["rm", "queue", "session", "turn", "child", "role", "time"]
     }
 
     /// A child's start goes in one hook, one read (fix check r2, FC1), with sync's tool home and the deadline the
@@ -177,19 +177,24 @@ impl Adapter for Codex {
     /// Codex's hooks (`~/.codex/hooks.json`) run a command line; `child` is the guard a probe showed it runs (design
     /// note 2026-10-31-lords-core-lines-composer, P2): the child took its context, once the hook was trusted. `role`
     /// too: its `UserPromptSubmit` event and context are Claude's (design note 2026-11-02-lords-role-at-launch, H3).
+    /// `time`: its `apply_patch` and MCP calls reach `PreToolUse` (design note 2026-11-02-lords-time-guard, §2).
     fn guards(&self) -> &'static [&'static str] {
-        &["child", "role"]
+        &["child", "role", "time"]
     }
 
     /// A command line, and the whole context passed on (`additionalContextLimit` 0): no parts. On Windows Codex runs it
     /// with PowerShell, where a line starting with a quoted path is no command (design note 2026-11-02-lords-role-at-
-    /// launch, H8, H9): there it is PowerShell's call, `& 'exe' …`, each path a literal string.
+    /// launch, H8, H9): there it is PowerShell's call, `& 'exe' …`, each path a literal string. Only `child` and `role`
+    /// take the tool home.
     fn guard_hooks(&self, exe: &str, guard: &str, home: &str) -> Vec<serde_json::Value> {
+        let homed = guard == "child" || guard == "role";
         let mut line = if cfg!(windows) {
             let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
-            format!("& {} guard {guard} --home {}", lit(exe), lit(home))
+            let home = if homed { format!(" --home {}", lit(home)) } else { String::new() };
+            format!("& {} guard {guard}{home}", lit(exe))
         } else {
-            format!("\"{exe}\" guard {guard} --home \"{home}\"")
+            let home = if homed { format!(" --home \"{home}\"") } else { String::new() };
+            format!("\"{exe}\" guard {guard}{home}")
         };
         // The role hook names its harness, whose place file the start goes beside (F10-R1-03).
         if guard == "role" {

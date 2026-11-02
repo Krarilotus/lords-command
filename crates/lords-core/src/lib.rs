@@ -26,6 +26,7 @@ pub mod schema;
 pub mod stack;
 pub mod sync;
 pub mod temporary;
+pub mod time_guard;
 pub mod view;
 
 pub use finding::{Finding, Severity};

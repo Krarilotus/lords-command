@@ -89,7 +89,8 @@ pub struct Target {
     #[serde(default)]
     pub exclude: Vec<String>,
     /// settings: guards registered as the harness's hooks (guard.rs): `rm` (PreToolUse, Bash), `queue` (Stop),
-    /// `session` (SessionStart), `turn` (UserPromptSubmit).
+    /// `session` (SessionStart), `turn` (UserPromptSubmit), `child`, `role`, `time` (PreToolUse, editor writes and T3
+    /// messages; time_guard.rs).
     #[serde(default)]
     pub guards: Vec<String>,
 }

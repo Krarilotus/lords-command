@@ -1779,6 +1779,71 @@ fn sync_registers_the_session_and_turn_guards() {
     );
 }
 
+// Spec (the brief: "Lords registers the hook through the settings targets, as with the other guards: a new guard name,
+// added to the guards list in the schema the way `child` and `role` were"; design note 2026-11-02-lords-time-guard §2,
+// §3: `PreToolUse` with the exact-list matcher of the editor tools and both T3 send names; Codex's line takes no
+// `--home`): with `guards = ["rm", "time"]` sync writes the `rm` entry and the `time` entry, the plan says so, `lords
+// check` accepts the target; through the binary the guard denies a placeholder in a T3 message, exit 0, and a usage
+// error is exit 0, nothing on stdout, a note naming the guard.
+#[test]
+fn sync_registers_the_time_guard_and_the_binary_answers() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (public, private) = (d.join("pub"), d.join("priv"));
+    fs::create_dir_all(&public).unwrap();
+    fs::create_dir_all(&private).unwrap();
+    fs::create_dir_all(d.join("home/.claude-balanced")).unwrap();
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    fs::write(
+        private.join("stack.toml"),
+        "name = \"priv\"\nvisibility = \"private\"\n[[targets]]\nname = \"balanced settings\"\nadapter = \"claude\"\nkind = \"settings\"\npath = \"~/.claude-balanced/settings.json\"\nguards = [\"rm\", \"time\"]\n",
+    )
+    .unwrap();
+    assert!(env.git(&private, &["init", "-q"]).status.success());
+    env.git(&private, &["add", "-A"]);
+    env.git(&private, &["commit", "-q", "-m", "start"]);
+    let stacks =
+        ["--public-stack", public.to_str().unwrap(), "--private-stack", private.to_str().unwrap()];
+    assert!(env.lords(d, &["guard", "install"]).status.success());
+    let matcher = "Write|Edit|mcp__t3-code__t3_thread_send|mcp__t3_code__t3_thread_send";
+    let o = env.lords(d, &[&["sync", "--user"][..], &stacks].concat());
+    let added = format!("Lords hook added: the time guard (PreToolUse, {matcher})");
+    assert!(text(&o).contains(&added), "{}", text(&o));
+    let o = env.lords(d, &[&["sync", "--user", "--apply"][..], &stacks].concat());
+    assert!(o.status.success(), "{}", text(&o));
+    let named =
+        d.join("home/.lords-command/bin/lords-guard.exe").display().to_string().replace('\\', "/");
+    let lords =
+        |g: &str| serde_json::json!({"type": "command", "command": named, "args": ["guard", g]});
+    let v: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(d.join("home/.claude-balanced/settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        v["hooks"]["PreToolUse"],
+        serde_json::json!([
+            {"matcher": "Bash", "hooks": [lords("rm")]},
+            {"matcher": matcher, "hooks": [lords("time")]},
+        ])
+    );
+    let out = text(&env.lords(d, &[&["check"][..], &stacks].concat()));
+    assert!(!out.contains("settings.json") && !out.contains("guards"), "{out}");
+    let codex = lords_core::adapters::get("codex").unwrap();
+    let line = codex.guard_hooks("C:/x/lords-guard.exe", "time", "C:/h")[0]["command"].clone();
+    assert!(line.as_str().is_some_and(|l| l.ends_with("guard time")), "{line}");
+    let ev = serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": "mcp__t3-code__t3_thread_send",
+        "tool_input": {"threadId": "t", "message": "done at 14:xx"}})
+    .to_string();
+    let o = rules_guard(&env, &["guard", "time"], &ev);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{v}");
+    let o = rules_guard(&env, &["guard", "time", "extra"], &ev);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    assert!(o.stdout.is_empty(), "{}", text(&o));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("guard time"), "{}", text(&o));
+}
+
 /// A repo `r` declared in a private stack with one rule, and its worktree `wts/one`, synced by the CLI: each holds
 /// `CLAUDE.local.md` and `.lords`. Gives the repo, the worktree and the stack arguments every call here takes.
 fn synced_worktree(env: &Env) -> (PathBuf, PathBuf, Vec<String>) {

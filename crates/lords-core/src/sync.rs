@@ -1441,8 +1441,8 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
 }
 
 /// The hook event each guard runs on, and its matcher: `rm` before a Bash call, `queue` when a turn would end, `session`
-/// when a session starts, `turn` when a prompt does (never a native subagent's `SubagentStop`), and `child` when a
-/// native subagent starts.
+/// when a session starts, `turn` when a prompt does (never a native subagent's `SubagentStop`), `child` when a
+/// native subagent starts, and `time` before an editor write or a T3 message.
 fn guard_event(name: &str) -> Option<(&'static str, Option<&'static str>)> {
     match name {
         "rm" => Some(("PreToolUse", Some("Bash"))),
@@ -1453,6 +1453,8 @@ fn guard_event(name: &str) -> Option<(&'static str, Option<&'static str>)> {
         "child" => Some(("SubagentStart", None)),
         // A session whose launch names its role (F10).
         "role" => Some(("UserPromptSubmit", None)),
+        // An editor write or a T3 message (design note 2026-11-02-lords-time-guard, §2).
+        "time" => Some(("PreToolUse", Some(crate::time_guard::MATCHER))),
         _ => None,
     }
 }
@@ -1541,7 +1543,7 @@ fn guard_hooks(
     let mut wanted = Vec::new();
     for g in guards {
         let (event, matcher) = guard_event(g).ok_or_else(|| {
-            format!("no guard `{g}`; there are: rm, queue, session, turn, child, role")
+            format!("no guard `{g}`; there are: rm, queue, session, turn, child, role, time")
         })?;
         if !adapter.guards().contains(&g.as_str()) {
             return Err(format!(
