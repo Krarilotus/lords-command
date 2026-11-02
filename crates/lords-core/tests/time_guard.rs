@@ -152,6 +152,8 @@ fn real_times_durations_ratios_and_code_pass() {
     passes("fe80::1 and xx:xx:xx:xx");
     passes("timing mm:ss and MM:SS");
     passes("hex ab:cd and regex (?:x)");
+    // Line citations by a one-letter source (measured: `H:25–35` in a note, design note §5).
+    passes("sources H:25–35, h:63 and C:40");
     passes("no times at all");
 }
 
@@ -250,6 +252,9 @@ fn plans_other_days_and_other_zones_are_not_flagged() {
     assert_eq!(future("yesterday 23:10", "08:00"), Vec::<String>::new());
     assert_eq!(future("16:00 UTC", "08:00"), Vec::<String>::new());
     assert_eq!(future("00:05", "23:58"), Vec::<String>::new());
+    // More than 12 hours ahead is the evening before, written after midnight (design note §5).
+    assert_eq!(future("ran 23:50–23:56", "02:19"), Vec::<String>::new());
+    assert_eq!(future("at 14:20", "02:19"), ["14:20"]);
     assert_eq!(future("`14:00` in code", "08:00"), Vec::<String>::new());
     // Today's date named on the line keeps the check.
     assert_eq!(future("2 Nov, 14:00", "08:00"), ["14:00"]);
@@ -258,6 +263,34 @@ fn plans_other_days_and_other_zones_are_not_flagged() {
     assert_eq!(future("nearby 14:00", "08:00"), ["14:00"]);
     let none = findings("at 14:00", "", None);
     assert!(none.iter().all(|f| f.kind != Kind::Future), "{none:?}");
+}
+
+// Spec (the steer: "If false denies are more than about 1 in 200 lines with times, make this part add context (a
+// one-line reminder) instead of denying. The placeholder part stays a deny"; measured about 26 in 200, design note §5;
+// the reason: "write the real time from the clock, or mark it as a plan"): F answers with one line of context and no
+// decision, naming the time, the clock and the fix; with a placeholder too, the answer is P's denial.
+#[test]
+fn a_future_time_is_a_reminder_not_a_denial() {
+    let send = |text: &str, hm: &str| {
+        let ev = json!({"hook_event_name": "PreToolUse", "tool_name": "mcp__t3-code__t3_thread_send",
+            "tool_input": {"threadId": "t", "message": text}});
+        let out = time_hook(&ev.to_string(), at(hm), Some(&berlin()));
+        serde_json::from_str::<Value>(&out).unwrap()["hookSpecificOutput"].clone()
+    };
+    let h = send("Merged, about 06:27.", "06:21");
+    assert_eq!(h["hookEventName"], "PreToolUse", "{h}");
+    assert!(h.get("permissionDecision").is_none(), "{h}");
+    let line = h["additionalContext"].as_str().unwrap();
+    assert!(!line.contains('\n'), "{line}");
+    for part in [
+        "`06:27`",
+        "Berlin 06:21 Mon 2 Nov",
+        "write the real time from the clock, or mark it as a plan",
+    ] {
+        assert!(line.contains(part), "{part}: {line}");
+    }
+    let h = send("Merged, about 06:27, then 06:3x.", "06:21");
+    assert_eq!(h["permissionDecision"], "deny", "{h}");
 }
 
 // Spec (design note §1, F: "Text a write keeps unchanged is never judged"): a future time already in the old text
