@@ -39,6 +39,8 @@ struct Word {
     text: String,
     /// Each `$` expansion in the word: whether it was inside double quotes, and whether it is `${NAME:?…}`.
     vars: Vec<(bool, bool)>,
+    /// Where in `text` the word's first redirection operator is: its first `<` or `>` neither quoted nor escaped.
+    redirect: Option<usize>,
 }
 
 /// The simple command being read: its words so far and the word in progress. After `<<<` (`data`), the next word to
@@ -267,6 +269,9 @@ fn list(
             }
             _ => {
                 after_op = !double && matches!(ch, '>' | '<');
+                if after_op && s.word.redirect.is_none() {
+                    s.word.redirect = Some(s.word.text.len());
+                }
                 s.word.text.push(ch);
                 s.started = true;
             }
@@ -643,9 +648,8 @@ pub enum Shell {
 
 /// PowerShell text as the lexer above reads it (design note §3): `` ` `` escapes the next character, as `\` does in
 /// Bash, and a `\` is a literal; a here-string (`@'` or `@"` ending its line, to a line opening with `'@` or `"@`) and
-/// a `<# … #>` comment are data, an empty word. Single-quoted text stays as it is. Sol-loop r1: a CR ends a line (S2);
-/// a `#` line comment is data (S3); an assignment's right-hand side (S4) and a script block's braces (S5) start a
-/// command; `$((…))` is a subexpression holding a group, not arithmetic (S6).
+/// a `<# … #>` comment are data, an empty word. Single-quoted text stays as it is. Sol-loop r1, S2-S6: a CR ends a
+/// line, a `#` comment is data, assignments and braces start commands, `$((…))` is a subexpression.
 fn powershell_as_bash(text: &str) -> String {
     let c: Vec<char> = text.replace("\r\n", "\n").replace('\r', "\n").chars().collect();
     let (mut out, mut i, mut single, mut double) = (String::new(), 0, false, false);
@@ -660,9 +664,7 @@ fn powershell_as_bash(text: &str) -> String {
             && out.chars().last().is_none_or(|p| p.is_whitespace() || ";|&(){}".contains(p));
         match ch {
             '#' if token_start => {
-                while c.get(i).is_some_and(|x| *x != '\n') {
-                    i += 1;
-                }
+                i = c[i..].iter().position(|x| *x == '\n').map_or(c.len(), |p| i + p)
             }
             // `${name}`: a variable, braces and all.
             '$' if !double && c.get(i) == Some(&'{') => {
@@ -717,12 +719,21 @@ fn here_string_opens(c: &[char], i: usize) -> bool {
         && line.iter().take_while(|x| **x != '\n').all(|x| matches!(x, ' ' | '\t' | '\r'))
 }
 
-/// Whether `out` ends with a variable that an `=` after it assigns to (`$page`, `[string]$page`, `$env:X`, the `+` of
-/// `+=`): PowerShell runs the command on its right-hand side.
+/// Whether `out` ends with a variable that an `=` after it assigns to (`$page`, `${page}`, `[string]$page`, `$env:X`,
+/// the `+` of `+=`) where a statement starts (sol-loop r2, S4, S8): PowerShell runs the command on its right-hand side.
 fn assigns(out: &str) -> bool {
     let t = out.trim_end_matches([' ', '\t', '+', '-', '*', '/', '%', '?']);
-    let name = t.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':');
-    name.len() < t.len() && name.ends_with('$')
+    let var = if t.ends_with('}') {
+        t.rfind("${")
+    } else {
+        let name = t.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':');
+        (name.len() < t.len() && name.ends_with('$')).then(|| name.len() - 1)
+    };
+    let Some(mut before) = var.map(|k| t[..k].trim_end_matches([' ', '\t'])) else { return false };
+    while let Some(cast) = before.strip_suffix(']').and_then(|b| b.rfind('[').map(|k| &b[..k])) {
+        before = cast.trim_end_matches([' ', '\t']);
+    }
+    before.is_empty() || before.ends_with([';', '\n', '(', '&', '|'])
 }
 
 /// The page one simple command would have git open, if any (design note §1, from git's source at v2.56.0): D1 `git
@@ -731,22 +742,20 @@ fn assigns(out: &str) -> bool {
 fn help_topic(words: &[Word]) -> Option<String> {
     let at = command_at(words).filter(|&k| base_name(&words[k].text) == "git")?;
     let mut args = Vec::new();
-    let mut rest = words[at + 1..].iter().map(|w| w.text.as_str());
-    // A redirection (`2>/dev/null`, `2>&1`, `2>$null`, `*>&1`, `>` `out`), a word of its own or touching the argument
-    // before it (`--help>/dev/null`; sol-loop r1, S1): the argument stays git's, and an operator without its target
-    // takes the next word.
+    let mut rest = words[at + 1..].iter();
+    // A redirection (`2>/dev/null`, `*>&1`, `>` `out`), alone or touching an argument, which stays git's (sol-loop r1,
+    // S1; r2, S7): an operator at its word's end takes the next word as its target (r2, S1).
     while let Some(w) = rest.next() {
-        let (arg, op) = match w.find(['<', '>']) {
-            Some(k) if w[..k].bytes().all(|b| b.is_ascii_digit() || b"&*".contains(&b)) => {
-                ("", &w[k..])
-            }
-            Some(k) => (w[..k].strip_suffix('&').unwrap_or(&w[..k]), &w[k..]),
-            None => (w, ""),
+        let t = w.text.as_str();
+        let (arg, op) = match w.redirect {
+            Some(k) if t[..k].bytes().all(|b| b"0123456789&*".contains(&b)) => ("", &t[k..]),
+            Some(k) => (t[..k].strip_suffix('&').unwrap_or(&t[..k]), &t[k..]),
+            None => (t, ""),
         };
         if !arg.is_empty() {
             args.push(arg);
         }
-        if !op.is_empty() && op.trim_start_matches(['<', '>', '&', '|']).is_empty() {
+        if op.ends_with(['<', '>', '&', '|']) {
             rest.next();
         }
     }
