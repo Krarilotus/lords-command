@@ -39,7 +39,8 @@ usage:
   lords sizes [--json]   every file sync writes, by section; fails past the warning line
   lords paths [--json] [--codex PATH] [--deadline-ms N]   which T3-delegated sessions start with their role's lines;
     exit 1 when one doesn't (Codex: asks its app-server whether it trusts Lords' hook)
-  lords guard rm   Claude's PreToolUse hook: refuses an `rm` whose path holds a variable not written as quoted ${VAR:?}
+  lords guard rm   Claude's PreToolUse hook: refuses an `rm` whose path holds a variable not written as quoted ${VAR:?},
+    and a git call that would skip or repoint its hooks
   lords guard queue [--deadline-ms N]   Claude's Stop hook: holds a turn's end while items may wait in its T3 queue
   lords guard session   Claude's SessionStart hook: records the Lords files the session reads
   lords guard turn   Claude's UserPromptSubmit hook: the clock, and the Lords files changed since the session started
@@ -136,11 +137,12 @@ fn public_rules(public: &Path, private: Option<&Stack>) -> Result<Rules, String>
 /// `lords guard rm`: the tool-call guard Claude Code runs before a Bash call (guard.rs). Reads the event on stdin and
 /// prints a denial, or nothing. It never fails the call: a usage error or input it can't read is a note on stderr and
 /// exit 0 (orchestrator, 30 Oct: Claude Code takes exit 2 from a PreToolUse hook as a refusal). `lords guard
-/// --self-test` prints `ok` when the guard refuses its witness; sync runs it before installing the copy hooks name.
+/// --self-test` prints `ok` when the guard refuses its witnesses, one per refusal; sync runs it before installing the
+/// copy hooks name.
 fn cmd_guard(mut a: Args) -> ExitCode {
     let note = |line: &str| say_err(&format!("lords guard: {line}; this call is let through"));
     if a.flag("--help") || a.flag("-h") {
-        say("usage: lords guard rm   (Claude Code's PreToolUse hook; the event on stdin)");
+        say("usage: lords guard rm   (Claude Code's PreToolUse hook on Bash: rm and git's hooks; the event on stdin)");
         say("       lords guard queue [--deadline-ms N]   (Claude Code's Stop hook; the event on stdin)");
         say("       lords guard session | turn   (Claude Code's SessionStart and UserPromptSubmit hooks)");
         say("       lords guard child   (the SubagentStart hook: a native child's start file)");
@@ -148,8 +150,11 @@ fn cmd_guard(mut a: Args) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if a.flag("--self-test") {
-        let witness = r#"{"tool_name":"Bash","tool_input":{"command":"rm -f $OUT/x"}}"#;
-        let ok = lords_core::guard::rm_hook(witness).contains("\"deny\"");
+        let witnesses = ["rm -f $OUT/x", "git commit --no-verify -m x"];
+        let ok = witnesses.iter().all(|c| {
+            let event = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": c}});
+            lords_core::guard::rm_hook(&event.to_string()).contains("\"deny\"")
+        });
         say(if ok { "ok" } else { "the guard let its witness through" });
         return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
     }

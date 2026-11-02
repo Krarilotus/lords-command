@@ -5,16 +5,21 @@
 //! minutes on Claude Code's "dangerous rm on a possibly-empty variable path" prompt for `rm -f $OUT/$id.json`; its
 //! parent saw only "running".
 //!
-//! `rm`: a path that holds a shell variable deletes the wrong place when the variable is empty (`rm -rf "$OUT/"` is
-//! `rm -rf /`). The only form let through is `"${VAR:?}"`, quoted, which stops the command when `VAR` is empty or
-//! unset. Quoting alone (`"$OUT/x"`) doesn't: an empty `OUT` still makes it `/x`, so it is refused too.
+//! `rm` (the Bash guard, registered as `guard rm`) refuses two kinds of Bash call (design note
+//! Harness/notes/2026-11-02-lords-bash-guard.md; a command that only mentions them is let through):
 //!
-//! Scope: the plain form only (orchestrator, 30 Oct, after the rm-guard review r1: a guard on the deletion path must
-//! stay simple enough to finish reviewing). A simple command whose word after leading `NAME=value` assignments is
-//! `rm` or `rm.exe`, or a path to one; every operand after it is checked. Not covered, by design: `rm` behind
-//! keywords, wrappers or their options (`then rm`, `sudo -u x rm`, `time -p rm`), leading redirections, `rm` inside a
-//! string another command runs (`trap`, `eval`, `sh -c`), other spellings of its name (`$'\x72m'`), `find -delete`,
-//! `xargs rm` and `rm $(…)`. A miss is no regression: the call goes on to Claude Code's own check, as before the guard.
+//! - An `rm` whose path holds a shell variable: it deletes the wrong place when the variable is empty (`rm -rf
+//!   "$OUT/"` is `rm -rf /`). The only form let through is `"${VAR:?}"`, quoted, which stops the command when `VAR`
+//!   is empty or unset. Quoting alone (`"$OUT/x"`) doesn't: an empty `OUT` still makes it `/x`, so it is refused too.
+//! - A git call that would run without its hooks (rule.hooks-run-on-every-commit): an option that skips them, a
+//!   `core.hooksPath` set on the command line or written by `git config`, or an environment override of them.
+//!
+//! Both find a command's word the same way: past assignments, the keywords that open a command (`then`, `do`, `!`,
+//! `{` …), and the prefix commands that run the command after them (`env`, `sudo`, `timeout` …), with their options;
+//! inside `$(…)` and backticks too, and in a heredoc fed to a shell (defect D7: an `rm` after `then` used to go on to
+//! Claude Code's own prompt, which a delegated child can't answer). Not covered: strings another program runs (`sh
+//! -c`, `eval`, `trap`, `env -S`, `git rebase --exec`), git aliases, options in a variable, leading redirections, other
+//! spellings of a name (`$'\x72m'`), `find -delete`. A miss is no regression: the call goes on to the harness's checks.
 
 use crate::fsguard::{Contained, Part, Root};
 use serde_json::{json, Value};
@@ -33,93 +38,179 @@ struct Word {
     vars: Vec<(bool, bool)>,
 }
 
-/// The simple commands of `command`, each as its words (split at `;`, `&`, `|`, `(`, `)` and newlines outside quotes).
+/// The simple command being read: its words so far and the word in progress. After `<<<` (`data`), the next word to
+/// start is the here-string's data, no argument; its variables are kept apart (`dropped`), for an enclosing
+/// substitution still counts them.
+#[derive(Default)]
+struct Simple {
+    words: Vec<Word>,
+    word: Word,
+    started: bool,
+    data: bool,
+    dropped: Vec<(bool, bool)>,
+}
+
+impl Simple {
+    fn end_word(&mut self) {
+        if self.started {
+            let word = std::mem::take(&mut self.word);
+            if std::mem::take(&mut self.data) {
+                self.dropped.extend(word.vars);
+            } else {
+                self.words.push(word);
+            }
+            self.started = false;
+        }
+    }
+
+    fn end(&mut self, out: &mut Vec<Vec<Word>>) {
+        self.end_word();
+        self.data = false;
+        if !self.words.is_empty() {
+            out.push(std::mem::take(&mut self.words));
+        }
+    }
+}
+
+/// A heredoc waiting for its body: the delimiter as written without its quotes, whether `<<-` strips leading tabs,
+/// whether the command it feeds runs the body (`runs_body`), and whether any of the delimiter was quoted (the body is
+/// then literal, else the outer shell expands it).
+struct Heredoc {
+    delim: String,
+    tabs: bool,
+    runs: bool,
+    quoted: bool,
+}
+
+/// The simple commands of `command`, each as its words, as Bash would run them (design note §2): split at `;`, `&`,
+/// `|`, `(`, `)` and newlines outside quotes; the commands inside `$(…)` and backticks are commands of their own; a
+/// heredoc's body is skipped as data, unless the command it feeds runs it.
 fn commands(command: &str) -> Vec<Vec<Word>> {
     let c: Vec<char> = command.chars().collect();
-    let (mut out, mut words, mut word) = (Vec::new(), Vec::new(), Word::default());
-    let mut started = false;
+    let mut out = Vec::new();
+    list(&c, &mut 0, None, &mut out);
+    out
+}
+
+/// Reads commands from `c[*i]` into `out`, to the end or, inside a substitution, to its `close` (`)` or a backtick)
+/// outside any quotes and subshells it opened; `*i` is then past it. Returns the variables of the here-string words
+/// it read, which are no command's words.
+fn list(
+    c: &[char],
+    i: &mut usize,
+    close: Option<char>,
+    out: &mut Vec<Vec<Word>>,
+) -> Vec<(bool, bool)> {
+    let mut s = Simple::default();
     let (mut single, mut double) = (false, false);
     // Whether the character before this one was an active redirection operator (`>` or `<`, unquoted and unescaped):
     // a literal one (`\>`, `">"`) is word text and starts no redirection (rm-guard fix check r3, R9).
     let mut after_op = false;
-    let mut i = 0;
-    let end_word = |words: &mut Vec<Word>, word: &mut Word, started: &mut bool| {
-        if *started {
-            words.push(std::mem::take(word));
-            *started = false;
-        }
-    };
-    while i < c.len() {
-        let ch = c[i];
+    // The subshells open in this substitution: a `)` closes one of them before it closes the substitution.
+    let mut depth = 0usize;
+    let mut heredocs: Vec<Heredoc> = Vec::new();
+    while *i < c.len() {
+        let ch = c[*i];
         let op_before = std::mem::take(&mut after_op);
         if single {
             if ch == '\'' {
                 single = false;
             } else {
-                word.text.push(ch);
+                s.word.text.push(ch);
             }
-            i += 1;
+            *i += 1;
             continue;
         }
+        if Some(ch) == close && !double && (ch == '`' || depth == 0) {
+            *i += 1;
+            break;
+        }
         match ch {
-            '\\' if i + 1 < c.len() => {
-                if c[i + 1] != '\n' {
-                    word.text.push(c[i + 1]);
-                    started = true;
+            '\\' if *i + 1 < c.len() => {
+                if c[*i + 1] != '\n' {
+                    s.word.text.push(c[*i + 1]);
+                    s.started = true;
                 }
-                i += 2;
+                *i += 2;
                 continue;
             }
             '\'' if !double => {
                 single = true;
-                started = true;
+                s.started = true;
             }
             // `$'…'`: ANSI-C quoting, a literal with backslash escapes (sol-loop r1, S6).
-            '$' if !double && i + 1 < c.len() && c[i + 1] == '\'' => {
-                started = true;
-                let mut j = i + 2;
+            '$' if !double && c.get(*i + 1) == Some(&'\'') => {
+                s.started = true;
+                let mut j = *i + 2;
                 while j < c.len() && c[j] != '\'' {
                     if c[j] == '\\' && j + 1 < c.len() {
-                        word.text.push(c[j + 1]);
+                        s.word.text.push(c[j + 1]);
                         j += 2;
                     } else {
-                        word.text.push(c[j]);
+                        s.word.text.push(c[j]);
                         j += 1;
                     }
                 }
-                i = j + 1;
+                *i = j + 1;
                 continue;
             }
             // A comment: from an unquoted `#` at a word's start to the line's end (sol-loop r1, S5).
-            '#' if !double && !started => {
-                while i < c.len() && c[i] != '\n' {
-                    i += 1;
+            '#' if !double && !s.started => {
+                while *i < c.len() && c[*i] != '\n' {
+                    *i += 1;
                 }
                 continue;
             }
             '"' => {
                 double = !double;
-                started = true;
+                s.started = true;
             }
-            '$' if i + 1 < c.len()
-                && (c[i + 1] == '{'
-                    || c[i + 1] == '_'
-                    || c[i + 1].is_ascii_alphanumeric()
-                    || "@*#?$!-".contains(c[i + 1])) =>
+            // `$((…))`: arithmetic, which runs no command.
+            '$' if c.get(*i + 1) == Some(&'(') && c.get(*i + 2) == Some(&'(') => {
+                let (start, mut open) = (*i, 0usize);
+                *i += 1;
+                while *i < c.len() {
+                    open = match c[*i] {
+                        '(' => open + 1,
+                        ')' => open.saturating_sub(1),
+                        _ => open,
+                    };
+                    *i += 1;
+                    if open == 0 {
+                        break;
+                    }
+                }
+                s.word.text.extend(&c[start..*i]);
+                s.started = true;
+                continue;
+            }
+            // `$(…)` and backticks, quoted or not: their commands run too.
+            '$' | '`' if ch == '`' || c.get(*i + 1) == Some(&'(') => {
+                let start = *i;
+                *i += if ch == '`' { 1 } else { 2 };
+                substitution(c, i, start, if ch == '`' { '`' } else { ')' }, &mut s.word, out);
+                s.started = true;
+                continue;
+            }
+            '$' if *i + 1 < c.len()
+                && (c[*i + 1] == '{'
+                    || c[*i + 1] == '_'
+                    || c[*i + 1].is_ascii_alphanumeric()
+                    || "@*#?$!-".contains(c[*i + 1])) =>
             {
-                started = true;
-                if c[i + 1] == '{' {
-                    let close = c[i..].iter().position(|x| *x == '}').map_or(c.len(), |p| i + p);
-                    let inner: String = c[i + 2..close.min(c.len())].iter().collect();
+                s.started = true;
+                if c[*i + 1] == '{' {
+                    let end = c[*i..].iter().position(|x| *x == '}').map_or(c.len(), |p| *i + p);
+                    let inner: String = c[*i + 2..end.min(c.len())].iter().collect();
                     let name_end = inner
                         .find(|x: char| !(x == '_' || x.is_ascii_alphanumeric()))
                         .unwrap_or(inner.len());
                     let guarded = name_end > 0 && inner[name_end..].starts_with(":?");
-                    word.vars.push((double, guarded));
-                    word.text.extend(&c[i..(close + 1).min(c.len())]);
-                    i = close + 1;
+                    s.word.vars.push((double, guarded));
+                    s.word.text.extend(&c[*i..(end + 1).min(c.len())]);
+                    *i = end + 1;
                 } else {
-                    let mut j = i + 1;
+                    let mut j = *i + 1;
                     if c[j].is_ascii_alphabetic() || c[j] == '_' {
                         while j < c.len() && (c[j] == '_' || c[j].is_ascii_alphanumeric()) {
                             j += 1;
@@ -127,73 +218,418 @@ fn commands(command: &str) -> Vec<Vec<Word>> {
                     } else {
                         j += 1;
                     }
-                    word.vars.push((double, false));
-                    word.text.extend(&c[i..j]);
-                    i = j;
+                    s.word.vars.push((double, false));
+                    s.word.text.extend(&c[*i..j]);
+                    *i = j;
                 }
                 continue;
             }
-            ' ' | '\t' if !double => end_word(&mut words, &mut word, &mut started),
+            // `<<<`: a here-string. Its one word is stdin data, never an argument (a substitution in it is still
+            // read); no body follows, and the command goes on (review r1, BG-R1-01; sol-loop r3, R2).
+            '<' if !double && c[*i..].starts_with(&['<', '<', '<']) => {
+                s.end_word();
+                s.data = true;
+                *i += 3;
+                continue;
+            }
+            // A heredoc (`<<`, `<<-`): its body starts after this line.
+            '<' if !double && c.get(*i + 1) == Some(&'<') => {
+                s.end_word();
+                *i += 2;
+                heredocs.push(heredoc(c, i, runs_body(&s.words)));
+                continue;
+            }
+            ' ' | '\t' if !double => s.end_word(),
             // `&` and `|` that are part of a trailing redirection (`2>&1`, `&>`, `>|`) don't end the command: what
             // follows is still this command's (rm-guard fix check r2, R9).
-            '&' | '|' if !double && (op_before || ch == '&' && c.get(i + 1) == Some(&'>')) => {
-                word.text.push(ch);
-                started = true;
+            '&' | '|' if !double && (op_before || ch == '&' && c.get(*i + 1) == Some(&'>')) => {
+                s.word.text.push(ch);
+                s.started = true;
             }
             ';' | '&' | '|' | '(' | ')' | '\n' if !double => {
-                end_word(&mut words, &mut word, &mut started);
-                if !words.is_empty() {
-                    out.push(std::mem::take(&mut words));
+                match ch {
+                    '(' => depth += 1,
+                    ')' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                s.end(out);
+                if ch == '\n' && !heredocs.is_empty() {
+                    *i += 1;
+                    for h in std::mem::take(&mut heredocs) {
+                        let dropped = heredoc_body(c, i, &h, out);
+                        s.dropped.extend(dropped);
+                    }
+                    continue;
                 }
             }
             _ => {
                 after_op = !double && matches!(ch, '>' | '<');
-                word.text.push(ch);
-                started = true;
+                s.word.text.push(ch);
+                s.started = true;
             }
         }
-        i += 1;
+        *i += 1;
     }
-    end_word(&mut words, &mut word, &mut started);
-    if !words.is_empty() {
-        out.push(words);
+    s.end(out);
+    // An unterminated `${`, `$'` or delimiter steps past the end; the caller's slice must not (sol-loop r1, S1).
+    *i = (*i).min(c.len());
+    s.dropped
+}
+
+/// A substitution opened at `c[start]`, read from `c[*i]` to past its `close`: its commands go to `out`; the word it
+/// stands in gets its text and every variable in it (so `rm "$(dirname "$F")/x"` counts `$F`, as before).
+fn substitution(
+    c: &[char],
+    i: &mut usize,
+    start: usize,
+    close: char,
+    word: &mut Word,
+    out: &mut Vec<Vec<Word>>,
+) {
+    let first = out.len();
+    let dropped = list(c, i, Some(close), out);
+    word.text.extend(&c[start..*i]);
+    word.vars.extend(out[first..].iter().flatten().flat_map(|w| w.vars.iter().copied()));
+    word.vars.extend(dropped);
+}
+
+/// A heredoc's delimiter, read from `c[*i]` just past `<<`: quotes and backslashes removed, as Bash compares it.
+fn heredoc(c: &[char], i: &mut usize, runs: bool) -> Heredoc {
+    let tabs = c.get(*i) == Some(&'-');
+    *i += usize::from(tabs);
+    while matches!(c.get(*i), Some(' ' | '\t')) {
+        *i += 1;
+    }
+    let (mut delim, mut quote, mut quoted) = (String::new(), None, false);
+    while let Some(&ch) = c.get(*i) {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => delim.push(ch),
+            None if ch == '\'' || ch == '"' => (quote, quoted) = (Some(ch), true),
+            // `$'EOF'` and `$"EOF"`: the `$` is quoting, not part of the delimiter (sol-loop r1, S5).
+            None if ch == '$' && matches!(c.get(*i + 1), Some('\'' | '"')) => {}
+            None if ch == '\\' => {
+                *i += 1;
+                delim.extend(c.get(*i));
+                quoted = true;
+            }
+            None if " \t\n;&|()<>".contains(ch) => break,
+            None => delim.push(ch),
+        }
+        *i += 1;
+    }
+    Heredoc { delim, tabs, runs, quoted }
+}
+
+/// An unquoted heredoc's body as the shell it feeds receives it, the outer shell's escapes resolved (Bash manual
+/// §3.6.6; review r1, BG-R1-02), a whole run of backslashes at a time (sol-loop r3, R1): each `\\` is one backslash,
+/// and an odd last one quotes a `$`, `` ` `` or newline after it (the bare character; the newline goes) and is kept
+/// before anything else. Expansions are left as written, to be checked as the commands they are part of. One the
+/// outer shell runs, after an even run, gets an even run, so the lexer reads it as an expansion too.
+fn as_received(body: &[char]) -> Vec<char> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut k = 0;
+    while k < body.len() {
+        let n = body[k..].iter().take_while(|c| **c == '\\').count();
+        if n == 0 {
+            out.push(body[k]);
+            k += 1;
+            continue;
+        }
+        let next = body.get(k + n).copied();
+        let kept = match next {
+            Some('$' | '`' | '\n') if n % 2 == 1 => n / 2,
+            Some('$' | '`') => (n / 2).next_multiple_of(2),
+            _ => n / 2 + n % 2,
+        };
+        out.extend(std::iter::repeat_n('\\', kept));
+        k += n + usize::from(next == Some('\n') && n % 2 == 1);
     }
     out
 }
 
-/// The first operand of a plain `rm` command holding a variable not written `"${VAR:?}"`, if any (the module's
-/// scope). Every operand is checked, redirection targets and options included: a false refusal costs a retry.
-pub fn unguarded_rm(command: &str) -> Option<String> {
-    let assignment = |t: &str| {
-        t.contains('=')
-            && !t.starts_with('=')
-            && t.split('=')
-                .next()
-                .is_some_and(|n| n.chars().all(|x| x == '_' || x.is_ascii_alphanumeric()))
-    };
-    for words in commands(command) {
-        let mut rest = words.iter().skip_while(|w| assignment(&w.text));
-        let Some(first) = rest.next() else { continue };
-        if !is_rm(&first.text) {
+/// A heredoc's body, from `c[*i]` at a line's start to past the line that is its delimiter (or the end). Data, skipped,
+/// unless the command it feeds runs it: then its commands go to `out`, read as that command receives them, and the
+/// variables of its here-string words are returned, as `list` returns them (sol-loop r5, P1).
+fn heredoc_body(
+    c: &[char],
+    i: &mut usize,
+    h: &Heredoc,
+    out: &mut Vec<Vec<Word>>,
+) -> Vec<(bool, bool)> {
+    let mut body = Vec::new();
+    while *i < c.len() {
+        let end = c[*i..].iter().position(|x| *x == '\n').map_or(c.len(), |p| *i + p);
+        let mut line = &c[*i..end];
+        while h.tabs && line.first() == Some(&'\t') {
+            line = &line[1..];
+        }
+        *i = (end + 1).min(c.len());
+        if line.iter().collect::<String>().trim_end_matches('\r') == h.delim {
+            break;
+        }
+        body.extend(line);
+        body.push('\n');
+    }
+    if !h.runs {
+        return Vec::new();
+    }
+    let body = if h.quoted { body } else { as_received(&body) };
+    list(&body, &mut 0, None, out)
+}
+
+/// The commands that run a heredoc's body: shells, and `ssh`, which gives it to the remote shell.
+const BODY_RUNNERS: [&str; 6] = ["sh", "bash", "dash", "zsh", "ksh", "ssh"];
+
+fn runs_body(words: &[Word]) -> bool {
+    command_at(words).is_some_and(|k| BODY_RUNNERS.contains(&base_name(&words[k].text).as_str()))
+}
+
+/// A command's name as the guard compares it: its last path part, lower-case, without `.exe` (rm-guard review r1,
+/// R5: `rm.exe` is the same GNU rm on Git Bash).
+fn base_name(word: &str) -> String {
+    let name = word.rsplit(['/', '\\']).next().unwrap_or(word).to_ascii_lowercase();
+    name.strip_suffix(".exe").map(str::to_string).unwrap_or(name)
+}
+
+/// Whether `t` is a `NAME=value` assignment.
+fn is_assignment(t: &str) -> bool {
+    t.split_once('=').is_some_and(|(n, _)| {
+        !n.is_empty() && n.chars().all(|x| x == '_' || x.is_ascii_alphanumeric())
+    })
+}
+
+/// The reserved words after which a command starts (Bash's grammar): its word comes next.
+const KEYWORDS: [&str; 9] = ["if", "then", "else", "elif", "do", "while", "until", "!", "{"];
+
+/// A program's options as the guard reads them: the short ones that take a value (the rest of their cluster, or the
+/// next word), those whose value can only be attached (the rest of the cluster, `-S<key>`), the long ones that take a
+/// value (`--name value`; `--name=value` is one word), and the short ones the guard looks for (`hit`).
+struct Opts {
+    short: &'static str,
+    attached: &'static str,
+    long: &'static [&'static str],
+    hit: &'static str,
+}
+
+impl Opts {
+    /// How option word `w` reads: whether its value is the next word, and whether it holds a `hit` letter.
+    fn read(&self, w: &str) -> (bool, bool) {
+        if let Some(l) = w.strip_prefix("--") {
+            return (!l.contains('=') && self.long.contains(&l), false);
+        }
+        let cluster = w.strip_prefix('-').unwrap_or(w);
+        for (k, ch) in cluster.char_indices() {
+            if self.hit.contains(ch) {
+                return (false, true);
+            }
+            if self.short.contains(ch) {
+                return (k + 1 == cluster.len(), false);
+            }
+            if self.attached.contains(ch) || !ch.is_ascii_alphanumeric() {
+                break;
+            }
+        }
+        (false, false)
+    }
+}
+
+/// A prefix command, which runs the command after its options (design note I2): its options (a `hit` letter means it
+/// runs none: `command -v`, `sudo -l`), and whether an operand comes before the command (`timeout`'s duration).
+struct Prefix {
+    name: &'static str,
+    opts: Opts,
+    operand: bool,
+}
+
+const fn prefix(
+    name: &'static str,
+    short: &'static str,
+    long: &'static [&'static str],
+    hit: &'static str,
+    operand: bool,
+) -> Prefix {
+    Prefix { name, opts: Opts { short, attached: "", long, hit }, operand }
+}
+
+/// The prefix commands and their options that take a value (GNU coreutils, findutils, sudo, Bash's `time`).
+const PREFIXES: [Prefix; 8] = [
+    prefix("command", "", &[], "vV", false),
+    prefix("exec", "a", &[], "", false),
+    prefix("time", "fo", &["format", "output"], "", false),
+    prefix("nohup", "", &[], "", false),
+    prefix("env", "uCS", &["unset", "chdir", "split-string"], "", false),
+    prefix("xargs", "adEILnPs", &[], "", false),
+    prefix(
+        "sudo",
+        "ugCDprtTU",
+        &["user", "group", "chdir", "host", "prompt", "role", "type", "other-user", "close-from"],
+        "elvVK",
+        false,
+    ),
+    prefix("timeout", "ks", &["kill-after", "signal"], "", true),
+];
+
+/// Where a simple command's own word is: past `NAME=value` assignments, the keywords that open a command, and the
+/// prefix commands with their options and operands. `None` where it runs no command (only assignments, `command -v`).
+fn command_at(words: &[Word]) -> Option<usize> {
+    let mut i = 0;
+    loop {
+        let w = words.get(i)?.text.as_str();
+        if is_assignment(w) || KEYWORDS.contains(&w) {
+            i += 1;
             continue;
         }
-        if let Some(w) =
-            rest.find(|w| w.vars.iter().any(|(quoted, guarded)| !(*quoted && *guarded)))
-        {
-            return Some(w.text.clone());
+        let name = base_name(w);
+        let Some(p) = PREFIXES.iter().find(|p| p.name == name) else { return Some(i) };
+        i += 1;
+        while let Some(o) = words.get(i).map(|w| w.text.as_str()).filter(|o| o.starts_with('-')) {
+            i += 1;
+            if o == "--" {
+                break;
+            }
+            let (value, hit) = p.opts.read(o);
+            if hit {
+                return None;
+            }
+            i += usize::from(value);
         }
+        i += usize::from(p.operand);
+    }
+}
+
+/// The first operand of an `rm` command holding a variable not written `"${VAR:?}"`, if any (the module's scope).
+/// Every operand is checked, redirection targets and options included: a false refusal costs a retry.
+pub fn unguarded_rm(command: &str) -> Option<String> {
+    commands(command).into_iter().find_map(|words| {
+        let at = command_at(&words).filter(|&k| base_name(&words[k].text) == "rm")?;
+        let unguarded = |w: &&Word| w.vars.iter().any(|(quoted, guarded)| !(*quoted && *guarded));
+        words[at + 1..].iter().find(unguarded).map(|w| w.text.clone())
+    })
+}
+
+/// The git subcommands that take `--no-verify` (git 2.56, `git <cmd> -h`).
+const HOOK_SKIPPERS: [&str; 6] = ["commit", "am", "merge", "pull", "push", "rebase"];
+
+/// Where `-n` is `--no-verify` too (it is `--no-stat` or `--dry-run` elsewhere), with the options that take a value,
+/// so a value (`-m -nope`) is never read as an option. On the other four, a value that is itself `--no-verify` is read
+/// as the option (cut 1, the Lords owner, 2 Nov).
+const DASH_N: [(&str, Opts); 2] = [
+    ("commit", Opts { short: "FmcCtU", attached: "Su", long: &["message", "file"], hit: "n" }),
+    ("am", Opts { short: "Cp", attached: "S", long: &[], hit: "n" }),
+];
+
+const NO_OPTS: Opts = Opts { short: "", attached: "", long: &[], hit: "" };
+
+/// Git's own options that take the next word as their value (git 2.56, `git -h`).
+const GIT_VALUE_OPTIONS: [&str; 7] =
+    ["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--attr-source"];
+
+fn is_hooks_path(key: &str) -> bool {
+    key.eq_ignore_ascii_case("core.hooksPath")
+}
+
+/// Whether assignment `w` turns git's hooks off or repoints them: husky's `HUSKY=0`, or git config from the
+/// environment that sets `core.hooksPath` (`GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_PARAMETERS`).
+fn overrides_hooks(w: &str) -> bool {
+    let Some((name, value)) = w.split_once('=').filter(|_| is_assignment(w)) else { return false };
+    let numbered = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+    match name {
+        "HUSKY" => value == "0",
+        "GIT_CONFIG_PARAMETERS" => value.to_ascii_lowercase().contains("core.hookspath"),
+        _ => name.strip_prefix("GIT_CONFIG_KEY_").is_some_and(numbered) && is_hooks_path(value),
+    }
+}
+
+/// Whether `git config`'s arguments write `core.hooksPath`: set it (`set`, or the old form's two operands), or
+/// `--unset`, `--unset-all`, `--add`, `--replace-all` or `unset` it. A read (`--get`, one operand, `get`) never does.
+fn config_writes_hooks_path(args: &[Word]) -> bool {
+    const VALUE: [&str; 9] =
+        ["-f", "--file", "--blob", "-t", "--type", "--default", "--comment", "--value", "--url"];
+    const WRITE: [&str; 4] = ["--unset", "--unset-all", "--add", "--replace-all"];
+    let (mut ops, mut write, mut other) = (Vec::new(), false, false);
+    let mut i = 0;
+    while let Some(w) = args.get(i).map(|w| w.text.as_str()) {
+        i += 1;
+        if w == "--" {
+            ops.extend(args[i..].iter().map(|w| w.text.as_str()));
+            break;
+        }
+        if !w.starts_with('-') {
+            ops.push(w);
+        }
+        i += usize::from(VALUE.contains(&w));
+        write |= WRITE.contains(&w);
+        // The old form's reads and its editor: none writes a key's value.
+        other |= w.starts_with("--get") || matches!(w, "-l" | "--list" | "-e" | "--edit");
+    }
+    match ops.as_slice() {
+        ["set" | "unset", key, ..] => is_hooks_path(key),
+        [key, rest @ ..] if is_hooks_path(key) => write || (!other && !rest.is_empty()),
+        _ => false,
+    }
+}
+
+/// The word by which a simple command would run git without its hooks, if any (design note I1).
+fn skips_hooks(words: &[Word]) -> Option<String> {
+    let at = command_at(words);
+    // An environment override: an assignment before the command's word, or an operand of `export`.
+    let before = &words[..at.unwrap_or(words.len())];
+    let exported = at.filter(|&k| words[k].text == "export").map_or(&[][..], |k| &words[k + 1..]);
+    if let Some(w) = before.iter().chain(exported).find(|w| overrides_hooks(&w.text)) {
+        return Some(w.text.clone());
+    }
+    let args = &words[at.filter(|&k| base_name(&words[k].text) == "git")? + 1..];
+    let mut i = 0;
+    while let Some(w) = args.get(i).map(|w| w.text.as_str()).filter(|w| w.starts_with('-')) {
+        i += 1;
+        let value = if let Some(v) = w.strip_prefix("--config-env=") {
+            Some(v)
+        } else if GIT_VALUE_OPTIONS.contains(&w) {
+            i += 1;
+            args.get(i - 1).map(|v| v.text.as_str()).filter(|_| w == "-c" || w == "--config-env")
+        } else {
+            None
+        };
+        if let Some(v) = value.filter(|v| is_hooks_path(v.split('=').next().unwrap_or(v))) {
+            return Some(v.to_string());
+        }
+    }
+    let sub = args.get(i)?.text.as_str();
+    let rest = &args[i + 1..];
+    if sub == "config" {
+        return config_writes_hooks_path(rest).then(|| "git config core.hooksPath".to_string());
+    }
+    if !HOOK_SKIPPERS.contains(&sub) {
+        return None;
+    }
+    let opts = DASH_N.iter().find(|(name, _)| *name == sub).map_or(&NO_OPTS, |(_, o)| o);
+    let mut j = 0;
+    while let Some(w) = rest.get(j).map(|w| w.text.as_str()) {
+        j += 1;
+        if w == "--" {
+            break;
+        }
+        if !w.starts_with('-') {
+            continue;
+        }
+        // `--no-verify` or a prefix git takes for it (it accepts a long option's unique abbreviation).
+        let no_verify = w.len() >= "--no-v".len() && "--no-verify".starts_with(w);
+        let (value, hit) = opts.read(w);
+        if no_verify || hit {
+            return Some(w.to_string());
+        }
+        j += usize::from(value);
     }
     None
 }
 
-/// Whether a command word names `rm`: `rm` or `rm.exe` (any case), bare or as a path's last part (rm-guard review r1,
-/// R5: `rm.exe` is the same GNU rm on Git Bash).
-fn is_rm(word: &str) -> bool {
-    let name = word.rsplit(['/', '\\']).next().unwrap_or(word);
-    name.eq_ignore_ascii_case("rm") || name.eq_ignore_ascii_case("rm.exe")
+/// The word by which `command` would run git without its hooks, if any (design note I1).
+pub fn hook_bypass(command: &str) -> Option<String> {
+    commands(command).iter().find_map(|words| skips_hooks(words))
 }
 
-/// The guard hook's answer to one `PreToolUse` event (the harness's stdin JSON): a denial naming the fix, or nothing
+/// The Bash guard's answer to one `PreToolUse` event (the harness's stdin JSON): a denial naming the fix, or nothing
 /// (empty: the call goes on to the harness's own checks). Only Bash calls are looked at; input that isn't such an
 /// event is let through, so the guard never stops a call it can't read.
 pub fn rm_hook(input: &str) -> String {
@@ -202,18 +638,27 @@ pub fn rm_hook(input: &str) -> String {
         return String::new();
     }
     let Some(command) = ev["tool_input"]["command"].as_str() else { return String::new() };
-    match unguarded_rm(command) {
-        None => String::new(),
-        Some(word) => json!({ "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": format!(
-                "Lords: `rm` with a variable path ({word}) deletes the wrong place if the variable is empty. Write \
-                 each variable as {RM_FIX}: quoted, with `:?`, so an empty one stops the command."
-            ),
-        } })
-        .to_string(),
-    }
+    let reason = if let Some(word) = unguarded_rm(command) {
+        format!(
+            "Lords: `rm` with a variable path ({word}) deletes the wrong place if the variable is empty. Write each \
+             variable as {RM_FIX}: quoted, with `:?`, so an empty one stops the command."
+        )
+    } else if let Some(word) = hook_bypass(command) {
+        format!(
+            "Lords: `{word}` would run git without its hooks. rule.hooks-run-on-every-commit: commit through the \
+             normal hooks, never skip them or repoint their path. Run it without that; if a hook fails, fix what it \
+             reports, and if the hook itself is broken, tell the repo's owner. A test fixture's own hooks path goes \
+             in a script file."
+        )
+    } else {
+        return String::new();
+    };
+    json!({ "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
+    } })
+    .to_string()
 }
 
 // ---------------------------------------------------------------- queue
