@@ -2,7 +2,7 @@
 //! default browser (defect D16; design note Harness/notes/2026-11-02-lords-git-help-guard.md). What git turns into
 //! `git help <topic>` is read from its source at v2.56.0 (design note §1); a command that only mentions it passes.
 
-use lords_core::guard::rm_hook;
+use lords_core::guard::{rm_hook, shell_hook, Shell};
 use serde_json::{json, Value};
 
 /// The guard's denial reason for `command` run by `tool` (`Bash` or `PowerShell`), or `None` when it lets it through.
@@ -274,5 +274,35 @@ fn sol_loop_r2_forms() {
     }
     for command in ["Write-Output $name=git help config", "Write-Output $name = git help config"] {
         passes_in("PowerShell", command);
+    }
+}
+
+// Spec: review r1, D16-R1-02 (accepted by the Lords owner, 2 Nov): "the right side of a PowerShell assignment is a
+// command, wherever the assignment sits": in a quoted `$( … )` (the review's witness), typed (S10) or to several
+// targets (S11); a script block in a quoted `$( … )` is code. For the PowerShell tool and for a `Bash` event under
+// `--shell powershell`. Literal single-quoted text, an escaped `$` and plain quoted mentions pass.
+#[test]
+fn powershell_code_in_quoted_subexpressions_and_any_assignment() {
+    let denied = |command: &str| {
+        ["PowerShell", "Bash"].map(|tool| {
+            let ev = json!({"tool_name": tool, "tool_input": {"command": command}});
+            shell_hook(&ev.to_string(), Shell::PowerShell).contains("rule.no-default-browser")
+        })
+    };
+    for command in [
+        "Write-Host \"help: $($page = git help config; $page)\"",
+        "Write-Host \"$(if ($true) {git help config})\"",
+        "[string[]]$page = git help config",
+        "$a, $b = git help config",
+    ] {
+        assert_eq!(denied(command), [true, true], "{command}");
+    }
+    for command in [
+        "Write-Host '$($page = git help config)'",
+        "Write-Host \"`$($page = git help config)\"",
+        "Write-Host \"see git help config\"",
+        "Write-Host \"$($env:USERNAME) ran git help config\"",
+    ] {
+        assert_eq!(denied(command), [false, false], "{command}");
     }
 }

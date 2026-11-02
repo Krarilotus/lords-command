@@ -2392,6 +2392,64 @@ fn the_rm_guard_reads_powershell_for_its_tool_and_for_codex() {
     }
 }
 
+// Spec: review r1, D16-R1-01 (accepted by the Lords owner, 2 Nov): "sync never registers a guard hook command line
+// that the installed guard copy doesn't accept", as FC4 set for the child and role hooks. A copy from before D16 (the
+// old-guard stub: `ok` to the self-test, nothing to `guard rm`) is refused for both adapters, naming `lords guard
+// install`, and their files stay as they are; once installed, the hooks are written, the copy denies the original
+// witness with the exact arguments each hook names, and a second sync changes nothing.
+#[test]
+fn sync_registers_the_rm_guard_only_with_a_copy_that_speaks_it() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (public, private) = (d.join("pub"), d.join("priv"));
+    for dir in [&public, &private, &d.join("home/.claude-balanced"), &d.join("home/.codex")] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    let target = |adapter: &str, path: &str| {
+        format!("[[targets]]\nname = \"{adapter}\"\nadapter = \"{adapter}\"\nkind = \"settings\"\npath = \"{path}\"\nguards = [\"rm\"]\n")
+    };
+    let (claude, codex) = (
+        target("claude", "~/.claude-balanced/settings.json"),
+        target("codex", "~/.codex/hooks.json"),
+    );
+    let manifest = format!("name = \"priv\"\nvisibility = \"private\"\n{claude}{codex}");
+    fs::write(private.join("stack.toml"), manifest).unwrap();
+    assert!(env.git(&private, &["init", "-q"]).status.success());
+    env.git(&private, &["add", "-A"]);
+    env.git(&private, &["commit", "-q", "-m", "start"]);
+    let stacks =
+        ["--public-stack", public.to_str().unwrap(), "--private-stack", private.to_str().unwrap()];
+    let sync = || env.lords(d, &[&["sync", "--user", "--apply"][..], &stacks].concat());
+    let files = [d.join("home/.claude-balanced/settings.json"), d.join("home/.codex/hooks.json")];
+    let read = || files.iter().map(|f| fs::read(f).ok()).collect::<Vec<_>>();
+    let copy = d.join("home/.lords-command/bin/lords-guard.exe");
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_lords-old-guard-stub"), &copy).unwrap();
+    let o = sync();
+    assert!(!o.status.success() && text(&o).contains("lords guard install"), "{}", text(&o));
+    assert_eq!(read(), [None, None], "nothing written");
+    assert!(env.lords(d, &["guard", "install"]).status.success());
+    assert!(sync().status.success());
+    let after = read();
+    let json = |b: &Option<Vec<u8>>| -> serde_json::Value {
+        serde_json::from_slice(b.as_ref().unwrap()).unwrap()
+    };
+    let claude_args = json(&after[0])["hooks"]["PreToolUse"][0]["hooks"][0]["args"].clone();
+    let codex_line = json(&after[1])["hooks"]["PreToolUse"][0]["hooks"][0]["command"].clone();
+    let codex_args =
+        format!("guard {}", codex_line.as_str().unwrap().split(" guard ").nth(1).unwrap());
+    let claude_args: Vec<&str> =
+        claude_args.as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
+    let event = r#"{"tool_name":"Bash","tool_input":{"command":"git help config"}}"#;
+    for args in [claude_args, codex_args.split(' ').collect()] {
+        let o = guard(&env, &copy, &args, event);
+        assert!(String::from_utf8_lossy(&o.stdout).contains("\"deny\""), "{args:?}: {}", text(&o));
+    }
+    assert!(sync().status.success());
+    assert_eq!(read(), after, "a second sync changes nothing");
+}
+
 /// A repo `r` declared in a private stack with one rule, and its worktree `wts/one`, synced by the CLI: each holds
 /// `CLAUDE.local.md` and `.lords`. Gives the repo, the worktree and the stack arguments every call here takes.
 fn synced_worktree(env: &Env) -> (PathBuf, PathBuf, Vec<String>) {
