@@ -772,6 +772,8 @@ fn the_post_checkout_install_goes_through_a_global_dispatcher_and_a_previous_hoo
 // - A global hooks path without a post-checkout (today this one installed, with a note): "global".
 // - Review r1, R1-01, its witness: no hooks path in the main checkout, but a conditional include that only a linked
 //   worktree's git dir matches sets an empty one there; the stand-in can't see it, so the include is named.
+// Since D14b these cases fall back to a config hook; an owner's global `hook.lords-post-checkout` blocks that here, and
+// is named too (design note 2026-11-02-lords-hooks-config, C5), and the local config stays as it was.
 #[test]
 fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
     let env = Env::new();
@@ -780,6 +782,9 @@ fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
     let guard = real_dispatcher(&d.join("guard"));
     let guard = guard.to_str().unwrap();
     let elsewhere = other_repo_with_lords_hook(&env);
+    for (k, v) in [("event", "pre-commit"), ("command", "true")] {
+        env.git(&repo, &["config", "--global", &format!("hook.lords-post-checkout.{k}"), v]);
+    }
     let silent = d.join("silent");
     fs::create_dir_all(&silent).unwrap();
     fs::write(silent.join("post-checkout"), "#!/bin/sh\nexit 0\n").unwrap();
@@ -828,12 +833,14 @@ fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
             args.push(v);
             assert!(env.git(&repo, &args).status.success(), "{name}: git {args:?}");
         }
-        let hooks_path = config(&env, &repo, "core.hooksPath");
+        let (hooks_path, local) = (config(&env, &repo, "core.hooksPath"), local_config(&repo));
         let o = install_post_checkout(&env, &repo, &stacks);
         let out = text(&o);
         eprintln!("{name}: {out}");
         assert!(!o.status.success(), "{name}: must be refused: {out}");
         assert!(out.contains(says) && out.contains("post-checkout"), "{name}: {out}");
+        assert!(name == "include" || out.contains("set already (global"), "{name}: {out}");
+        assert_eq!(local_config(&repo), local, "{name}: the local config is as it was");
         assert_eq!(listing(&hooks), before, "{name}: the hooks dir is as it was");
         assert_eq!(fs::read(&ledger).unwrap(), recorded, "{name}: the ledger is as it was");
         assert_eq!(config(&env, &repo, "core.hooksPath"), hooks_path, "{name}");
@@ -906,7 +913,8 @@ fn copied_stacks(env: &Env, n: &str) -> [String; 4] {
 // refused install leaves the hooks dir as it was): after a first install, the real dispatcher forwards to another dir
 // holding a copy of that earlier hook; a re-install is refused, as the copy isn't the hook it writes, and keeps the
 // tool's earlier hook, byte for byte, though the new one would differ (the stacks are named at other paths), and the
-// ledger as it was.
+// ledger as it was. Nor is a config hook written beside that earlier hook: both would run (D14b, design note
+// 2026-11-02-lords-hooks-config, C6), so the refusal names it and the local config is as it was.
 #[test]
 fn a_refused_reinstall_keeps_the_tools_earlier_hook() {
     let env = Env::new();
@@ -916,17 +924,21 @@ fn a_refused_reinstall_keeps_the_tools_earlier_hook() {
     let d = env.dir.path();
     let hooks = repo.join(".git/hooks");
     let ledger = d.join("home/.lords-command/state/ledger.toml");
-    let before = (listing(&hooks), fs::read(&ledger).unwrap());
     let stale = d.join("stale");
     fs::create_dir_all(&stale).unwrap();
     fs::copy(hooks.join("post-checkout"), stale.join("post-checkout")).unwrap();
     let guard = real_dispatcher(&d.join("guard"));
     env.git(&repo, &["config", "core.hooksPath", guard.to_str().unwrap()]);
     env.git(&repo, &["config", "attributionGuard.previousHooksPath", stale.to_str().unwrap()]);
+    let before = (listing(&hooks), fs::read(&ledger).unwrap(), local_config(&repo));
 
     let o = install_post_checkout(&env, &repo, &copied_stacks(&env, "2"));
-    assert!(!o.status.success() && !text(&o).contains("back failed"), "{}", text(&o));
-    assert_eq!((listing(&hooks), fs::read(&ledger).unwrap()), before);
+    let out = text(&o);
+    assert!(
+        !o.status.success() && !out.contains("back failed") && out.contains("stands in"),
+        "{out}"
+    );
+    assert_eq!((listing(&hooks), fs::read(&ledger).unwrap(), local_config(&repo)), before);
 }
 
 // Spec (review r1, D14D15-R1-02: "A refusal restores the hooks dir and ledger exactly, including a chained earlier hook
@@ -951,6 +963,143 @@ fn a_reinstall_whose_ledger_cant_be_saved_changes_nothing() {
     let o = install_post_checkout(&env, &repo, &stacks);
     assert!(!o.status.success(), "{}", text(&o));
     assert_eq!((listing(&hooks), fs::read(&ledger).unwrap()), before, "{}", text(&o));
+}
+
+// ---------------------------------------------------------------- post-checkout as a config hook (D14b)
+
+/// The repo's local config file, its bytes.
+fn local_config(repo: &Path) -> Vec<u8> {
+    fs::read(repo.join(".git/config")).unwrap()
+}
+
+/// The relative case: the real dispatcher as the local hooks path, forwarding to `.githooks`, a path relative to each
+/// worktree, so to its tracked files (design note 2026-11-02-lords-hooks-dispatcher, "Finding first").
+fn forwards_to_tracked_hooks(env: &Env, repo: &Path) {
+    let guard = real_dispatcher(&env.dir.path().join("guard"));
+    env.git(repo, &["config", "core.hooksPath", guard.to_str().unwrap()]);
+    env.git(repo, &["config", "attributionGuard.previousHooksPath", ".githooks"]);
+}
+
+// Spec (D14b, the Lords owner's brief, 2 Nov: "`lords hooks install --post-checkout` on a repo whose own hooks dir
+// can't be proven to run installs a config-defined hook instead, in the repo's local config only. It never repoints
+// `core.hooksPath`, never touches the dispatcher or its keys, and never edits a tracked file"; "`lords uninstall` for that
+// repo removes exactly that entry, and only while it still holds what Lords wrote"; design note
+// 2026-11-02-lords-hooks-config, C1-C3, C6, C8): in the relative case, with an owner's global config hook for
+// post-checkout under another name, the install writes `hook.lords-post-checkout` and names why the hooks dir isn't
+// reached; the hooks dir, the dispatcher's keys and the tracked files are as they were; `git worktree add` gets its place
+// file and runs the owner's hook too. Once the hooks dir would be reached, a re-install stays a config hook. Uninstall
+// leaves the local config byte for byte as before the install; after an owner's edit it leaves the entry as edited.
+#[test]
+fn a_hooks_dir_that_isnt_reached_gets_a_config_hook_instead() {
+    let env = Env::new();
+    let (repo, wts, stacks) = post_checkout_repo(&env);
+    fs::create_dir_all(repo.join(".githooks")).unwrap();
+    fs::write(repo.join(".githooks/pre-commit"), "#!/bin/sh\nexit 0\n").unwrap();
+    env.git(&repo, &["add", "-A"]);
+    assert!(env.git(&repo, &["commit", "-q", "-m", "tracked hooks"]).status.success());
+    forwards_to_tracked_hooks(&env, &repo);
+    let owners = "echo ran >> \"$(git rev-parse --git-common-dir)/owners.log\"";
+    env.git(&repo, &["config", "--global", "hook.owners.command", owners]);
+    env.git(&repo, &["config", "--global", "hook.owners.event", "post-checkout"]);
+    let hooks = repo.join(".git/hooks");
+    let before = (listing(&hooks), local_config(&repo));
+
+    let o = install_post_checkout(&env, &repo, &stacks);
+    let out = text(&o);
+    assert!(
+        o.status.success() && out.contains("relative") && out.contains("lords-post-checkout"),
+        "{out}"
+    );
+    assert_eq!(listing(&hooks), before.0, "the hooks dir is as it was");
+    assert_eq!(
+        config(&env, &repo, "attributionGuard.previousHooksPath").as_deref(),
+        Some(".githooks")
+    );
+    let _ = fs::remove_file(repo.join(".git/owners.log"));
+    assert!(
+        new_worktree_gets_its_place_file(&env, &repo, &wts, "one"),
+        "log: {}",
+        fs::read_to_string(repo_log(&repo)).unwrap_or_default()
+    );
+    assert!(fs::read_to_string(repo.join(".git/owners.log")).unwrap().contains("ran"));
+    assert!(text(&env.git(&repo, &["status", "--porcelain"])).is_empty(), "no tracked file edited");
+
+    let own = hooks.canonicalize().unwrap();
+    let own = own.to_str().unwrap().trim_start_matches(r"\\?\");
+    env.git(&repo, &["config", "attributionGuard.previousHooksPath", own]);
+    let o = install_post_checkout(&env, &repo, &stacks);
+    assert!(o.status.success() && listing(&hooks) == before.0, "{}", text(&o));
+    env.git(&repo, &["config", "attributionGuard.previousHooksPath", ".githooks"]);
+
+    let mut uninstall = vec!["uninstall", "--repo", "r", "--apply"];
+    uninstall.extend(stacks.iter().map(String::as_str));
+    let o = env.lords(&repo, &uninstall);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(local_config(&repo), before.1, "the local config is byte for byte as before");
+    assert!(install_post_checkout(&env, &repo, &stacks).status.success());
+    env.git(&repo, &["config", "hook.lords-post-checkout.enabled", "false"]);
+    let edited = local_config(&repo);
+    let o = env.lords(&repo, &uninstall);
+    assert!(
+        o.status.success() && text(&o).contains("changed since Lords wrote it"),
+        "{}",
+        text(&o)
+    );
+    assert_eq!(local_config(&repo), edited, "the owner's edit stays");
+    let ledger = env.dir.path().join("home/.lords-command/state/ledger.toml");
+    assert!(!fs::read_to_string(ledger).unwrap().contains("hookconfig:"), "its record goes");
+}
+
+// Spec (D14b brief: "where Git doesn't list config hooks …, and wherever the probe fails, the install refuses, names
+// the reason, and leaves the config as it was"; "every failure path restores the config and the ledger exactly"; design
+// note C3-C5, C7, H7): in the relative case each of these is refused, naming its reason, with the local config, the
+// ledger and the hooks dir byte for byte as before:
+// - `git hook list` fails: Git 2.43 has no `list` (exit 129); the witness here is a config Git 2.56 dies on (128);
+// - the owner set `hook.lords-post-checkout` locally;
+// - a conditional include that only a linked worktree reads sets `hook.*`;
+// - the probe gets no answer after the write: `hook.post-checkout.enabled = false` switches the event off.
+// Then, over Lords' config hook, a re-install whose probe fails and (Windows) one whose ledger save fails.
+#[test]
+fn a_config_hook_that_cant_be_proven_is_refused_and_changes_nothing() {
+    let env = Env::new();
+    let (repo, _wts, stacks) = post_checkout_repo(&env);
+    forwards_to_tracked_hooks(&env, &repo);
+    fs::write(repo.join(".git/hooks.inc"), "[hook \"lords-post-checkout\"]\n\tenabled = false\n")
+        .unwrap();
+    let hooks = repo.join(".git/hooks");
+    let ledger = env.dir.path().join("home/.lords-command/state/ledger.toml");
+    let state = || (listing(&hooks), local_config(&repo), fs::read(&ledger).ok());
+    let cases = [
+        ("hook.post-checkout.event", "post-checkout", "nor a config hook: `git hook list"),
+        ("hook.lords-post-checkout.command", "echo mine", "set already (local"),
+        ("includeIf.gitdir:**/worktrees/.path", "hooks.inc", "includeif.gitdir"),
+        ("hook.post-checkout.enabled", "false", "nor a config hook: `git hook run"),
+    ];
+    for (key, value, says) in cases {
+        env.git(&repo, &["config", key, value]);
+        let before = state();
+        let o = install_post_checkout(&env, &repo, &stacks);
+        assert!(!o.status.success() && text(&o).contains(says), "{key}: {}", text(&o));
+        assert_eq!(state(), before, "{key}: as it was");
+        env.git(&repo, &["config", "--unset", key]);
+    }
+
+    assert!(install_post_checkout(&env, &repo, &stacks).status.success());
+    env.git(&repo, &["config", "hook.post-checkout.enabled", "false"]);
+    let before = state();
+    let o = install_post_checkout(&env, &repo, &stacks);
+    assert!(!o.status.success() && !text(&o).contains("differs"), "{}", text(&o));
+    assert_eq!(state(), before, "{}", text(&o));
+    env.git(&repo, &["config", "--unset", "hook.post-checkout.enabled"]);
+    #[cfg(windows)]
+    {
+        let before = state();
+        let o = Command::new("compact").args(["/c", "/q"]).arg(&ledger).output().unwrap();
+        assert!(o.status.success(), "{}", text(&o));
+        let o = install_post_checkout(&env, &repo, &stacks);
+        assert!(!o.status.success(), "{}", text(&o));
+        assert_eq!(state(), before, "{}", text(&o));
+    }
 }
 
 /// A nonce as `lords check` makes them: 32 hex digits.
