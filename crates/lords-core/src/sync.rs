@@ -1654,13 +1654,30 @@ fn guard_hooks(
                 emptied.push(false);
                 continue;
             }
+            // An entry Lords' hook shares with others: the hook is rewritten in its slot while the entry's matcher is its
+            // guard's (sol-loop r1, S1), and goes from there otherwise.
+            let shared = e["matcher"].as_str().map(str::to_string);
             let Some(hs) = e.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
                 emptied.push(false);
                 continue;
             };
             let held = hs.len();
-            hs.retain(|h| !ours(h));
-            emptied.push(held > 0 && hs.is_empty());
+            let mut kept = Vec::with_capacity(held);
+            for h in hs.drain(..) {
+                let Some(name) = adapter.guard_of(&h, &exe) else {
+                    kept.push(h);
+                    continue;
+                };
+                let slot = wanted.iter().find(|(g, event, m)| {
+                    **g == name && *event == ev && *m == shared.as_deref() && !placed.contains(g)
+                });
+                if let Some((g, ..)) = slot {
+                    placed.insert(*g);
+                    kept.extend(adapter.guard_hooks(&exe, g, &home));
+                }
+            }
+            emptied.push(held > 0 && kept.is_empty());
+            *hs = kept;
         }
         let mut emptied = emptied.into_iter();
         list.retain(|_| !emptied.next().unwrap_or(false));
