@@ -471,7 +471,8 @@ from before the ledger are listed by `lords adopt --list`. Adopting a file recor
 sync would write now (`lords adopt PATH...`). Anything else goes by `lords set-aside PATH... --yes`, which moves it
 whole into a new backup dir (refused for a ledger path, anything holding a link, or across volumes); `restore` moves
 it back. Both are a human's steps. `lords uninstall [--apply]` removes every tool-owned path in scope that still
-matches the ledger.
+matches the ledger. With `--place DIR`, one checkout's: a changed copy stays with its record, and so does `.lords`
+while a kept instruction file names a file in it (its role-files line, its memory pointer).
 
 **Out of git without editing git.** A tool-owned dir (a skill copy, `.lords/`) holds a `.gitignore` of `*`, so it
 ignores itself. Only the two root files need lines in `.git/info/exclude`.
