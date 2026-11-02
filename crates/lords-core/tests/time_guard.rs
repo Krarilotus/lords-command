@@ -122,6 +122,8 @@ fn placeholder_clock_times_are_denied() {
     placeholder("line one\nwritten 13:4x, then more");
     // A one-line triple-backtick span is no fence: prose after it is judged (sol-loop r1, S3).
     placeholder("```HH:MM``` then\ndone 14:xx");
+    // A span doesn't reach across list items (sol-loop r2, S7).
+    placeholder("- example `text\n- done 14:xx\n- end`");
 }
 
 // Spec (the brief: "The deny reason names the fix: take the time from the turn hook's "Berlin HH:MM" line or from
@@ -158,6 +160,7 @@ fn real_times_durations_ratios_and_code_pass() {
     passes("sources H:25–35, h:63 and C:40");
     // A port is no minute, and a code span may wrap (sol-loop r1, S1, S2).
     passes("a `format\nHH:MM\nend` span, wrapped");
+    passes("`a\n\u{a0}\nHH:MM\nb`");
     passes("see http://xx:80/ there");
     passes("no times at all");
 }
@@ -218,8 +221,9 @@ fn a_placeholder_the_write_keeps_passes() {
     let old = "# Template\n\nstamp HH:MM\n";
     let note = d.file("t.md", Some(old));
     assert_eq!(write(&note, &format!("{old}added 13:05\n")), None);
-    // A second copy of a kept line is added text (sol-loop r1, S4).
+    // A second copy of a kept line is added text (sol-loop r1, S4); a copy in code doesn't use up the kept one (r2, S6).
     assert!(write(&note, &format!("{old}stamp HH:MM\n")).is_some());
+    assert_eq!(write(&note, &format!("```\nstamp HH:MM\n```\n{old}")), None);
     assert_eq!(edit(&note, "stamp HH:MM\n", "stamp HH:MM\nadded 13:05\n"), None);
     // A fence the edit doesn't touch still holds its lines as code.
     let fenced = d.file("f.md", Some("```\nold\n```\n"));
