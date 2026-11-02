@@ -1440,12 +1440,13 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
     item
 }
 
-/// The hook event each guard runs on, and its matcher: `rm` before a Bash call, `queue` when a turn would end, `session`
+/// The hook event each guard runs on, and its matcher: `rm` before a shell call (Bash or PowerShell, an exact list in
+/// both harnesses; design note 2026-11-02-lords-git-help-guard §3), `queue` when a turn would end, `session`
 /// when a session starts, `turn` when a prompt does (never a native subagent's `SubagentStop`), `child` when a
 /// native subagent starts, and `time` before an editor write or a T3 message.
 fn guard_event(name: &str) -> Option<(&'static str, Option<&'static str>)> {
     match name {
-        "rm" => Some(("PreToolUse", Some("Bash"))),
+        "rm" => Some(("PreToolUse", Some("Bash|PowerShell"))),
         "queue" => Some(("Stop", None)),
         "session" => Some(("SessionStart", None)),
         "turn" => Some(("UserPromptSubmit", None)),

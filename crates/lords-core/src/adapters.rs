@@ -177,9 +177,10 @@ impl Adapter for Codex {
     /// Codex's hooks (`~/.codex/hooks.json`) run a command line; `child` is the guard a probe showed it runs (design
     /// note 2026-10-31-lords-core-lines-composer, P2): the child took its context, once the hook was trusted. `role`
     /// too: its `UserPromptSubmit` event and context are Claude's (design note 2026-11-02-lords-role-at-launch, H3).
-    /// `time`: its `apply_patch` and MCP calls reach `PreToolUse` (design note 2026-11-02-lords-time-guard, §2).
+    /// `time`: its `apply_patch` and MCP calls reach `PreToolUse` (design note 2026-11-02-lords-time-guard, §2). `rm`:
+    /// its shell tool reaches `PreToolUse` as `Bash` with the command (design note 2026-11-02-lords-git-help-guard, §2).
     fn guards(&self) -> &'static [&'static str] {
-        &["child", "role", "time"]
+        &["rm", "child", "role", "time"]
     }
 
     /// A command line, and the whole context passed on (`additionalContextLimit` 0): no parts. On Windows Codex runs it
@@ -199,6 +200,10 @@ impl Adapter for Codex {
         // The role hook names its harness, whose place file the start goes beside (F10-R1-03).
         if guard == "role" {
             line.push_str(" --adapter codex");
+        }
+        // The shell commands it sends as `Bash` are PowerShell's on Windows (git-help-guard design note, §2).
+        if guard == "rm" && cfg!(windows) {
+            line.push_str(" --shell powershell");
         }
         vec![serde_json::json!({
             "type": "command",
