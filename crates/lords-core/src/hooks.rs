@@ -1,6 +1,7 @@
 //! `hooks install`: the privacy check as a repo's pre-commit, pre-merge-commit and commit-msg hooks, in
-//! `.git/hooks` (design: Privacy).
-//! Never through `core.hooksPath`: a global hooks path whose dispatcher runs the repo's own hooks keeps working.
+//! `.git/hooks` (design: Privacy); with `--post-checkout`, the hook that gives a new worktree its place files.
+//! Never through `core.hooksPath`: a global hooks path whose dispatcher runs the repo's own hooks keeps working. The
+//! post-checkout hook stands only where a probe sees a new worktree reach it, through a local or global hooks path too.
 //! A hook is the tool's only by its ledger record (design: Ownership boundary): any other hook there, readable or
 //! not, is the owner's (Sol review r2, R2-16). Every write goes through `fsguard`, below the checkout's verified
 //! hooks root (design-simplification-r6, rule A), and nothing is overwritten. Installing takes the apply lock, so
@@ -26,6 +27,8 @@ pub struct Installed {
     pub backup: Option<PathBuf>,
     /// The global `core.hooksPath`, if any: its dispatcher must run `.git/hooks/pre-commit`.
     pub global_hooks_path: Option<String>,
+    /// The post-checkout hook: the `core.hooksPath` its probe went through, if one is set.
+    pub via: Option<String>,
 }
 
 /// The repo's own commit check, which the pre-commit hook runs first where the repo tracks one (orchestrator, 25 Oct:
@@ -250,8 +253,7 @@ fn backup_name(dir: &Root, name: &str) -> Result<Contained, String> {
     unreachable!()
 }
 
-/// The repo's hooks dir as a verified root: the repo's checkout root (git's top level, exactly), then git's common
-/// hooks dir, made where it isn't yet.
+/// The repo's hooks dir for the privacy hooks: `own_hooks_dir`, refused where a local `core.hooksPath` bypasses it.
 fn hooks_dir(repo: &Path) -> Result<Root, String> {
     if git::status(repo, &["config", "--local", "--get", "core.hooksPath"])? {
         let local = git::run(repo, &["config", "--local", "--get", "core.hooksPath"])?;
@@ -260,6 +262,12 @@ fn hooks_dir(repo: &Path) -> Result<Root, String> {
             local.trim()
         ));
     }
+    own_hooks_dir(repo)
+}
+
+/// The repo's own hooks dir as a verified root: the repo's checkout root (git's top level, exactly), then git's common
+/// hooks dir, made where it isn't yet.
+fn own_hooks_dir(repo: &Path) -> Result<Root, String> {
     let top = git::run(repo, &["rev-parse", "--show-toplevel"])?;
     let dir = Root::hooks(&Root::checkout(Path::new(top.trim()))?)?;
     dir.create()?;
@@ -324,6 +332,7 @@ pub fn install(
             hook: hook.path().to_path_buf(),
             backup,
             global_hooks_path: global_hooks_path.clone(),
+            via: None,
         });
     }
     ledger.save(home)?;
@@ -351,8 +360,9 @@ fn quoted(p: &Path) -> String {
 /// A post-checkout hook that writes a new worktree's place files (orchestrator, 25 Oct). It never fails or slows
 /// the checkout: it acts only when the old HEAD is all zeros (`git worktree add`), runs sync in the background
 /// under a time limit, and only logs (to `<git common dir>/lords-post-checkout.log`); a hook that was here before
-/// runs first, and its exit status is the hook's.
-pub fn post_checkout_script(lords_exe: &Path, args: &SyncArgs) -> String {
+/// runs first, and its exit status is the hook's. It answers the install's probe first, with `label`
+/// (`probe_label`), and does nothing else then (`probe_lines`; D14, design note H5).
+pub fn post_checkout_script(lords_exe: &Path, args: &SyncArgs, home: &Path, label: &str) -> String {
     let mut stacks = String::new();
     if let Some(p) = &args.public_stack {
         stacks.push_str(&format!(" --public-stack {}", quoted(p)));
@@ -364,7 +374,7 @@ pub fn post_checkout_script(lords_exe: &Path, args: &SyncArgs) -> String {
         r#"#!/bin/sh
 {SYNC_MARKER} (installed by `lords hooks install --post-checkout`).
 # Never fails or slows a checkout: only a new worktree (old HEAD all zeros), in the background, time-boxed, logged.
-status=0
+{probe}status=0
 before="$(dirname "$0")/{CHAINED}"
 if [ -f "$before" ]; then
   "$before" "$@"
@@ -391,40 +401,225 @@ exit $status
 "#,
         exe = quoted(lords_exe),
         repo = quoted(Path::new(&args.repo)),
+        probe = probe_lines(home, label),
     )
+}
+
+/// What a post-checkout hook answers a probe with: its name and a token made for this install alone, so no other hook
+/// can answer for it, another repo's or a copy of an earlier one (sol-loop r1 and r2, S2).
+fn probe_label() -> String {
+    format!("post-checkout-{}", &nonce()[..16])
 }
 
 /// Installs the post-checkout hook in the repo's own hooks dir (the common dir, so every worktree has it); `home`
 /// holds the ledger. A hook there that isn't the tool's moves to `post-checkout.before-lords` and is chained; the
-/// tool's own is replaced.
+/// tool's own is replaced. It stands only once a new worktree's post-checkout is seen to reach it, through whatever
+/// `core.hooksPath` or dispatcher is set (D14, design note 2026-11-02-lords-hooks-dispatcher, H1); otherwise the dir is
+/// put back as it was, nothing is recorded, and the refusal names the case (H4, H6). `core.hooksPath` and a
+/// dispatcher are never changed (H3). A conditional include that may route hooks for a new worktree, which the probe's
+/// stand-in can't see, refuses before anything is written (review r1, R1-01).
 pub fn install_post_checkout(
     repo: &Path,
     lords_exe: &Path,
     args: &SyncArgs,
     home: &Path,
 ) -> Result<Installed, String> {
-    let dir = hooks_dir(repo)?;
+    let unseen = routing_includes(repo)?;
+    if !unseen.is_empty() {
+        return Err(format!(
+            "the repo's config has a conditional include that may route hooks (core.hooksPath, attributionGuard.*, hook.*, a further include, or a file that can't be read) in a new worktree, where the probe can't see it: {}; no post-checkout installed",
+            unseen.join("; ")
+        ));
+    }
+    let dir = own_hooks_dir(repo)?;
     let _lock = ApplyLock::take(home, 60)?;
     let mut ledger = Ledger::load(home)?;
     let hook = dir.join(&[Part::new("post-checkout")?]);
+    let chained = dir.join(&[Part::new(CHAINED)?]);
     let mut backup = None;
-    if fsguard::kind(hook.path())? != fsguard::Kind::Missing && !ours(&ledger, hook.path())? {
-        let chained = dir.join(&[Part::new(CHAINED)?]);
-        if fsguard::kind(chained.path())? != fsguard::Kind::Missing {
-            return Err(format!(
-                "{} isn't the tool's and {} exists already; merge them by hand first",
-                hook.path().display(),
-                chained.path().display()
-            ));
+    // The tool's earlier hook, aside until the new one is proven (sol-loop r1, S1).
+    let mut earlier = None;
+    if fsguard::kind(hook.path())? != fsguard::Kind::Missing {
+        if ours(&ledger, hook.path())? {
+            earlier = Some(fsguard::move_aside(&hook)?);
+        } else {
+            if fsguard::kind(chained.path())? != fsguard::Kind::Missing {
+                return Err(format!(
+                    "{} isn't the tool's and {} exists already; merge them by hand first",
+                    hook.path().display(),
+                    chained.path().display()
+                ));
+            }
+            fsguard::move_to(&hook, &chained)?;
+            backup = Some(chained.path().to_path_buf());
         }
-        fsguard::move_to(&hook, &chained)?;
-        backup = Some(chained.path().to_path_buf());
     }
     let scope = format!("hooks:{}", crate::ledger::key(dir.path()));
-    put_hook(&mut ledger, &hook, &post_checkout_script(lords_exe, args), &scope)?;
-    ledger.save(home)?;
-    let global_hooks_path = git::run(repo, &["config", "--global", "--get", "core.hooksPath"])
-        .ok()
-        .map(|s| s.trim().to_string());
-    Ok(Installed { hook: hook.path().to_path_buf(), backup, global_hooks_path })
+    let label = probe_label();
+    let text = post_checkout_script(lords_exe, args, home, &label);
+    // Written, proven, recorded: the ledger save is the last step that can still be undone (review r1, R1-02).
+    let done = put_hook(&mut ledger, &hook, &text, &scope)
+        .and_then(|()| {
+            post_checkout_reaches_new_worktree(repo, home, &label)
+                .map_err(|why| refusal(repo, &dir, &why))
+        })
+        .and_then(|()| ledger.save(home));
+    if let Err(why) = done {
+        // As it was (H4): this hook gone, then the tool's earlier one or the owner's back at its name, where nothing is
+        // overwritten; the ledger isn't saved.
+        let undone = fsguard::kind(hook.path())
+            .and_then(|k| match k {
+                fsguard::Kind::Missing => Ok(()),
+                _ => fsguard::delete_file(&hook),
+            })
+            .and_then(|()| match (&earlier, &backup) {
+                (Some(aside), _) => aside.back(),
+                (None, Some(_)) => fsguard::move_to(&chained, &hook),
+                (None, None) => Ok(()),
+            });
+        return Err(match undone {
+            Ok(()) => format!("{why}; {} is as it was", hook.path().display()),
+            Err(e) => format!("{why}; putting {} back failed: {e}", hook.path().display()),
+        });
+    }
+    if let Some(aside) = earlier {
+        let at = aside.path().to_path_buf();
+        aside.delete().map_err(|e| {
+            format!(
+                "installed and recorded, but the earlier hook's copy {} stays: {e}",
+                at.display()
+            )
+        })?;
+    }
+    Ok(Installed {
+        hook: hook.path().to_path_buf(),
+        backup,
+        global_hooks_path: None,
+        via: hooks_path(repo).map(|(path, _)| path),
+    })
+}
+
+/// The conditional includes of the repo's effective config (`includeIf.<condition>.path`, with where each is set) whose
+/// file may route hooks: it sets `core.hooksPath`, `attributionGuard.*` or `hook.*`, includes further, or can't be read.
+/// A new worktree may match a condition the probe's stand-in doesn't (`gitdir:` on its own git dir, `onbranch:` on its
+/// branch), so the probe can't vouch for such an include; one that routes no hook can't move a hook (review r1, R1-01).
+fn routing_includes(repo: &Path) -> Result<Vec<String>, String> {
+    let pattern = r"^includeif\..*\.path$";
+    if !git::status(repo, &["config", "--get-regexp", pattern])? {
+        return Ok(Vec::new());
+    }
+    let out =
+        git::run(repo, &["config", "-z", "--show-origin", "--path", "--get-regexp", pattern])?;
+    let fields: Vec<&str> = out.split('\0').collect();
+    let mut found = Vec::new();
+    for [origin, entry] in fields.as_chunks::<2>().0 {
+        let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
+        // A relative include is relative to the file that sets it, whose own path is relative to the repo.
+        let from = repo.join(origin.strip_prefix("file:").unwrap_or(origin));
+        let file = from.parent().map_or_else(|| PathBuf::from(value), |d| d.join(value));
+        let routes = match fsguard::kind(&file) {
+            Ok(fsguard::Kind::Missing) => false,
+            Ok(fsguard::Kind::File) => {
+                let path = file.to_string_lossy();
+                git::run(repo, &["config", "--file", &path, "--name-only", "--list"])
+                    .map_or(true, |keys| keys.lines().any(routes_hooks))
+            }
+            _ => true,
+        };
+        if routes {
+            found.push(format!("{key} = {value} ({origin})"));
+        }
+    }
+    Ok(found)
+}
+
+/// Whether a config key routes hooks: where they are, what a dispatcher reads, config-defined hooks, further includes.
+fn routes_hooks(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k == "core.hookspath"
+        || ["attributionguard.", "hook.", "include.", "includeif."].iter().any(|p| k.starts_with(p))
+}
+
+/// The effective `core.hooksPath` and the scope that sets it (`local`, `global`, …), if one is set.
+fn hooks_path(repo: &Path) -> Option<(String, String)> {
+    let out = git::run(repo, &["config", "--show-scope", "--get", "core.hooksPath"]).ok()?;
+    let (scope, path) = out.trim().split_once('\t')?;
+    Some((path.to_string(), scope.to_string()))
+}
+
+/// Whether a new worktree's post-checkout reaches the tool's hook, found out by running it as `git worktree add` would
+/// (H1): `git hook run post-checkout` in an empty stand-in for the new worktree (the repo's common dir as its git dir),
+/// so whatever lies between, a hooks path, a dispatcher, a path relative to the worktree, a skip, is run, never read.
+/// The hook answers a nonce whose file is made in `home` just before, with `label`, the token of the install that wrote
+/// it, so no other Lords hook can answer for it (`probe_label`); the nonce file and the stand-in go after.
+fn post_checkout_reaches_new_worktree(repo: &Path, home: &Path, label: &str) -> Result<(), String> {
+    let common = git::run(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    let n = nonce();
+    let state = Root::home(home)?.join(&[Part::new("state")?]);
+    fsguard::create_dir_all(&state)?;
+    let probe = state.child(Part::new(&format!("probe-{n}"))?);
+    let stand_in = state.child(Part::new(&format!("probe-{n}.worktree"))?);
+    fsguard::create_file(&probe, b"")?;
+    let ran = fsguard::create_dir_all(&stand_in).and_then(|()| {
+        let wt = stand_in.path().to_string_lossy().into_owned();
+        let zeros = "0".repeat(40);
+        let args = ["hook", "run", "--ignore-missing", "post-checkout", "--", &zeros, &zeros, "1"];
+        let env = [(PROBE_VAR, n.as_str()), ("GIT_DIR", common.trim()), ("GIT_WORK_TREE", &wt)];
+        let out = crate::process::git_env(stand_in.path(), &args, &env)?;
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if out.status.success() && said.contains(&probe_answer(&n, label)) {
+            Ok(())
+        } else {
+            Err(format!(
+                "`git hook run post-checkout` from a new worktree ended with {} and no answer",
+                out.status
+            ))
+        }
+    });
+    // Both go, whatever the other did.
+    let probe_gone = fsguard::delete_file(&probe);
+    let stand_in_gone = fsguard::kind(stand_in.path()).and_then(|k| match k {
+        fsguard::Kind::Missing => Ok(()),
+        _ => fsguard::delete_tree(&stand_in),
+    });
+    match (ran, probe_gone.and(stand_in_gone)) {
+        (Ok(()), gone) => gone,
+        (Err(e), Ok(())) => Err(e),
+        (Err(e), Err(stays)) => Err(format!("{e}; the probe's files stay: {stays}")),
+    }
+}
+
+/// Why a new worktree's post-checkout doesn't reach `dir`'s hook, from the config the hooks path and the attribution
+/// guard's dispatcher read (H6); `why` is the probe's outcome.
+fn refusal(repo: &Path, dir: &Root, why: &str) -> String {
+    let hook = dir.path().join("post-checkout");
+    let Some((path, scope)) = hooks_path(repo) else {
+        return format!("a new worktree's post-checkout doesn't reach {} ({why})", hook.display());
+    };
+    let skips = git::run(repo, &["config", "--get-all", "attributionGuard.skipPreviousHook"])
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.trim() == "post-checkout");
+    let previous =
+        git::run(repo, &["config", "--path", "--get", "attributionGuard.previousHooksPath"])
+            .ok()
+            .map(|p| p.trim().to_string());
+    let case = match previous {
+        _ if skips => "its dispatcher skips the repo's own post-checkout (attributionGuard.skipPreviousHook)".to_string(),
+        Some(p) if Path::new(&p).is_relative() => format!(
+            "its dispatcher forwards to attributionGuard.previousHooksPath = {p}, a relative path, so to each worktree's own copy of it (tracked files); a hook installed once can't reach a new worktree"
+        ),
+        Some(p) if crate::ledger::key(Path::new(&p)) != crate::ledger::key(dir.path()) => format!(
+            "its dispatcher forwards to attributionGuard.previousHooksPath = {p}, not to this repo's own hooks dir {}, the only one Lords writes",
+            dir.path().display()
+        ),
+        _ => format!("it doesn't run {} for a new worktree", hook.display()),
+    };
+    format!(
+        "core.hooksPath = {path} ({scope}): {case} ({why}); no post-checkout installed; core.hooksPath and what it runs are left as they are"
+    )
 }

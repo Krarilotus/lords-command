@@ -11,12 +11,13 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// One path and whether it delivers its role's lines.
+/// One path and whether it delivers its role's lines; `in_use`: whether its place is in use (`in_use`, D15).
 #[derive(Debug, Serialize)]
 pub struct Row {
     pub state: &'static str,
     pub path: String,
     pub why: String,
+    pub in_use: bool,
 }
 
 /// Where `paths` looks: the tool home (the guard copy, the hooks' command line), the Codex it asks, and how long it
@@ -31,7 +32,44 @@ pub struct Ask {
 pub const CODEX_DEADLINE: Duration = Duration::from_secs(20);
 
 fn row(complete: bool, path: String, why: impl Into<String>) -> Row {
-    Row { state: if complete { "complete" } else { "incomplete" }, path, why: why.into() }
+    let state = if complete { "complete" } else { "incomplete" };
+    Row { state, path, why: why.into(), in_use: true }
+}
+
+/// How recently a worktree's git files must have changed for it to be in use (D15; design note
+/// 2026-11-02-lords-hooks-dispatcher, P1: on 2 Nov this kept 47 of 126 places, at a gap from 2.9 to 6.9 days).
+pub const IN_USE: Duration = Duration::from_secs(3 * 86_400);
+
+/// Whether the worktree at `dir` is in use (P1): its HEAD, its index or its branch's loose ref changed within `IN_USE`.
+/// A git dir or HEAD that can't be read is in use, so an unknown is never hidden; an index or loose ref that isn't
+/// there (none yet, or a packed ref) gives no sign.
+fn worktree_in_use(dir: &Path) -> bool {
+    use crate::fsguard::{self, Kind};
+    let dot = dir.join(".git");
+    let git_dir = match fsguard::kind(&dot) {
+        Ok(Kind::Dir) => dot,
+        Ok(Kind::File) => match fsguard::read_string(&dot) {
+            Ok(t) => match t.trim().strip_prefix("gitdir:") {
+                Some(g) => dir.join(g.trim()),
+                None => return true,
+            },
+            Err(_) => return true,
+        },
+        _ => return true,
+    };
+    let Ok(head) = fsguard::read_string(git_dir.join("HEAD")) else { return true };
+    let common = match fsguard::read_string(git_dir.join("commondir")) {
+        Ok(c) => git_dir.join(c.trim()),
+        Err(_) => git_dir.clone(),
+    };
+    let mut files = vec![git_dir.join("HEAD"), git_dir.join("index")];
+    if let Some(branch) = head.trim().strip_prefix("ref: ") {
+        files.push(common.join(branch));
+    }
+    files.iter().any(|f| match fsguard::modified(f) {
+        Ok(t) => t.elapsed().map_or(true, |age| age <= IN_USE),
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    })
 }
 
 /// Every row (module doc).
@@ -49,8 +87,34 @@ pub fn paths(stacks: &Stacks, ask: &Ask) -> Vec<Row> {
             Err(why) => row(false, path, why),
         });
     }
-    rows.extend(role_rows(stacks));
+    rows.extend(role_rows(stacks, &ask.home));
     rows
+}
+
+/// The live sessions' cwds (`guard::live_session_cwds`), each resolved (`resolved`), so an alias names its place
+/// (sol-loop repair r1, R1-03). `None` when one can't be known.
+fn session_dirs(home: &Path) -> Option<Vec<PathBuf>> {
+    crate::guard::live_session_cwds(home)?.iter().map(|c| resolved(c)).collect()
+}
+
+/// `path` resolved (`fsguard::canonical`): its nearest dir that is there, with the rest as written, so a cwd removed
+/// since still names the place it was in (sol-loop repair r2, R2-01). `None` on any other error.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    match crate::fsguard::canonical(path) {
+        Ok(p) => Some(p),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Some(resolved(path.parent()?)?.join(path.file_name()?))
+        }
+        Err(_) => None,
+    }
+}
+
+/// Whether a live session's resolved cwd is at or below `dir`; yes when either can't be known.
+fn has_session(sessions: Option<&[PathBuf]>, dir: &Path) -> bool {
+    match (sessions, crate::fsguard::canonical(dir)) {
+        (Some(s), Ok(dir)) => s.iter().any(|c| c.starts_with(&dir)),
+        _ => true,
+    }
 }
 
 /// The event a role hook must be under to run at a session's first prompt (F10-R1-02).
@@ -148,17 +212,29 @@ fn find_codex() -> Option<PathBuf> {
 /// where the role guard couldn't give the role's start, decided by the guard's own `guard::deliverable` (F10-FC1-02:
 /// the installed start and that harness's place file, never a recomposition); or one complete row. The checkouts and
 /// worktrees are sync's own (`sync::checkouts`, sol-loop r2 S1); a repo whose can't be listed is a row of its own,
-/// incomplete.
-fn role_rows(stacks: &Stacks) -> Vec<Row> {
+/// incomplete. `home`: the tool home, whose session records mark places in use.
+fn role_rows(stacks: &Stacks, home: &Path) -> Vec<Row> {
     use crate::fsguard::InDir;
     let Some(private) = &stacks.private else { return Vec::new() };
     let mut rows = Vec::new();
-    let mut dirs: Vec<(String, PathBuf, &[String])> = Vec::new();
+    let sessions = session_dirs(home);
+    // Each place: its label, dir, adapters, and whether it is in use: a declared checkout or a workspace always is, a
+    // worktree with a live session or recent git activity (P1; review r1, R1-03).
+    let mut dirs: Vec<(String, PathBuf, &[String], bool)> = Vec::new();
     for (name, repo) in &private.manifest.repos {
+        let declared: Vec<String> = repo
+            .checkouts
+            .iter()
+            .map(|c| crate::ledger::key(&crate::config::expand_home(c)))
+            .collect();
         match sync::checkouts(repo) {
             Ok((roots, _, _)) => dirs.extend(roots.iter().map(|r| {
                 let p = r.path().to_path_buf();
-                (format!("repo {name} ({})", crate::adapters::slashes(&p)), p, &repo.adapters[..])
+                let in_use = declared.contains(&crate::ledger::key(&p))
+                    || has_session(sessions.as_deref(), &p)
+                    || worktree_in_use(&p);
+                let label = format!("repo {name} ({})", crate::adapters::slashes(&p));
+                (label, p, &repo.adapters[..], in_use)
             })),
             Err(e) => rows.push(row(
                 false,
@@ -169,22 +245,25 @@ fn role_rows(stacks: &Stacks) -> Vec<Row> {
     }
     for (name, w) in &private.manifest.workspaces {
         let dir = crate::config::expand_home(&w.path);
-        dirs.push((format!("workspace {name}"), dir, &w.adapters[..]));
+        dirs.push((format!("workspace {name}"), dir, &w.adapters[..], true));
     }
     for role in sync::declared_roles(stacks).iter().filter(|r| *r != crate::compose::PRODUCT_ROLE) {
         let file = sync::start_file(role);
         let mut refused = Vec::new();
-        for (label, dir, ids) in &dirs {
+        for (label, dir, ids, in_use) in &dirs {
             let lords = dir.join(sync::ROLE_DIR);
             let start = match crate::fsguard::read_text_in(&lords, &file) {
                 Ok(InDir::Text(t)) => t,
                 Ok(_) => String::new(),
                 Err(e) => {
-                    refused.push(row(
-                        false,
-                        format!("T3-delegated as {role}, {label}"),
-                        format!("{file} can't be read ({e})"),
-                    ));
+                    refused.push(Row {
+                        in_use: *in_use,
+                        ..row(
+                            false,
+                            format!("T3-delegated as {role}, {label}"),
+                            format!("{file} can't be read ({e})"),
+                        )
+                    });
                     continue;
                 }
             };
@@ -192,7 +271,10 @@ fn role_rows(stacks: &Stacks) -> Vec<Row> {
             for a in adapters::ALL.iter().copied().filter(|a| has(*a)) {
                 if let Err(why) = crate::guard::deliverable(&lords, &start, role, Some(a.id())) {
                     let path = format!("T3-delegated as {role} via {}, {label}", a.repo_file());
-                    refused.push(row(false, path, format!("{why}: sync the place")));
+                    refused.push(Row {
+                        in_use: *in_use,
+                        ..row(false, path, format!("{why}: sync the place"))
+                    });
                 }
             }
         }

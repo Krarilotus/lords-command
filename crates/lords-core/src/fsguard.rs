@@ -115,6 +115,12 @@ pub fn modified(path: impl AsRef<Path>) -> std::io::Result<std::time::SystemTime
     fs::metadata(path)?.modified()
 }
 
+/// A path with every link, junction and short name resolved (std's `fs::canonicalize`): `lords paths` matches a
+/// session's cwd to a place by it.
+pub fn canonical(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
+    fs::canonicalize(path)
+}
+
 /// A file's bytes for display, `None` on any error (fonts in the GUI).
 pub fn read_bytes_lossy(path: impl AsRef<Path>) -> Option<Vec<u8>> {
     fs::read(path).ok()

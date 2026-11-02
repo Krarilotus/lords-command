@@ -606,3 +606,93 @@ fn paths_and_the_hook_agree_where_a_place_file_is_missing() {
         rows.iter().find(|r| r.1.contains("as reviewer") && r.1.contains("AGENTS.override.md"));
     assert!(code == Some(1) && refused.is_some_and(|r| r.0 == "incomplete"), "{rows:?}");
 }
+
+/// Sets `path`'s modification time `days` days back.
+fn age(path: &Path, days: u64) {
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+    fs::File::options().write(true).open(path).unwrap().set_modified(then).unwrap();
+}
+
+/// Ages the git files that mark a checkout or worktree in use (design note P1): its HEAD and index in `git_dir`, and
+/// its branch's loose ref in the repo's `common` dir.
+fn age_git_files(git_dir: &Path, common: &Path, days: u64) {
+    let head = fs::read_to_string(git_dir.join("HEAD")).unwrap();
+    let branch = head.trim().strip_prefix("ref: ").unwrap();
+    for p in [git_dir.join("HEAD"), git_dir.join("index"), common.join(branch)] {
+        age(&p, days);
+    }
+}
+
+// Spec (D15, the Lords owner's contract, 2 Nov: "By default, `paths` shows the places in use and folds the rest into
+// one count line, naming the flag that lists them … `--all` shows every row, as today … The machine-readable output
+// (`--json`) keeps every row, with an `in_use` field"; design note 2026-11-02-lords-hooks-dispatcher, P1: in use is a
+// declared checkout, a workspace, or a worktree whose HEAD, index or branch ref changed within 3 days): of two
+// worktrees without their starts, the one untouched for 10 days is folded into one count line naming `--all`, the
+// fresh one is listed, and so is the declared checkout, aged 10 days too; `--all` lists all three; `--json` has every
+// row with `in_use`; exit 1 (rows incomplete) in every form.
+#[test]
+fn paths_folds_the_places_not_in_use_into_one_line() {
+    let d = TempDir::new().unwrap();
+    let d = d.path();
+    let stacks = stacks(d, "[]", "[]");
+    let stacks: Vec<&str> = stacks.iter().map(String::as_str).collect();
+    let manifest = fs::read_to_string(d.join("priv/stack.toml")).unwrap();
+    fs::write(d.join("priv/stack.toml"), manifest.replace("worktrees = false", "worktrees = true"))
+        .unwrap();
+    git(d, &d.join("priv"), &["commit", "-q", "-a", "-m", "worktrees"]);
+    git(d, &d.join("checkout"), &["worktree", "add", "-q", "../wt-old"]);
+    git(d, &d.join("checkout"), &["worktree", "add", "-q", "../wt-new"]);
+    let common = d.join("checkout/.git");
+    age_git_files(&common.join("worktrees/wt-old"), &common, 10);
+    age_git_files(&common, &common, 10);
+
+    let o = lords(d, &[&["paths"][..], &stacks].concat(), &[]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert_eq!(o.status.code(), Some(1), "{}", said(&o));
+    assert!(out.contains("/wt-new)") && out.contains("/checkout)"), "{out}");
+    assert!(!out.contains("/wt-old)"), "{out}");
+    let fold: Vec<&str> = out.lines().filter(|l| l.contains("--all")).collect();
+    assert_eq!(fold.len(), 1, "{out}");
+    let per_place = out.lines().filter(|l| l.contains("/wt-new)")).count();
+    assert!(per_place > 0 && fold[0].starts_with(&format!("{per_place} rows")), "{out}");
+
+    let o = lords(d, &[&["paths", "--all"][..], &stacks].concat(), &[]);
+    let all = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert_eq!(o.status.code(), Some(1), "{}", said(&o));
+    assert!(all.contains("/wt-old)") && all.contains("/wt-new)") && all.contains("/checkout)"));
+    assert!(!all.contains("--all"), "{all}");
+
+    let o = lords(d, &[&["paths", "--json"][..], &stacks].concat(), &[]);
+    assert_eq!(o.status.code(), Some(1), "{}", said(&o));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let rows = v.as_array().unwrap();
+    assert_eq!(rows.len(), all.lines().count(), "every row: {rows:?}");
+    for r in rows {
+        let path = r["path"].as_str().unwrap();
+        let in_use = r["in_use"].as_bool().unwrap_or_else(|| panic!("no in_use: {r}"));
+        assert_eq!(in_use, !path.contains("/wt-old)"), "{r}");
+    }
+
+    // Review r1, R1-03, its witness: a session opened in the aged worktree (Lords' session hook records it, as Claude
+    // Code's SessionStart runs it), with no git write, makes that place in use: its rows are listed, nothing folds. Its
+    // cwd names the worktree through an alias, a junction or symlink (sol-loop repair r1, R1-03), and is removed after
+    // the session started (sol-loop repair r2, R2-01): the record still names that place.
+    fs::create_dir_all(d.join("wt-old/sub")).unwrap();
+    #[cfg(windows)]
+    let o = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(d.join("alias"))
+        .arg(d.join("wt-old"))
+        .output();
+    #[cfg(unix)]
+    let o = std::os::unix::fs::symlink(d.join("wt-old"), d.join("alias"));
+    assert!(o.is_ok() && d.join("alias/sub").is_dir(), "{o:?}");
+    let ev = serde_json::json!({"hook_event_name": "SessionStart", "session_id": "s-old",
+        "cwd": d.join("alias/sub"), "source": "startup", "transcript_path": "x"});
+    assert!(run(&d.join("home"), d, &["guard", "session"], &ev.to_string(), &[]).status.success());
+    fs::remove_dir(d.join("wt-old/sub")).unwrap();
+    let o = lords(d, &[&["paths"][..], &stacks].concat(), &[]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert_eq!(o.status.code(), Some(1), "{}", said(&o));
+    assert!(out.contains("/wt-old)") && !out.contains("--all"), "{out}");
+}
