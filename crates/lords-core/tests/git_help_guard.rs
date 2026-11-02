@@ -217,3 +217,41 @@ fn powershell_mentions_and_listings_pass() {
         passes_in("PowerShell", command);
     }
 }
+
+// Spec: sol-loop r1 (witnesses, probed with the binary): a redirection touching its argument still leaves the argument
+// to git (S1); in PowerShell a CR ends a line (S2), a line comment is data whatever quotes it holds (S3), an assignment
+// runs its right-hand side (S4), a script block's braces need no spaces (S5), and `$((…))` is a subexpression, not
+// arithmetic (S6). The must-allow forms next to each still pass.
+#[test]
+fn sol_loop_r1_forms() {
+    for command in ["git commit --help>/dev/null", "git commit --help&>/dev/null"] {
+        help_denied("Bash", command);
+    }
+    for command in ["git help -a>commands.txt", "git help -a> commands.txt", "git help -g 2>&1"] {
+        passes_in("Bash", command);
+    }
+    for command in [
+        "git commit --help\r\n",
+        "# don't\r\nGet-ChildItem \"C:\\tmp\\\"; git help config",
+        "$page = git help config",
+        "$page=git help config",
+        "[string]$page = git help config",
+        "if ($true) {git help config}",
+        "try { git help config } catch { }",
+        "Get-Content topics.txt | ForEach-Object {git help $_}",
+        "git -C ${env:TEMP} help config",
+        "$page = $((git help config))",
+    ] {
+        help_denied("PowerShell", command);
+    }
+    for command in [
+        "git help `\r\n-a",
+        "# \"quoted\n<#\ngit help config\n#>",
+        "# don't run git help config\nGet-Date",
+        "$m = @{ a = 'git help config' }",
+        "git -C ${env:TEMP} help -a",
+        "$n = $((1 + 2))",
+    ] {
+        passes_in("PowerShell", command);
+    }
+}
