@@ -175,10 +175,13 @@ fn patch_sections(patch: &str) -> Vec<(String, String)> {
 /// The clock times the guard objects to among `new`'s lines that aren't `old`'s, outside code: fenced blocks and inline
 /// code spans. `now`: the zoned clock; `None` skips F.
 pub fn findings(new: &str, old: &str, now: Option<&Zoned>) -> Vec<Finding> {
-    // Each old line keeps as many copies of itself as the old text has (sol-loop r1, S4).
+    // Each old prose line keeps as many copies of itself as the old text has (sol-loop r1, S4); code on either side
+    // neither keeps nor uses up a line (r2, S6; r3, S8).
     let mut kept: HashMap<&str, usize> = HashMap::new();
-    for line in old.lines() {
-        *kept.entry(line).or_default() += 1;
+    for (line, plain) in old.lines().zip(without_code(old).lines()) {
+        if !plain.trim().is_empty() {
+            *kept.entry(line).or_default() += 1;
+        }
     }
     let prose = without_code(new);
     let mut out = Vec::new();
