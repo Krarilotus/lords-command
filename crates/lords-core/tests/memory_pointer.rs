@@ -10,8 +10,8 @@ mod common;
 use common::*;
 use lords_core::compose::END;
 use lords_core::ledger::{self, Ledger};
-use lords_core::sync::{apply, plan, Options, Plan};
-use std::collections::BTreeMap;
+use lords_core::sync::{apply, plan, Action, Options, Plan};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -220,4 +220,58 @@ fn the_file_comes_and_goes_with_the_setting_and_the_place() {
     let records = Ledger::load(&f.home()).unwrap().owned;
     let under = ledger::key(&checkout.join(".lords"));
     assert!(!records.keys().any(|k| k.starts_with(&under)), "{:?}", records.keys());
+}
+
+// Spec (the Lords owner, 2 Nov, accepting review r1 R1-01: "`uninstall --place` never removes a Lords file that a file
+// it keeps still names. If an instruction file is kept (changed inside the Lords block, so exit 1 and named in
+// `remaining`), then the `.lords` files that kept file points to stay too, and are listed in `remaining`. That covers
+// `memory-<adapter>.md` and the role-files line's `role-*.md`"; design note §6b, RA1, RA2, RA4): a place file edited
+// inside its block is kept, and `.lords` stays with it, with its record, so what the kept file names is still there;
+// the unchanged place file goes; exactly those two remain. Once the kept file is gone, `.lords` goes too, and nothing
+// of the place remains.
+#[test]
+fn a_kept_place_file_keeps_the_lords_files_it_names() {
+    // RA1: Codex's pointer; RA2: Claude's role-files line, without the setting.
+    for (setting, kept, other, named) in [
+        (CODEX, "AGENTS.override.md", "CLAUDE.local.md", "memory-codex.md"),
+        ("", "CLAUDE.local.md", "AGENTS.override.md", "role-coder.md"),
+    ] {
+        let (f, checkout) = place(&NOTES);
+        let manifest = f.read("priv/stack.toml");
+        f.write("priv/stack.toml", &format!("{manifest}{setting}"));
+        apply(&plan(&f.stacks(), &f.opts()).unwrap()).unwrap();
+        let (lords, kept, other) =
+            (checkout.join(".lords"), checkout.join(kept), checkout.join(other));
+        let text = fs::read_to_string(&kept).unwrap();
+        assert!(lords.join(named).exists() && text.contains(&format!("{named}`")), "{text}");
+        // A line after the begin marker: inside the block, so neither a whole-file nor a block-only removal.
+        fs::write(&kept, text.replacen('\n', "\nmine, inside the block\n", 1)).unwrap();
+        let place = Options {
+            repo: Some("beta-core".into()),
+            place: Some(checkout.clone()),
+            uninstall: true,
+            ..f.opts()
+        };
+        let action = |p: &Plan, path: &Path| {
+            p.items
+                .iter()
+                .find(|i| ledger::key(&i.path) == ledger::key(path))
+                .map(|i| i.action.clone())
+        };
+        let p = plan(&f.stacks(), &place).unwrap();
+        assert_eq!(action(&p, &kept), Some(Action::Report), "{named}: {:?}", p.items);
+        assert_eq!(action(&p, &lords), Some(Action::Report), "{named}: {:?}", p.items);
+        assert_eq!(action(&p, &other), Some(Action::Remove), "{named}: {:?}", p.items);
+        apply(&p).unwrap();
+        assert!(lords.join(named).exists() && !other.exists(), "{named}");
+        let left = plan(&f.stacks(), &place).unwrap();
+        let remaining: BTreeSet<String> = left.items.iter().map(|i| ledger::key(&i.path)).collect();
+        assert_eq!(remaining, BTreeSet::from([ledger::key(&kept), ledger::key(&lords)]), "{named}");
+        assert!(left.items.iter().all(|i| i.action == Action::Report), "{:?}", left.items);
+        // RA4: the hold lets go with the kept file.
+        fs::remove_file(&kept).unwrap();
+        apply(&plan(&f.stacks(), &place).unwrap()).unwrap();
+        assert!(!lords.exists(), "{named}");
+        assert!(plan(&f.stacks(), &place).unwrap().items.is_empty(), "{named}: nothing remains");
+    }
 }
