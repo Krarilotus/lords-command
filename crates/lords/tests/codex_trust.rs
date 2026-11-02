@@ -62,9 +62,11 @@ impl T {
         c.output().unwrap()
     }
 
-    /// The target's guards (a TOML list), committed.
+    /// The target's guards (a TOML list), committed. Its path is absolute, so a plan made in this process never reads
+    /// this process's own home.
     fn guards(&self, guards: &str) {
-        let manifest = format!("name = \"priv\"\nvisibility = \"private\"\n[[targets]]\nname = \"codex hooks\"\nadapter = \"codex\"\nkind = \"settings\"\npath = \"~/.codex/hooks.json\"\nguards = {guards}\n");
+        let hooks = self.path("home/.codex/hooks.json").display().to_string().replace('\\', "/");
+        let manifest = format!("name = \"priv\"\nvisibility = \"private\"\n[[targets]]\nname = \"codex hooks\"\nadapter = \"codex\"\nkind = \"settings\"\npath = '{hooks}'\nguards = {guards}\n");
         fs::write(self.path("priv/stack.toml"), manifest).unwrap();
         self.git(&["add", "-A"]);
         self.git(&["commit", "-q", "--allow-empty", "-m", guards]);
@@ -263,7 +265,6 @@ fn sync_trusts_only_lords_own_guard_hooks_in_the_file_it_wrote() {
     let add = t.path("add.json");
     let o = t.sync(true, &[("LORDS_STUB_ADD", add.to_str().unwrap())]);
     let writes = t.calls("config/batchWrite");
-    assert_eq!(writes.len(), 2, "role's at the first sync, time's now: {}", said(&o));
     let listed = t.stub("list");
     let at = |h: &&Value| h["key"].as_str().unwrap().ends_with(":pre_tool_use:2:0");
     let time = listed.as_array().unwrap().iter().find(at).unwrap_or_else(|| panic!("{listed}"));
@@ -272,8 +273,11 @@ fn sync_trusts_only_lords_own_guard_hooks_in_the_file_it_wrote() {
     want.insert(time["key"].as_str().unwrap().into(), json!({"trusted_hash": time["currentHash"]}));
     let edit = json!({"keyPath": "hooks.state", "value": want, "mergeStrategy": "upsert"});
     let want = json!({"edits": [edit], "reloadUserConfig": true});
-    assert_eq!(writes[1]["params"], want, "Lords' time hook alone, as listed");
+    // The answer first (review r1, E1): this run's one write holds Lords' time hook alone, as listed.
+    let last = writes.last().map(|w| &w["params"]);
+    assert_eq!(last, Some(&want), "Lords' time hook alone, as listed: {}", said(&o));
     assert_eq!(time["trustStatus"], "trusted", "{listed}");
+    assert_eq!(writes.len(), 2, "role's at the first sync, time's now: {}", said(&o));
     let others = lookalikes.len() + 3;
     assert_eq!((o.status.code(), not_trusted(&o)), (Some(1), others), "{}", said(&o));
     let text = out(&o);
@@ -379,15 +383,67 @@ fn a_switched_off_lords_hook_stays_off() {
 fn a_hook_changed_after_the_list_is_named() {
     let t = T::new("[\"time\"]");
     let o = t.sync(true, &[("LORDS_STUB_MODE", "race")]);
-    let writes = t.calls("config/batchWrite");
-    assert_eq!(writes.len(), 1, "{}", said(&o));
     let listed = t.stub("list");
     let raced = &listed[0];
+    // The answer first (review r1, E1): the read-back names the changed hook, by its key, as not Lords', alone.
+    let key = raced["key"].as_str().unwrap();
+    let named = out(&o).lines().any(|l| l.contains(key) && l.contains("not Lords'"));
+    assert!(named && not_trusted(&o) == 1 && o.status.code() == Some(1), "{}", said(&o));
     assert!(raced["command"].as_str().unwrap().ends_with(" --raced"), "{listed}");
     assert_eq!(raced["trustStatus"], "modified", "{listed}");
-    assert_eq!((o.status.code(), not_trusted(&o)), (Some(1), 1), "{}", said(&o));
-    let key = raced["key"].as_str().unwrap();
-    assert!(out(&o).lines().any(|l| l.contains(key) && l.contains("not Lords'")), "{}", said(&o));
+    assert_eq!(t.calls("config/batchWrite").len(), 1, "one write, no retry: {}", said(&o));
+}
+
+// Spec (review r1, R1-01; design note §3 I3: "A sync that adds or changes Lords hooks never moves an entry it didn't
+// write"): a user's own hook added to Lords' `time` entry, whose matcher the user changed: Lords' matcher can't go on
+// that entry without moving the user's hook, so adding `rm` is refused as a conflict naming that entry, before any write.
+#[test]
+fn a_shared_entry_under_another_matcher_is_a_conflict() {
+    let t = T::new("[\"time\"]");
+    assert!(t.sync(true, &[]).status.success());
+    let mut hooks = t.hooks();
+    hooks["hooks"]["PreToolUse"][0]["matcher"] = json!("Write|Edit");
+    let audit = json!({"type": "command", "command": "audit"});
+    hooks["hooks"]["PreToolUse"][0]["hooks"].as_array_mut().unwrap().push(audit);
+    t.set_hooks(&hooks);
+    t.guards("[\"rm\", \"time\"]");
+    let o = t.sync(true, &[]);
+    assert_eq!(t.hooks(), hooks, "the user's slot, unchanged: {}", said(&o));
+    let named = said(&o).contains("`hooks.PreToolUse` entry 1") && said(&o).contains("matcher");
+    assert!(named && o.status.code() == Some(2), "{}", said(&o));
+}
+
+// Spec (review r1, R1-02; design note §3 I1: "After any `sync --apply` that wrote Codex's hooks file, every hook in that
+// file is either trusted at its current hash, or named"): another process holds the old hooks file open without delete
+// sharing once the new one is in, so the old copy can't be deleted. The new hooks file is settled all the same: Lords'
+// new `rm` hook is trusted; and the apply's error still names the old copy it couldn't delete.
+#[cfg(windows)]
+#[test]
+fn a_hooks_file_in_place_before_a_cleanup_error_is_settled() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let t = T::new("[\"time\"]");
+    assert!(t.sync(true, &[]).status.success());
+    t.guards("[\"time\", \"rm\"]");
+    let stacks = lords_core::Stacks::load(&t.path("pub"), Some(&t.path("priv"))).unwrap();
+    let deadline = std::time::Duration::from_secs(20);
+    let codex = lords_core::codex_trust::Codex::Ask { exe: STUB.into(), deadline };
+    let home = t.path("home/.lords-command");
+    let opts = lords_core::sync::Options { user_only: true, home, codex, ..Default::default() };
+    let plan = lords_core::sync::plan(&stacks, &opts).unwrap();
+    let dir = t.path("home/.codex");
+    let mut held = Vec::new();
+    let applied = lords_core::sync::apply_between(&plan, |_| {
+        let old = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path());
+        let old = old.filter(|p| p.to_string_lossy().contains(".lords-old-"));
+        // FILE_SHARE_READ alone: no delete sharing, as a reader that opened it would.
+        held.extend(old.map(|p| fs::OpenOptions::new().read(true).share_mode(1).open(p).unwrap()));
+    });
+    drop(held);
+    let listed = t.stub("list");
+    let rm = |h: &&Value| h["command"].to_string().contains(" guard rm");
+    let rm = listed.as_array().unwrap().iter().find(rm);
+    assert_eq!(rm.map(|h| &h["trustStatus"]), Some(&json!("trusted")), "{applied:?}");
+    assert!(applied.is_err_and(|e| e.contains(".lords-old-")), "the cleanup error stays");
 }
 
 // Spec (design note §2.4; D17: "`lords paths` checks only the role hook"): `lords paths` gives Codex's row complete when
