@@ -6,9 +6,10 @@
 //! `$CODEX_HOME/config.toml` (Lords never reads it). Every request is logged to `$CODEX_HOME/stub-calls.jsonl`.
 //! `LORDS_STUB_TRUST` forces every hook's trust (`hang`: never answers `hooks/list`); `LORDS_STUB_DISABLED` switches one
 //! event's hooks off; `LORDS_STUB_MODE`: `exit` ends at once, `nolist` and `writeerr` answer an error, `malformed` a list
-//! that isn't one, `race` edits the hooks file once after a list (another writer). Run as `trust-all` it trusts every
-//! hook listed, as the owner would under `/hooks`; as `list`, it prints the list. It ends at the end of its input, as no
-//! real server does before it has answered.
+//! that isn't one, `race` edits the hooks file once after a list (another writer); `LORDS_STUB_ADD` names a JSON object
+//! of hook entries per event that another writer appends to the hooks file once, before a list. Run as `trust-all` it
+//! trusts every hook listed, as the owner would under `/hooks`; as `list`, it prints the list. It ends at the end of
+//! its input, as no real server does before it has answered.
 
 // Test support is outside the filesystem boundary (fsguard.rs), as the tests are.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -37,8 +38,11 @@ fn list(home: &Path, cwds: &[&str]) -> Vec<Value> {
     files.extend(cwds.iter().map(|c| Path::new(c).join(".codex").join("hooks.json")));
     let mut listed = Vec::new();
     for file in files {
-        let source = file.display().to_string();
-        for (event, groups) in read(&file)["hooks"].as_object().into_iter().flatten() {
+        // One spelling of the file, however `CODEX_HOME` spells it (Codex's keys read `C:\…\.codex\hooks.json:…`).
+        let source = std::fs::canonicalize(&file).unwrap_or(file).display().to_string();
+        let source = source.trim_start_matches(r"\\?\").to_string();
+        let file = Path::new(&source);
+        for (event, groups) in read(file)["hooks"].as_object().into_iter().flatten() {
             // Named as Codex names it: `PreToolUse` → `preToolUse`, and `pre_tool_use` in its key.
             let mut name = event.clone();
             name[..1].make_ascii_lowercase();
@@ -123,6 +127,17 @@ fn main() {
             Some("hooks/list") if mode == "nolist" => (Value::Null, failed),
             Some("hooks/list") if mode == "malformed" => (json!({"data": "a"}), Value::Null),
             Some("hooks/list") => {
+                let added = home.join("stub-added");
+                if let (Ok(add), false) = (std::env::var("LORDS_STUB_ADD"), added.exists()) {
+                    let mut hooks = read(&home.join("hooks.json"));
+                    for (event, groups) in read(Path::new(&add)).as_object().into_iter().flatten() {
+                        let list = hooks["hooks"][event].as_array().cloned().unwrap_or_default();
+                        let more = groups.as_array().into_iter().flatten().cloned();
+                        hooks["hooks"][event] = list.into_iter().chain(more).collect();
+                    }
+                    std::fs::write(home.join("hooks.json"), hooks.to_string()).unwrap();
+                    std::fs::write(&added, "").unwrap();
+                }
                 let cwds = req["params"]["cwds"].as_array().into_iter().flatten();
                 let cwds: Vec<&str> = cwds.filter_map(Value::as_str).collect();
                 (json!({"data": [{"cwd": ".", "hooks": list(&home, &cwds)}]}), Value::Null)
