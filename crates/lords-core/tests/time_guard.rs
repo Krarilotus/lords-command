@@ -124,6 +124,9 @@ fn placeholder_clock_times_are_denied() {
     placeholder("```HH:MM``` then\ndone 14:xx");
     // A span doesn't reach across list items (sol-loop r2, S7).
     placeholder("- example `text\n- done 14:xx\n- end`");
+    // Prose after a quoted fence is judged, whether the fence closes or its quote ends (review r1, C15-R1-01).
+    placeholder("Example from the note:\n> ```text\n> HH:MM\n> ```\ndone 14:xx");
+    placeholder("> ```\n> HH:MM\ndone 14:xx");
 }
 
 // Spec (the brief: "The deny reason names the fix: take the time from the turn hook's "Berlin HH:MM" line or from
@@ -161,6 +164,9 @@ fn real_times_durations_ratios_and_code_pass() {
     // A port is no minute, and a code span may wrap (sol-loop r1, S1, S2).
     passes("a `format\nHH:MM\nend` span, wrapped");
     passes("`a\n\u{a0}\nHH:MM\nb`");
+    // A fence inside a blockquote is code (review r1, C15-R1-01: its exact payload), nested quotes too.
+    passes("Example from the note:\n> ```text\n> HH:MM\n> ```");
+    passes("> > ```\n> > HH:MM\n> > ```");
     passes("see http://xx:80/ there");
     passes("no times at all");
 }
