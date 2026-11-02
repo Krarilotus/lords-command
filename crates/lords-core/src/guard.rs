@@ -5,14 +5,17 @@
 //! minutes on Claude Code's "dangerous rm on a possibly-empty variable path" prompt for `rm -f $OUT/$id.json`; its
 //! parent saw only "running".
 //!
-//! `rm` (the Bash guard, registered as `guard rm`) refuses two kinds of Bash call (design note
-//! Harness/notes/2026-11-02-lords-bash-guard.md; a command that only mentions them is let through):
+//! `rm` (the Bash guard, registered as `guard rm`) refuses three kinds of shell call (design notes
+//! Harness/notes/2026-11-02-lords-bash-guard.md and 2026-11-02-lords-git-help-guard.md; a command that only mentions
+//! them is let through); the third alone also in PowerShell text (Claude Code's PowerShell tool, Codex on Windows):
 //!
 //! - An `rm` whose path holds a shell variable: it deletes the wrong place when the variable is empty (`rm -rf
 //!   "$OUT/"` is `rm -rf /`). The only form let through is `"${VAR:?}"`, quoted, which stops the command when `VAR`
 //!   is empty or unset. Quoting alone (`"$OUT/x"`) doesn't: an empty `OUT` still makes it `/x`, so it is refused too.
 //! - A git call that would run without its hooks (rule.hooks-run-on-every-commit): an option that skips them, a
 //!   `core.hooksPath` set on the command line or written by `git config`, or an environment override of them.
+//! - Git's help on a topic (`git help X`, `git --help X`, `git <cmd> --help`), which Git for Windows opens as a web page
+//!   in the owner's default browser (rule.no-default-browser; defect D16). Listings and usage pass.
 //!
 //! Both find a command's word the same way: past assignments, the keywords that open a command (`then`, `do`, `!`,
 //! `{` …), and the prefix commands that run the command after them (`env`, `sudo`, `timeout` …), with their options;
@@ -36,6 +39,8 @@ struct Word {
     text: String,
     /// Each `$` expansion in the word: whether it was inside double quotes, and whether it is `${NAME:?…}`.
     vars: Vec<(bool, bool)>,
+    /// Where in `text` the word's first redirection operator is: its first `<` or `>` neither quoted nor escaped.
+    redirect: Option<usize>,
 }
 
 /// The simple command being read: its words so far and the word in progress. After `<<<` (`data`), the next word to
@@ -264,6 +269,9 @@ fn list(
             }
             _ => {
                 after_op = !double && matches!(ch, '>' | '<');
+                if after_op && s.word.redirect.is_none() {
+                    s.word.redirect = Some(s.word.text.len());
+                }
                 s.word.text.push(ch);
                 s.started = true;
             }
@@ -629,26 +637,235 @@ pub fn hook_bypass(command: &str) -> Option<String> {
     commands(command).iter().find_map(|words| skips_hooks(words))
 }
 
-/// The Bash guard's answer to one `PreToolUse` event (the harness's stdin JSON): a denial naming the fix, or nothing
-/// (empty: the call goes on to the harness's own checks). Only Bash calls are looked at; input that isn't such an
-/// event is let through, so the guard never stops a call it can't read.
-pub fn rm_hook(input: &str) -> String {
-    let Ok(ev) = serde_json::from_str::<Value>(input) else { return String::new() };
-    if ev["tool_name"] != "Bash" {
-        return String::new();
+/// The language of a shell call's text (`lords guard rm --shell`; design note 2026-11-02-lords-git-help-guard §2):
+/// Claude Code's Bash tool runs Bash and its PowerShell tool PowerShell; Codex sends its shell commands as `Bash`, run
+/// by PowerShell on Windows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shell {
+    Bash,
+    PowerShell,
+}
+
+/// PowerShell text as the lexer above reads it (design note §3): `` ` `` escapes the next character, as `\` does in
+/// Bash, and a `\` is a literal; a here-string (`@'` or `@"` ending its line, to a line opening with `'@` or `"@`) and
+/// a `<# … #>` comment are data, an empty word. Single-quoted text stays as it is. Sol-loop r1, S2-S6: a CR ends a
+/// line, a `#` comment is data, assignments and braces start commands, `$((…))` is a subexpression.
+fn powershell_as_bash(text: &str) -> String {
+    let c: Vec<char> = text.replace("\r\n", "\n").replace('\r', "\n").chars().collect();
+    let (mut out, mut i, mut single, mut double) = (String::new(), 0, false, false);
+    // The open `$( … )`s: the string state each was opened in, and its open parentheses.
+    let mut subs: Vec<(bool, usize)> = Vec::new();
+    while let Some(&ch) = c.get(i) {
+        i += 1;
+        if single {
+            single = ch != '\'';
+            out.push(ch);
+            continue;
+        }
+        let token_start = !double
+            && out.chars().last().is_none_or(|p| p.is_whitespace() || ";|&(){}".contains(p));
+        match ch {
+            '#' if token_start => {
+                i = c[i..].iter().position(|x| *x == '\n').map_or(c.len(), |p| i + p)
+            }
+            // `${name}`: a variable, braces and all.
+            '$' if !double && c.get(i) == Some(&'{') => {
+                let end = c[i..].iter().position(|x| *x == '}').map_or(c.len(), |p| i + p + 1);
+                out.extend(&c[i - 1..end]);
+                i = end;
+            }
+            '{' | '}' if !double => out.push(';'),
+            // `$( … )` is code, in a string too, to its `)` (review r1, D16-R1-02); `$((` holds a group.
+            '$' if c.get(i) == Some(&'(') => {
+                out.push_str(if c.get(i + 1) == Some(&'(') { "$( " } else { "$(" });
+                subs.push((double, 0));
+                (double, i) = (false, i + 1);
+            }
+            '(' | ')' if !double && !subs.is_empty() => {
+                let open = &mut subs.last_mut().expect("not empty").1;
+                match (ch, *open) {
+                    (')', 0) => double = subs.pop().expect("not empty").0,
+                    (')', n) => *open = n - 1,
+                    _ => *open += 1,
+                }
+                out.push(ch);
+            }
+            '=' if !double && assigns(&out) => out.push_str("=;"),
+            '`' => {
+                out.push('\\');
+                out.extend(c.get(i));
+                i += 1;
+            }
+            '\\' => out.push_str("\\\\"),
+            '"' => {
+                double = !double;
+                out.push(ch);
+            }
+            '\'' if !double => {
+                single = true;
+                out.push(ch);
+            }
+            '@' if !double && here_string_opens(&c, i) => {
+                let close = [c[i], '@'];
+                let next_line =
+                    |from: usize| c[from..].iter().position(|x| *x == '\n').map(|p| from + p + 1);
+                let mut at = next_line(i).unwrap_or(c.len());
+                while at < c.len() && !c[at..].starts_with(&close) {
+                    at = next_line(at).unwrap_or(c.len());
+                }
+                out.push_str("''");
+                i = (at + 2).min(c.len());
+            }
+            '<' if !double && c.get(i) == Some(&'#') => {
+                let end = (i + 1..c.len()).find(|&k| c[k] == '#' && c.get(k + 1) == Some(&'>'));
+                out.push(' ');
+                i = end.map_or(c.len(), |k| k + 2);
+            }
+            _ => out.push(ch),
+        }
     }
+    out
+}
+
+/// Whether `c[i]` opens a here-string after its `@`: a quote, then only blanks to the end of its line.
+fn here_string_opens(c: &[char], i: usize) -> bool {
+    let line = c.get(i + 1..).unwrap_or_default();
+    matches!(c.get(i), Some('\'' | '"'))
+        && line.contains(&'\n')
+        && line.iter().take_while(|x| **x != '\n').all(|x| matches!(x, ' ' | '\t' | '\r'))
+}
+
+/// Whether `out` ends with a variable that an `=` after it assigns to (`$page`, `${page}`, `$env:X`, the `+` of `+=`)
+/// where a statement starts, after only casts (`[string[,]]$p`) and further targets each with its comma (`$a, $b`;
+/// sol-loop r2, S4, S8; review r1, D16-R1-02, its sol-loop R1, R2): PowerShell runs the command on its right side.
+fn assigns(out: &str) -> bool {
+    let t = out.trim_end_matches([' ', '\t', '+', '-', '*', '/', '%', '?']);
+    let var = if t.ends_with('}') {
+        t.rfind("${")
+    } else {
+        let name = t.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':');
+        (name.len() < t.len() && name.ends_with('$')).then(|| name.len() - 1)
+    };
+    let Some(k) = var else { return false };
+    let start = t[..k].rfind([';', '\n', '(', '&', '|']).map_or(0, |b| b + 1);
+    let (mut depth, mut rest) = (0usize, String::new());
+    for ch in t[start..k].chars() {
+        match ch {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => rest.push(ch),
+            _ => {}
+        }
+    }
+    let rest = rest.trim_end_matches([' ', '\t']);
+    (rest.is_empty() || rest.ends_with(','))
+        && rest.split([' ', '\t', ',']).all(|w| w.is_empty() || w.starts_with('$'))
+}
+
+/// The page one simple command would have git open, if any (design note §1, from git's source at v2.56.0): D1 `git
+/// help` with an operand; D2 git's own `--help` or `-h` before one, which git reads as `help` (git.c:171, :973); D3
+/// `--help` as the first word after the subcommand (git.c:762). Redirections are no words of git's.
+fn help_topic(words: &[Word]) -> Option<String> {
+    let at = command_at(words).filter(|&k| base_name(&words[k].text) == "git")?;
+    let mut args = Vec::new();
+    let mut rest = words[at + 1..].iter();
+    // A redirection (`2>/dev/null`, `*>&1`, `>` `out`), alone or touching an argument, which stays git's (sol-loop r1,
+    // S1; r2, S7): an operator at its word's end takes the next word as its target (r2, S1).
+    while let Some(w) = rest.next() {
+        let t = w.text.as_str();
+        let (arg, op) = match w.redirect {
+            Some(k) if t[..k].bytes().all(|b| b"0123456789&*".contains(&b)) => ("", &t[k..]),
+            Some(k) => (t[..k].strip_suffix('&').unwrap_or(&t[..k]), &t[k..]),
+            None => (t, ""),
+        };
+        if !arg.is_empty() {
+            args.push(arg);
+        }
+        if op.ends_with(['<', '>', '&', '|']) {
+            rest.next();
+        }
+    }
+    let mut i = 0;
+    while let Some(w) =
+        args.get(i).filter(|w| w.starts_with('-') && !matches!(**w, "--help" | "-h"))
+    {
+        i += 1 + usize::from(GIT_VALUE_OPTIONS.contains(w));
+    }
+    let sub = match *args.get(i)? {
+        "--help" | "-h" => "help",
+        s => s,
+    };
+    let rest = &args[i + 1..];
+    if rest.first() == Some(&"--help") {
+        return Some(sub.to_string());
+    }
+    if sub != "help" {
+        return None;
+    }
+    // A topic: a word that isn't an option, or any word after `--`.
+    let mut ended = false;
+    for w in rest {
+        if ended || !w.starts_with('-') {
+            return Some(w.to_string());
+        }
+        ended = *w == "--";
+    }
+    None
+}
+
+/// The page `command` would have git open in the browser, if any (design note §1), its text read as `shell` reads it.
+pub fn git_help(command: &str, shell: Shell) -> Option<String> {
+    let commands = match shell {
+        Shell::Bash => commands(command),
+        Shell::PowerShell => commands(&powershell_as_bash(command)),
+    };
+    commands.iter().find_map(|words| help_topic(words))
+}
+
+/// The rm protocol this guard speaks, which sync checks in the installed copy with the rm hook's own arguments before it
+/// writes one (review r1, D16-R1-01): 1 is D16's, with git's help refused, `--shell` and the PowerShell tool.
+pub const RM_PROTOCOL: u32 = 1;
+
+/// The guard's answer to an event from Claude Code's Bash tool, or any tool whose text is Bash's (`shell_hook`).
+pub fn rm_hook(input: &str) -> String {
+    shell_hook(input, Shell::Bash)
+}
+
+/// The shell guard's answer to one `PreToolUse` event (the harness's stdin JSON): a denial naming the fix, or nothing
+/// (empty: the call goes on to the harness's own checks). A `Bash` tool's text is in `bash_tool` (`--shell`), a
+/// `PowerShell` tool's in PowerShell; any other tool, and input that isn't such an event, is let through, so the guard
+/// never stops a call it can't read. Bash text gets every check, PowerShell text git's help only: the `rm` fix is
+/// Bash syntax (design note 2026-11-02-lords-git-help-guard §3). The probe event is answered with `RM_PROTOCOL`.
+pub fn shell_hook(input: &str, bash_tool: Shell) -> String {
+    let Ok(ev) = serde_json::from_str::<Value>(input) else { return String::new() };
+    if ev["hook_event_name"] == CHILD_PROBE_EVENT {
+        return format!("lords guard rm {RM_PROTOCOL}");
+    }
+    let shell = match ev["tool_name"].as_str() {
+        Some("Bash") => bash_tool,
+        Some("PowerShell") => Shell::PowerShell,
+        _ => return String::new(),
+    };
     let Some(command) = ev["tool_input"]["command"].as_str() else { return String::new() };
-    let reason = if let Some(word) = unguarded_rm(command) {
+    let bash = shell == Shell::Bash;
+    let reason = if let Some(word) = bash.then(|| unguarded_rm(command)).flatten() {
         format!(
             "Lords: `rm` with a variable path ({word}) deletes the wrong place if the variable is empty. Write each \
              variable as {RM_FIX}: quoted, with `:?`, so an empty one stops the command."
         )
-    } else if let Some(word) = hook_bypass(command) {
+    } else if let Some(word) = bash.then(|| hook_bypass(command)).flatten() {
         format!(
             "Lords: `{word}` would run git without its hooks. rule.hooks-run-on-every-commit: commit through the \
              normal hooks, never skip them or repoint their path. Run it without that; if a hook fails, fix what it \
              reports, and if the hook itself is broken, tell the repo's owner. A test fixture's own hooks path goes \
              in a script file."
+        )
+    } else if let Some(topic) = git_help(command, shell) {
+        format!(
+            "Lords: this opens git's help on `{topic}` as a web page in the owner's default browser \
+             (rule.no-default-browser). Print to the terminal instead: `git {topic} -h` gives a command's options, \
+             and every page is text to grep under `C:/Program Files/Git/ucrt64/share/doc/git-doc/` \
+             (`git-{topic}.adoc`; a guide is `git<name>.adoc`, as `githooks.adoc`)."
         )
     } else {
         return String::new();

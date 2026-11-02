@@ -62,6 +62,10 @@ pub trait Adapter: Sync {
     fn guards(&self) -> &'static [&'static str] {
         &[]
     }
+    /// The rm hook's arguments after `guard rm`, which sync's probe asks with too (review r1, D16-R1-01).
+    fn rm_args(&self) -> &'static [&'static str] {
+        &[]
+    }
     /// The hook entries that run guard `guard` of Lords' copy `exe`: one.
     /// `home`: the tool home sync runs with, which `child` takes (its apply lock; repair 2 sol-loop r3, X1).
     fn guard_hooks(&self, exe: &str, guard: &str, _home: &str) -> Vec<serde_json::Value> {
@@ -177,9 +181,19 @@ impl Adapter for Codex {
     /// Codex's hooks (`~/.codex/hooks.json`) run a command line; `child` is the guard a probe showed it runs (design
     /// note 2026-10-31-lords-core-lines-composer, P2): the child took its context, once the hook was trusted. `role`
     /// too: its `UserPromptSubmit` event and context are Claude's (design note 2026-11-02-lords-role-at-launch, H3).
-    /// `time`: its `apply_patch` and MCP calls reach `PreToolUse` (design note 2026-11-02-lords-time-guard, §2).
+    /// `time`: its `apply_patch` and MCP calls reach `PreToolUse` (design note 2026-11-02-lords-time-guard, §2). `rm`:
+    /// its shell tool reaches `PreToolUse` as `Bash` with the command (design note 2026-11-02-lords-git-help-guard, §2).
     fn guards(&self) -> &'static [&'static str] {
-        &["child", "role", "time"]
+        &["rm", "child", "role", "time"]
+    }
+
+    /// Its shell commands, sent as `Bash`, are PowerShell's on Windows (git-help-guard design note, §2).
+    fn rm_args(&self) -> &'static [&'static str] {
+        if cfg!(windows) {
+            &["--shell", "powershell"]
+        } else {
+            &[]
+        }
     }
 
     /// A command line, and the whole context passed on (`additionalContextLimit` 0): no parts. On Windows Codex runs it
@@ -199,6 +213,9 @@ impl Adapter for Codex {
         // The role hook names its harness, whose place file the start goes beside (F10-R1-03).
         if guard == "role" {
             line.push_str(" --adapter codex");
+        }
+        if guard == "rm" {
+            line.extend(self.rm_args().iter().map(|a| format!(" {a}")));
         }
         vec![serde_json::json!({
             "type": "command",

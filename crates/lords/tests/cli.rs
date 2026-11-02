@@ -2066,7 +2066,8 @@ fn the_queue_guard_kills_the_clis_process_tree_at_its_deadline() {
 
 // Spec (brief, 30 Oct: "Registration goes through the settings target's existing `guards` list … `queue` becomes a
 // `Stop` entry. Foreign hook entries stay"; "SubagentStop … must not be registered"): with `guards = ["rm",
-// "queue"]` and the copy installed, sync names the copy in a `PreToolUse` Bash entry (`guard rm`) and in a `Stop` entry
+// "queue"]` and the copy installed, sync names the copy in a `PreToolUse` entry on Bash and PowerShell (`guard rm`;
+// D16's brief, design note 2026-11-02-lords-git-help-guard §3) and in a `Stop` entry
 // without a matcher (`guard queue`) after the user's own `Stop` hook, writes no `SubagentStop`, and the plan says what
 // it adds; `lords check` accepts the target; taking `queue` out of the list takes out only Lords' `Stop` hook.
 #[test]
@@ -2120,7 +2121,7 @@ fn sync_registers_the_queue_guard_as_a_stop_hook() {
     let theirs: serde_json::Value = serde_json::from_str(theirs).unwrap();
     assert_eq!(
         v["hooks"]["PreToolUse"],
-        serde_json::json!([{"matcher": "Bash", "hooks": [lords("rm")]}])
+        serde_json::json!([{"matcher": "Bash|PowerShell", "hooks": [lords("rm")]}])
     );
     assert_eq!(v["hooks"]["Stop"], serde_json::json!([theirs, {"hooks": [lords("queue")]}]));
     assert!(v["hooks"].get("SubagentStop").is_none(), "{v}");
@@ -2135,7 +2136,7 @@ fn sync_registers_the_queue_guard_as_a_stop_hook() {
     assert_eq!(v["hooks"]["Stop"], serde_json::json!([theirs]));
     assert_eq!(
         v["hooks"]["PreToolUse"],
-        serde_json::json!([{"matcher": "Bash", "hooks": [lords("rm")]}])
+        serde_json::json!([{"matcher": "Bash|PowerShell", "hooks": [lords("rm")]}])
     );
 }
 
@@ -2330,7 +2331,7 @@ fn sync_registers_the_time_guard_and_the_binary_answers() {
     assert_eq!(
         v["hooks"]["PreToolUse"],
         serde_json::json!([
-            {"matcher": "Bash", "hooks": [lords("rm")]},
+            {"matcher": "Bash|PowerShell", "hooks": [lords("rm")]},
             {"matcher": matcher, "hooks": [lords("time")]},
         ])
     );
@@ -2350,6 +2351,103 @@ fn sync_registers_the_time_guard_and_the_binary_answers() {
     assert_eq!(o.status.code(), Some(0), "{}", text(&o));
     assert!(o.stdout.is_empty(), "{}", text(&o));
     assert!(String::from_utf8_lossy(&o.stderr).contains("guard time"), "{}", text(&o));
+}
+
+// Spec: D16's brief: "probe whether Claude's `PowerShell` tool and Codex's shell tool reach a PreToolUse hook with the
+// command text. Cover each that does, with the same check" (design note 2026-11-02-lords-git-help-guard §2: both do;
+// Codex sends its commands as `Bash`, in PowerShell on Windows; §3: Codex runs the `rm` guard, its line on Windows
+// with `--shell powershell`). Through the binary: a form only PowerShell reads as git help is denied for the
+// PowerShell tool and under `--shell powershell`, not as Bash text; a bad `--shell` is a usage note, exit 0, nothing
+// on stdout.
+#[test]
+fn the_rm_guard_reads_powershell_for_its_tool_and_for_codex() {
+    let env = Env::new();
+    let exe = Path::new(env!("CARGO_BIN_EXE_lords"));
+    let codex = lords_core::adapters::get("codex").unwrap();
+    assert!(codex.guards().contains(&"rm"), "{:?}", codex.guards());
+    let line = codex.guard_hooks("C:/x/lords-guard.exe", "rm", "C:/h")[0]["command"].clone();
+    let want = if cfg!(windows) { "guard rm --shell powershell" } else { "guard rm" };
+    assert!(line.as_str().is_some_and(|l| l.ends_with(want)), "{line}");
+    // `"C:\tmp\"` ends its string in PowerShell, so `git help config` runs; in Bash the string never ends.
+    let ps = "Get-ChildItem \"C:\\tmp\\\"; git help config";
+    let event = |tool: &str, command: &str| {
+        serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": {"command": command}})
+            .to_string()
+    };
+    let denies = |o: &Output| String::from_utf8_lossy(&o.stdout).contains("\"deny\"");
+    for (args, tool, command, deny) in [
+        (&["guard", "rm", "--shell", "powershell"][..], "Bash", ps, true),
+        (&["guard", "rm"], "PowerShell", ps, true),
+        (&["guard", "rm"], "Bash", ps, false),
+        (&["guard", "rm", "--shell", "bash"], "Bash", "git help config", true),
+    ] {
+        let o = guard(&env, exe, args, &event(tool, command));
+        assert_eq!(o.status.code(), Some(0), "{args:?}: {}", text(&o));
+        assert_eq!(denies(&o), deny, "{args:?} {tool} `{command}`: {}", text(&o));
+    }
+    for args in [&["guard", "rm", "--shell"][..], &["guard", "rm", "--shell", "zsh"]] {
+        let o = guard(&env, exe, args, &event("Bash", "git help config"));
+        assert_eq!(o.status.code(), Some(0), "{args:?}: {}", text(&o));
+        assert!(o.stdout.is_empty() && !o.stderr.is_empty(), "{args:?}: {}", text(&o));
+    }
+}
+
+// Spec: review r1, D16-R1-01 (accepted by the Lords owner, 2 Nov): "sync never registers a guard hook command line
+// that the installed guard copy doesn't accept", as FC4 set for the child and role hooks. A copy from before D16 (the
+// old-guard stub: `ok` to the self-test, nothing to `guard rm`) is refused for both adapters, naming `lords guard
+// install`, and their files stay as they are; once installed, the hooks are written, the copy denies the original
+// witness with the exact arguments each hook names, and a second sync changes nothing.
+#[test]
+fn sync_registers_the_rm_guard_only_with_a_copy_that_speaks_it() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (public, private) = (d.join("pub"), d.join("priv"));
+    for dir in [&public, &private, &d.join("home/.claude-balanced"), &d.join("home/.codex")] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    let target = |adapter: &str, path: &str| {
+        format!("[[targets]]\nname = \"{adapter}\"\nadapter = \"{adapter}\"\nkind = \"settings\"\npath = \"{path}\"\nguards = [\"rm\"]\n")
+    };
+    let (claude, codex) = (
+        target("claude", "~/.claude-balanced/settings.json"),
+        target("codex", "~/.codex/hooks.json"),
+    );
+    let manifest = format!("name = \"priv\"\nvisibility = \"private\"\n{claude}{codex}");
+    fs::write(private.join("stack.toml"), manifest).unwrap();
+    assert!(env.git(&private, &["init", "-q"]).status.success());
+    env.git(&private, &["add", "-A"]);
+    env.git(&private, &["commit", "-q", "-m", "start"]);
+    let stacks =
+        ["--public-stack", public.to_str().unwrap(), "--private-stack", private.to_str().unwrap()];
+    let sync = || env.lords(d, &[&["sync", "--user", "--apply"][..], &stacks].concat());
+    let files = [d.join("home/.claude-balanced/settings.json"), d.join("home/.codex/hooks.json")];
+    let read = || files.iter().map(|f| fs::read(f).ok()).collect::<Vec<_>>();
+    let copy = d.join("home/.lords-command/bin/lords-guard.exe");
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_lords-old-guard-stub"), &copy).unwrap();
+    let o = sync();
+    assert!(!o.status.success() && text(&o).contains("lords guard install"), "{}", text(&o));
+    assert_eq!(read(), [None, None], "nothing written");
+    assert!(env.lords(d, &["guard", "install"]).status.success());
+    assert!(sync().status.success());
+    let after = read();
+    let json = |b: &Option<Vec<u8>>| -> serde_json::Value {
+        serde_json::from_slice(b.as_ref().unwrap()).unwrap()
+    };
+    let claude_args = json(&after[0])["hooks"]["PreToolUse"][0]["hooks"][0]["args"].clone();
+    let codex_line = json(&after[1])["hooks"]["PreToolUse"][0]["hooks"][0]["command"].clone();
+    let codex_args =
+        format!("guard {}", codex_line.as_str().unwrap().split(" guard ").nth(1).unwrap());
+    let claude_args: Vec<&str> =
+        claude_args.as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
+    let event = r#"{"tool_name":"Bash","tool_input":{"command":"git help config"}}"#;
+    for args in [claude_args, codex_args.split(' ').collect()] {
+        let o = guard(&env, &copy, &args, event);
+        assert!(String::from_utf8_lossy(&o.stdout).contains("\"deny\""), "{args:?}: {}", text(&o));
+    }
+    assert!(sync().status.success());
+    assert_eq!(read(), after, "a second sync changes nothing");
 }
 
 /// A repo `r` declared in a private stack with one rule, and its worktree `wts/one`, synced by the CLI: each holds

@@ -117,6 +117,9 @@ pub struct Item {
     /// note D6).
     #[serde(skip)]
     pub(crate) names_role_guard: Option<&'static str>,
+    /// And the rm guard, with its hook's arguments: apply checks the copy speaks this build's rm protocol (D16-R1-01).
+    #[serde(skip)]
+    pub(crate) names_rm_guard: Option<&'static [&'static str]>,
 }
 
 /// An item as plans show it (`--json`, the app): a redacted item without its texts.
@@ -256,6 +259,7 @@ impl Item {
             names_guard: None,
             names_child_guard: false,
             names_role_guard: None,
+            names_rm_guard: None,
         }
     }
 
@@ -369,7 +373,13 @@ fn guard_ready(place: &Contained) -> Result<(), String> {
 /// child hooks run (`process::guard_protocol`), so sync never names a copy in a hook whose arguments it refuses
 /// or whose answer is another protocol's. Checked when planning and again when applying. Read only.
 fn guard_speaks_child(place: &Contained, home: &Path) -> Result<(), String> {
-    guard_speaks(place, home, "child", &[], crate::guard::CHILD_PROTOCOL)
+    guard_speaks(place, Some(home), "child", &[], crate::guard::CHILD_PROTOCOL)
+}
+
+/// Whether the guard copy speaks this build's rm protocol, asked as `guard_speaks_child` asks, with the rm hook's own
+/// arguments for its harness (`Adapter::rm_args`; review r1, D16-R1-01).
+fn guard_speaks_rm(place: &Contained, args: &[&str]) -> Result<(), String> {
+    guard_speaks(place, None, "rm", args, crate::guard::RM_PROTOCOL)
 }
 
 /// Whether the guard copy speaks this build's role protocol, asked as `guard_speaks_child` asks, with the role hook's
@@ -379,13 +389,13 @@ pub(crate) fn guard_speaks_role(
     home: &Path,
     adapter: &str,
 ) -> Result<(), String> {
-    guard_speaks(place, home, "role", &["--adapter", adapter], crate::guard::ROLE_PROTOCOL)
+    guard_speaks(place, Some(home), "role", &["--adapter", adapter], crate::guard::ROLE_PROTOCOL)
 }
 
 /// Whether the guard copy answers protocol `want` of guard `which` (`process::guard_protocol`).
 fn guard_speaks(
     place: &Contained,
-    home: &Path,
+    home: Option<&Path>,
     which: &str,
     extra: &[&str],
     want: u32,
@@ -1395,6 +1405,12 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
             return conflict(&t.name, &path, e);
         }
     }
+    let rm = guards.iter().any(|g| g == "rm").then(|| adapter.rm_args());
+    if let Some(args) = rm {
+        if let Err(e) = guard_speaks_rm(&guard, args) {
+            return conflict(&t.name, &path, e);
+        }
+    }
     let hooks = match guard_hooks(guards, adapter, &value, guard.path(), &pl.plan.home) {
         Ok(h) => h,
         Err(e) => return conflict(&t.name, &path, e),
@@ -1429,6 +1445,7 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
     item.names_guard = (!guards.is_empty()).then(|| guard.clone());
     item.names_child_guard = child;
     item.names_role_guard = role;
+    item.names_rm_guard = rm;
     let names = |h: &serde_json::Value| guard_names(h, adapter, guard.path());
     let changed = hooks.as_ref().map(|h| (names(&before_hooks), names(h)));
     if let (Some((before, after)), Some(why)) = (&changed, adapter.guard_note()) {
@@ -1440,12 +1457,13 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
     item
 }
 
-/// The hook event each guard runs on, and its matcher: `rm` before a Bash call, `queue` when a turn would end, `session`
+/// The hook event each guard runs on, and its matcher: `rm` before a shell call (Bash or PowerShell, an exact list in
+/// both harnesses; design note 2026-11-02-lords-git-help-guard §3), `queue` when a turn would end, `session`
 /// when a session starts, `turn` when a prompt does (never a native subagent's `SubagentStop`), `child` when a
 /// native subagent starts, and `time` before an editor write or a T3 message.
 fn guard_event(name: &str) -> Option<(&'static str, Option<&'static str>)> {
     match name {
-        "rm" => Some(("PreToolUse", Some("Bash"))),
+        "rm" => Some(("PreToolUse", Some("Bash|PowerShell"))),
         "queue" => Some(("Stop", None)),
         "session" => Some(("SessionStart", None)),
         "turn" => Some(("UserPromptSubmit", None)),
@@ -2997,6 +3015,9 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
         if let Some(id) = i.names_role_guard {
             guard_speaks_role(g, &plan.home, id)
                 .map_err(|e| format!("{e} (nothing was changed)"))?;
+        }
+        if let Some(args) = i.names_rm_guard {
+            guard_speaks_rm(g, args).map_err(|e| format!("{e} (nothing was changed)"))?;
         }
     }
     let mut run = Run::new(&plan.home)?;

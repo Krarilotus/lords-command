@@ -40,8 +40,9 @@ usage:
   lords paths [--all] [--json] [--codex PATH] [--deadline-ms N]   which T3-delegated sessions start with their role's lines;
     exit 1 when one doesn't (Codex: asks its app-server whether it trusts Lords' hook); places not in use are one
     line unless --all
-  lords guard rm   Claude's PreToolUse hook: refuses an `rm` whose path holds a variable not written as quoted ${VAR:?},
-    and a git call that would skip or repoint its hooks
+  lords guard rm [--shell bash|powershell]   the PreToolUse hook on shell calls: refuses an `rm` whose path holds a
+    variable not written as quoted ${VAR:?}, a git call that would skip or repoint its hooks, and git's help on a topic
+    (it opens a browser); --shell: the language of a `Bash` tool's text (Codex on Windows: powershell)
   lords guard queue [--deadline-ms N]   Claude's Stop hook: holds a turn's end while items may wait in its T3 queue
   lords guard session   Claude's SessionStart hook: records the Lords files the session reads
   lords guard turn   Claude's UserPromptSubmit hook: the clock, and the Lords files changed since the session started
@@ -137,7 +138,7 @@ fn public_rules(public: &Path, private: Option<&Stack>) -> Result<Rules, String>
     Rules::public().with_allow_from(public).with_private(private)
 }
 
-/// `lords guard rm`: the tool-call guard Claude Code runs before a Bash call (guard.rs). Reads the event on stdin and
+/// `lords guard rm`: the tool-call guard a harness runs before a shell call (guard.rs). Reads the event on stdin and
 /// prints a denial, or nothing. It never fails the call: a usage error or input it can't read is a note on stderr and
 /// exit 0 (orchestrator, 30 Oct: Claude Code takes exit 2 from a PreToolUse hook as a refusal). `lords guard
 /// --self-test` prints `ok` when the guard refuses its witnesses, one per refusal; sync runs it before installing the
@@ -145,7 +146,7 @@ fn public_rules(public: &Path, private: Option<&Stack>) -> Result<Rules, String>
 fn cmd_guard(mut a: Args) -> ExitCode {
     let note = |line: &str| say_err(&format!("lords guard: {line}; this call is let through"));
     if a.flag("--help") || a.flag("-h") {
-        say("usage: lords guard rm   (Claude Code's PreToolUse hook on Bash: rm and git's hooks; the event on stdin)");
+        say("usage: lords guard rm [--shell bash|powershell]   (the PreToolUse hook on shell calls: rm, git's hooks, git's help; the event on stdin)");
         say("       lords guard queue [--deadline-ms N]   (Claude Code's Stop hook; the event on stdin)");
         say("       lords guard session | turn   (Claude Code's SessionStart and UserPromptSubmit hooks)");
         say("       lords guard child   (the SubagentStart hook: a native child's start file)");
@@ -154,9 +155,14 @@ fn cmd_guard(mut a: Args) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if a.flag("--self-test") {
-        let witnesses = ["rm -f $OUT/x", "git commit --no-verify -m x"];
-        let ok = witnesses.iter().all(|c| {
-            let event = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": c}});
+        let witnesses = [
+            ("Bash", "rm -f $OUT/x"),
+            ("Bash", "git commit --no-verify -m x"),
+            ("Bash", "git help config"),
+            ("PowerShell", "git commit --help"),
+        ];
+        let ok = witnesses.iter().all(|(tool, c)| {
+            let event = serde_json::json!({"tool_name": tool, "tool_input": {"command": c}});
             lords_core::guard::rm_hook(&event.to_string()).contains("\"deny\"")
         });
         let time = serde_json::json!({"tool_name": "mcp__t3-code__t3_thread_send", "tool_input": {"message": "14:xx"}});
@@ -183,10 +189,15 @@ fn cmd_guard(mut a: Args) -> ExitCode {
     if which.as_deref() == Some("time") {
         return guard_time(a);
     }
-    if which.as_deref() != Some("rm") || a.done().is_err() {
-        note("usage `lords guard rm` (event on stdin)");
+    let shell = match a.value("--shell").as_ref().map(|s| s.as_deref()) {
+        Ok(None | Some("bash")) => Some(lords_core::guard::Shell::Bash),
+        Ok(Some("powershell")) => Some(lords_core::guard::Shell::PowerShell),
+        _ => None,
+    };
+    let (true, Ok(()), Some(shell)) = (which.as_deref() == Some("rm"), a.done(), shell) else {
+        note("usage `lords guard rm [--shell bash|powershell]` (event on stdin)");
         return ExitCode::SUCCESS;
-    }
+    };
     let input = match std::io::read_to_string(std::io::stdin()) {
         Ok(i) => i,
         Err(e) => {
@@ -194,7 +205,7 @@ fn cmd_guard(mut a: Args) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
-    let out = lords_core::guard::rm_hook(&input);
+    let out = lords_core::guard::shell_hook(&input, shell);
     if !out.is_empty() {
         say(&out);
     }

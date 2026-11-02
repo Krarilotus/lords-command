@@ -393,11 +393,12 @@ fn sync_registers_the_child_guard_on_subagent_start() {
     };
     let lords = serde_json::json!({"type": "command", "command": line, "timeout": 30, "additionalContextLimit": 0});
     assert_eq!(v, serde_json::json!({"hooks": {"SubagentStart": [{"hooks": [lords]}]}}), "{v}");
-    fs::write(private.join("stack.toml"), manifest("[\"child\", \"rm\"]")).unwrap();
-    git(&["commit", "-q", "-a", "-m", "an rm guard for Codex"]);
+    // `queue`: Codex runs `rm` since D16 (design note 2026-11-02-lords-git-help-guard §2), not a `Stop` guard.
+    fs::write(private.join("stack.toml"), manifest("[\"child\", \"queue\"]")).unwrap();
+    git(&["commit", "-q", "-a", "-m", "a queue guard for Codex"]);
     let o = run(&home, d.path(), &[&["sync", "--user", "--apply"][..], &stacks].concat(), "");
     assert!(!o.status.success(), "{o:?}");
-    assert!(String::from_utf8_lossy(&o.stderr).contains("runs no `rm` guard"), "{o:?}");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("runs no `queue` guard"), "{o:?}");
     assert_eq!(read(&codex), v, "nothing written");
 }
 
