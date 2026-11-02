@@ -799,7 +799,7 @@ impl Planner<'_> {
         let records: Vec<ledger::Owned> = self.ledger.owned.values().cloned().collect();
         for o in records {
             let path = o.path();
-            if o.scope.starts_with("hooks:") {
+            if o.scope.starts_with("hooks:") || o.scope.starts_with(crate::hooks::config::SCOPE) {
                 continue;
             }
             if !self.declared(&o.scope) {

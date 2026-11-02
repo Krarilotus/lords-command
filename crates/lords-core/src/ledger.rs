@@ -82,8 +82,10 @@ fn upcase(c: char) -> char {
 /// kind, a hook in the hooks dir its scope names. Where it must lie is sync's to check (`sync::plan`), which knows
 /// the targets.
 fn well_formed(o: &Owned) -> Result<(), String> {
-    if o.kind != "file" && o.kind != "dir" {
-        return Err(format!("kind `{}` (a file or a dir)", o.kind));
+    // A config hook's entry, its own kind (D14b, design note 2026-11-02-lords-hooks-config, C8).
+    let config = o.scope.starts_with(crate::hooks::config::SCOPE);
+    if config != (o.kind == "config") || !(config || o.kind == "file" || o.kind == "dir") {
+        return Err(format!("kind `{}` (a file or a dir; `config` for scope hookconfig:)", o.kind));
     }
     if o.sha.len() != 64 || !o.sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
@@ -107,8 +109,17 @@ fn well_formed(o: &Owned) -> Result<(), String> {
             }
             Ok(())
         }
+        Some(("hookconfig", name)) if !name.is_empty() => {
+            let file = Path::new(&o.root).file_name().is_some_and(|n| n == "config");
+            if !file || o.parts != [crate::hooks::config::SECTION] {
+                return Err(format!("not {} in a config file", crate::hooks::config::SECTION));
+            }
+            Ok(())
+        }
         Some(("target" | "repo" | "workspace", name)) if !name.is_empty() => Ok(()),
-        _ => Err(format!("scope `{}` (target:, repo:, workspace: or hooks:)", o.scope)),
+        _ => {
+            Err(format!("scope `{}` (target:, repo:, workspace:, hooks: or hookconfig:)", o.scope))
+        }
     }
 }
 
