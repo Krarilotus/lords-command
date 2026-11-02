@@ -164,6 +164,19 @@ pub struct PlaceFiles {
     /// The warning line for those files in `check`, in bytes, in place of 75 % of the adapter's limit.
     #[serde(default)]
     pub warn_bytes: Option<usize>,
+    /// How those files carry the Memory section: whole (default), or as one line naming the place's
+    /// `.lords/memory-<adapter>.md`, which holds it (the Lords owner, 2 Nov: Codex headroom).
+    #[serde(default)]
+    pub memory: MemoryForm,
+}
+
+/// A place file's Memory section (`PlaceFiles::memory`).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryForm {
+    #[default]
+    List,
+    Pointer,
 }
 
 impl Stacks {

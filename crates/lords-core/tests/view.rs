@@ -155,6 +155,7 @@ fn the_composed_view_maps_each_line_to_its_source() {
             opener: None,
             child: None,
             default_role_lines: true,
+            memory_file: None,
         },
     );
     let v = view::composed(&s, &c);

@@ -205,6 +205,7 @@ fn relative_paths_are_one_switch() {
             opener: None,
             child: None,
             default_role_lines: true,
+            memory_file: None,
         };
         lords_core::compose::compose(&f.stacks(), &ctx).text
     };

@@ -212,6 +212,8 @@ pub(super) fn plan(stacks: &Stacks, private: &Stack, opts: &Options) -> Result<P
             );
         }
     }
+    // The instruction files kept, and the `.lords` dirs planned to go (by their items' index), for the hold below.
+    let (mut kept_files, mut role_dirs): (Vec<PathBuf>, Vec<usize>) = (Vec::new(), Vec::new());
     for ((mut item, o, at, slot), rel) in placed.into_iter().zip(rels) {
         let rel = fold(&rel);
         let files = tracked.get(&ledger::key(at.root().path())).map(Vec::as_slice).unwrap_or(&[]);
@@ -220,6 +222,10 @@ pub(super) fn plan(stacks: &Stacks, private: &Stack, opts: &Options) -> Result<P
             .any(|f| *f == rel || f.strip_prefix(&rel).is_some_and(|r| r.starts_with('/')))
         {
             kept(&mut item, "the repo tracks it (or a file below it) now, and uninstall never touches a tracked file");
+            // A kept instruction file all the same: it holds what it names (sol-loop repair r1, U1).
+            if matches!(slot, Slot::AdapterFile(_)) {
+                kept_files.push(at.path().to_path_buf());
+            }
             plan.items.push(item);
             continue;
         }
@@ -277,7 +283,33 @@ pub(super) fn plan(stacks: &Stacks, private: &Stack, opts: &Options) -> Result<P
                 &format!("a {k:?} where its record says a {}", o.kind).to_lowercase(),
             ),
         }
+        match (slot, &item.action) {
+            (Slot::AdapterFile(_), Action::Report) => kept_files.push(path),
+            (Slot::RoleDir, Action::Remove) => role_dirs.push(plan.items.len()),
+            _ => {}
+        }
         plan.items.push(item);
+    }
+    // A kept instruction file holds the `.lords` files it names (the role-files line, the memory pointer): `.lords`, one
+    // record, stays with it (the Lords owner, 2 Nov, review r1 R1-01). A reading that fails holds it (design note §6b).
+    for i in role_dirs {
+        let names: Option<Vec<String>> = fsguard::read_tree(&plan.items[i].path)
+            .ok()
+            .map(|t| t.into_keys().filter(|n| n != ".gitignore").collect());
+        let holder = kept_files.iter().find(|f| match (fsguard::read(f), &names) {
+            (Ok(None), _) => false,
+            (Ok(Some(b)), Some(names)) => {
+                let text = String::from_utf8_lossy(&b);
+                names.iter().any(|n| text.contains(n.as_str()))
+            }
+            _ => true,
+        });
+        if let Some(f) = holder {
+            let item = &mut plan.items[i];
+            item.action = Action::Report;
+            item.notes =
+                vec![format!("named by {}, which stays: kept, with its ledger record", display(f))];
+        }
     }
     plan.items.sort_by_key(|i| ledger::key(&i.path));
     // Every record of the place was looked at, and the stacks loaded with no problem (rule B).
