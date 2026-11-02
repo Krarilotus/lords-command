@@ -747,9 +747,13 @@ pub fn session_hook(input: &str, env: &RulesEnv) -> Answer {
         Ok(()) => quiet(),
         Err(e) => noted(format!("the session's files aren't recorded ({e})")),
     };
-    let place =
-        || place_file(Path::new(ev["cwd"].as_str()?), &env.home, crate::sync::CHILD_FILE).ok()?;
-    if let Some((lords, _)) = (ev["source"] == "compact").then(place).flatten() {
+    // The nearest `.lords` at or above the cwd, a dir, found without reading any file in it (F10-SR-02).
+    let place = || {
+        let lords =
+            Path::new(ev["cwd"].as_str()?).ancestors().map(|d| d.join(crate::sync::ROLE_DIR));
+        lords.into_iter().find(|l| matches!(crate::fsguard::kind(l), Ok(crate::fsguard::Kind::Dir)))
+    };
+    if let Some(lords) = (ev["source"] == "compact").then(place).flatten() {
         let line = format!(
             "Lords: after the compaction, if your launch named a role, re-read your role's file `role-<role>.md` in `{}` now; it binds you.",
             lords.display()
@@ -948,13 +952,17 @@ const T3_ROLES: [(&str, &str); 3] =
 
 /// The role a session's launch names (design note D1, revised after review r1, F10-R1-01: the launcher's signal wins).
 /// Where the prompt opens with T3's prefix, the prefix alone decides: the Lords role its role maps to, or none. Without
-/// it, the first word after `Role:` on the prompt's first non-empty line, the brief's own (a heading mark, Markdown
-/// emphasis and backticks around it ignored, never a quote mark), lower-cased. A word that can't be a role's file name
+/// it, the first word after `Role:` on the prompt's first line, the brief's own (a heading mark, Markdown emphasis and
+/// backticks around it ignored, never a quote mark), lower-cased. Either starts at column 0 of the first line: an
+/// indented or later line is quoted text, never a signal (F10-SR-01). A word that can't be a role's file name
 /// (`role_word`) names nothing.
 pub fn launch_role(prompt: &str) -> Option<Launch> {
-    let first = prompt.trim_start_matches('\u{feff}').lines().find(|l| !l.trim().is_empty())?;
+    let first = prompt.trim_start_matches('\u{feff}').lines().next()?;
+    if first.starts_with(char::is_whitespace) {
+        return None;
+    }
     if let Some(word) =
-        first.trim().strip_prefix(T3_PREFIX.0).and_then(|r| r.strip_suffix(T3_PREFIX.1))
+        first.trim_end().strip_prefix(T3_PREFIX.0).and_then(|r| r.strip_suffix(T3_PREFIX.1))
     {
         let role = T3_ROLES.iter().find(|(t, _)| *t == word)?.1.to_string();
         return Some(Launch { role });
