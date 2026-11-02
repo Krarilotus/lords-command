@@ -672,4 +672,15 @@ fn paths_folds_the_places_not_in_use_into_one_line() {
         let in_use = r["in_use"].as_bool().unwrap_or_else(|| panic!("no in_use: {r}"));
         assert_eq!(in_use, !path.contains("/wt-old)"), "{r}");
     }
+
+    // Review r1, R1-03, its witness: a session opened in the aged worktree (Lords' session hook records it, as Claude
+    // Code's SessionStart runs it), with no git write, makes that place in use: its rows are listed, nothing folds.
+    let ev = serde_json::json!({"hook_event_name": "SessionStart", "session_id": "s-old",
+        "cwd": d.join("wt-old/sub"), "source": "startup", "transcript_path": "x"});
+    fs::create_dir_all(d.join("wt-old/sub")).unwrap();
+    assert!(run(&d.join("home"), d, &["guard", "session"], &ev.to_string(), &[]).status.success());
+    let o = lords(d, &[&["paths"][..], &stacks].concat(), &[]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert_eq!(o.status.code(), Some(1), "{}", said(&o));
+    assert!(out.contains("/wt-old)") && !out.contains("--all"), "{out}");
 }

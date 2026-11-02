@@ -707,7 +707,8 @@ fn new_worktree_gets_its_place_file(env: &Env, repo: &Path, wts: &Path, name: &s
 // chaining any hook already there, as today … The install never repoints `core.hooksPath` and never edits the
 // dispatcher. Test it against a copy of the real dispatcher: `git worktree add` then gets place files."): with the
 // repo's local hooks path the real dispatcher, the install succeeds and chains the owner's hook; a new worktree gets
-// its place file and the owner's hook runs; the hooks path and the dispatcher are as they were.
+// its place file and the owner's hook runs; the hooks path and the dispatcher are as they were. A conditional include
+// that only a linked worktree reads, and that routes no hook (it names the user), doesn't stop it (review r1, R1-01).
 #[test]
 fn the_post_checkout_install_goes_through_a_local_dispatcher_that_forwards() {
     let env = Env::new();
@@ -715,6 +716,8 @@ fn the_post_checkout_install_goes_through_a_local_dispatcher_that_forwards() {
     let guard = real_dispatcher(&env.dir.path().join("guard"));
     let guard_path = guard.to_str().unwrap();
     env.git(&repo, &["config", "core.hooksPath", guard_path]);
+    fs::write(repo.join(".git/user.inc"), "[user]\n\tname = Linked\n").unwrap();
+    env.git(&repo, &["config", "includeIf.gitdir:**/worktrees/.path", "user.inc"]);
     fs::write(repo.join(".git/hooks/post-checkout"), OWNERS_HOOK).unwrap();
     let dispatcher = fs::read(env.dir.path().join("guard/dispatch.sh")).unwrap();
 
@@ -767,6 +770,8 @@ fn the_post_checkout_install_goes_through_a_global_dispatcher_and_a_previous_hoo
 //   answer bound to this repo's hooks dir tells them apart (sol-loop r1, S2).
 // - A local hooks path whose post-checkout runs nothing: "local".
 // - A global hooks path without a post-checkout (today this one installed, with a note): "global".
+// - Review r1, R1-01, its witness: no hooks path in the main checkout, but a conditional include that only a linked
+//   worktree's git dir matches sets an empty one there; the stand-in can't see it, so the include is named.
 #[test]
 fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
     let env = Env::new();
@@ -780,23 +785,16 @@ fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
     fs::write(silent.join("post-checkout"), "#!/bin/sh\nexit 0\n").unwrap();
     let empty = d.join("empty");
     fs::create_dir_all(&empty).unwrap();
+    let inc = format!("[core]\n\thooksPath = {}\n", empty.display()).replace('\\', "/");
+    fs::write(repo.join(".git/linked-hooks.inc"), inc).unwrap();
     let hooks = repo.join(".git/hooks");
     fs::write(hooks.join("post-checkout"), OWNERS_HOOK).unwrap();
-    let listing = |dir: &Path| -> Vec<(String, Vec<u8>)> {
-        let mut v: Vec<_> = fs::read_dir(dir)
-            .unwrap()
-            .flatten()
-            .map(|e| (e.file_name().to_string_lossy().into_owned(), fs::read(e.path()).unwrap()))
-            .collect();
-        v.sort();
-        v
-    };
     let before = listing(&hooks);
     let ledger = d.join("home/.lords-command/state/ledger.toml");
     let recorded = fs::read(&ledger).unwrap();
 
     type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a str);
-    let cases: [Case; 5] = [
+    let cases: [Case; 6] = [
         (
             "relative",
             vec![("core.hooksPath", guard), ("attributionGuard.previousHooksPath", ".githooks")],
@@ -817,6 +815,11 @@ fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
         ),
         ("local", vec![("core.hooksPath", silent.to_str().unwrap())], "local"),
         ("global", vec![("--global core.hooksPath", empty.to_str().unwrap())], "global"),
+        (
+            "include",
+            vec![("includeIf.gitdir:**/worktrees/.path", "linked-hooks.inc")],
+            "includeif.gitdir:**/worktrees/.path",
+        ),
     ];
     for (name, settings, says) in cases {
         for (k, v) in &settings {
@@ -840,6 +843,17 @@ fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
             assert!(env.git(&repo, &args).status.success(), "{name}: git {args:?}");
         }
     }
+}
+
+/// Every file in `dir`, by name, with its bytes, sorted.
+fn listing(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut v: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), fs::read(e.path()).unwrap()))
+        .collect();
+    v.sort();
+    v
 }
 
 /// Another repo, `other` (one commit), declared in a stack of its own (`pub2`, `priv2`) and given Lords' post-checkout
@@ -897,17 +911,7 @@ fn a_refused_reinstall_keeps_the_tools_earlier_hook() {
     let d = env.dir.path();
     let hooks = repo.join(".git/hooks");
     let ledger = d.join("home/.lords-command/state/ledger.toml");
-    let names = |dir: &Path| -> Vec<String> {
-        let mut v: Vec<_> = fs::read_dir(dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        v.sort();
-        v
-    };
-    let before = (names(&hooks), fs::read(hooks.join("post-checkout")).unwrap());
-    let recorded = fs::read(&ledger).unwrap();
+    let before = (listing(&hooks), fs::read(&ledger).unwrap());
     let stale = d.join("stale");
     fs::create_dir_all(&stale).unwrap();
     fs::copy(hooks.join("post-checkout"), stale.join("post-checkout")).unwrap();
@@ -917,8 +921,31 @@ fn a_refused_reinstall_keeps_the_tools_earlier_hook() {
 
     let o = install_post_checkout(&env, &repo, &copied_stacks(&env, "2"));
     assert!(!o.status.success() && !text(&o).contains("back failed"), "{}", text(&o));
-    assert_eq!((names(&hooks), fs::read(hooks.join("post-checkout")).unwrap()), before);
-    assert_eq!(fs::read(&ledger).unwrap(), recorded);
+    assert_eq!((listing(&hooks), fs::read(&ledger).unwrap()), before);
+}
+
+// Spec (review r1, D14D15-R1-02: "A refusal restores the hooks dir and ledger exactly, including a chained earlier hook
+// and a Lords hook from before"; its witness): after an install over an owner's hook, a re-install whose probe passes
+// but whose ledger save is refused (the ledger NTFS-compressed, an attribute fsguard won't carry over) leaves the hooks
+// dir, every file in it byte for byte (no copy of the earlier hook left), and the ledger as they were. Windows only:
+// elsewhere fsguard keeps every mode, and a read-only state dir would stop the probe first.
+#[cfg(windows)]
+#[test]
+fn a_reinstall_whose_ledger_cant_be_saved_changes_nothing() {
+    let env = Env::new();
+    let (repo, _wts, stacks) = post_checkout_repo(&env);
+    let hooks = repo.join(".git/hooks");
+    fs::write(hooks.join("post-checkout"), OWNERS_HOOK).unwrap();
+    let o = install_post_checkout(&env, &repo, &stacks);
+    assert!(o.status.success(), "{}", text(&o));
+    let ledger = env.dir.path().join("home/.lords-command/state/ledger.toml");
+    let before = (listing(&hooks), fs::read(&ledger).unwrap());
+    let o = Command::new("compact").args(["/c", "/q"]).arg(&ledger).output().unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+
+    let o = install_post_checkout(&env, &repo, &stacks);
+    assert!(!o.status.success(), "{}", text(&o));
+    assert_eq!((listing(&hooks), fs::read(&ledger).unwrap()), before, "{}", text(&o));
 }
 
 /// A nonce as `lords check` makes them: 32 hex digits.
