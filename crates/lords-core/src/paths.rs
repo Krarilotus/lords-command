@@ -87,8 +87,18 @@ pub fn paths(stacks: &Stacks, ask: &Ask) -> Vec<Row> {
             Err(why) => row(false, path, why),
         });
     }
-    rows.extend(role_rows(stacks));
+    rows.extend(role_rows(stacks, &ask.home));
     rows
+}
+
+/// Whether a live session's cwd (`guard::live_session_cwds`) is at or below `dir`; with the records unknown, yes.
+fn has_session(sessions: Option<&[PathBuf]>, dir: &Path) -> bool {
+    let dir = crate::ledger::key(dir);
+    let under = |c: &PathBuf| {
+        let c = crate::ledger::key(c);
+        c == dir || c.starts_with(&format!("{}/", dir.trim_end_matches('/')))
+    };
+    sessions.is_none_or(|s| s.iter().any(under))
 }
 
 /// The event a role hook must be under to run at a session's first prompt (F10-R1-02).
@@ -186,12 +196,14 @@ fn find_codex() -> Option<PathBuf> {
 /// where the role guard couldn't give the role's start, decided by the guard's own `guard::deliverable` (F10-FC1-02:
 /// the installed start and that harness's place file, never a recomposition); or one complete row. The checkouts and
 /// worktrees are sync's own (`sync::checkouts`, sol-loop r2 S1); a repo whose can't be listed is a row of its own,
-/// incomplete.
-fn role_rows(stacks: &Stacks) -> Vec<Row> {
+/// incomplete. `home`: the tool home, whose session records mark places in use.
+fn role_rows(stacks: &Stacks, home: &Path) -> Vec<Row> {
     use crate::fsguard::InDir;
     let Some(private) = &stacks.private else { return Vec::new() };
     let mut rows = Vec::new();
-    // Each place: its label, dir, adapters, and whether it is in use (a declared checkout or a workspace always is).
+    let sessions = crate::guard::live_session_cwds(home);
+    // Each place: its label, dir, adapters, and whether it is in use: a declared checkout or a workspace always is, a
+    // worktree with a live session or recent git activity (P1; review r1, R1-03).
     let mut dirs: Vec<(String, PathBuf, &[String], bool)> = Vec::new();
     for (name, repo) in &private.manifest.repos {
         let declared: Vec<String> = repo
@@ -202,7 +214,9 @@ fn role_rows(stacks: &Stacks) -> Vec<Row> {
         match sync::checkouts(repo) {
             Ok((roots, _, _)) => dirs.extend(roots.iter().map(|r| {
                 let p = r.path().to_path_buf();
-                let in_use = declared.contains(&crate::ledger::key(&p)) || worktree_in_use(&p);
+                let in_use = declared.contains(&crate::ledger::key(&p))
+                    || has_session(sessions.as_deref(), &p)
+                    || worktree_in_use(&p);
                 let label = format!("repo {name} ({})", crate::adapters::slashes(&p));
                 (label, p, &repo.adapters[..], in_use)
             })),

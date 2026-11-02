@@ -416,7 +416,8 @@ fn probe_label() -> String {
 /// tool's own is replaced. It stands only once a new worktree's post-checkout is seen to reach it, through whatever
 /// `core.hooksPath` or dispatcher is set (D14, design note 2026-11-02-lords-hooks-dispatcher, H1); otherwise the dir is
 /// put back as it was, nothing is recorded, and the refusal names the case (H4, H6). `core.hooksPath` and a
-/// dispatcher are never changed (H3).
+/// dispatcher are never changed (H3). A conditional include that may route hooks for a new worktree, which the probe's
+/// stand-in can't see, refuses before anything is written (review r1, R1-01).
 pub fn install_post_checkout(
     repo: &Path,
     lords_exe: &Path,
@@ -424,6 +425,13 @@ pub fn install_post_checkout(
     home: &Path,
 ) -> Result<Installed, String> {
     let dir = own_hooks_dir(repo)?;
+    let unseen = routing_includes(repo)?;
+    if !unseen.is_empty() {
+        return Err(format!(
+            "the repo's config has a conditional include that may route hooks (core.hooksPath, attributionGuard.*, hook.*, a further include, or a file that can't be read) in a new worktree, where the probe can't see it: {}; no post-checkout installed",
+            unseen.join("; ")
+        ));
+    }
     let _lock = ApplyLock::take(home, 60)?;
     let mut ledger = Ledger::load(home)?;
     let hook = dir.join(&[Part::new("post-checkout")?]);
@@ -449,9 +457,14 @@ pub fn install_post_checkout(
     let scope = format!("hooks:{}", crate::ledger::key(dir.path()));
     let label = probe_label();
     let text = post_checkout_script(lords_exe, args, home, &label);
-    let proof = put_hook(&mut ledger, &hook, &text, &scope)
-        .and_then(|()| post_checkout_reaches_new_worktree(repo, home, &label));
-    if let Err(why) = proof {
+    // Written, proven, recorded: the ledger save is the last step that can still be undone (review r1, R1-02).
+    let done = put_hook(&mut ledger, &hook, &text, &scope)
+        .and_then(|()| {
+            post_checkout_reaches_new_worktree(repo, home, &label)
+                .map_err(|why| refusal(repo, &dir, &why))
+        })
+        .and_then(|()| ledger.save(home));
+    if let Err(why) = done {
         // As it was (H4): this hook gone, then the tool's earlier one or the owner's back at its name, where nothing is
         // overwritten; the ledger isn't saved.
         let undone = fsguard::kind(hook.path())
@@ -464,15 +477,19 @@ pub fn install_post_checkout(
                 (None, Some(_)) => fsguard::move_to(&chained, &hook),
                 (None, None) => Ok(()),
             });
-        let refused = refusal(repo, &dir, &why);
         return Err(match undone {
-            Ok(()) => refused,
-            Err(e) => format!("{refused}; putting {} back failed: {e}", hook.path().display()),
+            Ok(()) => format!("{why}; {} is as it was", hook.path().display()),
+            Err(e) => format!("{why}; putting {} back failed: {e}", hook.path().display()),
         });
     }
-    ledger.save(home)?;
     if let Some(aside) = earlier {
-        aside.delete()?;
+        let at = aside.path().to_path_buf();
+        aside.delete().map_err(|e| {
+            format!(
+                "installed and recorded, but the earlier hook's copy {} stays: {e}",
+                at.display()
+            )
+        })?;
     }
     Ok(Installed {
         hook: hook.path().to_path_buf(),
@@ -480,6 +497,47 @@ pub fn install_post_checkout(
         global_hooks_path: None,
         via: hooks_path(repo).map(|(path, _)| path),
     })
+}
+
+/// The conditional includes of the repo's effective config (`includeIf.<condition>.path`, with where each is set) whose
+/// file may route hooks: it sets `core.hooksPath`, `attributionGuard.*` or `hook.*`, includes further, or can't be read.
+/// A new worktree may match a condition the probe's stand-in doesn't (`gitdir:` on its own git dir, `onbranch:` on its
+/// branch), so the probe can't vouch for such an include; one that routes no hook can't move a hook (review r1, R1-01).
+fn routing_includes(repo: &Path) -> Result<Vec<String>, String> {
+    let pattern = r"^includeif\..*\.path$";
+    if !git::status(repo, &["config", "--get-regexp", pattern])? {
+        return Ok(Vec::new());
+    }
+    let out =
+        git::run(repo, &["config", "-z", "--show-origin", "--path", "--get-regexp", pattern])?;
+    let fields: Vec<&str> = out.split('\0').collect();
+    let mut found = Vec::new();
+    for [origin, entry] in fields.as_chunks::<2>().0 {
+        let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
+        // A relative include is relative to the file that sets it, whose own path is relative to the repo.
+        let from = repo.join(origin.strip_prefix("file:").unwrap_or(origin));
+        let file = from.parent().map_or_else(|| PathBuf::from(value), |d| d.join(value));
+        let routes = match fsguard::kind(&file) {
+            Ok(fsguard::Kind::Missing) => false,
+            Ok(fsguard::Kind::File) => {
+                let path = file.to_string_lossy();
+                git::run(repo, &["config", "--file", &path, "--name-only", "--list"])
+                    .map_or(true, |keys| keys.lines().any(routes_hooks))
+            }
+            _ => true,
+        };
+        if routes {
+            found.push(format!("{key} = {value} ({origin})"));
+        }
+    }
+    Ok(found)
+}
+
+/// Whether a config key routes hooks: where they are, what a dispatcher reads, config-defined hooks, further includes.
+fn routes_hooks(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k == "core.hookspath"
+        || ["attributionguard.", "hook.", "include.", "includeif."].iter().any(|p| k.starts_with(p))
 }
 
 /// The effective `core.hooksPath` and the scope that sets it (`local`, `global`, …), if one is set.

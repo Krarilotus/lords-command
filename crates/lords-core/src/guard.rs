@@ -1127,6 +1127,23 @@ fn write_record(
     }
 }
 
+/// The cwds of the sessions with a live record, one written within `SESSION_RECORD_DAYS` (`lords paths`: a place with
+/// one is in use; review r1, D14D15-R1-03). `None` when a record can't be listed or read, so no place is shown to have
+/// none.
+pub fn live_session_cwds(home: &Path) -> Option<Vec<PathBuf>> {
+    let dir = Root::home(home).ok()?.join(&[Part::new("guard").ok()?, Part::new("session").ok()?]);
+    let max = Duration::from_secs(SESSION_RECORD_DAYS * 24 * 3600);
+    let mut cwds = Vec::new();
+    for p in crate::fsguard::list_dir(dir.path()).ok()? {
+        if crate::fsguard::modified(&p).ok()?.elapsed().is_ok_and(|age| age > max) {
+            continue;
+        }
+        let name = Part::new(p.file_name()?.to_str()?).ok()?;
+        cwds.push(read_record(&dir.child(name)).ok()??.cwd);
+    }
+    Some(cwds)
+}
+
 /// Removes every session record older than `SESSION_RECORD_DAYS`. Best effort: a record left is only a small file.
 fn sweep_records(home: &Path) {
     let Ok(dir) =
