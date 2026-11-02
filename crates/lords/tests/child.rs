@@ -20,6 +20,8 @@ fn run(home: &Path, cwd: &Path, args: &[&str], stdin: &str) -> Output {
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        // The Codex sync asks after it writes Codex's hooks: the stub, never one on PATH (tests/codex_trust.rs).
+        .env("LORDS_CODEX", env!("CARGO_BIN_EXE_lords-codex-stub"))
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
