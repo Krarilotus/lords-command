@@ -506,6 +506,10 @@ never writes memory back.
   - Notes for one role (`roles`, e.g. orchestrator) are left out wherever the reader's role is unknown (a user-level
     file, a repo's files); one line says how many there are per role and where. A target that names its role lists
     them.
+  - With the stack's `[place_files.<adapter>] memory = "pointer"` (default `"list"`), that adapter's place files show
+    the Memory section as one line naming the place's `.lords/memory-<adapter>.md`, which holds the section as it
+    was (headroom under Codex's limit; design note `Harness/notes/2026-11-02-lords-memory-pointer.md`). One file per
+    adapter, as each composes its own; none where there would be no section.
 - **`sync --apply` imports first** (one commit), then writes, so the index points at the notes as they are. A dry run
   says how many notes an import would bring.
 - **A note binds nobody.** The index is introduced as notes, not rules. Making a note binding is a promotion: it

@@ -1093,6 +1093,7 @@ fn context(
         opener: Some(opener(home)),
         child: None,
         default_role_lines: true,
+        memory_file: None,
     }
 }
 
@@ -1940,6 +1941,12 @@ pub fn start_file(role: &str) -> String {
     format!("start-{role}.md")
 }
 
+/// The file in a place's role dir that holds an adapter's Memory section, where its place files name it instead
+/// (`place_files.<adapter>.memory = "pointer"`): one per adapter, as each composes its own section.
+pub fn memory_file(adapter: &str) -> String {
+    format!("memory-{adapter}.md")
+}
+
 /// Everything someone in `role` follows in a place, standing alone: every global entry for the role, the project,
 /// the place, and the memory index; for every agent family (lines for only some are labelled).
 pub fn role_composed(stacks: &Stacks, layers: Layers, role: &str, home: &Path) -> Composed {
@@ -1961,6 +1968,7 @@ fn role_context(layers: Layers, role: &str, home: &Path) -> Context {
         opener: Some(opener(home)),
         child: None,
         default_role_lines: true,
+        memory_file: None,
     }
 }
 
@@ -2019,6 +2027,7 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
             )),
         }
     }
+    let every = chosen.clone();
     chosen.retain(|a| only.is_none_or(|o| o == a.id()));
     pl.cover(&place_scope(place, None), under);
     for a in &chosen {
@@ -2253,6 +2262,21 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
         }
         tree.insert(file, text.into_bytes());
     }
+    // The Memory section of each adapter whose place files name it instead, whatever adapter this sync takes: those
+    // files name it in every checkout (design note 2026-11-02-lords-memory-pointer, I2, A5). It is the same in each.
+    let pointer =
+        |a: &dyn Adapter| pl.stacks.place_files(a.id()).memory == stack::MemoryForm::Pointer;
+    if let Some(root) = place.paths.iter().find(|r| r.path().is_dir()) {
+        for a in every.into_iter().filter(|a| pointer(*a)) {
+            let home = &pl.plan.home;
+            let mut ctx = place_context(pl.stacks, a, place.layers(false), Some(root.path()), home);
+            // Its paths are whole, as it sits below the checkout, whatever the adapter shows (A11).
+            ctx.relative_to = None;
+            if let Some(text) = compose::compose(pl.stacks, &ctx).memory {
+                tree.insert(memory_file(a.id()), text.into_bytes());
+            }
+        }
+    }
     tree.insert(".gitignore".into(), b"*\n".to_vec());
     pl.undeliverable |= !undeliverable.is_empty();
     let tree = std::sync::Arc::new(tree);
@@ -2338,6 +2362,7 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
             opener: None,
             child: None,
             default_role_lines: true,
+            memory_file: None,
         };
         let composed = compose::compose(pl.stacks, &ctx);
         let label = format!("{} (tracked AGENTS.md)", place.label);
@@ -3329,6 +3354,7 @@ fn place_skills(stacks: &Stacks, layers: Layers) -> Vec<&Entry> {
         opener: None,
         child: None,
         default_role_lines: true,
+        memory_file: None,
     };
     compose::applicable(stacks, &ctx)
         .into_iter()
@@ -3403,7 +3429,11 @@ fn place_context(
     ctx.role_dir = checkout.map(|c| c.join(ROLE_DIR));
     ctx.default_role = default_role;
     ctx.default_role_inline = adapter.default_role_inline();
-    ctx.default_role_lines = stacks.place_files(adapter.id()).default_role_lines.unwrap_or(true);
+    let settings = stacks.place_files(adapter.id());
+    ctx.default_role_lines = settings.default_role_lines.unwrap_or(true);
+    if settings.memory == stack::MemoryForm::Pointer {
+        ctx.memory_file = ctx.role_dir.as_ref().map(|d| d.join(memory_file(adapter.id())));
+    }
     if adapter.relative_paths() {
         ctx.relative_to = checkout.map(Path::to_path_buf);
     }

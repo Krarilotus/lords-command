@@ -387,6 +387,9 @@ pub struct Context {
     /// In a place's file, whether the default role's lines for only some roles show (labelled) or stay in its role
     /// file like any other role's (stack.toml `place_files.<adapter>.default_role_lines`).
     pub default_role_lines: bool,
+    /// The file the Memory section goes to (stack.toml `place_files.<adapter>.memory = "pointer"`): the composition
+    /// then shows one line naming it, and `Composed::memory` is that file's text.
+    pub memory_file: Option<PathBuf>,
 }
 
 /// Which start file a native child gets (sync.rs `CHILD_FILE`, `CHILD_WHOLE_FILE`).
@@ -448,6 +451,8 @@ pub struct Composed {
     pub overridden: Vec<String>,
     /// Applicable skills (installed as links, not composed into text).
     pub skills: Vec<String>,
+    /// With `Context::memory_file`, that file's text: the Memory section in a managed block. `None` without a section.
+    pub memory: Option<String>,
 }
 
 fn in_layers(e: &Entry, layers: &Layers) -> bool {
@@ -960,16 +965,28 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         if !lines.is_empty() {
             lines.push(String::new());
         }
-        lines.push("# Memory".into());
-        lines.push(String::new());
-        lines.push(MEMORY_INTRO.into());
-        lines.push(String::new());
+        let mut section: Vec<String> =
+            vec!["# Memory".into(), String::new(), MEMORY_INTRO.into(), String::new()];
         for (name, index) in &live_here {
-            lines.push(format!("- {name}: its index is `{index}`, which its agents keep current"));
+            section
+                .push(format!("- {name}: its index is `{index}`, which its agents keep current"));
         }
-        push_index(&index_items(&notes), ctx, &mut lines, &mut out);
+        let mut found = Composed::default();
+        push_index(&index_items(&notes), ctx, &mut section, &mut found);
         if let Some(p) = pointer {
-            lines.push(p);
+            section.push(p);
+        }
+        // With a memory file the section goes there whole, and one line here names it (the Lords owner, 2 Nov).
+        if let Some(file) = &ctx.memory_file {
+            out.memory = Some(format!("{BEGIN}\n{HEADER}\n{}\n{END}\n", section.join("\n")));
+            lines.extend(["# Memory".into(), String::new(), format!("Notes agents wrote down earlier are listed in `{}`. Read a note's file when its topic comes up; notes are not rules.", shown(file, ctx))]);
+        } else {
+            for s in found.sources.iter_mut() {
+                s.line += lines.len();
+            }
+            out.sources.append(&mut found.sources);
+            out.ids.append(&mut found.ids);
+            lines.append(&mut section);
         }
     }
     // A child's file names its role even with nothing else: the place's file's labels then say what binds it.
