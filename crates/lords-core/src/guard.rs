@@ -62,12 +62,14 @@ impl Simple {
     }
 }
 
-/// A heredoc waiting for its body: the delimiter as written without its quotes, whether `<<-` strips leading tabs, and
-/// whether the command it feeds runs the body (`runs_body`).
+/// A heredoc waiting for its body: the delimiter as written without its quotes, whether `<<-` strips leading tabs,
+/// whether the command it feeds runs the body (`runs_body`), and whether any of the delimiter was quoted (the body is
+/// then literal, else the outer shell expands it).
 struct Heredoc {
     delim: String,
     tabs: bool,
     runs: bool,
+    quoted: bool,
 }
 
 /// The simple commands of `command`, each as its words, as Bash would run them (design note §2): split at `;`, `&`,
@@ -206,8 +208,16 @@ fn list(c: &[char], i: &mut usize, close: Option<char>, out: &mut Vec<Vec<Word>>
                 }
                 continue;
             }
-            // A heredoc (`<<`, `<<-`; `<<<` is a here-string, word text): its body starts after this line.
-            '<' if !double && c.get(*i + 1) == Some(&'<') && c.get(*i + 2) != Some(&'<') => {
+            // `<<<`: a here-string, whose one word is data. No body follows, and the command goes on (review r1,
+            // BG-R1-01).
+            '<' if !double && c[*i..].starts_with(&['<', '<', '<']) => {
+                s.word.text.push_str("<<<");
+                s.started = true;
+                *i += 3;
+                continue;
+            }
+            // A heredoc (`<<`, `<<-`): its body starts after this line.
+            '<' if !double && c.get(*i + 1) == Some(&'<') => {
                 s.end_word();
                 *i += 2;
                 heredocs.push(heredoc(c, i, runs_body(&s.words)));
@@ -271,28 +281,57 @@ fn heredoc(c: &[char], i: &mut usize, runs: bool) -> Heredoc {
     while matches!(c.get(*i), Some(' ' | '\t')) {
         *i += 1;
     }
-    let (mut delim, mut quote) = (String::new(), None);
+    let (mut delim, mut quote, mut quoted) = (String::new(), None, false);
     while let Some(&ch) = c.get(*i) {
         match quote {
             Some(q) if ch == q => quote = None,
             Some(_) => delim.push(ch),
-            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch == '\'' || ch == '"' => (quote, quoted) = (Some(ch), true),
             // `$'EOF'` and `$"EOF"`: the `$` is quoting, not part of the delimiter (sol-loop r1, S5).
             None if ch == '$' && matches!(c.get(*i + 1), Some('\'' | '"')) => {}
             None if ch == '\\' => {
                 *i += 1;
                 delim.extend(c.get(*i));
+                quoted = true;
             }
             None if " \t\n;&|()<>".contains(ch) => break,
             None => delim.push(ch),
         }
         *i += 1;
     }
-    Heredoc { delim, tabs, runs }
+    Heredoc { delim, tabs, runs, quoted }
+}
+
+/// An unquoted heredoc's body as the shell it feeds receives it, the outer shell's escapes resolved (Bash manual
+/// §3.6.6; review r1, BG-R1-02): `\$` and `` \` `` are the bare character, `\`-newline is nothing, `\\` is one
+/// backslash. Its expansions are left as written, to be checked as the commands they are part of. A `\\` right before
+/// one stays `\\`, so the lexer still reads the expansion that follows as one.
+fn as_received(body: &[char]) -> Vec<char> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut k = 0;
+    while k < body.len() {
+        match (body[k], body.get(k + 1)) {
+            ('\\', Some('\n')) => {}
+            ('\\', Some(&e @ ('$' | '`'))) => out.push(e),
+            ('\\', Some('\\')) => {
+                out.push('\\');
+                if matches!(body.get(k + 2), Some('$' | '`')) {
+                    out.push('\\');
+                }
+            }
+            (ch, _) => {
+                out.push(ch);
+                k += 1;
+                continue;
+            }
+        }
+        k += 2;
+    }
+    out
 }
 
 /// A heredoc's body, from `c[*i]` at a line's start to past the line that is its delimiter (or the end). Data, skipped,
-/// unless the command it feeds runs it: then its commands go to `out`.
+/// unless the command it feeds runs it: then its commands go to `out`, read as that command receives them.
 fn heredoc_body(c: &[char], i: &mut usize, h: &Heredoc, out: &mut Vec<Vec<Word>>) {
     let mut body = Vec::new();
     while *i < c.len() {
@@ -309,6 +348,7 @@ fn heredoc_body(c: &[char], i: &mut usize, h: &Heredoc, out: &mut Vec<Vec<Word>>
         body.push('\n');
     }
     if h.runs {
+        let body = if h.quoted { body } else { as_received(&body) };
         list(&body, &mut 0, None, out);
     }
 }
