@@ -162,7 +162,8 @@ fn real_times_durations_ratios_and_code_pass() {
 // Spec (the brief: "A file write by an agent's editor tools (Claude `Write`/`Edit`/`MultiEdit`; Codex's edit tool …)
 // is denied when the new text contains a placeholder"; "Scope it by file type (Markdown and plain text)"; the steer:
 // "Run the same check on outgoing T3 messages … its `message`"; design note §2: Codex's `apply_patch` with the patch in
-// `command`, the T3 tool under either server name): each input that adds one is denied.
+// `command`, the T3 tool under either server name; `MultiEdit` cut, the Lords owner, 2 Nov: Claude Code 2.1.316 has
+// none): each input that adds one is denied.
 #[test]
 fn every_input_that_adds_a_placeholder_is_denied() {
     let d = Dir::new();
@@ -172,11 +173,6 @@ fn every_input_that_adds_a_placeholder_is_denied() {
     let note = d.file("note.md", Some("# Log\n\nreal 13:05\n"));
     assert!(write(&note, "# Log\n\nreal 13:05\nthen 14:xx\n").is_some());
     assert!(edit(&note, "real 13:05", "real 13:05, then 14:xx").is_some());
-    let multi = json!({"file_path": note, "edits": [
-        {"old_string": "# Log", "new_string": "# Log"},
-        {"old_string": "real 13:05", "new_string": "real HH:MM"},
-    ]});
-    assert!(denied_at("MultiEdit", multi, "23:59").is_some());
     let add = "*** Begin Patch\n*** Add File: notes/a.md\n+# A\n+at 14:xx\n*** End Patch\n";
     assert!(denied_at("apply_patch", json!({"command": add}), "23:59").is_some());
     let update = "*** Begin Patch\n*** Update File: notes/b.txt\n@@\n keep\n-old 13:05\n+new 13:0x\n*** End Patch\n";

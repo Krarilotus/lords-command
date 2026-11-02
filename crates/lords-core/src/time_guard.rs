@@ -15,9 +15,8 @@ use std::path::{Path, PathBuf};
 
 /// The tools the hook runs on, as an exact list (letters, digits, `_`, `-`, `|`) in both harnesses' matcher syntax:
 /// Claude Code's editor tools and the T3 send under both server spellings; Codex's `apply_patch` answers to `Write` and
-/// `Edit` (design note §2).
-pub const MATCHER: &str =
-    "Write|Edit|MultiEdit|mcp__t3-code__t3_thread_send|mcp__t3_code__t3_thread_send";
+/// `Edit` (design note §2). No `MultiEdit`: Claude Code 2.1.316 has none.
+pub const MATCHER: &str = "Write|Edit|mcp__t3-code__t3_thread_send|mcp__t3_code__t3_thread_send";
 
 /// The words that mark a time as a plan (the Lords owner's steer, 2 Nov), compared whole and in any case.
 pub const MARKERS: [&str; 9] =
@@ -90,7 +89,7 @@ fn added(ev: &Value) -> Vec<(String, String)> {
             vec![(text("message"), String::new())]
         }
         "apply_patch" => patch_sections(input["command"].as_str().unwrap_or("")),
-        "Write" | "Edit" | "MultiEdit" => {
+        "Write" | "Edit" => {
             let Some(path) = input["file_path"].as_str().map(|p| place(ev, p)) else {
                 return Vec::new();
             };
@@ -100,41 +99,24 @@ fn added(ev: &Value) -> Vec<(String, String)> {
             // A file that is there but can't be read is let through: what the write keeps is unknown.
             let Ok(old) = fsguard::read_text(&path) else { return Vec::new() };
             let old = old.unwrap_or_default();
-            let edits: Vec<(String, String, bool)> = match tool {
-                "Write" => return vec![(text("content"), old)],
-                "Edit" => {
-                    vec![(text("old_string"), text("new_string"), input["replace_all"] == true)]
-                }
-                _ => input["edits"]
-                    .as_array()
-                    .map(|es| {
-                        es.iter()
-                            .map(|e| {
-                                let s = |k: &str| e[k].as_str().unwrap_or("").to_string();
-                                (s("old_string"), s("new_string"), e["replace_all"] == true)
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+            if tool == "Write" {
+                return vec![(text("content"), old)];
+            }
+            // The file after the edit, against the file before; where the old text isn't there (the edit will fail),
+            // the edit's own new and old text.
+            let (from, to) = (text("old_string"), text("new_string"));
+            if from.is_empty() || !old.contains(&from) {
+                return vec![(to, from)];
+            }
+            let new = if input["replace_all"] == true {
+                old.replace(&from, &to)
+            } else {
+                old.replacen(&from, &to, 1)
             };
-            edited(&old, &edits)
+            vec![(new, old)]
         }
         _ => Vec::new(),
     }
-}
-
-/// The file after `edits`, against the file before; where an edit's old text isn't there (the edit will fail), each
-/// edit's own new and old text.
-fn edited(old: &str, edits: &[(String, String, bool)]) -> Vec<(String, String)> {
-    let mut new = old.to_string();
-    for (from, to, all) in edits {
-        if from.is_empty() || !new.contains(from.as_str()) {
-            return edits.iter().map(|(f, t, _)| (t.clone(), f.clone())).collect();
-        }
-        new =
-            if *all { new.replace(from.as_str(), to) } else { new.replacen(from.as_str(), to, 1) };
-    }
-    vec![(new, old.to_string())]
 }
 
 /// A file path as the event names it, against the event's `cwd` when relative.

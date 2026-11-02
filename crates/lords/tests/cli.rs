@@ -1805,7 +1805,7 @@ fn sync_registers_the_time_guard_and_the_binary_answers() {
     let stacks =
         ["--public-stack", public.to_str().unwrap(), "--private-stack", private.to_str().unwrap()];
     assert!(env.lords(d, &["guard", "install"]).status.success());
-    let matcher = "Write|Edit|MultiEdit|mcp__t3-code__t3_thread_send|mcp__t3_code__t3_thread_send";
+    let matcher = "Write|Edit|mcp__t3-code__t3_thread_send|mcp__t3_code__t3_thread_send";
     let o = env.lords(d, &[&["sync", "--user"][..], &stacks].concat());
     let added = format!("Lords hook added: the time guard (PreToolUse, {matcher})");
     assert!(text(&o).contains(&added), "{}", text(&o));
