@@ -38,18 +38,23 @@ struct Word {
     vars: Vec<(bool, bool)>,
 }
 
-/// The simple command being read: its words so far and the word in progress.
+/// The simple command being read: its words so far and the word in progress, which is no argument when it is a
+/// here-string's data (`data`).
 #[derive(Default)]
 struct Simple {
     words: Vec<Word>,
     word: Word,
     started: bool,
+    data: bool,
 }
 
 impl Simple {
     fn end_word(&mut self) {
         if self.started {
-            self.words.push(std::mem::take(&mut self.word));
+            let word = std::mem::take(&mut self.word);
+            if !std::mem::take(&mut self.data) {
+                self.words.push(word);
+            }
             self.started = false;
         }
     }
@@ -208,12 +213,15 @@ fn list(c: &[char], i: &mut usize, close: Option<char>, out: &mut Vec<Vec<Word>>
                 }
                 continue;
             }
-            // `<<<`: a here-string, whose one word is data. No body follows, and the command goes on (review r1,
-            // BG-R1-01).
+            // `<<<`: a here-string. Its one word is stdin data, never an argument (a substitution in it is still
+            // read); no body follows, and the command goes on (review r1, BG-R1-01; sol-loop r3, R2).
             '<' if !double && c[*i..].starts_with(&['<', '<', '<']) => {
-                s.word.text.push_str("<<<");
-                s.started = true;
+                s.end_word();
+                (s.started, s.data) = (true, true);
                 *i += 3;
+                while matches!(c.get(*i), Some(' ' | '\t')) {
+                    *i += 1;
+                }
                 continue;
             }
             // A heredoc (`<<`, `<<-`): its body starts after this line.
@@ -303,29 +311,28 @@ fn heredoc(c: &[char], i: &mut usize, runs: bool) -> Heredoc {
 }
 
 /// An unquoted heredoc's body as the shell it feeds receives it, the outer shell's escapes resolved (Bash manual
-/// §3.6.6; review r1, BG-R1-02): `\$` and `` \` `` are the bare character, `\`-newline is nothing, `\\` is one
-/// backslash. Its expansions are left as written, to be checked as the commands they are part of. A `\\` right before
-/// one stays `\\`, so the lexer still reads the expansion that follows as one.
+/// §3.6.6; review r1, BG-R1-02), a whole run of backslashes at a time (sol-loop r3, R1): each `\\` is one backslash,
+/// and an odd last one quotes a `$`, `` ` `` or newline after it (the bare character; the newline goes) and is kept
+/// before anything else. Expansions are left as written, to be checked as the commands they are part of. One the
+/// outer shell runs, after an even run, gets an even run, so the lexer reads it as an expansion too.
 fn as_received(body: &[char]) -> Vec<char> {
     let mut out = Vec::with_capacity(body.len());
     let mut k = 0;
     while k < body.len() {
-        match (body[k], body.get(k + 1)) {
-            ('\\', Some('\n')) => {}
-            ('\\', Some(&e @ ('$' | '`'))) => out.push(e),
-            ('\\', Some('\\')) => {
-                out.push('\\');
-                if matches!(body.get(k + 2), Some('$' | '`')) {
-                    out.push('\\');
-                }
-            }
-            (ch, _) => {
-                out.push(ch);
-                k += 1;
-                continue;
-            }
+        let n = body[k..].iter().take_while(|c| **c == '\\').count();
+        if n == 0 {
+            out.push(body[k]);
+            k += 1;
+            continue;
         }
-        k += 2;
+        let next = body.get(k + n).copied();
+        let kept = match next {
+            Some('$' | '`' | '\n') if n % 2 == 1 => n / 2,
+            Some('$' | '`') => (n / 2).next_multiple_of(2),
+            _ => n / 2 + n % 2,
+        };
+        out.extend(std::iter::repeat_n('\\', kept));
+        k += n + usize::from(next == Some('\n') && n % 2 == 1);
     }
     out
 }
