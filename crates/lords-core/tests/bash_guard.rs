@@ -161,6 +161,32 @@ fn a_heredoc_body_that_is_data_passes() {
     passes("cat <<EOF\nrm $X");
 }
 
+// Spec: review r1, BG-R1-01 (the Lords owner accepted it, 2 Nov): `<<<` is a here-string, not a heredoc. Its one word is
+// data, and the command goes on after it, so what follows is checked as usual (Bash manual §3.6.7). The review's
+// witnesses.
+#[test]
+fn a_here_string_is_one_word_of_data() {
+    rm_denied("cat <<< \"ready\"\nrm -f \"$OUT/file\"");
+    bypass_denied("cat <<< \"ready\"\ngit commit --no-verify -m fix");
+    passes("cat <<< 'rm -rf $X'");
+    passes("grep -c x <<< \"git commit --no-verify\"");
+}
+
+// Spec: review r1, BG-R1-02 (accepted): an unquoted heredoc fed to a shell is what that shell runs once the outer shell
+// has expanded it. Its escapes `\$`, `` \` ``, `\\` and `\`-newline are resolved first (Bash manual §3.6.6), so `\$X`
+// can't hide an unguarded variable. A quoted delimiter keeps the body literal, and data stays data. The review's
+// witness and allowances; then `\\$X`, where the outer shell expands `$X` itself, and `\\\$X`, where it doesn't.
+#[test]
+fn an_unquoted_shell_heredoc_is_checked_as_its_shell_receives_it() {
+    rm_denied("bash <<EOF\nrm -f \"\\$OUT/file\"\nEOF");
+    rm_denied("ssh build-host <<EOF\nrm -f \"\\$OUT/file\"\nEOF");
+    passes("bash <<'EOF'\nrm -f \"\\$OUT/file\"\nEOF");
+    passes("bash <<EOF\nrm -f \"\\${OUT:?}/file\"\nEOF");
+    passes("cat <<EOF\nrm -f \"\\$OUT/file\"\nEOF");
+    rm_denied("bash <<EOF\nrm -rf \\\\$X/\nEOF");
+    passes("bash <<EOF\nrm -f \"\\\\\\$OUT/file\"\nEOF");
+}
+
 // ---------------------------------------------------------------- I1: git without its hooks
 
 // Spec: the brief: "`--no-verify` or `-n` on `git commit`/`git merge`/`git push`/`git am`" gets a deny naming
