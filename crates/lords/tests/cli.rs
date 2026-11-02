@@ -32,7 +32,9 @@ impl Env {
             .env("GIT_CONFIG_GLOBAL", self.dir.path().join("gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("HOME", self.dir.path().join("home"))
-            .env("USERPROFILE", self.dir.path().join("home"));
+            .env("USERPROFILE", self.dir.path().join("home"))
+            // The Codex sync asks after it writes Codex's hooks: the stub, never one on PATH (tests/codex_trust.rs).
+            .env("LORDS_CODEX", env!("CARGO_BIN_EXE_lords-codex-stub"));
         c
     }
 

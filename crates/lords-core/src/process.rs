@@ -5,7 +5,9 @@
 //! for its self-test before sync installs it, and the T3 CLI, which the queue guard asks about its thread (it
 //! reads; its process tree ends with the guard's). The panel's push is `git` too, bounded by a deadline that ends its
 //! whole tree (`bounded`), and the window on another PC runs `ssh -N` for its forward while it is open (`Tunnel`).
-//! `lords paths` asks Codex's app-server which hooks it trusts (`codex_ask`; it reads), bounded the same way.
+//! `lords paths` asks Codex's app-server which hooks it trusts (`codex_ask`; it reads), bounded the same way; sync asks it
+//! the same, and to trust Lords' own hooks after it wrote Codex's hooks file, which Codex's own writer does
+//! (codex_trust.rs).
 
 // The door: the one place the resolved boundary lints allow (clippy.toml).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]

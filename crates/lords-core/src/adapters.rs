@@ -238,7 +238,7 @@ impl Adapter for Codex {
     }
 
     fn guard_note(&self) -> Option<&'static str> {
-        Some("Codex runs a new or changed hook once it is reviewed: open Codex and accept it under /hooks")
+        Some("Codex runs a new or changed hook once it is trusted: an applying sync trusts Lords' own after the write, and names any it couldn't; accept those in Codex under /hooks")
     }
 
     /// The override replaces the tracked `AGENTS.md` and Codex doesn't expand includes, so the tracked text is

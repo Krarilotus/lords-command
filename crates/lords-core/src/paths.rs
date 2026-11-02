@@ -5,6 +5,7 @@
 //! is a row marked incomplete, never complete.
 
 use crate::adapters::{self, Adapter};
+use crate::codex_trust as trust;
 use crate::stack::Stacks;
 use crate::sync;
 use serde::Serialize;
@@ -28,8 +29,8 @@ pub struct Ask {
     pub deadline: Duration,
 }
 
-/// How long Codex's app-server may take to answer `hooks/list` (0.8 s measured on this PC; probe H4).
-pub const CODEX_DEADLINE: Duration = Duration::from_secs(20);
+/// How long Codex's app-server may take to answer `hooks/list` (`codex_trust::DEADLINE`).
+pub const CODEX_DEADLINE: Duration = crate::codex_trust::DEADLINE;
 
 fn row(complete: bool, path: String, why: impl Into<String>) -> Row {
     let state = if complete { "complete" } else { "incomplete" };
@@ -156,56 +157,41 @@ fn target_state(
     if adapter.id() != "codex" {
         return Ok("its role hook is registered and the guard copy speaks its protocol".into());
     }
-    let want = want["command"].as_str().unwrap_or_default().to_string();
-    let codex_home = file.parent().unwrap_or(Path::new(".")).to_path_buf();
-    match codex_trust(ask, &codex_home, &want) {
-        Ok(Some(s)) if s == "trusted" => Ok("Codex trusts Lords' role hook".into()),
-        Ok(Some(s)) => Err(format!(
-            "Codex reports Lords' role hook as {s}, so it doesn't run: accept it in Codex under /hooks"
+    codex_trusts(ask, &file, &sync::lords_hooks(adapter, &t.guards, exe.path(), &ask.home))
+}
+
+/// Whether Codex runs every Lords hook in its hooks file `file` (D17: each, not only the role hook): as `hooks/list`
+/// lists it in that file, with Lords' exact command on its event (`codex_trust::lords_guard`), enabled and trusted.
+fn codex_trusts(ask: &Ask, file: &Path, lords: &[trust::Lords]) -> Result<String, String> {
+    let codex = ask.codex.clone().or_else(trust::find).ok_or_else(|| "no `codex` on PATH".into());
+    let home = file.parent().unwrap_or(Path::new("."));
+    let listed = codex.and_then(|c| trust::list(&c, ask.deadline, home));
+    let why = |e| format!("Codex can't be asked whether it trusts Lords' hooks ({e})");
+    let listed = listed.map_err(why)?;
+    let mut off = Vec::new();
+    for l in lords {
+        let one = std::slice::from_ref(l);
+        let it = |h: &&serde_json::Value| {
+            trust::in_file(h, file) && trust::lords_guard(h, one).is_some()
+        };
+        let state = listed.iter().find(it).map(|h| (h["enabled"] == false, &h["trustStatus"]));
+        match state {
+            None => off.push(format!("{} ({}) not listed", l.guard, l.event)),
+            Some((true, _)) => off.push(format!("{} ({}) disabled", l.guard, l.event)),
+            Some((false, s)) if s != "trusted" => {
+                off.push(format!("{} ({}) {}", l.guard, l.event, s.as_str().unwrap_or("?")))
+            }
+            Some(_) => {}
+        }
+    }
+    let names: Vec<&str> = lords.iter().map(|l| l.guard.as_str()).collect();
+    match off.is_empty() {
+        true => Ok(format!("Codex trusts Lords' hooks: {}", names.join(", "))),
+        false => Err(format!(
+            "Codex doesn't run every Lords hook: {}; accept them in Codex under /hooks",
+            off.join("; ")
         )),
-        Ok(None) => Err("Codex doesn't list Lords' role hook".into()),
-        Err(e) => Err(format!("Codex can't be asked whether it trusts Lords' role hook ({e})")),
     }
-}
-
-/// The trust status Codex's app-server gives the hook whose command is `want`, `None` where it lists no such hook.
-fn codex_trust(ask: &Ask, codex_home: &Path, want: &str) -> Result<Option<String>, String> {
-    let codex = match &ask.codex {
-        Some(c) => c.clone(),
-        None => find_codex().ok_or("no `codex` on PATH")?,
-    };
-    let cwd = adapters::slashes(codex_home);
-    let requests = [
-        serde_json::json!({"id": 1, "method": "initialize",
-            "params": {"clientInfo": {"name": "lords", "version": env!("CARGO_PKG_VERSION")}}})
-        .to_string(),
-        serde_json::json!({"method": "initialized"}).to_string(),
-        serde_json::json!({"id": 2, "method": "hooks/list", "params": {"cwds": [cwd]}}).to_string(),
-    ];
-    let answer = crate::process::codex_ask(&codex, codex_home, &requests, 2, ask.deadline)?;
-    if let Some(e) = answer.get("error") {
-        return Err(format!("it answered an error: {e}"));
-    }
-    // The command on the prompt event (Codex names it `userPromptSubmit`; F10-R1-02), and not switched off.
-    let hooks = answer["result"]["data"].as_array().into_iter().flatten();
-    let found = hooks.flat_map(|d| d["hooks"].as_array().into_iter().flatten()).find(|h| {
-        h["command"].as_str() == Some(want) && h["eventName"].as_str() == Some("userPromptSubmit")
-    });
-    Ok(found.map(|h| match h["enabled"].as_bool() {
-        Some(false) => "disabled".to_string(),
-        _ => h["trustStatus"].as_str().unwrap_or("unknown").to_string(),
-    }))
-}
-
-/// `codex` on PATH: `codex.exe`, then the npm shim `codex.cmd` on Windows; `codex` elsewhere.
-fn find_codex() -> Option<PathBuf> {
-    let names: &[&str] = if cfg!(windows) { &["codex.exe", "codex.cmd"] } else { &["codex"] };
-    let dirs: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH")?).collect();
-    names.iter().find_map(|n| {
-        dirs.iter()
-            .map(|d| d.join(n))
-            .find(|p| matches!(crate::fsguard::kind(p), Ok(crate::fsguard::Kind::File)))
-    })
 }
 
 /// Per role but `product`: one row per checkout, worktree or workspace dir sync writes for, and harness the place has,

@@ -120,6 +120,10 @@ pub struct Item {
     /// And the rm guard, with its hook's arguments: apply checks the copy speaks this build's rm protocol (D16-R1-01).
     #[serde(skip)]
     pub(crate) names_rm_guard: Option<&'static [&'static str]>,
+    /// Codex's hooks file: Lords' hooks as rendered for it, whose trust apply settles once it wrote the file
+    /// (`codex_trust::settle`).
+    #[serde(skip)]
+    pub(crate) codex_lords: Option<Vec<crate::codex_trust::Lords>>,
 }
 
 /// An item as plans show it (`--json`, the app): a redacted item without its texts.
@@ -260,6 +264,7 @@ impl Item {
             names_child_guard: false,
             names_role_guard: None,
             names_rm_guard: None,
+            codex_lords: None,
         }
     }
 
@@ -301,6 +306,9 @@ pub struct Plan {
     /// before the install stage drops a blocked place's items.
     #[serde(skip)]
     pub over_limit: bool,
+    /// The Codex apply asks about trust after it writes Codex's hooks (`Options::codex`).
+    #[serde(skip)]
+    pub codex: crate::codex_trust::Codex,
 }
 
 /// What applying a plan releases besides its installs and updates: paths it removes, and ledger records it forgets
@@ -451,6 +459,9 @@ pub struct Options {
     pub uninstall: bool,
     /// What the apply may do: everything, or the install stage only.
     pub stage: Stage,
+    /// The Codex an apply that writes Codex's hooks asks to trust Lords' own and reads trust back from (design note
+    /// 2026-11-02-lords-codex-trust); none by default, and then every hook of that file is named as not known trusted.
+    pub codex: crate::codex_trust::Codex,
 }
 
 /// `~/.lords-command`, the tool's own dir on this machine.
@@ -1447,6 +1458,17 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
     item.names_child_guard = child;
     item.names_role_guard = role;
     item.names_rm_guard = rm;
+    // Codex keys trust by position (design note 2026-11-02-lords-codex-trust): Lords' hooks as rendered here are the
+    // only ones apply trusts once it wrote the file, and the plan says what the write does to trust (§2.5).
+    if adapter.id() == "codex" {
+        let lords = lords_hooks(adapter, guards, guard.path(), &pl.plan.home);
+        if let Some(h) = &hooks {
+            let was = serde_json::json!({ "hooks": before_hooks });
+            let will = serde_json::json!({ "hooks": h });
+            item.notes.extend(crate::codex_trust::foresee(&was, &will, &lords));
+        }
+        item.codex_lords = Some(lords);
+    }
     let names = |h: &serde_json::Value| guard_names(h, adapter, guard.path());
     let changed = hooks.as_ref().map(|h| (names(&before_hooks), names(h)));
     if let (Some((before, after)), Some(why)) = (&changed, adapter.guard_note()) {
@@ -1476,6 +1498,24 @@ fn guard_event(name: &str) -> Option<(&'static str, Option<&'static str>)> {
         "time" => Some(("PreToolUse", Some(crate::time_guard::MATCHER))),
         _ => None,
     }
+}
+
+/// Lords' hooks for `guards` as `guard_hooks` writes them for `adapter`, each with the event Codex lists it under: the
+/// only hooks sync trusts in Codex (design note 2026-11-02-lords-codex-trust, I2).
+pub(crate) fn lords_hooks(
+    adapter: &dyn Adapter,
+    guards: &[String],
+    guard: &Path,
+    home: &Path,
+) -> Vec<crate::codex_trust::Lords> {
+    let (exe, home) = (adapters::slashes(guard), adapters::slashes(home));
+    let hook = |g: &String| {
+        let (event, _) = guard_event(g)?;
+        let hook = adapter.guard_hooks(&exe, g, &home).into_iter().next()?;
+        let (guard, event) = (g.clone(), crate::codex_trust::event_name(event));
+        Some(crate::codex_trust::Lords { guard, event, command: hook["command"].as_str()?.into() })
+    };
+    guards.iter().filter_map(hook).collect()
 }
 
 /// The hook events Lords' guards are written to.
@@ -1580,7 +1620,18 @@ fn guard_hooks(
     };
     let before = hooks.clone();
     let events = hooks.as_object_mut().expect("an object");
-    // Only Lords' own hooks go; their entry stays while it holds others (sol-loop r1, S2).
+    let entry = |g: &str, matcher: Option<&str>| {
+        let hooks = adapter.guard_hooks(&exe, g, &home);
+        match matcher {
+            Some(m) => serde_json::json!({ "matcher": m, "hooks": hooks }),
+            None => serde_json::json!({ "hooks": hooks }),
+        }
+    };
+    // Every hook keeps its event, group and handler index, which Codex keys trust by (design note
+    // 2026-11-02-lords-codex-trust, I3; D17): a wanted guard's hook is rewritten where Lords wrote it, in its own entry
+    // on its event, and a new one is appended. Any other hook of Lords' goes, and its entry with it once it held
+    // nothing else (sol-loop r1, S2): the one change that moves later hooks.
+    let mut placed = BTreeSet::new();
     for ev in GUARD_EVENTS {
         let Some(list) = events.get_mut(ev) else { continue };
         let Some(list) = list.as_array_mut() else {
@@ -1589,21 +1640,64 @@ fn guard_hooks(
             }
             continue;
         };
-        for e in list.iter_mut() {
-            if let Some(hs) = e["hooks"].as_array_mut() {
-                hs.retain(|h| !ours(h));
+        let mut emptied = Vec::new();
+        for (i, e) in list.iter_mut().enumerate() {
+            let alone = match e["hooks"].as_array().map(Vec::as_slice) {
+                Some([h]) => adapter.guard_of(h, &exe),
+                _ => None,
+            };
+            let here = wanted.iter().find(|(g, event, _)| {
+                alone.as_deref() == Some(g.as_str()) && *event == ev && !placed.contains(g)
+            });
+            if let Some((g, _, matcher)) = here {
+                placed.insert(*g);
+                *e = entry(g, *matcher);
+                emptied.push(false);
+                continue;
             }
+            // An entry Lords' hook shares with others: the hook is rewritten in its slot while the entry's matcher is its
+            // guard's (sol-loop r1, S1); under another matcher, Lords' can't go on without moving the others' hooks, so
+            // the target is a conflict, before any write (review r1, R1-01).
+            let shared = e["matcher"].as_str().map(str::to_string);
+            let Some(hs) = e.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+                emptied.push(false);
+                continue;
+            };
+            let held = hs.len();
+            let mut kept = Vec::with_capacity(held);
+            for h in hs.drain(..) {
+                let Some(name) = adapter.guard_of(&h, &exe) else {
+                    kept.push(h);
+                    continue;
+                };
+                let slot = wanted
+                    .iter()
+                    .find(|(g, event, _)| **g == name && *event == ev && !placed.contains(g));
+                match slot {
+                    Some((g, _, m)) if *m == shared.as_deref() => {
+                        placed.insert(*g);
+                        kept.extend(adapter.guard_hooks(&exe, g, &home));
+                    }
+                    Some((g, _, m)) => {
+                        let (has, wants) = (shared.as_deref(), m.unwrap_or("none"));
+                        return Err(format!(
+                            "`hooks.{ev}` entry {} holds Lords' {g} hook beside others' hooks under matcher {}, not Lords' {wants}; sync moves no one else's hook: give Lords' hook an entry of its own, or that entry Lords' matcher",
+                            i + 1,
+                            has.unwrap_or("none")
+                        ));
+                    }
+                    None => {}
+                }
+            }
+            emptied.push(held > 0 && kept.is_empty());
+            *hs = kept;
         }
-        list.retain(|e| e["hooks"].as_array().is_none_or(|hs| !hs.is_empty()));
+        let mut emptied = emptied.into_iter();
+        list.retain(|_| !emptied.next().unwrap_or(false));
     }
-    for (g, event, matcher) in wanted {
-        let hooks = adapter.guard_hooks(&exe, g, &home);
-        let entry = match matcher {
-            Some(m) => serde_json::json!({ "matcher": m, "hooks": hooks }),
-            None => serde_json::json!({ "hooks": hooks }),
-        };
-        let list = events.entry(event).or_insert(serde_json::json!([]));
-        list.as_array_mut().expect("a list, checked above").push(entry);
+    for (g, event, matcher) in wanted.iter().filter(|(g, ..)| !placed.contains(g)) {
+        let list = events.entry(*event).or_insert(serde_json::json!([]));
+        list.as_array_mut().expect("a list, checked above").push(entry(g, *matcher));
     }
     if hooks == before {
         return Ok(None);
@@ -2471,6 +2565,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         plan: Plan {
             home: opts.home.clone(),
             ledger_revision: ledger.revision(),
+            codex: opts.codex.clone(),
             ..Plan::default()
         },
         ledger,
@@ -2779,6 +2874,17 @@ impl Run {
         self.line(&["created", &path.to_string_lossy(), written])
     }
 
+    /// Keeps what a file sync never writes held before a program sync asks writes it (Codex's config.toml, before its
+    /// writer trusts Lords' hooks; design note 2026-11-02-lords-codex-trust, §2.2). `restore` names it, never writes it.
+    fn copy(&mut self, path: &Path) -> Result<(), String> {
+        let Some(bytes) = fsguard::read(path)? else { return Ok(()) };
+        let dir = self.dir()?;
+        self.n += 1;
+        let name = format!("{:04}", self.n);
+        fsguard::create_file(&dir.child(Part::new(&name)?), &bytes)?;
+        self.line(&["copy", &path.to_string_lossy(), &name])
+    }
+
     /// Notes a path moved here by `set-aside`, under its number, and where it goes.
     fn aside(&mut self, path: &Path) -> Result<Contained, String> {
         let dir = self.dir()?;
@@ -2789,11 +2895,13 @@ impl Run {
     }
 }
 
-/// What an apply did: one line per change, and the backup dir, if it changed an owner file.
+/// What an apply did: one line per change, and the backup dir, if it changed an owner file; and one line per hook of
+/// a Codex hooks file it wrote that doesn't run (`codex_trust::settle`).
 #[derive(Clone, Debug, Default)]
 pub struct Applied {
     pub done: Vec<String>,
     pub backups: Option<PathBuf>,
+    pub codex: Vec<String>,
 }
 
 fn stale(item: &Item, what: &str) -> String {
@@ -2814,7 +2922,11 @@ fn containing(roots: &[Root], path: &Path) -> Option<Contained> {
 /// failed backup changes nothing (Sol review r3, R3-02); then it moves aside, what moved is compared again (an edit
 /// made since, even mid-apply, stops it), and the new file goes in with the old one's attributes, or the item
 /// refuses for an attribute sync can't set back (rule C). Any error after the move puts the old file back.
-fn owner_update(item: &Item, run: &mut Run) -> Result<(), String> {
+fn owner_update(
+    item: &Item,
+    run: &mut Run,
+    installed: &mut dyn FnMut(&Path),
+) -> Result<(), String> {
     let Dest::Owner(owner) = &item.dest else {
         return Err(format!("{}: no owner file the config names", item.path.display()));
     };
@@ -2826,7 +2938,9 @@ fn owner_update(item: &Item, run: &mut Run) -> Result<(), String> {
             return Err(stale(item, "something appeared"));
         }
         run.created(path, &want)?;
-        return fsguard::put_file(owner, new);
+        fsguard::put_file(owner, new)?;
+        installed(path);
+        return Ok(());
     }
     let planned = item.current.as_deref().map(str::as_bytes);
     let now = fsguard::read(path)?;
@@ -2852,6 +2966,7 @@ fn owner_update(item: &Item, run: &mut Run) -> Result<(), String> {
             ),
         });
     }
+    installed(path);
     aside.delete()
 }
 
@@ -2985,6 +3100,13 @@ fn tool_change(item: &Item, ledger: &mut Ledger) -> Result<(), String> {
 /// planned, and nothing is removed or forgotten without the plan's proof of a complete view (rule B). Nothing to
 /// change touches nothing, not even a lock (Sol review r2, R2-21).
 pub fn apply(plan: &Plan) -> Result<Applied, String> {
+    apply_between(plan, |_| {})
+}
+
+/// `apply`, with `installed` run as each owner file's new version is in and before its old one goes: the point where
+/// another process can hold that old copy open, for tests that must reach it without timing (review r1, R1-02).
+#[doc(hidden)]
+pub fn apply_between(plan: &Plan, mut installed: impl FnMut(&Path)) -> Result<Applied, String> {
     // The refusal rules a dry run reports too (`Plan::applies`).
     plan.applies().map_err(|e| format!("{e} (nothing was changed)"))?;
     let changing: Vec<&Item> =
@@ -3047,11 +3169,64 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
     }
     let mut run = Run::new(&plan.home)?;
     let mut applied = Applied::default();
-    for item in changing {
+    let mut wrote = Vec::new();
+    let result = apply_items(
+        &changing,
+        plan,
+        &mut run,
+        &mut ledger,
+        &mut applied,
+        &mut wrote,
+        &mut installed,
+    );
+    // Codex's trust for each of its hooks files written, whatever came after it (design note
+    // 2026-11-02-lords-codex-trust, I1).
+    for item in wrote {
+        let (text, lords) = (item.proposed.as_deref().unwrap_or(""), item.codex_lords.as_deref());
+        let mut backup = |p: &Path| run.copy(p);
+        let lines = crate::codex_trust::settle(
+            &plan.codex,
+            &item.path,
+            text,
+            lords.unwrap_or_default(),
+            &mut backup,
+        );
+        applied.codex.extend(lines);
+    }
+    applied.backups = run.dir.as_ref().map(|d| d.path().to_path_buf());
+    match result {
+        Err(e) if !applied.codex.is_empty() => Err(format!(
+            "{e}; and {} Codex hook(s) not trusted: {}",
+            applied.codex.len(),
+            applied.codex.join("; ")
+        )),
+        r => r.map(|()| applied),
+    }
+}
+
+/// `apply`'s changes, item by item; `wrote` gets each Codex hooks file written.
+fn apply_items<'a>(
+    changing: &[&'a Item],
+    plan: &Plan,
+    run: &mut Run,
+    ledger: &mut Ledger,
+    applied: &mut Applied,
+    wrote: &mut Vec<&'a Item>,
+    installed: &mut dyn FnMut(&Path),
+) -> Result<(), String> {
+    for item in changing.iter().copied() {
+        let mut put = false;
         let result = match item.class {
-            Class::Owner => owner_update(item, &mut run),
-            Class::Tool => tool_change(item, &mut ledger).and_then(|()| ledger.save(&plan.home)),
+            Class::Owner => owner_update(item, run, &mut |p: &Path| {
+                put = true;
+                installed(p)
+            }),
+            Class::Tool => tool_change(item, ledger).and_then(|()| ledger.save(&plan.home)),
         };
+        // A Codex hooks file in place is settled, whatever failed after it went in (review r1, R1-02).
+        if put && item.codex_lords.is_some() {
+            wrote.push(item);
+        }
         applied.backups = run.dir.as_ref().map(|d| d.path().to_path_buf());
         result?;
         // The check after each action (design: Ownership boundary, "Operating assumption"; Sol review r3, R3-05).
@@ -3066,7 +3241,7 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
         }
         applied.done.push(format!("{:?} {}", item.action, item.path.display()));
     }
-    Ok(applied)
+    Ok(())
 }
 
 /// One manifest line, re-derived under the current config.
@@ -3077,11 +3252,13 @@ enum Undo {
 }
 
 /// One manifest line, parsed whole (r7 fix check, FC-02): each kind's every field, as `Run` writes it. A path is
-/// absolute, a backup name a `Part`, a hash 64 hex digits, attributes `attrs:<hex>`; anything else is no record.
+/// absolute, a backup name a `Part`, a hash 64 hex digits, attributes `attrs:<hex>`; anything else is no record. A
+/// `copy` is another program's file, kept before it wrote (`Run::copy`): named, never written back.
 enum Record<'a> {
     Edit { path: &'a Path, name: Part, written: &'a str, attrs: fsguard::Attrs },
     Created { path: &'a Path, written: &'a str },
     Aside { path: &'a Path, name: Part },
+    Copy { path: &'a Path, name: Part },
 }
 
 impl<'a> Record<'a> {
@@ -3102,6 +3279,7 @@ impl<'a> Record<'a> {
             },
             ["created", p, written] => Record::Created { path: path(p)?, written: hash(written)? },
             ["aside", p, name] => Record::Aside { path: path(p)?, name: Part::new(name).ok()? },
+            ["copy", p, name] => Record::Copy { path: path(p)?, name: Part::new(name).ok()? },
             _ => return None,
         })
     }
@@ -3131,6 +3309,7 @@ pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
     };
     let mut undo = Vec::new();
     let mut refused = Vec::new();
+    let mut left = Vec::new();
     for line in manifest.lines().rev() {
         let kept = |name: &str| format!("{}", backup_dir.join(name).display());
         // A record that doesn't parse completely refuses the whole restore, never is skipped (R7-07, FC-02).
@@ -3195,6 +3374,11 @@ pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
                     kept(name.as_str())
                 )),
             },
+            Record::Copy { path, name } => left.push(format!(
+                "left {} as it is (not sync's to write); what it held before that apply is in {}",
+                path.display(),
+                kept(name.as_str())
+            )),
         }
     }
     if !refused.is_empty() {
@@ -3260,6 +3444,7 @@ pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
         };
         done.push(step);
     }
+    done.extend(left);
     Ok(done)
 }
 
@@ -3972,7 +4157,7 @@ mod tests {
         item.proposed = Some("NEW\n".into());
         item.want = Some(fsguard::sha(b"NEW\n"));
         fsguard::fail_links(true);
-        let result = owner_update(&item, &mut Run::new(&home).unwrap());
+        let result = owner_update(&item, &mut Run::new(&home).unwrap(), &mut |_| {});
         fsguard::fail_links(false);
         assert!(result.is_err(), "{result:?}");
         assert_eq!(fsguard::read(&path).unwrap().as_deref(), Some(&b"OLD\n"[..]));

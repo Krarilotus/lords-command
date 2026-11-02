@@ -1047,6 +1047,7 @@ impl App {
             repo: (!self.plan_repo.is_empty()).then(|| self.plan_repo.clone()),
             user_only: self.plan_repo.is_empty(),
             home: sync::default_home().unwrap_or_default(),
+            codex: lords_core::codex_trust::Codex::found(lords_core::codex_trust::DEADLINE),
             ..sync::Options::default()
         }
     }
@@ -1122,6 +1123,7 @@ impl App {
                                     b.display()
                                 ));
                             }
+                            done.extend(applied.codex);
                             Ok(done)
                         }));
                         self.confirm_apply = false;
