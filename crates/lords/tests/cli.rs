@@ -1113,6 +1113,41 @@ fn a_config_hook_that_cant_be_proven_is_refused_and_changes_nothing() {
     }
 }
 
+// Spec (review r1, D14b-R1-01, accepted by the Lords owner, 2 Nov: "a config-hook uninstall is all-or-nothing, just like
+// install. If the ledger save fails, compression refusal included, Lords' two keys go back exactly as they were (owner
+// sections and comments included), and the ledger stays unchanged"; the review's witness): with only a config hook
+// recorded and an owner's note in its section, an uninstall whose ledger save is refused (the ledger NTFS-compressed)
+// fails, and the local config, the ledger and the hooks dir are byte for byte as before. A guard (it passes before the
+// fix too): one whose key removal fails (git's own `config.lock` held) keeps the entry and its record. Windows only, as
+// for install's save refusal.
+#[cfg(windows)]
+#[test]
+fn a_config_hook_uninstall_whose_ledger_cant_be_saved_changes_nothing() {
+    let env = Env::new();
+    let (repo, _wts, stacks) = post_checkout_repo(&env);
+    forwards_to_tracked_hooks(&env, &repo);
+    owners_note(&repo);
+    let o = install_post_checkout(&env, &repo, &stacks);
+    assert!(o.status.success(), "{}", text(&o));
+    let hooks = repo.join(".git/hooks");
+    let ledger = env.dir.path().join("home/.lords-command/state/ledger.toml");
+    let state = || (listing(&hooks), local_config(&repo), fs::read(&ledger).unwrap());
+    let before = state();
+    let mut uninstall = vec!["uninstall", "--repo", "r", "--apply"];
+    uninstall.extend(stacks.iter().map(String::as_str));
+
+    fs::write(repo.join(".git/config.lock"), "").unwrap();
+    let o = env.lords(&repo, &uninstall);
+    assert!(text(&o).contains("can't remove it"), "{}", text(&o));
+    assert_eq!(state(), before, "{}", text(&o));
+    fs::remove_file(repo.join(".git/config.lock")).unwrap();
+    let o = Command::new("compact").args(["/c", "/q"]).arg(&ledger).output().unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let o = env.lords(&repo, &uninstall);
+    assert!(!o.status.success(), "{}", text(&o));
+    assert_eq!(state(), before, "{}", text(&o));
+}
+
 /// A nonce as `lords check` makes them: 32 hex digits.
 const NONCE: &str = "0123456789abcdef0123456789abcdef";
 
