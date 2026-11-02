@@ -424,7 +424,6 @@ pub fn install_post_checkout(
     args: &SyncArgs,
     home: &Path,
 ) -> Result<Installed, String> {
-    let dir = own_hooks_dir(repo)?;
     let unseen = routing_includes(repo)?;
     if !unseen.is_empty() {
         return Err(format!(
@@ -432,6 +431,7 @@ pub fn install_post_checkout(
             unseen.join("; ")
         ));
     }
+    let dir = own_hooks_dir(repo)?;
     let _lock = ApplyLock::take(home, 60)?;
     let mut ledger = Ledger::load(home)?;
     let hook = dir.join(&[Part::new("post-checkout")?]);

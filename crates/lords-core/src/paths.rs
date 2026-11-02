@@ -91,14 +91,24 @@ pub fn paths(stacks: &Stacks, ask: &Ask) -> Vec<Row> {
     rows
 }
 
-/// Whether a live session's cwd (`guard::live_session_cwds`) is at or below `dir`; with the records unknown, yes.
+/// The live sessions' cwds (`guard::live_session_cwds`), each resolved (`fsguard::canonical`), so an alias names its
+/// place (sol-loop repair r1, R1-03); a cwd that is gone can be in no place. `None` when one can't be known.
+fn session_dirs(home: &Path) -> Option<Vec<PathBuf>> {
+    let cwds = crate::guard::live_session_cwds(home)?;
+    let resolved = cwds.iter().filter_map(|c| match crate::fsguard::canonical(c) {
+        Ok(p) => Some(Some(p)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(None),
+    });
+    resolved.collect()
+}
+
+/// Whether a live session's resolved cwd is at or below `dir`; yes when either can't be known.
 fn has_session(sessions: Option<&[PathBuf]>, dir: &Path) -> bool {
-    let dir = crate::ledger::key(dir);
-    let under = |c: &PathBuf| {
-        let c = crate::ledger::key(c);
-        c == dir || c.starts_with(&format!("{}/", dir.trim_end_matches('/')))
-    };
-    sessions.is_none_or(|s| s.iter().any(under))
+    match (sessions, crate::fsguard::canonical(dir)) {
+        (Some(s), Ok(dir)) => s.iter().any(|c| c.starts_with(&dir)),
+        _ => true,
+    }
 }
 
 /// The event a role hook must be under to run at a session's first prompt (F10-R1-02).
@@ -201,7 +211,7 @@ fn role_rows(stacks: &Stacks, home: &Path) -> Vec<Row> {
     use crate::fsguard::InDir;
     let Some(private) = &stacks.private else { return Vec::new() };
     let mut rows = Vec::new();
-    let sessions = crate::guard::live_session_cwds(home);
+    let sessions = session_dirs(home);
     // Each place: its label, dir, adapters, and whether it is in use: a declared checkout or a workspace always is, a
     // worktree with a live session or recent git activity (P1; review r1, R1-03).
     let mut dirs: Vec<(String, PathBuf, &[String], bool)> = Vec::new();

@@ -1233,7 +1233,7 @@ fn cmd_paths(mut a: Args) -> Result<bool, String> {
         if !folded.is_empty() {
             let incomplete = folded.iter().filter(|r| r.state != "complete").count();
             println!(
-                "{} rows of places not in use (no HEAD, index or branch change in {} days), {incomplete} incomplete: --all lists them",
+                "{} rows of places not in use (no live session, no HEAD, index or branch change in {} days), {incomplete} incomplete: --all lists them",
                 folded.len(),
                 lords_core::paths::IN_USE.as_secs() / 86_400
             );
