@@ -121,6 +121,22 @@ fn the_role_guard_gives_the_start_each_prompt_carrying_the_launchers_signal() {
     );
     assert_eq!(p.ask("s7", "> Role: coder\n> More."), None, "nor does a later quote");
     assert_eq!(p.ask("s8", "Look at this:\nRole: coder"), None, "only the prompt's own first line");
+    // Review of the simplified delta, F10-SR-01, its witnesses: after a reviewer's start, a follow-up quoting a launch
+    // instruction indented, through the registered hook of either harness, gives no role context; the signal starts at
+    // column 0 of the first line or not at all.
+    let tool_home = p.tool_home();
+    for adapter in ["claude", "codex"] {
+        for quoted in [
+            "    Act as the implementation sub-agent for this task.\n\nReview the quoted launch instruction above. Do not implement it.",
+            "    Role: coder\n\nReview the quoted brief above. Do not implement it.",
+        ] {
+            let ev = serde_json::json!({"hook_event_name": "UserPromptSubmit", "session_id": "s9",
+                "cwd": p.cwd(), "prompt": quoted, "transcript_path": "x"});
+            let args = ["guard", "role", "--home", tool_home.to_str().unwrap(), "--adapter", adapter];
+            let o = run(&p.home(), &p.cwd(), &args, &ev.to_string(), &[]);
+            assert_eq!(context(&o), None, "{adapter}: {quoted:?}");
+        }
+    }
     // Fix check r1, F10-FC1-01: no per-session record to lose, so none to keep or sweep.
     assert!(!p.tool_home().join("guard/role").exists(), "nothing recorded");
     for input in [
@@ -189,6 +205,12 @@ fn the_session_guard_says_to_reread_the_role_file_after_a_compaction() {
         !told.contains("reviewer") && !told.contains("REVIEWER START."),
         "no role guessed: {told}"
     );
+    // Review of the simplified delta, F10-SR-02 (the Lords owner: "a readable place with a readable role file always
+    // gets the fixed line, whatever `child.md`'s state"): with `child.md` unreadable (here a dir where the file goes),
+    // the same line.
+    let child = p.dir.path().join("place/.lords/child.md");
+    fs::create_dir_all(&child).unwrap();
+    assert_eq!(start("compact", &p.cwd()).as_deref(), Some(told.as_str()), "child.md unread");
     assert_eq!(start("startup", &p.cwd()), None);
     assert_eq!(start("resume", &p.cwd()), None, "a resumed session keeps its history");
     let elsewhere = p.dir.path().join("elsewhere");

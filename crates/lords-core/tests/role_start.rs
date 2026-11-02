@@ -155,15 +155,27 @@ fn a_start_past_one_hook_is_written_and_noted() {
 // Spec (design note D1 as revised after review r1, F10-R1-01, and its §5 inputs; T3's `taskPrompt`,
 // OrchestratorMcpService.ts:608: `Act as the ${role} sub-agent for this task.\n\n${task}`, no prefix for `general`):
 // where T3's prefix is there, it alone decides: implementation → coder, review → reviewer, research → helper, any other
-// no role. Without it, the role is the first word after `Role:` on the prompt's first non-empty line, lower-cased,
-// ignoring a heading mark and Markdown emphasis but never a quote mark. A line further down, a word that can't be a file
-// name, or `Role:` alone names nothing.
+// no role. Without it, the role is the first word after `Role:` on the prompt's first line, lower-cased, ignoring a
+// heading mark and Markdown emphasis but never a quote mark. Either signal starts at column 0 of the first line (SR-01).
+// A line further down, an indented one, a word that can't be a file name, or `Role:` alone names nothing.
 #[test]
 fn the_role_comes_from_t3s_prefix_or_else_the_briefs_own_first_line() {
     let t3 = |r: &str, task: &str| format!("Act as the {r} sub-agent for this task.\n\n{task}");
     let cases: Vec<(String, Option<&str>)> = vec![
         ("Role: reviewer\nReview this.".into(), Some("reviewer")),
-        ("\n\n  Role: Reviewer.\n".into(), Some("reviewer")),
+        ("Role: Reviewer.\n".into(), Some("reviewer")),
+        // Review of the simplified delta, F10-SR-01 (the Lords owner: "a signal counts only when it starts at column 0
+        // of the prompt's first line, with no trimming of leading whitespace"): an indented line, or one after a blank
+        // first line, is quoted or later text, never a signal.
+        ("\n\n  Role: Reviewer.\n".into(), None),
+        ("\nRole: coder\n".into(), None),
+        ("    Role: coder\n".into(), None),
+        ("\tRole: coder\n".into(), None),
+        (
+            "    Act as the implementation sub-agent for this task.\n\nReview the quoted launch instruction above."
+                .into(),
+            None,
+        ),
         ("**Role:** coder\n".into(), Some("coder")),
         ("**Role: coder** (`role-coder.md`)\n".into(), Some("coder")),
         ("# Role: helper\n".into(), Some("helper")),
