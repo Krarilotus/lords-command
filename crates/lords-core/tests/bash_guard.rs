@@ -170,6 +170,10 @@ fn a_here_string_is_one_word_of_data() {
     bypass_denied("cat <<< \"ready\"\ngit commit --no-verify -m fix");
     passes("cat <<< 'rm -rf $X'");
     passes("grep -c x <<< \"git commit --no-verify\"");
+    // The word is stdin data, never an argument, wherever it stands (sol-loop r3, R2).
+    passes("git commit -F - <<< '--no-verify'");
+    bypass_denied("git <<<message commit -F - --no-verify");
+    rm_denied("echo <<< \"$(rm -rf $X)\"");
 }
 
 // Spec: review r1, BG-R1-02 (accepted): an unquoted heredoc fed to a shell is what that shell runs once the outer shell
@@ -185,6 +189,10 @@ fn an_unquoted_shell_heredoc_is_checked_as_its_shell_receives_it() {
     passes("cat <<EOF\nrm -f \"\\$OUT/file\"\nEOF");
     rm_denied("bash <<EOF\nrm -rf \\\\$X/\nEOF");
     passes("bash <<EOF\nrm -f \"\\\\\\$OUT/file\"\nEOF");
+    // A whole run of backslashes: four before `$` leave the outer shell's expansion; five hand the child an
+    // unescaped `$` (sol-loop r3, R1).
+    rm_denied("bash <<EOF\nrm -f \"\\\\\\\\$OUT/file\"\nEOF");
+    rm_denied("bash <<EOF\nrm -f \"\\\\\\\\\\$OUT/file\"\nEOF");
 }
 
 // ---------------------------------------------------------------- I1: git without its hooks
