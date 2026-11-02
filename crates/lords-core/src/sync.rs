@@ -2885,7 +2885,11 @@ fn containing(roots: &[Root], path: &Path) -> Option<Contained> {
 /// failed backup changes nothing (Sol review r3, R3-02); then it moves aside, what moved is compared again (an edit
 /// made since, even mid-apply, stops it), and the new file goes in with the old one's attributes, or the item
 /// refuses for an attribute sync can't set back (rule C). Any error after the move puts the old file back.
-fn owner_update(item: &Item, run: &mut Run) -> Result<(), String> {
+fn owner_update(
+    item: &Item,
+    run: &mut Run,
+    installed: &mut dyn FnMut(&Path),
+) -> Result<(), String> {
     let Dest::Owner(owner) = &item.dest else {
         return Err(format!("{}: no owner file the config names", item.path.display()));
     };
@@ -2897,7 +2901,9 @@ fn owner_update(item: &Item, run: &mut Run) -> Result<(), String> {
             return Err(stale(item, "something appeared"));
         }
         run.created(path, &want)?;
-        return fsguard::put_file(owner, new);
+        fsguard::put_file(owner, new)?;
+        installed(path);
+        return Ok(());
     }
     let planned = item.current.as_deref().map(str::as_bytes);
     let now = fsguard::read(path)?;
@@ -2923,6 +2929,7 @@ fn owner_update(item: &Item, run: &mut Run) -> Result<(), String> {
             ),
         });
     }
+    installed(path);
     aside.delete()
 }
 
@@ -3056,6 +3063,13 @@ fn tool_change(item: &Item, ledger: &mut Ledger) -> Result<(), String> {
 /// planned, and nothing is removed or forgotten without the plan's proof of a complete view (rule B). Nothing to
 /// change touches nothing, not even a lock (Sol review r2, R2-21).
 pub fn apply(plan: &Plan) -> Result<Applied, String> {
+    apply_between(plan, |_| {})
+}
+
+/// `apply`, with `installed` run as each owner file's new version is in and before its old one goes: the point where
+/// another process can hold that old copy open, for tests that must reach it without timing (review r1, R1-02).
+#[doc(hidden)]
+pub fn apply_between(plan: &Plan, mut installed: impl FnMut(&Path)) -> Result<Applied, String> {
     // The refusal rules a dry run reports too (`Plan::applies`).
     plan.applies().map_err(|e| format!("{e} (nothing was changed)"))?;
     let changing: Vec<&Item> =
@@ -3119,7 +3133,15 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
     let mut run = Run::new(&plan.home)?;
     let mut applied = Applied::default();
     let mut wrote = Vec::new();
-    let result = apply_items(&changing, plan, &mut run, &mut ledger, &mut applied, &mut wrote);
+    let result = apply_items(
+        &changing,
+        plan,
+        &mut run,
+        &mut ledger,
+        &mut applied,
+        &mut wrote,
+        &mut installed,
+    );
     // Codex's trust for each of its hooks files written, whatever came after it (design note
     // 2026-11-02-lords-codex-trust, I1).
     for item in wrote {
@@ -3153,10 +3175,11 @@ fn apply_items<'a>(
     ledger: &mut Ledger,
     applied: &mut Applied,
     wrote: &mut Vec<&'a Item>,
+    installed: &mut dyn FnMut(&Path),
 ) -> Result<(), String> {
     for item in changing.iter().copied() {
         let result = match item.class {
-            Class::Owner => owner_update(item, run),
+            Class::Owner => owner_update(item, run, installed),
             Class::Tool => tool_change(item, ledger).and_then(|()| ledger.save(&plan.home)),
         };
         applied.backups = run.dir.as_ref().map(|d| d.path().to_path_buf());
@@ -4087,7 +4110,7 @@ mod tests {
         item.proposed = Some("NEW\n".into());
         item.want = Some(fsguard::sha(b"NEW\n"));
         fsguard::fail_links(true);
-        let result = owner_update(&item, &mut Run::new(&home).unwrap());
+        let result = owner_update(&item, &mut Run::new(&home).unwrap(), &mut |_| {});
         fsguard::fail_links(false);
         assert!(result.is_err(), "{result:?}");
         assert_eq!(fsguard::read(&path).unwrap().as_deref(), Some(&b"OLD\n"[..]));
