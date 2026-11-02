@@ -91,26 +91,28 @@ fn context(o: &Output) -> Option<String> {
     Some(v["hookSpecificOutput"]["additionalContext"].as_str()?.to_string())
 }
 
-// Spec (F10: "the role comes from a signal the launcher already gives, such as the brief's first line or T3's `role`,
-// read by the turn hook on the first prompt. The hook then adds that role's lines"; design note D3, D4; review r1,
-// F10-R1-01, the Lords owner's contract: "the session's role is fixed once, from the launch, and never from a later
-// prompt or from quoted text. The launcher's signal (T3's prefix) wins over a `Role:` line"; Claude Code's and Codex's
-// `UserPromptSubmit` take `hookSpecificOutput.additionalContext`): a session's first prompt naming a role gets that
-// role's start from the nearest `.lords`, without its marker lines, and no later prompt changes or repeats it, whatever
-// it names; another session gets its own. T3's prefix names the role, over a `Role:` line and over quoted text; a root
-// session whose first prompt names none gets none later either.
+// Spec (F10; the Lords owner after fix check r1: "The role guard goes stateless … On each prompt, it gives a role's
+// start only when that prompt itself carries the launcher's signal: T3's prefix at the very start, or a `Role:` line
+// as the prompt's own first line, never in quoted text. A prompt without one gets nothing … A later prompt that
+// carries a signal is the launcher's again"; review r1, F10-R1-01: the prefix wins over a `Role:` line; Claude Code's
+// and Codex's `UserPromptSubmit` take `hookSpecificOutput.additionalContext`): each prompt carrying a signal gets that
+// role's start from the nearest `.lords`, without its marker lines, every time; a prompt carrying none, or only quoted
+// text, gets nothing; nothing is recorded anywhere.
 #[test]
-fn the_role_guard_gives_the_launch_role_once_a_session() {
+fn the_role_guard_gives_the_start_each_prompt_carrying_the_launchers_signal() {
     let p = Place::new();
     assert_eq!(p.ask("s1", "Role: reviewer\nReview the diff.").as_deref(), Some("REVIEWER START."));
-    assert_eq!(p.ask("s1", "Role: reviewer\nAnd again."), None, "once a session");
-    assert_eq!(p.ask("s1", "Fix the finding."), None, "no role named");
-    assert_eq!(p.ask("s1", "Role: coder\nBuild it."), None, "never from a later prompt");
-    assert_eq!(p.ask("s2", "Role: reviewer\n").as_deref(), Some("REVIEWER START."));
+    assert_eq!(p.ask("s1", "Role: reviewer\nAgain.").as_deref(), Some("REVIEWER START."), "again");
+    assert_eq!(p.ask("s1", "Fix the finding."), None, "no signal");
+    assert_eq!(
+        p.ask("s1", "Role: coder\nBuild it.").as_deref(),
+        Some("CODER START."),
+        "the launcher's"
+    );
     let t3 = "Act as the review sub-agent for this task.\n\nLook at it.";
     assert_eq!(p.ask("s3", t3).as_deref(), Some("REVIEWER START."));
     let both = p.ask("s4", "Act as the review sub-agent for this task.\n\nRole: coder\nBuild.");
-    assert_eq!(both.as_deref(), Some("REVIEWER START."), "the launcher's role wins");
+    assert_eq!(both.as_deref(), Some("REVIEWER START."), "the prefix wins");
     let quoted = "Act as the review sub-agent for this task.\n\n> Role: coder\n> Implement the change.\n\nReview whether this brief is safe to send. Do not implement it.";
     assert_eq!(
         p.ask("s7", quoted).as_deref(),
@@ -118,11 +120,9 @@ fn the_role_guard_gives_the_launch_role_once_a_session() {
         "quoted text names nothing"
     );
     assert_eq!(p.ask("s7", "> Role: coder\n> More."), None, "nor does a later quote");
-    assert_eq!(p.ask("s8", "Fix the bug."), None);
-    assert_eq!(p.ask("s8", "Role: coder\nBuild it."), None, "a root session's role is fixed too");
-    // Sol-loop r1 S3: a record that can't be read (here a dir where the file goes) is no reason to give nothing.
-    fs::create_dir_all(p.tool_home().join("guard/role/s6")).unwrap();
-    assert_eq!(p.ask("s6", "Role: reviewer\n").as_deref(), Some("REVIEWER START."));
+    assert_eq!(p.ask("s8", "Look at this:\nRole: coder"), None, "only the prompt's own first line");
+    // Fix check r1, F10-FC1-01: no per-session record to lose, so none to keep or sweep.
+    assert!(!p.tool_home().join("guard/role").exists(), "nothing recorded");
     for input in [
         serde_json::json!({"hook_event_name": "SessionStart", "session_id": "s5", "cwd": p.cwd(),
             "prompt": "Role: reviewer"})
@@ -134,19 +134,19 @@ fn the_role_guard_gives_the_launch_role_once_a_session() {
     }
 }
 
-// Spec (design note C2: a session that can't get its role's lines is told so at its first prompt, with the role file to
-// read, never left to look complete; C4: nothing said to a session T3 didn't delegate and whose launch names no role):
-// a role with no start in the place, a start past one hook's 9,500 characters, and a delegated session
-// (`T3CODE_THREAD_ID` `thread:delegated-task:…`) whose launch names no role (also T3's prefix naming none, whatever a
-// `Role:` line says: F10-R1-01) each get one line saying so, naming the role file to read where there is a role, once;
-// a root session naming no role gets nothing; a cwd in no place gets nothing.
+// Spec (design note C2: a prompt whose role's lines can't be given is told so, with the role file to read, never left
+// to look complete; review r1, F10-R1-04: whatever fails; the Lords owner after fix check r1: "A prompt without [a
+// signal] gets nothing"): a role with no start in the place, a start past one hook's 9,500 characters, and a start that
+// can't be read (here a dir where the file goes) each get one line naming the role file, at every prompt naming the
+// role; a prompt naming none gets nothing, T3-delegated or not, and so does T3's prefix naming no Lords role whatever a
+// `Role:` line says; a cwd in no place gets nothing.
 #[test]
-fn a_session_whose_role_cant_be_given_is_told_once() {
+fn a_prompt_whose_role_cant_be_given_is_told() {
     let p = Place::new();
     let lead = p.ask("s1", "Role: lead\nLead.").unwrap();
     assert_eq!(lead.lines().count(), 1, "{lead}");
     assert!(lead.contains("lead") && lead.contains("role-lead.md"), "{lead}");
-    assert_eq!(p.ask("s1", "Role: lead\nLead."), None, "once");
+    assert_eq!(p.ask("s1", "Role: lead\nLead.").as_deref(), Some(lead.as_str()), "every time");
     let long: Vec<String> =
         (0..300).map(|i| format!("- rule.r{i:03}: Line {i} of the long start.")).collect();
     p.start("reviewer", &long.join("\n"));
@@ -154,48 +154,46 @@ fn a_session_whose_role_cant_be_given_is_told_once() {
     assert_eq!(told.lines().count(), 1, "{told}");
     assert!(told.contains("role-reviewer.md") && told.contains("9500"), "{told}");
     assert!(!told.contains("Line 1 of"), "{told}");
-    let delegated = [("T3CODE_THREAD_ID", "thread:delegated-task:command%3Amcp%3Ax")];
-    let first = context(&p.prompt("s3", &p.cwd(), "Fix the bug.", &delegated)).unwrap();
-    assert_eq!(first.lines().count(), 1, "{first}");
-    assert!(first.contains("no role") && first.contains("Role:"), "{first}");
-    assert_eq!(context(&p.prompt("s3", &p.cwd(), "And this.", &delegated)), None, "once");
-    let design = "Act as the design sub-agent for this task.\n\nRole: coder\nSketch it.";
-    let none = context(&p.prompt("s6", &p.cwd(), design, &delegated)).unwrap();
-    assert!(none.contains("no role") && !none.contains("CODER START."), "{none}");
-    let root = [("T3CODE_THREAD_ID", "thread:4a1b")];
-    assert_eq!(context(&p.prompt("s4", &p.cwd(), "Fix the bug.", &root)), None);
-    let elsewhere = p.dir.path().join("elsewhere");
-    fs::create_dir_all(&elsewhere).unwrap();
-    assert_eq!(context(&p.prompt("s5", &elsewhere, "Role: reviewer\n", &delegated)), None);
-}
-
-// Spec (design note C5, D5; Claude Code's hooks docs: `SessionStart` runs with source `compact` after a compaction and
-// takes `additionalContext`): after a compaction the session guard gives the role recorded for the session again; at
-// any other start, or for a session given no role, nothing.
-#[test]
-fn the_session_guard_gives_the_role_again_after_a_compaction() {
-    let p = Place::new();
-    assert_eq!(p.ask("s1", "Role: reviewer\n").as_deref(), Some("REVIEWER START."));
-    let start = |session: &str, source: &str| {
-        let ev = serde_json::json!({"hook_event_name": "SessionStart", "session_id": session,
-            "cwd": p.cwd(), "source": source, "transcript_path": "x"});
-        context(&run(&p.home(), &p.cwd(), &["guard", "session"], &ev.to_string(), &[]))
-    };
-    assert_eq!(start("s1", "compact").as_deref(), Some("REVIEWER START."));
-    assert_eq!(start("s1", "startup"), None);
-    assert_eq!(start("s1", "resume"), None, "a resumed session keeps its history");
-    assert_eq!(start("s9", "compact"), None, "no role given");
-    // Review r1, F10-R1-04 (the Lords owner: "when giving the start fails for any reason, compaction included, the model
-    // gets the one-line fallback naming the role file in its context"): a start that can't be read (here a dir where
-    // the file goes), and a record that can't be read, each give one line in context; no role is invented.
-    let start_file = p.dir.path().join("place/.lords/start-reviewer.md");
+    let start_file = p.dir.path().join("place/.lords/start-coder.md");
     fs::remove_file(&start_file).unwrap();
     fs::create_dir(&start_file).unwrap();
-    let told = start("s1", "compact").unwrap_or_default();
-    assert!(told.contains("role-reviewer.md") && told.lines().count() == 1, "{told}");
-    fs::create_dir_all(p.tool_home().join("guard/role/s10")).unwrap();
-    let told = start("s10", "compact").unwrap_or_default();
-    assert!(told.contains("role-") && !told.contains("reviewer"), "{told}");
+    let unread = p.ask("s3", "Role: coder\n").unwrap_or_default();
+    assert!(unread.contains("role-coder.md") && unread.lines().count() == 1, "{unread}");
+    let delegated = [("T3CODE_THREAD_ID", "thread:delegated-task:command%3Amcp%3Ax")];
+    assert_eq!(context(&p.prompt("s4", &p.cwd(), "Fix the bug.", &delegated)), None);
+    let design = "Act as the design sub-agent for this task.\n\nRole: coder\nSketch it.";
+    assert_eq!(context(&p.prompt("s5", &p.cwd(), design, &delegated)), None);
+    let elsewhere = p.dir.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    assert_eq!(context(&p.prompt("s6", &elsewhere, "Role: reviewer\n", &[])), None);
+}
+
+// Spec (the Lords owner after fix check r1: "After a compaction, the session hook gives one fixed line: re-read your
+// role's file in that place's `.lords`. It doesn't guess a role"; Claude Code's hooks docs: `SessionStart` runs with
+// source `compact` after a compaction and takes `additionalContext`): after a compaction in a place, one line naming
+// that place's `.lords` and no role, whatever role a prompt named before; at any other start, or outside every place,
+// nothing.
+#[test]
+fn the_session_guard_says_to_reread_the_role_file_after_a_compaction() {
+    let p = Place::new();
+    assert_eq!(p.ask("s1", "Role: reviewer\n").as_deref(), Some("REVIEWER START."));
+    let start = |source: &str, cwd: &Path| {
+        let ev = serde_json::json!({"hook_event_name": "SessionStart", "session_id": "s1",
+            "cwd": cwd, "source": source, "transcript_path": "x"});
+        context(&run(&p.home(), cwd, &["guard", "session"], &ev.to_string(), &[]))
+    };
+    let told = start("compact", &p.cwd()).unwrap_or_default();
+    let lords = p.dir.path().join("place").join(".lords").display().to_string();
+    assert!(told.lines().count() == 1 && told.contains(&lords), "{told}");
+    assert!(
+        !told.contains("reviewer") && !told.contains("REVIEWER START."),
+        "no role guessed: {told}"
+    );
+    assert_eq!(start("startup", &p.cwd()), None);
+    assert_eq!(start("resume", &p.cwd()), None, "a resumed session keeps its history");
+    let elsewhere = p.dir.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    assert_eq!(start("compact", &elsewhere), None);
 }
 
 // Spec (review r1, F10-R1-03, the Lords owner: "complete means the whole start is present: the place file for that
@@ -293,6 +291,16 @@ fn lords(d: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
 
 fn said(o: &Output) -> String {
     format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))
+}
+
+/// A repo-wide rule for every role in `beta-core`, committed: the place's files then have Lords content to carry, the
+/// lines the starts leave out.
+fn wide_rule(d: &Path) {
+    let rule = "---\nid: rule.wide\nkind: rule\ntitle: rule.wide\naudience: [all]\nscope: repo:beta-core\nstatus: active\nvisibility: private\norigin:\n  type: own\nstart: core\ncore: REPO-WIDE line.\n---\nWide.\n";
+    fs::create_dir_all(d.join("priv/repo/beta-core/rules")).unwrap();
+    fs::write(d.join("priv/repo/beta-core/rules/wide.md"), rule).unwrap();
+    git(d, &d.join("priv"), &["add", "-A"]);
+    git(d, &d.join("priv"), &["commit", "-q", "-m", "a repo-wide rule"]);
 }
 
 // Spec (design note D3, D6; the child guard's registration, tests/child.rs): with `role` in a settings target's guards
@@ -408,6 +416,7 @@ fn paths_marks_each_t3_delegated_path_complete_or_incomplete() {
     let d = d.path();
     let stacks = stacks(d, "[\"role\"]", "[\"role\"]");
     let stacks: Vec<&str> = stacks.iter().map(String::as_str).collect();
+    wide_rule(d);
     let stub = env!("CARGO_BIN_EXE_lords-codex-stub");
     assert!(lords(d, &["guard", "install"], &[]).status.success());
     let (code, rows) = paths(d, &stacks, stub, "trusted");
@@ -481,6 +490,7 @@ fn paths_needs_the_role_hook_on_the_prompt_event() {
     let d = d.path();
     let stacks = stacks(d, "[\"role\"]", "[\"role\"]");
     let stacks: Vec<&str> = stacks.iter().map(String::as_str).collect();
+    wide_rule(d);
     let stub = env!("CARGO_BIN_EXE_lords-codex-stub");
     assert!(lords(d, &["guard", "install"], &[]).status.success());
     assert!(lords(d, &[&["sync", "--apply"][..], &stacks].concat(), &[]).status.success());
@@ -522,11 +532,7 @@ fn paths_needs_each_harnesss_place_file_beside_the_starts() {
     let d = d.path();
     let stacks = stacks(d, "[\"role\"]", "[\"role\"]");
     let stacks: Vec<&str> = stacks.iter().map(String::as_str).collect();
-    let rule = "---\nid: rule.wide\nkind: rule\ntitle: rule.wide\naudience: [all]\nscope: repo:beta-core\nstatus: active\nvisibility: private\norigin:\n  type: own\nstart: core\ncore: REPO-WIDE line.\n---\nWide.\n";
-    fs::create_dir_all(d.join("priv/repo/beta-core/rules")).unwrap();
-    fs::write(d.join("priv/repo/beta-core/rules/wide.md"), rule).unwrap();
-    git(d, &d.join("priv"), &["add", "-A"]);
-    git(d, &d.join("priv"), &["commit", "-q", "-m", "a repo-wide rule"]);
+    wide_rule(d);
     let stub = env!("CARGO_BIN_EXE_lords-codex-stub");
     assert!(lords(d, &["guard", "install"], &[]).status.success());
     assert!(lords(d, &[&["sync", "--user", "--apply"][..], &stacks].concat(), &[])
@@ -547,4 +553,34 @@ fn paths_needs_each_harnesss_place_file_beside_the_starts() {
         !rows.iter().any(|r| r.0 == "incomplete" && r.1.contains("CLAUDE.local.md")),
         "{rows:?}"
     );
+}
+
+// Spec (fix check r1, F10-FC1-02, the Lords owner: "`lords paths` and the hook decide 'can deliver here' with one shared
+// predicate. paths can't call a path complete where the hook would refuse"; its witness, a place whose own composition
+// is empty, after an adapter-filtered sync): where the registered Codex hook gives the role-file line instead of the
+// start (no Lords AGENTS.override.md there), `lords paths` marks that path incomplete, exit 1.
+#[test]
+fn paths_and_the_hook_agree_where_a_place_file_is_missing() {
+    let d = TempDir::new().unwrap();
+    let d = d.path();
+    let stacks = stacks(d, "[\"role\"]", "[\"role\"]");
+    let stacks: Vec<&str> = stacks.iter().map(String::as_str).collect();
+    let stub = env!("CARGO_BIN_EXE_lords-codex-stub");
+    assert!(lords(d, &["guard", "install"], &[]).status.success());
+    assert!(lords(d, &[&["sync", "--user", "--apply"][..], &stacks].concat(), &[])
+        .status
+        .success());
+    let claude_only = ["sync", "--repo", "beta-core", "--adapter", "claude", "--apply"];
+    assert!(lords(d, &[&claude_only[..], &stacks].concat(), &[]).status.success());
+    let ev = serde_json::json!({"hook_event_name": "UserPromptSubmit", "session_id": "s1",
+        "cwd": d.join("checkout"), "prompt": "Role: reviewer\nReview it.", "transcript_path": "x"});
+    let tool_home = d.join("home/.lords-command");
+    let args = ["guard", "role", "--home", tool_home.to_str().unwrap(), "--adapter", "codex"];
+    let told = context(&run(&d.join("home"), &d.join("checkout"), &args, &ev.to_string(), &[]));
+    let told = told.unwrap_or_default();
+    assert!(told.contains("AGENTS.override.md") && told.contains("role-reviewer.md"), "{told}");
+    let (code, rows) = paths(d, &stacks, stub, "trusted");
+    let refused =
+        rows.iter().find(|r| r.1.contains("as reviewer") && r.1.contains("AGENTS.override.md"));
+    assert!(code == Some(1) && refused.is_some_and(|r| r.0 == "incomplete"), "{rows:?}");
 }
