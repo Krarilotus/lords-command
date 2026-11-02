@@ -184,6 +184,8 @@ fn a_here_string_is_one_word_of_data() {
 #[test]
 fn a_here_string_variable_counts_inside_a_substitution() {
     rm_denied("rm -f \"$(cat <<< \"$OUT\")/file\"");
+    // Also from the body of a shell heredoc inside it (sol-loop r5, P1).
+    rm_denied("rm -f \"$(bash <<'EOF'\ncat <<< \"$OUT\"\nEOF\n)/file\"");
 }
 
 // Spec: review r1, BG-R1-02 (accepted): an unquoted heredoc fed to a shell is what that shell runs once the outer shell
