@@ -405,10 +405,10 @@ exit $status
     )
 }
 
-/// What the post-checkout hook in hooks dir `dir` answers a probe with: its name and 16 hex digits of the dir's
-/// ledger key, so each repo's hook answers for its own dir alone (sol-loop r1, S2).
-fn probe_label(dir: &Path) -> String {
-    format!("post-checkout-{}", &fsguard::sha(crate::ledger::key(dir).as_bytes())[..16])
+/// What a post-checkout hook answers a probe with: its name and a token made for this install alone, so no other hook
+/// can answer for it, another repo's or a copy of an earlier one (sol-loop r1 and r2, S2).
+fn probe_label() -> String {
+    format!("post-checkout-{}", &nonce()[..16])
 }
 
 /// Installs the post-checkout hook in the repo's own hooks dir (the common dir, so every worktree has it); `home`
@@ -447,7 +447,7 @@ pub fn install_post_checkout(
         }
     }
     let scope = format!("hooks:{}", crate::ledger::key(dir.path()));
-    let label = probe_label(dir.path());
+    let label = probe_label();
     let text = post_checkout_script(lords_exe, args, home, &label);
     let proof = put_hook(&mut ledger, &hook, &text, &scope)
         .and_then(|()| post_checkout_reaches_new_worktree(repo, home, &label));
@@ -492,9 +492,8 @@ fn hooks_path(repo: &Path) -> Option<(String, String)> {
 /// Whether a new worktree's post-checkout reaches the tool's hook, found out by running it as `git worktree add` would
 /// (H1): `git hook run post-checkout` in an empty stand-in for the new worktree (the repo's common dir as its git dir),
 /// so whatever lies between, a hooks path, a dispatcher, a path relative to the worktree, a skip, is run, never read.
-/// The hook answers a nonce whose file is made in `home` just before, with `label`, which names the hooks dir it was
-/// installed in, so another repo's Lords hook can't answer for it (sol-loop r1, S2); the nonce file and the stand-in go
-/// after.
+/// The hook answers a nonce whose file is made in `home` just before, with `label`, the token of the install that wrote
+/// it, so no other Lords hook can answer for it (`probe_label`); the nonce file and the stand-in go after.
 fn post_checkout_reaches_new_worktree(repo: &Path, home: &Path, label: &str) -> Result<(), String> {
     let common = git::run(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
     let n = nonce();
