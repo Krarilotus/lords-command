@@ -643,9 +643,11 @@ pub enum Shell {
 
 /// PowerShell text as the lexer above reads it (design note §3): `` ` `` escapes the next character, as `\` does in
 /// Bash, and a `\` is a literal; a here-string (`@'` or `@"` ending its line, to a line opening with `'@` or `"@`) and
-/// a `<# … #>` comment are data, an empty word. Single-quoted text stays as it is.
+/// a `<# … #>` comment are data, an empty word. Single-quoted text stays as it is. Sol-loop r1: a CR ends a line (S2);
+/// a `#` line comment is data (S3); an assignment's right-hand side (S4) and a script block's braces (S5) start a
+/// command; `$((…))` is a subexpression holding a group, not arithmetic (S6).
 fn powershell_as_bash(text: &str) -> String {
-    let c: Vec<char> = text.chars().collect();
+    let c: Vec<char> = text.replace("\r\n", "\n").replace('\r', "\n").chars().collect();
     let (mut out, mut i, mut single, mut double) = (String::new(), 0, false, false);
     while let Some(&ch) = c.get(i) {
         i += 1;
@@ -654,7 +656,23 @@ fn powershell_as_bash(text: &str) -> String {
             out.push(ch);
             continue;
         }
+        let token_start = !double
+            && out.chars().last().is_none_or(|p| p.is_whitespace() || ";|&(){}".contains(p));
         match ch {
+            '#' if token_start => {
+                while c.get(i).is_some_and(|x| *x != '\n') {
+                    i += 1;
+                }
+            }
+            // `${name}`: a variable, braces and all.
+            '$' if !double && c.get(i) == Some(&'{') => {
+                let end = c[i..].iter().position(|x| *x == '}').map_or(c.len(), |p| i + p + 1);
+                out.extend(&c[i - 1..end]);
+                i = end;
+            }
+            '{' | '}' if !double => out.push(';'),
+            '(' if out.ends_with("$(") => out.push_str(" ("),
+            '=' if !double && assigns(&out) => out.push_str("=;"),
             '`' => {
                 out.push('\\');
                 out.extend(c.get(i));
@@ -699,12 +717,12 @@ fn here_string_opens(c: &[char], i: usize) -> bool {
         && line.iter().take_while(|x| **x != '\n').all(|x| matches!(x, ' ' | '\t' | '\r'))
 }
 
-/// Whether word `w` is a redirection, and if so whether its target is the next word (`>` `out`) rather than in it
-/// (`2>/dev/null`, `2>&1`, PowerShell's `2>$null`, `*>&1`): an optional descriptor (digits, `&` or `*`), then `<` or
-/// `>`.
-fn redirection(w: &str) -> Option<bool> {
-    let op = w.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&' || c == '*');
-    op.starts_with(['<', '>']).then(|| op.trim_start_matches(['<', '>', '&', '|']).is_empty())
+/// Whether `out` ends with a variable that an `=` after it assigns to (`$page`, `[string]$page`, `$env:X`, the `+` of
+/// `+=`): PowerShell runs the command on its right-hand side.
+fn assigns(out: &str) -> bool {
+    let t = out.trim_end_matches([' ', '\t', '+', '-', '*', '/', '%', '?']);
+    let name = t.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':');
+    name.len() < t.len() && name.ends_with('$')
 }
 
 /// The page one simple command would have git open, if any (design note §1, from git's source at v2.56.0): D1 `git
@@ -714,11 +732,22 @@ fn help_topic(words: &[Word]) -> Option<String> {
     let at = command_at(words).filter(|&k| base_name(&words[k].text) == "git")?;
     let mut args = Vec::new();
     let mut rest = words[at + 1..].iter().map(|w| w.text.as_str());
+    // A redirection (`2>/dev/null`, `2>&1`, `2>$null`, `*>&1`, `>` `out`), a word of its own or touching the argument
+    // before it (`--help>/dev/null`; sol-loop r1, S1): the argument stays git's, and an operator without its target
+    // takes the next word.
     while let Some(w) = rest.next() {
-        match redirection(w) {
-            Some(true) => drop(rest.next()),
-            Some(false) => {}
-            None => args.push(w),
+        let (arg, op) = match w.find(['<', '>']) {
+            Some(k) if w[..k].bytes().all(|b| b.is_ascii_digit() || b"&*".contains(&b)) => {
+                ("", &w[k..])
+            }
+            Some(k) => (w[..k].strip_suffix('&').unwrap_or(&w[..k]), &w[k..]),
+            None => (w, ""),
+        };
+        if !arg.is_empty() {
+            args.push(arg);
+        }
+        if !op.is_empty() && op.trim_start_matches(['<', '>', '&', '|']).is_empty() {
+            rest.next();
         }
     }
     let mut i = 0;
