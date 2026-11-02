@@ -16,20 +16,19 @@ fn words(line: &str) -> Vec<String> {
     line.split(' ').map(str::to_string).collect()
 }
 
-/// `t3::session` for a hook whose `T3CODE_THREAD_ID` is `thread` and whose `CLAUDE_PID` is `pid`, the process `pid`
-/// names launched with `argv`; and how often the process was read.
+/// `t3::session` for a hook whose `T3CODE_THREAD_ID` is `thread` and whose `CLAUDE_PID` is `pid`, every process
+/// launched with `argv`; and the ids of the processes it read.
 fn session(
     thread: Option<&str>,
     pid: Option<&str>,
     argv: &[String],
-) -> (Result<bool, String>, u32) {
-    let reads = Cell::new(0);
+) -> (Result<bool, String>, Vec<u32>) {
+    let read = std::cell::RefCell::new(Vec::new());
     let answer = t3::session(thread, pid, |p| {
-        reads.set(reads.get() + 1);
-        assert_eq!(Some(p.to_string()).as_deref(), pid, "the process CLAUDE_PID names is read");
+        read.borrow_mut().push(p);
         Ok(argv.to_vec())
     });
-    (answer, reads.get())
+    (answer, read.into_inner())
 }
 
 // Spec (design note §5.1, the choice, H6 with H2): T3 iff `T3CODE_THREAD_ID` is set and the process `CLAUDE_PID` names
@@ -103,9 +102,9 @@ fn a_t3_launch_is_t3_and_a_cli_started_from_its_shell_is_not() {
         ),
     ];
     for (what, argv, want) in rows {
-        let (answer, reads) = session(Some("thread:delegated-task:x"), Some("4242"), &argv);
+        let (answer, read) = session(Some("thread:delegated-task:x"), Some("4242"), &argv);
         assert_eq!(answer, Ok(want), "{what}: {argv:?}");
-        assert_eq!(reads, 1, "{what}");
+        assert_eq!(read, [4242], "{what}: the process CLAUDE_PID names, once");
     }
 }
 
@@ -117,9 +116,9 @@ fn outside_t3_no_process_is_read() {
     let t3_launch = words("claude --allowedTools mcp__t3-code__*");
     for thread in [None, Some("")] {
         for pid in [None, Some("4242"), Some("x")] {
-            let (answer, reads) = session(thread, pid, &t3_launch);
+            let (answer, read) = session(thread, pid, &t3_launch);
             assert_eq!(answer, Ok(false), "{thread:?} {pid:?}");
-            assert_eq!(reads, 0, "{thread:?} {pid:?}");
+            assert!(read.is_empty(), "{thread:?} {pid:?}: read {read:?}");
         }
     }
 }
@@ -130,9 +129,9 @@ fn outside_t3_no_process_is_read() {
 fn a_session_that_cant_be_read_is_unknown() {
     let argv = words("claude --allowedTools mcp__t3-code__*");
     for pid in [None, Some(""), Some("abc"), Some("-1"), Some("4294967296"), Some(" 42")] {
-        let (answer, reads) = session(Some("thread:x"), pid, &argv);
+        let (answer, read) = session(Some("thread:x"), pid, &argv);
         assert!(answer.is_err(), "{pid:?}: {answer:?}");
-        assert_eq!(reads, 0, "{pid:?}");
+        assert!(read.is_empty(), "{pid:?}: read {read:?}");
     }
     let answer =
         t3::session(Some("thread:x"), Some("4242"), |_| Err("process 4242 is gone".into()));
