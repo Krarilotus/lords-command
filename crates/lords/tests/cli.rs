@@ -980,6 +980,13 @@ fn forwards_to_tracked_hooks(env: &Env, repo: &Path) {
     env.git(repo, &["config", "attributionGuard.previousHooksPath", ".githooks"]);
 }
 
+/// An owner's note in an otherwise empty `hook.lords-post-checkout` section: no entry, so nobody's hook (sol-loop r1, S1).
+fn owners_note(repo: &Path) {
+    let mut text = local_config(repo);
+    text.extend_from_slice(b"[hook \"lords-post-checkout\"]\n\t# the owner's note\n");
+    fs::write(repo.join(".git/config"), text).unwrap();
+}
+
 // Spec (D14b, the Lords owner's brief, 2 Nov: "`lords hooks install --post-checkout` on a repo whose own hooks dir
 // can't be proven to run installs a config-defined hook instead, in the repo's local config only. It never repoints
 // `core.hooksPath`, never touches the dispatcher or its keys, and never edits a tracked file"; "`lords uninstall` for that
@@ -988,7 +995,8 @@ fn forwards_to_tracked_hooks(env: &Env, repo: &Path) {
 // post-checkout under another name, the install writes `hook.lords-post-checkout` and names why the hooks dir isn't
 // reached; the hooks dir, the dispatcher's keys and the tracked files are as they were; `git worktree add` gets its place
 // file and runs the owner's hook too. Once the hooks dir would be reached, a re-install stays a config hook. Uninstall
-// leaves the local config byte for byte as before the install; after an owner's edit it leaves the entry as edited.
+// leaves the local config byte for byte as before the install, an owner's note in the hook's section included (sol-loop
+// r1, S1); after an owner's edit it leaves the entry as edited.
 #[test]
 fn a_hooks_dir_that_isnt_reached_gets_a_config_hook_instead() {
     let env = Env::new();
@@ -1001,6 +1009,7 @@ fn a_hooks_dir_that_isnt_reached_gets_a_config_hook_instead() {
     let owners = "echo ran >> \"$(git rev-parse --git-common-dir)/owners.log\"";
     env.git(&repo, &["config", "--global", "hook.owners.command", owners]);
     env.git(&repo, &["config", "--global", "hook.owners.event", "post-checkout"]);
+    owners_note(&repo);
     let hooks = repo.join(".git/hooks");
     let before = (listing(&hooks), local_config(&repo));
 
@@ -1058,12 +1067,14 @@ fn a_hooks_dir_that_isnt_reached_gets_a_config_hook_instead() {
 // - the owner set `hook.lords-post-checkout` locally;
 // - a conditional include that only a linked worktree reads sets `hook.*`;
 // - the probe gets no answer after the write: `hook.post-checkout.enabled = false` switches the event off.
-// Then, over Lords' config hook, a re-install whose probe fails and (Windows) one whose ledger save fails.
+// Then, over Lords' config hook, a re-install whose probe fails and (Windows) one whose ledger save fails. An owner's
+// note in the hook's otherwise empty section stays through each (sol-loop r1, S1).
 #[test]
 fn a_config_hook_that_cant_be_proven_is_refused_and_changes_nothing() {
     let env = Env::new();
     let (repo, _wts, stacks) = post_checkout_repo(&env);
     forwards_to_tracked_hooks(&env, &repo);
+    owners_note(&repo);
     fs::write(repo.join(".git/hooks.inc"), "[hook \"lords-post-checkout\"]\n\tenabled = false\n")
         .unwrap();
     let hooks = repo.join(".git/hooks");
