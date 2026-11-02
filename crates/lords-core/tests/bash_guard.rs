@@ -87,6 +87,7 @@ fn rm_after_a_prefix_command_is_checked() {
         "timeout 10 rm $X",
         "timeout -k 5 10 rm $X",
         "timeout --signal=KILL 10 rm $X",
+        "sudo --user bob rm \"$X\"",
         "if a; then sudo env FOO=1 nohup timeout 5 rm $X; fi",
     ] {
         rm_denied(command);
@@ -153,8 +154,9 @@ fn a_heredoc_body_that_is_data_passes() {
     ] {
         passes(command);
     }
-    // The heredoc's end: what follows it is a command again.
+    // The heredoc's end: what follows it is a command again, whatever quoting the delimiter has (sol-loop r1, S5).
     rm_denied("cat <<'EOF'\nrm $X\nEOF\nrm $Y");
+    rm_denied("cat <<$'EOF'\ndata\nEOF\nrm \"$X\"");
     // An unterminated body is data to its end.
     passes("cat <<EOF\nrm $X");
 }
@@ -333,6 +335,11 @@ fn boundary_commands_pass() {
         "`",
         "cat <<",
         "x=$((",
+        // Unterminated inside a substitution (sol-loop r1, S1: these panicked).
+        "echo $(${X",
+        "echo \"$($'x\"",
+        "echo $(cat <<\\",
+        "echo `${X",
     ] {
         passes(command);
     }
