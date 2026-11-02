@@ -25,7 +25,8 @@ usage:
   lords privacy FILE...
   lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit, pre-merge-commit and commit-msg hooks; in a stack repo also `check --stack` and a pre-push
   lords hash PATH
-  lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--stage install] [--json] [--apply]
+  lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--stage install] [--json] [--apply] [--deadline-ms N]
+    (a write of Codex's hooks: trusts Lords' own through Codex's app-server, names each hook that isn't trusted, exit 1)
   lords sync --restore BACKUP_DIR   undo one apply's owner-file edits, each only while it holds what sync wrote
   lords uninstall [--user | --repo NAME] [--apply]   remove the tool's paths that still match its ledger
   lords uninstall --repo NAME --place DIR [--apply] [--json]   one checkout or worktree's recorded copies
@@ -521,6 +522,13 @@ fn print_applied(applied: &sync::Applied) {
             b.display()
         );
     }
+    // Last, so a caller sees it without reading every line (design note 2026-11-02-lords-codex-trust, §2.3).
+    for line in &applied.codex {
+        println!("{line}");
+    }
+    if !applied.codex.is_empty() {
+        println!("applied, {} Codex hook(s) not trusted", applied.codex.len());
+    }
 }
 
 /// A plan of the current config for every target and place: what `restore` and `set-aside` check paths against.
@@ -551,6 +559,12 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     let repo = a.value("--repo")?;
     let adapter = a.value("--adapter")?;
     let place = a.value("--place")?.map(PathBuf::from);
+    let deadline = match a.value("--deadline-ms")? {
+        None => lords_core::codex_trust::DEADLINE,
+        Some(ms) => std::time::Duration::from_millis(
+            ms.parse().map_err(|_| "--deadline-ms takes a number of milliseconds")?,
+        ),
+    };
     let p = paths(&mut a)?;
     a.done()?;
     if place.is_some() && repo.is_none() {
@@ -563,7 +577,9 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         ));
     }
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
-    let opts = sync::Options { repo, user_only, adapter, place, home, uninstall: false, stage };
+    let codex = lords_core::codex_trust::Codex::found(deadline);
+    let opts =
+        sync::Options { repo, user_only, adapter, place, home, uninstall: false, stage, codex };
     let plan = sync::plan(&stacks, &opts)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_default());
@@ -588,12 +604,13 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         return Ok(whole);
     }
     // One worktree (its post-checkout hook): only its files, no import or retiring, which commit to the stack.
-    if opts.place.is_some() {
-        print_applied(&sync::apply(&plan)?);
-        return Ok(whole);
-    }
-    print_applied(&sync::import_and_apply(&p.public, p.private.as_deref(), &opts)?);
-    Ok(whole)
+    let applied = match opts.place {
+        Some(_) => sync::apply(&plan)?,
+        None => sync::import_and_apply(&p.public, p.private.as_deref(), &opts)?,
+    };
+    print_applied(&applied);
+    // A Codex hook that doesn't run never reads as success either (design note 2026-11-02-lords-codex-trust, §2.3).
+    Ok(whole && applied.codex.is_empty())
 }
 
 /// One record of a place, as `uninstall --place` lists it.

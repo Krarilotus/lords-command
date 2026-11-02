@@ -3,6 +3,7 @@
 
 pub mod adapters;
 pub mod check;
+pub mod codex_trust;
 pub mod compose;
 pub mod config;
 pub mod core_lines;
