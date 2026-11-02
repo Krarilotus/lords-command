@@ -153,17 +153,22 @@ fn lords_in_file<'a>(event: &str, hook: &Value, lords: &'a [Lords]) -> Option<&'
     lords_guard(&json!({"command": hook["command"], "eventName": event_name(event)}), lords)
 }
 
+/// A hook of a hooks file's text, as sync names it: Lords' guard, or its event, entry and hook.
+fn slot_name(
+    ((event, g, n), (_, hook)): &((String, usize, usize), (Value, Value)),
+    lords: &[Lords],
+) -> String {
+    match lords_in_file(event, hook, lords) {
+        Some(l) => format!("Lords' {} guard ({event})", l.guard),
+        None => format!("{event} entry {} hook {}", g + 1, n + 1),
+    }
+}
+
 /// Every hook of the hooks file sync wrote (`text`), named as not known to be trusted, with `why` (I4).
 fn unknown(file: &Path, text: &str, lords: &[Lords], why: &str) -> Vec<String> {
     let v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).unwrap_or_default();
     let at = file.display();
-    let name = |((event, g, n), (_, hook)): ((String, usize, usize), (Value, Value))| {
-        let what = match lords_in_file(&event, &hook, lords) {
-            Some(l) => format!("Lords' {} guard ({event})", l.guard),
-            None => format!("{event} entry {} hook {}", g + 1, n + 1),
-        };
-        format!("Codex hook not known trusted: {what} in {at}: {why}")
-    };
+    let name = |s| format!("Codex hook not known trusted: {} in {at}: {why}", slot_name(&s, lords));
     slots(&v).into_iter().map(name).collect()
 }
 
@@ -240,5 +245,23 @@ pub fn settle(
     let off = |h: &&Value| {
         h["trustStatus"] != "trusted" || (h["enabled"] == false && lords_guard(h, lords).is_some())
     };
-    now.iter().filter(off).map(|h| named(h, lords)).collect()
+    let mut lines: Vec<String> = now.iter().filter(off).map(|h| named(h, lords)).collect();
+    // A hook of the file as it is now that Codex doesn't list doesn't run either (Codex's hooks switched off, a handler it
+    // skips; sol-loop r1, S2): matched by event and command, each listed hook once.
+    let held = crate::fsguard::read_text(file).ok().flatten().unwrap_or_else(|| text.to_string());
+    let held: Value = serde_json::from_str(held.trim_start_matches('\u{feff}')).unwrap_or_default();
+    let mut listed: Vec<(&Value, &Value)> =
+        now.iter().map(|h| (&h["eventName"], &h["command"])).collect();
+    for slot in slots(&held) {
+        let (event, hook) = (Value::from(event_name(&slot.0 .0)), &slot.1 .1);
+        match listed.iter().position(|(e, c)| **e == event && *c == &hook["command"]) {
+            Some(i) => drop(listed.swap_remove(i)),
+            None => lines.push(format!(
+                "Codex hook not trusted: {} in {}: Codex doesn't list it, so it doesn't run",
+                slot_name(&slot, lords),
+                file.display()
+            )),
+        }
+    }
+    lines
 }
