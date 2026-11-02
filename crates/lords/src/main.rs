@@ -228,9 +228,9 @@ fn guard_rules(which: &str, a: Args) -> ExitCode {
 }
 
 /// `lords guard child [--home DIR]`: the `SubagentStart` hook (Claude Code, Codex) that gives a native child its
-/// place's start file (guard.rs), in one read. `lords guard role [--home DIR]`: the `UserPromptSubmit` hook that gives a
-/// session the start of the role its launch names (guard.rs, `role_hook`); T3 delegated it when `T3CODE_THREAD_ID`
-/// says so. `--home`: the tool home sync ran with, whose apply lock it takes (sync names it in the hook it writes;
+/// place's start file (guard.rs), in one read. `lords guard role [--home DIR] [--adapter ID]`: the `UserPromptSubmit`
+/// hook that gives a prompt carrying the launcher's role signal that role's start (guard.rs, `role_hook`); `--adapter`
+/// names its harness. `--home`: the tool home sync ran with, whose apply lock it takes (sync names it in the hook it writes;
 /// default ~/.lords-command). Reads the event on stdin; like the other guards it never fails: every problem is a note
 /// on stderr and exit 0.
 fn guard_child(which: &str, mut a: Args) -> ExitCode {
@@ -279,9 +279,7 @@ fn guard_child(which: &str, mut a: Args) -> ExitCode {
         }
     };
     let answer = if which == "role" {
-        let delegated = std::env::var("T3CODE_THREAD_ID")
-            .is_ok_and(|t| t.starts_with(lords_core::guard::DELEGATED_THREAD));
-        let env = lords_core::guard::RoleEnv { home, delegated, adapter };
+        let env = lords_core::guard::RoleEnv { home, adapter };
         lords_core::guard::role_hook(&input, &env)
     } else {
         lords_core::guard::child_hook(&input, &home)

@@ -682,11 +682,10 @@ fn write_record(
     }
 }
 
-/// Removes every record in `<tool home>/guard/<name>` (`session`, `role`) older than `SESSION_RECORD_DAYS`. Best
-/// effort: a record left is only a small file.
-fn sweep_dir(home: &Path, name: &str) {
+/// Removes every session record older than `SESSION_RECORD_DAYS`. Best effort: a record left is only a small file.
+fn sweep_records(home: &Path) {
     let Ok(dir) =
-        Root::home(home).and_then(|r| Ok(r.join(&[Part::new("guard")?, Part::new(name)?])))
+        Root::home(home).and_then(|r| Ok(r.join(&[Part::new("guard")?, Part::new("session")?])))
     else {
         return;
     };
@@ -723,8 +722,9 @@ fn session_of(ev: &Value) -> Result<(&str, &Path), String> {
 /// new id; review r1, R1) Claude reloads its own files, so they are recorded anew, while the files the agent read
 /// itself keep the hash recorded before: a change to one of them is still named. With no record from before, nothing
 /// is known of those, so the session stays unrecorded and its next prompt is told (sol-loop r1, S1). Then stale
-/// records go (`sweep_dir`). On `compact` it gives the start of the role the session was given at its launch (design
-/// note C5), its only output. Any failure is a note; the session goes on.
+/// records go (`sweep_records`). On `compact`, in a place, it gives one fixed line, its only output: re-read your role's
+/// file in that place's `.lords` (F10, the Lords owner after fix check r1: no role is guessed). Any failure is a note;
+/// the session goes on.
 pub fn session_hook(input: &str, env: &RulesEnv) -> Answer {
     let Ok(ev) = serde_json::from_str::<Value>(input) else {
         return noted("the event can't be read");
@@ -742,19 +742,23 @@ pub fn session_hook(input: &str, env: &RulesEnv) -> Answer {
         }
         write_record(&place, cwd, &files)
     });
-    sweep_dir(&env.home, "session");
+    sweep_records(&env.home);
     let mut answer = match recorded {
         Ok(()) => quiet(),
         Err(e) => noted(format!("the session's files aren't recorded ({e})")),
     };
-    if ev["source"] == "compact" {
-        if let Some(start) = role_after_compaction(&ev, &env.home) {
-            answer.stdout = json!({"hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": start,
-            }})
-            .to_string();
-        }
+    let place =
+        || place_file(Path::new(ev["cwd"].as_str()?), &env.home, crate::sync::CHILD_FILE).ok()?;
+    if let Some((lords, _)) = (ev["source"] == "compact").then(place).flatten() {
+        let line = format!(
+            "Lords: after the compaction, if your launch named a role, re-read your role's file `role-<role>.md` in `{}` now; it binds you.",
+            lords.display()
+        );
+        answer.stdout = json!({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": line,
+        }})
+        .to_string();
     }
     answer
 }
@@ -977,85 +981,75 @@ fn role_word(w: &str) -> bool {
 /// note D6): 1 is `guard role --home DIR` on `UserPromptSubmit`, the starts `.lords/start-<role>.md`.
 pub const ROLE_PROTOCOL: u32 = 1;
 
-/// How T3 names a delegated task's thread (`T3CODE_THREAD_ID`): a session whose launch names no role is told so only
-/// there (design note C2, C4).
-pub const DELEGATED_THREAD: &str = "thread:delegated-task:";
-
-/// Where the role guard looks: the tool home (its records, sync's apply lock), whether T3 delegated this session, and the
-/// harness it runs for (`--adapter`, as sync writes it), whose place file the start goes beside (F10-R1-03).
+/// Where the role guard looks: the tool home (sync's apply lock), and the harness it runs for (`--adapter`, as sync
+/// writes it), whose place file the start goes beside (F10-R1-03).
 pub struct RoleEnv {
     pub home: PathBuf,
-    pub delegated: bool,
     pub adapter: Option<String>,
 }
 
-/// The role a session was given: `<tool home>/guard/role/<session id>`, holding the role or `-` (none named).
-fn role_record(home: &Path, session: &str) -> Result<Contained, String> {
-    Ok(Root::home(home)?.join(&[Part::new("guard")?, Part::new("role")?, Part::new(session)?]))
-}
-
-fn read_role(place: &Contained) -> Result<Option<String>, String> {
-    Ok(crate::fsguard::read_text(place.path())?.map(|t| t.trim().to_string()))
-}
-
-fn write_role(place: &Contained, role: &str) -> Result<(), String> {
-    crate::fsguard::create_dir_all(&place.root().join(&place.parts()[..place.parts().len() - 1]))?;
-    let text = format!("{role}\n");
-    match crate::fsguard::kind(place.path())? {
-        crate::fsguard::Kind::Missing => crate::fsguard::create_file(place, text.as_bytes()),
-        _ => crate::fsguard::replace_own_file(place, text.as_bytes()),
-    }
-}
-
-/// What a session of `role` in `cwd` is given (design note C1, C2): the role's start without its marker lines, where the
-/// place's file of its harness (`adapter`; none named: not checked) is there beside it (F10-R1-03); else one line
-/// saying why it isn't given and which file to read, whatever failed (F10-R1-04). `None` where `cwd` lies in no place.
-fn role_lines(cwd: &Path, home: &Path, role: &str, adapter: Option<&str>) -> Option<String> {
-    let file = crate::sync::role_file(role);
-    let not_given = |why: String, at: &str| {
-        format!("Lords: your role's start ({role}) isn't given here ({why}): read `{at}` now; it binds you.")
-    };
-    let in_dir = format!("{file}` in this place's `{}` dir", crate::sync::ROLE_DIR);
-    let (dir, text) = match place_file(cwd, home, &crate::sync::start_file(role)) {
-        Ok(None) => return None,
-        Ok(Some(found)) => found,
-        Err(e) => return Some(not_given(format!("it can't be read: {e}"), &in_dir)),
-    };
-    let at = dir.join(&file).display().to_string();
-    if text.is_empty() {
-        return Some(format!(
-            "Lords: the role `{role}` named at your launch has no start in this place ({}), so only the place's file binds you here; if `{at}` exists, read it now.",
-            dir.display()
-        ));
+/// Whether the start of `role` can be given for harness `adapter` (none named: not checked) from a place's `.lords` dir
+/// `lords`, whose `start-<role>.md` reads `start` ("" where there is none): the start without its marker lines, or why
+/// not. The one decision the role guard and `lords paths` share (F10-FC1-02): the start is there with Lords' marker,
+/// the harness's place file beside `.lords` is there with Lords' marker, as it carries the lines the start leaves out
+/// (F10-R1-03), and the start fits one hook.
+pub fn deliverable(
+    lords: &Path,
+    start: &str,
+    role: &str,
+    adapter: Option<&str>,
+) -> Result<String, String> {
+    if !start.contains(crate::compose::BEGIN) {
+        return Err(format!("no {} here", crate::sync::start_file(role)));
     }
     if let Some(id) = adapter {
-        let Some(place) = crate::adapters::get(id).map(|a| a.repo_file()) else {
-            return Some(not_given(format!("no harness `{id}` is known"), &at));
-        };
-        let place_path = dir.parent().unwrap_or(&dir).join(place);
-        match crate::fsguard::read_text(&place_path) {
+        let place = crate::adapters::get(id)
+            .map(|a| a.repo_file())
+            .ok_or_else(|| format!("no harness `{id}` is known"))?;
+        match crate::fsguard::read_text(&lords.parent().unwrap_or(lords).join(place)) {
             Ok(Some(t)) if t.contains(crate::compose::BEGIN) => {}
-            Ok(_) => return Some(not_given(format!("this place has no Lords {place}"), &at)),
-            Err(e) => return Some(not_given(format!("its {place} can't be read: {e}"), &at)),
+            Ok(_) => {
+                return Err(format!(
+                    "no Lords {place} here, which carries what the start leaves out"
+                ))
+            }
+            Err(e) => return Err(format!("its {place} can't be read: {e}")),
         }
     }
-    let start = child_context(&text);
-    let (n, max) = (start.chars().count(), crate::sync::CHILD_START_CHARS);
+    let text = child_context(start);
+    let (n, max) = (text.chars().count(), crate::sync::CHILD_START_CHARS);
     if n > max {
-        return Some(not_given(
-            format!("it is {n} characters, past the {max} one hook gives"),
-            &at,
-        ));
+        return Err(format!("it is {n} characters, past the {max} one hook gives"));
     }
-    Some(start)
+    Ok(text)
 }
 
-/// The role guard's answer to one `UserPromptSubmit` event (design note D3), Claude Code's and Codex's alike. A
-/// session's role is fixed once, from its launch (F10-R1-01): its first prompt, the one with no record yet (D4), is
-/// read (`launch_role`), and the record then holds the role, or `-` for none; no later prompt is read. That first
-/// prompt gets the role's start, or the line saying why not (`role_lines`); for a session T3 delegated whose launch
-/// names no role, one line saying so. Nothing is said to a session T3 didn't delegate whose launch names no role. Never
-/// a block: a failure is a note beside what the context says. The probe event is answered with `ROLE_PROTOCOL`.
+/// What a prompt naming `role` in `cwd` is given (design note C1, C2): the start, where `deliverable` says it can be;
+/// else one line saying why not and which file to read, whatever failed (F10-R1-04). `None` where `cwd` lies in no
+/// place.
+fn role_lines(cwd: &Path, home: &Path, role: &str, adapter: Option<&str>) -> Option<String> {
+    let file = crate::sync::role_file(role);
+    let not_given = |why: String, at: String| {
+        format!("Lords: your role's start ({role}) isn't given here ({why}): read `{at}` now; it binds you.")
+    };
+    match place_file(cwd, home, &crate::sync::start_file(role)) {
+        Ok(None) => None,
+        Ok(Some((lords, text))) => Some(
+            deliverable(&lords, &text, role, adapter)
+                .unwrap_or_else(|why| not_given(why, lords.join(&file).display().to_string())),
+        ),
+        Err(e) => Some(not_given(
+            format!("it can't be read: {e}"),
+            format!("{file}` in this place's `{}` dir", crate::sync::ROLE_DIR),
+        )),
+    }
+}
+
+/// The role guard's answer to one `UserPromptSubmit` event (design note D3), Claude Code's and Codex's alike. Stateless
+/// (the Lords owner after fix check r1): a prompt carrying the launcher's signal (`launch_role`) gets that role's start,
+/// or the line saying why not (`role_lines`), every time; any other prompt gets nothing. The launcher owns the role, so
+/// a later prompt carrying a signal is the launcher's again. Never a block. The probe event is answered with
+/// `ROLE_PROTOCOL`.
 pub fn role_hook(input: &str, env: &RoleEnv) -> Answer {
     let Ok(ev) = serde_json::from_str::<Value>(input) else {
         return noted("the event can't be read");
@@ -1066,81 +1060,18 @@ pub fn role_hook(input: &str, env: &RoleEnv) -> Answer {
     if ev["hook_event_name"] != "UserPromptSubmit" {
         return quiet();
     }
+    let Some(launch) = launch_role(ev["prompt"].as_str().unwrap_or("")) else { return quiet() };
     let Some(cwd) = ev["cwd"].as_str().map(Path::new) else {
         return noted("the event names no cwd");
     };
-    let record = ev["session_id"].as_str().map(|s| role_record(&env.home, s));
-    let given = match &record {
-        Some(Ok(r)) => read_role(r),
-        _ => Ok(None),
-    };
-    // A record that can't be read is none: the start is given again rather than not at all (sol-loop r1 S3, C2).
-    let mut unread = None;
-    let given = given.unwrap_or_else(|e| {
-        unread = Some(format!("the session's role record can't be read ({e})"));
-        None
-    });
-    // A session whose role is fixed hears nothing more, whatever a later prompt says.
-    if given.is_some() {
+    let Some(lines) = role_lines(cwd, &env.home, &launch.role, env.adapter.as_deref()) else {
         return quiet();
-    }
-    let launch = launch_role(ev["prompt"].as_str().unwrap_or(""));
-    let (role, lines) = match &launch {
-        None if !env.delegated => ("-".to_string(), Vec::new()),
-        None => match place_file(cwd, &env.home, crate::sync::CHILD_FILE) {
-            Ok(None) => ("-".to_string(), Vec::new()),
-            Ok(Some(_)) => ("-".to_string(), vec![format!(
-                "Lords: no role was named at your launch (T3's role, or else a brief's first line `Role: <role>`), so only this place's file binds you; if your brief gives you a role, read `role-<role>.md` in this place's `{}` dir now.",
-                crate::sync::ROLE_DIR
-            )]),
-            Err(e) => return noted(format!("the place can't be told ({e})")),
-        },
-        Some(l) => {
-            let lines = role_lines(cwd, &env.home, &l.role, env.adapter.as_deref());
-            (l.role.clone(), lines.into_iter().collect())
-        }
     };
-    let note = match &record {
-        None => Some("the event names no session, so nothing is recorded".to_string()),
-        Some(Err(e)) => Some(format!("nothing is recorded ({e})")),
-        Some(Ok(r)) => {
-            let saved = write_role(r, &role).err().map(|e| format!("not recorded ({e})"));
-            sweep_dir(&env.home, "role");
-            saved
-        }
-    };
-    let note = match (unread, note) {
-        (Some(u), Some(n)) => Some(format!("{u}; {n}")),
-        (u, n) => u.or(n),
-    };
-    if lines.is_empty() {
-        return Answer { stdout: String::new(), note };
-    }
-    context_answer(&lines, note)
-}
-
-/// A `UserPromptSubmit` answer giving `lines` as context.
-fn context_answer(lines: &[String], note: Option<String>) -> Answer {
     let out = json!({"hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",
-        "additionalContext": lines.join("\n"),
+        "additionalContext": lines,
     }});
-    Answer { stdout: out.to_string(), note }
-}
-
-/// What the session guard, Claude Code's `SessionStart` hook, gives after a compaction (design note C5, D5): what
-/// `role_lines` gives the role recorded for the session, beside Claude's place file; `None` for a session given none.
-/// A record that can't be read is said in one line too, naming no role (F10-R1-04: never an invented one).
-fn role_after_compaction(ev: &Value, home: &Path) -> Option<String> {
-    let (session, cwd) = session_of(ev).ok()?;
-    match role_record(home, session).and_then(|r| read_role(&r)) {
-        Ok(Some(role)) if role_word(&role) => role_lines(cwd, home, &role, Some("claude")),
-        Ok(_) => None,
-        Err(e) => Some(format!(
-            "Lords: this session's role can't be read after the compaction ({e}), so no role's start is given again: if your launch named a role, read `role-<role>.md` in this place's `{}` dir now.",
-            crate::sync::ROLE_DIR
-        )),
-    }
+    Answer { stdout: out.to_string(), note: None }
 }
 
 /// What one prompt finds (`rules_found`): the line to say, if any, and the record to save.

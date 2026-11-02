@@ -49,7 +49,7 @@ pub fn paths(stacks: &Stacks, ask: &Ask) -> Vec<Row> {
             Err(why) => row(false, path, why),
         });
     }
-    rows.extend(role_rows(stacks, &ask.home));
+    rows.extend(role_rows(stacks));
     rows
 }
 
@@ -144,23 +144,21 @@ fn find_codex() -> Option<PathBuf> {
     })
 }
 
-/// Per role but `product`: one row per checkout, worktree or workspace dir sync writes for whose installed start for it
-/// the guard can't give (missing, unreadable, or past what one hook gives; sol-loop r1 S1: what is delivered, not what
-/// would be composed), or one complete row. The checkouts and worktrees are sync's own (`sync::checkouts`, r2 S1); a
-/// repo whose can't be listed is a row of its own, incomplete. Beside the starts, each harness the place has needs its
-/// place file there, which carries the lines the starts leave out (F10-R1-03), wherever sync writes one (its
-/// composition there isn't empty): one row per dir and harness without it.
-fn role_rows(stacks: &Stacks, home: &Path) -> Vec<Row> {
+/// Per role but `product`: one row per checkout, worktree or workspace dir sync writes for, and harness the place has,
+/// where the role guard couldn't give the role's start, decided by the guard's own `guard::deliverable` (F10-FC1-02:
+/// the installed start and that harness's place file, never a recomposition); or one complete row. The checkouts and
+/// worktrees are sync's own (`sync::checkouts`, sol-loop r2 S1); a repo whose can't be listed is a row of its own,
+/// incomplete.
+fn role_rows(stacks: &Stacks) -> Vec<Row> {
     use crate::fsguard::InDir;
     let Some(private) = &stacks.private else { return Vec::new() };
     let mut rows = Vec::new();
-    let mut dirs: Vec<(String, PathBuf, &String, &[String])> = Vec::new();
+    let mut dirs: Vec<(String, PathBuf, &[String])> = Vec::new();
     for (name, repo) in &private.manifest.repos {
         match sync::checkouts(repo) {
             Ok((roots, _, _)) => dirs.extend(roots.iter().map(|r| {
                 let p = r.path().to_path_buf();
-                let label = format!("repo {name} ({})", crate::adapters::slashes(&p));
-                (label, p, name, &repo.adapters[..])
+                (format!("repo {name} ({})", crate::adapters::slashes(&p)), p, &repo.adapters[..])
             })),
             Err(e) => rows.push(row(
                 false,
@@ -171,61 +169,41 @@ fn role_rows(stacks: &Stacks, home: &Path) -> Vec<Row> {
     }
     for (name, w) in &private.manifest.workspaces {
         let dir = crate::config::expand_home(&w.path);
-        dirs.push((format!("workspace {name}"), dir, name, &w.adapters[..]));
+        dirs.push((format!("workspace {name}"), dir, &w.adapters[..]));
     }
-    let mut place_files = Vec::new();
-    for (label, dir, name, ids) in &dirs {
-        let has = |a: &dyn Adapter| ids.is_empty() || ids.iter().any(|i| i == a.id());
-        for a in adapters::ALL.iter().copied().filter(|a| has(*a)) {
-            let layers = sync::place_layers(stacks, name, false);
-            if sync::place_text(stacks, layers, a, dir, home).0.is_empty() {
-                continue;
-            }
-            let file = a.repo_file();
-            let why = match crate::fsguard::read_text(&dir.join(file)) {
-                Ok(Some(t)) if t.contains(crate::compose::BEGIN) => continue,
-                Ok(_) => format!("no Lords {file} there, which carries the lines the starts leave out: sync the place"),
-                Err(e) => format!("{file} can't be read ({e})"),
-            };
-            place_files.push(row(false, format!("T3-delegated with {file}, {label}"), why));
-        }
-    }
-    if place_files.is_empty() {
-        rows.push(row(
-            true,
-            "T3-delegated, place files".into(),
-            "every place has its harnesses' files",
-        ));
-    }
-    rows.extend(place_files);
-    let dirs: Vec<(String, PathBuf)> = dirs.into_iter().map(|(l, d, _, _)| (l, d)).collect();
-    let max = sync::CHILD_START_CHARS;
     for role in sync::declared_roles(stacks).iter().filter(|r| *r != crate::compose::PRODUCT_ROLE) {
         let file = sync::start_file(role);
-        let long: Vec<Row> = dirs
-            .iter()
-            .filter_map(|(label, dir)| {
-                let why = match crate::fsguard::read_text_in(&dir.join(sync::ROLE_DIR), &file) {
-                    Ok(InDir::Text(t)) if t.contains(crate::compose::BEGIN) => {
-                        let n = crate::guard::child_context(&t).chars().count();
-                        (n > max).then(|| format!(
-                            "its start is {n} characters, past the {max} one hook gives: such a session is told to read role-{role}.md instead"
-                        ))?
-                    }
-                    Ok(_) => format!("no {file} there: sync the place"),
-                    Err(e) => format!("{file} can't be read ({e})"),
-                };
-                Some(row(false, format!("T3-delegated as {role}, {label}"), why))
-            })
-            .collect();
-        if long.is_empty() {
+        let mut refused = Vec::new();
+        for (label, dir, ids) in &dirs {
+            let lords = dir.join(sync::ROLE_DIR);
+            let start = match crate::fsguard::read_text_in(&lords, &file) {
+                Ok(InDir::Text(t)) => t,
+                Ok(_) => String::new(),
+                Err(e) => {
+                    refused.push(row(
+                        false,
+                        format!("T3-delegated as {role}, {label}"),
+                        format!("{file} can't be read ({e})"),
+                    ));
+                    continue;
+                }
+            };
+            let has = |a: &dyn Adapter| ids.is_empty() || ids.iter().any(|i| i == a.id());
+            for a in adapters::ALL.iter().copied().filter(|a| has(*a)) {
+                if let Err(why) = crate::guard::deliverable(&lords, &start, role, Some(a.id())) {
+                    let path = format!("T3-delegated as {role} via {}, {label}", a.repo_file());
+                    refused.push(row(false, path, format!("{why}: sync the place")));
+                }
+            }
+        }
+        if refused.is_empty() {
             rows.push(row(
                 true,
                 format!("T3-delegated as {role}"),
-                format!("every place has its start, within one hook ({max} characters)"),
+                "every place can give its start",
             ));
         }
-        rows.extend(long);
+        rows.extend(refused);
     }
     rows
 }
