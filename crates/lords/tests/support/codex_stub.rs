@@ -140,7 +140,18 @@ fn main() {
                 }
                 let cwds = req["params"]["cwds"].as_array().into_iter().flatten();
                 let cwds: Vec<&str> = cwds.filter_map(Value::as_str).collect();
-                (json!({"data": [{"cwd": ".", "hooks": list(&home, &cwds)}]}), Value::Null)
+                let listed = list(&home, &cwds);
+                // Another writer edits the hooks file once, once listed: its first PreToolUse hook changes. Before the
+                // answer: Lords ends this process as soon as it has its answer.
+                let raced = home.join("stub-raced");
+                if mode == "race" && !raced.exists() {
+                    let mut hooks = read(&home.join("hooks.json"));
+                    let first = &mut hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"];
+                    *first = Value::from(format!("{} --raced", first.as_str().unwrap_or_default()));
+                    std::fs::write(home.join("hooks.json"), hooks.to_string()).unwrap();
+                    std::fs::write(&raced, "").unwrap();
+                }
+                (json!({"data": [{"cwd": ".", "hooks": listed}]}), Value::Null)
             }
             Some("config/batchWrite") if mode == "writeerr" => (Value::Null, failed),
             Some("config/batchWrite") => {
@@ -155,14 +166,5 @@ fn main() {
         };
         let _ = writeln!(out, "{answer}");
         let _ = out.flush();
-        // Another writer edits the hooks file once, after a list: its first PreToolUse hook changes.
-        let raced = home.join("stub-raced");
-        if mode == "race" && req["method"] == "hooks/list" && !raced.exists() {
-            let mut hooks = read(&home.join("hooks.json"));
-            let first = &mut hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"];
-            *first = Value::from(format!("{} --raced", first.as_str().unwrap_or_default()));
-            std::fs::write(home.join("hooks.json"), hooks.to_string()).unwrap();
-            std::fs::write(&raced, "").unwrap();
-        }
     }
 }
