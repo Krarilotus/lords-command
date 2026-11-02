@@ -183,6 +183,10 @@ pub fn findings(new: &str, old: &str, now: Option<&Zoned>) -> Vec<Finding> {
     let prose = without_code(new);
     let mut out = Vec::new();
     for (line, plain) in new.lines().zip(prose.lines()) {
+        // A line of code alone has nothing to judge and uses up no kept line (sol-loop r2, S6).
+        if plain.trim().is_empty() {
+            continue;
+        }
         match kept.get_mut(line) {
             Some(n) if *n > 0 => *n -= 1,
             _ => line_findings(plain, now, &mut out),
@@ -229,14 +233,22 @@ fn without_code(text: &str) -> String {
             }
             (None, None) => false,
         };
-        if code || body.trim().is_empty() {
+        // A blank line is spaces and tabs only (CommonMark; sol-loop r2, S2); a list item, heading, quote or table row
+        // starts a block of its own, which no span leaves (r2, S7).
+        let t = body.trim_start_matches([' ', '\t']);
+        let ordered = t.trim_start_matches(|c: char| c.is_ascii_digit());
+        let block = ["- ", "* ", "+ ", "#", ">", "|"].iter().any(|m| t.starts_with(m))
+            || (ordered.len() < t.len()
+                && (ordered.starts_with(". ") || ordered.starts_with(") ")));
+        if code || t.is_empty() || block {
             if let Some(s) = para.take() {
                 blank_spans(&mut b[s..start], blank);
             }
             if code {
                 blank(&mut b[start..start + body.len()]);
             }
-        } else {
+        }
+        if !code && !t.is_empty() {
             para.get_or_insert(start);
         }
     }
