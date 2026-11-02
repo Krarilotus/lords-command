@@ -153,6 +153,7 @@ fn cmd_guard(mut a: Args) -> ExitCode {
         say("       lords guard child   (the SubagentStart hook: a native child's start file)");
         say("       lords guard role   (the UserPromptSubmit hook: the start of the role a launch names)");
         say("       lords guard time   (the PreToolUse hook on editor writes and T3 messages: clock times)");
+        say("       lords guard helper   (the PreToolUse hook on Claude Code's native helper tool: refused in T3)");
         return ExitCode::SUCCESS;
     }
     if a.flag("--self-test") {
@@ -170,6 +171,10 @@ fn cmd_guard(mut a: Args) -> ExitCode {
         let (now, zone) = lords_core::guard::system_clock();
         let ok = ok
             && lords_core::time_guard::time_hook(&time.to_string(), now, zone.as_ref())
+                .contains("\"deny\"");
+        let ok = ok
+            && lords_core::helper_guard::helper_hook(r#"{"tool_name": "Agent"}"#, || Ok(true))
+                .stdout
                 .contains("\"deny\"");
         say(if ok { "ok" } else { "the guard let its witness through" });
         return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
@@ -189,6 +194,9 @@ fn cmd_guard(mut a: Args) -> ExitCode {
     }
     if which.as_deref() == Some("time") {
         return guard_time(a);
+    }
+    if which.as_deref() == Some("helper") {
+        return guard_helper(a);
     }
     let shell = match a.value("--shell").as_ref().map(|s| s.as_deref()) {
         Ok(None | Some("bash")) => Some(lords_core::guard::Shell::Bash),
@@ -233,6 +241,42 @@ fn guard_time(a: Args) -> ExitCode {
     let out = lords_core::time_guard::time_hook(&input, now, zone.as_ref());
     if !out.is_empty() {
         say(&out);
+    }
+    ExitCode::SUCCESS
+}
+
+/// `lords guard helper`: the `PreToolUse` hook on Claude Code's native helper tool (helper_guard.rs). Reads the event on
+/// stdin, and only for a helper start this session's `T3CODE_THREAD_ID`, `CLAUDE_PID` and that process's arguments
+/// (t3.rs); prints a denial in a session T3 started, or nothing. Like the other guards it never fails: every problem is
+/// a note on stderr and exit 0.
+fn guard_helper(a: Args) -> ExitCode {
+    let note =
+        |line: &str| say_err(&format!("lords guard helper: {line}; this call is let through"));
+    if a.done().is_err() {
+        note("usage `lords guard helper` (event on stdin)");
+        return ExitCode::SUCCESS;
+    }
+    let input = match std::io::read_to_string(std::io::stdin()) {
+        Ok(i) => i,
+        Err(e) => {
+            note(&format!("the event can't be read ({e})"));
+            return ExitCode::SUCCESS;
+        }
+    };
+    let var = |name: &str| std::env::var(name).ok();
+    let answer = lords_core::helper_guard::helper_hook(&input, || {
+        let (thread, pid) = (var("T3CODE_THREAD_ID"), var("CLAUDE_PID"));
+        lords_core::t3::session(
+            thread.as_deref(),
+            pid.as_deref(),
+            lords_core::process::command_line,
+        )
+    });
+    if let Some(n) = answer.note {
+        note(&n);
+    }
+    if !answer.stdout.is_empty() {
+        say(&answer.stdout);
     }
     ExitCode::SUCCESS
 }

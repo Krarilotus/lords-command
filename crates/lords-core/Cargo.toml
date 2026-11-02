@@ -30,6 +30,8 @@ tempfile = "3"
 [target.'cfg(windows)'.dependencies]
 # Job objects: the queue guard's T3 CLI ends with the guard, its whole process tree (process.rs).
 windows-sys = { version = "0.61", features = [
+    # The helper guard's T3 test: a process's command line (`NtQueryInformationProcess`; process.rs).
+    "Wdk_System_Threading",
     "Win32_Foundation",
     "Win32_Security",
     # The panel's token: an owner-only file from its creation, random bytes from the OS (fsguard.rs).
