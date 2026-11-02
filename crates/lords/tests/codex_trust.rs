@@ -185,6 +185,36 @@ fn adding_rm_before_time_keeps_every_codex_hook_in_its_slot() {
     assert_eq!(t.calls("hooks/list").len(), asked, "nothing written, nothing asked");
 }
 
+// Spec (design note §3 I3; sol-loop r1 S1): a user's own hook added to Lords' `time` entry, after Lords' hook, keeps its
+// slot when sync adds `rm`: that entry stays as it was, and `rm` comes after it.
+#[test]
+fn a_hook_sharing_lords_entry_keeps_its_slot() {
+    let t = T::new("[\"time\"]");
+    assert!(t.sync(true, &[]).status.success());
+    let mut hooks = t.hooks();
+    let audit = json!({"type": "command", "command": "audit"});
+    hooks["hooks"]["PreToolUse"][0]["hooks"].as_array_mut().unwrap().push(audit);
+    t.set_hooks(&hooks);
+    t.guards("[\"rm\", \"time\"]");
+    let o = t.sync(true, &[]);
+    let pre = t.hooks()["hooks"]["PreToolUse"].clone();
+    assert_eq!(pre[0], hooks["hooks"]["PreToolUse"][0], "{}", said(&o));
+    assert!(pre[1]["hooks"][0]["command"].as_str().unwrap().contains(" guard rm"), "{pre}");
+}
+
+// Spec (design note §3 I1: every hook of the file sync wrote is trusted or named; sol-loop r1 S2): when Codex lists no
+// hook of that file (its hooks switched off), nothing is trusted and each hook of the file is named as one Codex doesn't
+// list, so it doesn't run; sync's last line counts them, exit 1.
+#[test]
+fn a_hook_codex_doesnt_list_is_named() {
+    let t = T::new("[\"rm\", \"time\"]");
+    let o = t.sync(true, &[("LORDS_STUB_MODE", "empty")]);
+    assert_eq!((o.status.code(), not_trusted(&o)), (Some(1), 2), "{}", said(&o));
+    let named = out(&o).lines().filter(|l| l.contains("Codex doesn't list it")).count();
+    assert_eq!(named, 2, "{}", said(&o));
+    assert!(t.calls("config/batchWrite").is_empty(), "{}", said(&o));
+}
+
 // Spec (design note §2.2, §3 I1, I2, §4 A1, A2, A4, A10; the owner's grant F11, 2 Nov 18:58: re-trust "limited to hooks
 // that call Lords' own guard program"): after sync writes Codex's hooks file, it trusts exactly the hooks Codex
 // lists in that file whose command is byte for byte one Lords renders for a declared guard, on that guard's event. Here

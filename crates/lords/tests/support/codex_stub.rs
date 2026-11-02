@@ -6,7 +6,8 @@
 //! `$CODEX_HOME/config.toml` (Lords never reads it). Every request is logged to `$CODEX_HOME/stub-calls.jsonl`.
 //! `LORDS_STUB_TRUST` forces every hook's trust (`hang`: never answers `hooks/list`); `LORDS_STUB_DISABLED` switches one
 //! event's hooks off; `LORDS_STUB_MODE`: `exit` ends at once, `nolist` and `writeerr` answer an error, `malformed` a list
-//! that isn't one, `race` edits the hooks file once after a list (another writer); `LORDS_STUB_ADD` names a JSON object
+//! that isn't one, `empty` lists no hook (Codex's hooks switched off), `race` edits the hooks file once after a list
+//! (another writer); `LORDS_STUB_ADD` names a JSON object
 //! of hook entries per event that another writer appends to the hooks file once, before a list. Run as `trust-all` it
 //! trusts every hook listed, as the owner would under `/hooks`; as `list`, it prints the list. It ends at the end of
 //! its input, as no real server does before it has answered.
@@ -126,6 +127,7 @@ fn main() {
             Some("hooks/list") if hang => continue,
             Some("hooks/list") if mode == "nolist" => (Value::Null, failed),
             Some("hooks/list") if mode == "malformed" => (json!({"data": "a"}), Value::Null),
+            Some("hooks/list") if mode == "empty" => (json!({"data": []}), Value::Null),
             Some("hooks/list") => {
                 let added = home.join("stub-added");
                 if let (Ok(add), false) = (std::env::var("LORDS_STUB_ADD"), added.exists()) {
