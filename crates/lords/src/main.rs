@@ -47,7 +47,7 @@ usage:
   lords guard child [--home DIR]   the SubagentStart hook: a native child starts with its role's start file in its place
   lords guard role [--home DIR] [--adapter ID]   the UserPromptSubmit hook: a session gets the start of the role its launch names
   lords guard time   the PreToolUse hook on editor writes to Markdown and text files and on T3 messages: refuses a
-    placeholder clock time, or one more than 5 minutes after the clock not marked as a plan
+    placeholder clock time; reminds of one more than 5 minutes after the clock not marked as a plan
   lords guard install [--home DIR]   install or update the guard copy the hooks run (sync never writes it)
   lords panel serve [--port N]   the window on another PC reads and edits these stacks through it (127.0.0.1:7879)
   lords panel add ALIAS --bridge DIR [--embedded] [--apply]   set a PC this one reaches as ALIAS up for the panel;

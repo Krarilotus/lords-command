@@ -216,22 +216,30 @@ fn fence_mark(line: &str) -> Option<(u8, usize)> {
 fn without_code(text: &str) -> String {
     let mut b = text.as_bytes().to_vec();
     let blank = |b: &mut [u8]| b.iter_mut().filter(|c| **c != b'\n').for_each(|c| *c = b' ');
-    let (mut fence, mut para, mut at): (Option<(u8, usize)>, Option<usize>, usize) =
+    // An open fence: its character, length and the quote depth it opened at.
+    let (mut fence, mut para, mut at): (Option<(u8, usize, usize)>, Option<usize>, usize) =
         (None, None, 0);
     for line in text.split_inclusive('\n') {
         let (start, body) = (at, line.trim_end_matches(['\n', '\r']));
         at += line.len();
-        let mark = fence_mark(body);
-        let code = match (fence, mark) {
-            (Some((fc, fnn)), Some((c, n)))
-                if fc == c && n >= fnn && body.trim()[n..].is_empty() =>
+        // A fence inside a blockquote (`> `, nested too) is code, and ends with its quote (review r1, C15-R1-01).
+        let (mut depth, mut inner) = (0, body);
+        while let Some(rest) = inner.trim_start_matches(' ').strip_prefix('>') {
+            (depth, inner) = (depth + 1, rest.strip_prefix(' ').unwrap_or(rest));
+        }
+        if fence.is_some_and(|(_, _, d)| depth < d) {
+            fence = None;
+        }
+        let code = match (fence, fence_mark(inner)) {
+            (Some((fc, fnn, d)), Some((c, n)))
+                if fc == c && n >= fnn && d == depth && inner.trim()[n..].is_empty() =>
             {
                 fence = None;
                 true
             }
             (Some(_), _) => true,
-            (None, Some(m)) => {
-                fence = Some(m);
+            (None, Some((c, n))) => {
+                fence = Some((c, n, depth));
                 true
             }
             (None, None) => false,
