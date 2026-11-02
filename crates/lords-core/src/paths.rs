@@ -91,16 +91,22 @@ pub fn paths(stacks: &Stacks, ask: &Ask) -> Vec<Row> {
     rows
 }
 
-/// The live sessions' cwds (`guard::live_session_cwds`), each resolved (`fsguard::canonical`), so an alias names its
-/// place (sol-loop repair r1, R1-03); a cwd that is gone can be in no place. `None` when one can't be known.
+/// The live sessions' cwds (`guard::live_session_cwds`), each resolved (`resolved`), so an alias names its place
+/// (sol-loop repair r1, R1-03). `None` when one can't be known.
 fn session_dirs(home: &Path) -> Option<Vec<PathBuf>> {
-    let cwds = crate::guard::live_session_cwds(home)?;
-    let resolved = cwds.iter().filter_map(|c| match crate::fsguard::canonical(c) {
-        Ok(p) => Some(Some(p)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => Some(None),
-    });
-    resolved.collect()
+    crate::guard::live_session_cwds(home)?.iter().map(|c| resolved(c)).collect()
+}
+
+/// `path` resolved (`fsguard::canonical`): its nearest dir that is there, with the rest as written, so a cwd removed
+/// since still names the place it was in (sol-loop repair r2, R2-01). `None` on any other error.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    match crate::fsguard::canonical(path) {
+        Ok(p) => Some(p),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Some(resolved(path.parent()?)?.join(path.file_name()?))
+        }
+        Err(_) => None,
+    }
 }
 
 /// Whether a live session's resolved cwd is at or below `dir`; yes when either can't be known.
