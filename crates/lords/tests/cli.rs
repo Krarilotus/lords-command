@@ -501,6 +501,21 @@ fn compose_prints_what_a_harness_reads() {
 
 /// A repo `r` (one commit) declared in a private stack with one rule, worktrees under `wts`; the hook installed.
 fn repo_with_post_checkout(env: &Env) -> (PathBuf, PathBuf, PathBuf) {
+    let (repo, wts, stacks) = post_checkout_repo(env);
+    let o = install_post_checkout(env, &repo, &stacks);
+    assert!(o.status.success(), "{}", text(&o));
+    let log = repo_log(&repo);
+    (repo, wts, log)
+}
+
+/// `lords hooks install --post-checkout` in `repo`, with the stacks `post_checkout_repo` made.
+fn install_post_checkout(env: &Env, repo: &Path, stacks: &[String; 4]) -> Output {
+    let args: Vec<&str> = stacks.iter().map(String::as_str).collect();
+    env.lords(repo, &[&["hooks", "install", "--post-checkout"][..], &args].concat())
+}
+
+/// The repo `repo_with_post_checkout` makes, without the hook: the repo, where its worktrees go, and the stack args.
+fn post_checkout_repo(env: &Env) -> (PathBuf, PathBuf, [String; 4]) {
     let d = env.dir.path();
     let (public, private, repo) = (d.join("pub"), d.join("priv"), d.join("repo"));
     fs::create_dir_all(public.join("global/rules")).unwrap();
@@ -528,21 +543,13 @@ fn repo_with_post_checkout(env: &Env) -> (PathBuf, PathBuf, PathBuf) {
     fs::write(repo.join("README.md"), "a repo\n").unwrap();
     env.git(&repo, &["add", "-A"]);
     assert!(env.git(&repo, &["commit", "-q", "-m", "start"]).status.success());
-    let o = env.lords(
-        &repo,
-        &[
-            "hooks",
-            "install",
-            "--post-checkout",
-            "--public-stack",
-            public.to_str().unwrap(),
-            "--private-stack",
-            private.to_str().unwrap(),
-        ],
-    );
-    assert!(o.status.success(), "{}", text(&o));
-    let log = repo_log(&repo);
-    (repo, d.join("wts"), log)
+    let stacks = [
+        "--public-stack".to_string(),
+        public.display().to_string(),
+        "--private-stack".to_string(),
+        private.display().to_string(),
+    ];
+    (repo, d.join("wts"), stacks)
 }
 
 fn repo_log(repo: &Path) -> PathBuf {
@@ -638,6 +645,201 @@ fn a_missing_lords_never_fails_the_checkout() {
     assert!(o.status.success(), "{}", text(&o));
     assert!(!wt.join("CLAUDE.local.md").exists());
     assert!(fs::read_to_string(&log).unwrap().contains("lords not found at /nowhere/lords.exe"));
+}
+
+// ---------------------------------------------------------------- post-checkout through a dispatcher (D14)
+
+/// A verbatim copy of the owner's attribution guard dispatcher and its post-checkout wrapper
+/// (`~/.config/git/attribution-guard`, 2 Nov: dispatch.sh sha256 61886b99…, hooks/post-checkout 00949024…), set up in
+/// `dir` as the owner's is: `dir/hooks/post-checkout` hands over to `dir/dispatch.sh`. Returns `dir/hooks`.
+fn real_dispatcher(dir: &Path) -> PathBuf {
+    fs::create_dir_all(dir.join("hooks")).unwrap();
+    for (name, text) in [
+        ("dispatch.sh", include_str!("support/attribution-guard/dispatch.sh")),
+        ("hooks/post-checkout", include_str!("support/attribution-guard/hooks/post-checkout")),
+    ] {
+        let p = dir.join(name);
+        fs::write(&p, text).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    dir.join("hooks")
+}
+
+/// An owner's post-checkout hook: it logs that it ran, in the git common dir's `before.log`.
+const OWNERS_HOOK: &str =
+    "#!/bin/sh\necho ran >> \"$(git rev-parse --git-common-dir)/before.log\"\n";
+
+/// One config value of `repo` as git reads it (any scope), or `None`.
+fn config(env: &Env, repo: &Path, key: &str) -> Option<String> {
+    let o = env.git(repo, &["config", "--get", key]);
+    o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// Waits until the post-checkout log stops growing: the hook's sync runs in the background.
+fn settled(log: &Path) {
+    let mut before = fs::read_to_string(log).unwrap_or_default();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let now = fs::read_to_string(log).unwrap_or_default();
+        if now == before {
+            return;
+        }
+        before = now;
+    }
+}
+
+/// `git worktree add` of a new branch `name` under `wts`, then whether its place file appears (the hook's sync).
+fn new_worktree_gets_its_place_file(env: &Env, repo: &Path, wts: &Path, name: &str) -> bool {
+    let wt = wts.join(name);
+    let o = env.git(repo, &["worktree", "add", "-q", "-b", name, wt.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", text(&o));
+    let got = appears(&wt.join("CLAUDE.local.md"));
+    settled(&repo_log(repo));
+    got
+}
+
+// Spec (D14, the Lords owner's contract, 2 Nov: "When the effective hooks path (local or global) is a dispatcher that
+// provably forwards `post-checkout` to a directory, the install writes Lords' hook into that forwarded-to directory,
+// chaining any hook already there, as today … The install never repoints `core.hooksPath` and never edits the
+// dispatcher. Test it against a copy of the real dispatcher: `git worktree add` then gets place files."): with the
+// repo's local hooks path the real dispatcher, the install succeeds and chains the owner's hook; a new worktree gets
+// its place file and the owner's hook runs; the hooks path and the dispatcher are as they were.
+#[test]
+fn the_post_checkout_install_goes_through_a_local_dispatcher_that_forwards() {
+    let env = Env::new();
+    let (repo, wts, stacks) = post_checkout_repo(&env);
+    let guard = real_dispatcher(&env.dir.path().join("guard"));
+    let guard_path = guard.to_str().unwrap();
+    env.git(&repo, &["config", "core.hooksPath", guard_path]);
+    fs::write(repo.join(".git/hooks/post-checkout"), OWNERS_HOOK).unwrap();
+    let dispatcher = fs::read(env.dir.path().join("guard/dispatch.sh")).unwrap();
+
+    let o = install_post_checkout(&env, &repo, &stacks);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(
+        fs::read_to_string(repo.join(".git/hooks/post-checkout.before-lords")).unwrap(),
+        OWNERS_HOOK,
+        "the owner's hook is chained"
+    );
+    assert!(
+        new_worktree_gets_its_place_file(&env, &repo, &wts, "one"),
+        "log: {}",
+        fs::read_to_string(repo_log(&repo)).unwrap_or_default()
+    );
+    assert!(fs::read_to_string(repo.join(".git/before.log")).unwrap().contains("ran"));
+    assert_eq!(config(&env, &repo, "core.hooksPath").as_deref(), Some(guard_path));
+    assert_eq!(fs::read(env.dir.path().join("guard/dispatch.sh")).unwrap(), dispatcher);
+}
+
+// Spec (D14 contract, above: "local or global"; and "That dir is `attributionGuard.previousHooksPath` when it's set,
+// else the common dir's `hooks/`"): with the global hooks path the real dispatcher, and again with the repo's
+// `previousHooksPath` set to its own hooks dir (absolute), the install succeeds and a new worktree gets its place file.
+#[test]
+fn the_post_checkout_install_goes_through_a_global_dispatcher_and_a_previous_hooks_path() {
+    let env = Env::new();
+    let (repo, wts, stacks) = post_checkout_repo(&env);
+    let guard = real_dispatcher(&env.dir.path().join("guard"));
+    env.git(&repo, &["config", "--global", "core.hooksPath", guard.to_str().unwrap()]);
+    let o = install_post_checkout(&env, &repo, &stacks);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(new_worktree_gets_its_place_file(&env, &repo, &wts, "one"));
+
+    let own = repo.join(".git/hooks").canonicalize().unwrap();
+    let own = own.to_str().unwrap().trim_start_matches(r"\\?\");
+    env.git(&repo, &["config", "attributionGuard.previousHooksPath", own]);
+    let o = install_post_checkout(&env, &repo, &stacks);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(new_worktree_gets_its_place_file(&env, &repo, &wts, "two"));
+}
+
+// Spec (D14 contract: "A hooks path Lords can't prove forwards stays a refusal, with a message that names the case";
+// design note 2026-11-02-lords-hooks-dispatcher, H2, H4, H6): each case below is refused with its own reason, and
+// leaves everything as it was: the owner's hook back at `post-checkout` with its bytes, no `.before-lords`, no ledger
+// record of a hook, `core.hooksPath` unchanged.
+// - The real dispatcher, `previousHooksPath = .githooks` (relative, tracked hooks in the tree): "relative".
+// - The real dispatcher, `skipPreviousHook = post-checkout`: "skipPreviousHook".
+// - The real dispatcher, `previousHooksPath` absolute elsewhere: that dir is named.
+// - A local hooks path whose post-checkout runs nothing: "local".
+// - A global hooks path without a post-checkout (today this one installed, with a note): "global".
+#[test]
+fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
+    let env = Env::new();
+    let (repo, _wts, stacks) = post_checkout_repo(&env);
+    let d = env.dir.path();
+    let guard = real_dispatcher(&d.join("guard"));
+    let guard = guard.to_str().unwrap();
+    let elsewhere = d.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let silent = d.join("silent");
+    fs::create_dir_all(&silent).unwrap();
+    fs::write(silent.join("post-checkout"), "#!/bin/sh\nexit 0\n").unwrap();
+    let empty = d.join("empty");
+    fs::create_dir_all(&empty).unwrap();
+    let hooks = repo.join(".git/hooks");
+    fs::write(hooks.join("post-checkout"), OWNERS_HOOK).unwrap();
+    let listing = |dir: &Path| -> Vec<(String, Vec<u8>)> {
+        let mut v: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), fs::read(e.path()).unwrap()))
+            .collect();
+        v.sort();
+        v
+    };
+    let before = listing(&hooks);
+    let ledger = d.join("home/.lords-command/state/ledger.toml");
+
+    type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a str);
+    let cases: [Case; 5] = [
+        (
+            "relative",
+            vec![("core.hooksPath", guard), ("attributionGuard.previousHooksPath", ".githooks")],
+            "relative",
+        ),
+        (
+            "skip",
+            vec![("core.hooksPath", guard), ("attributionGuard.skipPreviousHook", "post-checkout")],
+            "skipPreviousHook",
+        ),
+        (
+            "elsewhere",
+            vec![
+                ("core.hooksPath", guard),
+                ("attributionGuard.previousHooksPath", elsewhere.to_str().unwrap()),
+            ],
+            "elsewhere",
+        ),
+        ("local", vec![("core.hooksPath", silent.to_str().unwrap())], "local"),
+        ("global", vec![("--global core.hooksPath", empty.to_str().unwrap())], "global"),
+    ];
+    for (name, settings, says) in cases {
+        for (k, v) in &settings {
+            let mut args = vec!["config"];
+            args.extend(k.split(' '));
+            args.push(v);
+            assert!(env.git(&repo, &args).status.success(), "{name}: git {args:?}");
+        }
+        let hooks_path = config(&env, &repo, "core.hooksPath");
+        let o = install_post_checkout(&env, &repo, &stacks);
+        let out = text(&o);
+        assert!(!o.status.success(), "{name}: must be refused: {out}");
+        assert!(out.contains(says) && out.contains("post-checkout"), "{name}: {out}");
+        assert_eq!(listing(&hooks), before, "{name}: the hooks dir is as it was");
+        assert!(
+            !fs::read_to_string(&ledger).unwrap_or_default().contains("post-checkout"),
+            "{name}: no ledger record"
+        );
+        assert_eq!(config(&env, &repo, "core.hooksPath"), hooks_path, "{name}");
+        for (k, _) in &settings {
+            let mut args = vec!["config", "--unset-all"];
+            args.extend(k.split(' '));
+            assert!(env.git(&repo, &args).status.success(), "{name}: git {args:?}");
+        }
+    }
 }
 
 /// A nonce as `lords check` makes them: 32 hex digits.
