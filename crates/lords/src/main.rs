@@ -748,12 +748,25 @@ fn cmd_uninstall(mut a: Args) -> Result<bool, String> {
     let p = paths(&mut a)?;
     a.done()?;
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
-    let opts = sync::Options { repo, user_only, home, uninstall: true, ..sync::Options::default() };
+    let opts = sync::Options {
+        repo: repo.clone(),
+        user_only,
+        home: home.clone(),
+        uninstall: true,
+        ..sync::Options::default()
+    };
     let plan = sync::plan(&stacks, &opts)?;
     print_plan(&plan);
     if apply {
         print_applied(&sync::apply(&plan)?);
-    } else {
+    }
+    // A repo's config hook (its post-checkout where the hooks dir isn't reached): its own ledger kind.
+    if !user_only {
+        for line in hooks::config::uninstall(&home, repo.as_deref(), apply)? {
+            println!("{line}");
+        }
+    }
+    if !apply {
         println!("dry run: nothing removed (`--apply` removes)");
     }
     Ok(true)
@@ -1088,7 +1101,14 @@ fn cmd_hooks(mut a: Args) -> Result<bool, String> {
             private_stack: explicit_private.map(|p| std::path::absolute(&p).unwrap_or(p)),
         };
         let r = hooks::install_post_checkout(&top, &exe, &args, &sync::default_home()?)?;
-        println!("installed {} (repo {name})", r.hook.display());
+        match &r.config {
+            Some(why) => println!(
+                "installed {} in {} (repo {name}), as a config hook: {why}",
+                hooks::config::SECTION,
+                r.hook.display()
+            ),
+            None => println!("installed {} (repo {name})", r.hook.display()),
+        }
         if let Some(b) = r.backup {
             println!("the hook that was there runs first, from {}", b.display());
         }

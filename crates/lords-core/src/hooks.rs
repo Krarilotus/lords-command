@@ -13,6 +13,8 @@ use crate::ledger::Ledger;
 use crate::sync::ApplyLock;
 use std::path::{Path, PathBuf};
 
+pub mod config;
+
 pub const MARKER: &str = "# lords-command: privacy check";
 
 /// The hooks the tool installs: the only names a `hooks:` ledger record may have.
@@ -29,6 +31,8 @@ pub struct Installed {
     pub global_hooks_path: Option<String>,
     /// The post-checkout hook: the `core.hooksPath` its probe went through, if one is set.
     pub via: Option<String>,
+    /// The post-checkout hook as a config hook (`hook` is then the config file): why the hooks dir isn't its place.
+    pub config: Option<String>,
 }
 
 /// The repo's own commit check, which the pre-commit hook runs first where the repo tracks one (orchestrator, 25 Oct:
@@ -333,6 +337,7 @@ pub fn install(
             backup,
             global_hooks_path: global_hooks_path.clone(),
             via: None,
+            config: None,
         });
     }
     ledger.save(home)?;
@@ -360,9 +365,20 @@ fn quoted(p: &Path) -> String {
 /// A post-checkout hook that writes a new worktree's place files (orchestrator, 25 Oct). It never fails or slows
 /// the checkout: it acts only when the old HEAD is all zeros (`git worktree add`), runs sync in the background
 /// under a time limit, and only logs (to `<git common dir>/lords-post-checkout.log`); a hook that was here before
-/// runs first, and its exit status is the hook's. It answers the install's probe first, with `label`
-/// (`probe_label`), and does nothing else then (`probe_lines`; D14, design note H5).
-pub fn post_checkout_script(lords_exe: &Path, args: &SyncArgs, home: &Path, label: &str) -> String {
+/// runs first, and its exit status is the hook's (`chain`; a config hook has no such neighbour). It answers the install's
+/// probe first, with `label` (`probe_label`), and does nothing else then (`probe_lines`; D14, design note H5).
+pub fn post_checkout_script(
+    lords_exe: &Path,
+    args: &SyncArgs,
+    home: &Path,
+    label: &str,
+    chain: bool,
+) -> String {
+    let chain = if chain {
+        format!("before=\"$(dirname \"$0\")/{CHAINED}\"\nif [ -f \"$before\" ]; then\n  \"$before\" \"$@\"\n  status=$?\nfi\n")
+    } else {
+        String::new()
+    };
     let mut stacks = String::new();
     if let Some(p) = &args.public_stack {
         stacks.push_str(&format!(" --public-stack {}", quoted(p)));
@@ -375,12 +391,7 @@ pub fn post_checkout_script(lords_exe: &Path, args: &SyncArgs, home: &Path, labe
 {SYNC_MARKER} (installed by `lords hooks install --post-checkout`).
 # Never fails or slows a checkout: only a new worktree (old HEAD all zeros), in the background, time-boxed, logged.
 {probe}status=0
-before="$(dirname "$0")/{CHAINED}"
-if [ -f "$before" ]; then
-  "$before" "$@"
-  status=$?
-fi
-case "$1" in
+{chain}case "$1" in
   "" | *[!0]*) exit $status ;;
 esac
 exe={exe}
@@ -417,7 +428,9 @@ fn probe_label() -> String {
 /// `core.hooksPath` or dispatcher is set (D14, design note 2026-11-02-lords-hooks-dispatcher, H1); otherwise the dir is
 /// put back as it was, nothing is recorded, and the refusal names the case (H4, H6). `core.hooksPath` and a
 /// dispatcher are never changed (H3). A conditional include that may route hooks for a new worktree, which the probe's
-/// stand-in can't see, refuses before anything is written (review r1, R1-01).
+/// stand-in can't see, refuses before anything is written (review r1, R1-01). Where the probe refuses, the hook goes
+/// into the repo's local config instead (`config`; D14b, design note 2026-11-02-lords-hooks-config); a repo whose config
+/// hook the ledger records keeps that route (C6).
 pub fn install_post_checkout(
     repo: &Path,
     lords_exe: &Path,
@@ -431,9 +444,45 @@ pub fn install_post_checkout(
             unseen.join("; ")
         ));
     }
-    let dir = own_hooks_dir(repo)?;
     let _lock = ApplyLock::take(home, 60)?;
-    let mut ledger = Ledger::load(home)?;
+    let ledger = Ledger::load(home)?;
+    if config::recorded(repo, &ledger)? {
+        let why = "Lords' config hook is this repo's route (its ledger record)".to_string();
+        return config::install(repo, lords_exe, args, home, ledger, why)
+            .map_err(|e| format!("{e}; no post-checkout installed"));
+    }
+    match in_hooks_dir(repo, lords_exe, args, home, ledger) {
+        Ok(installed) => Ok(installed),
+        Err(Refused::Failed(e)) => Err(e),
+        Err(Refused::Unreached(why)) => {
+            config::install(repo, lords_exe, args, home, Ledger::load(home)?, why.clone())
+                .map_err(|e| format!("{why}; nor a config hook: {e}; no post-checkout installed, and core.hooksPath and what it runs are as they were"))
+        }
+    }
+}
+
+/// Why `in_hooks_dir` installed nothing.
+enum Refused {
+    /// The probe got no answer, and the hooks dir is as it was: a config hook may stand in.
+    Unreached(String),
+    Failed(String),
+}
+
+impl From<String> for Refused {
+    fn from(e: String) -> Refused {
+        Refused::Failed(e)
+    }
+}
+
+/// D14's install in the repo's own hooks dir, under the caller's apply lock.
+fn in_hooks_dir(
+    repo: &Path,
+    lords_exe: &Path,
+    args: &SyncArgs,
+    home: &Path,
+    mut ledger: Ledger,
+) -> Result<Installed, Refused> {
+    let dir = own_hooks_dir(repo)?;
     let hook = dir.join(&[Part::new("post-checkout")?]);
     let chained = dir.join(&[Part::new(CHAINED)?]);
     let mut backup = None;
@@ -444,11 +493,11 @@ pub fn install_post_checkout(
             earlier = Some(fsguard::move_aside(&hook)?);
         } else {
             if fsguard::kind(chained.path())? != fsguard::Kind::Missing {
-                return Err(format!(
+                return Err(Refused::Failed(format!(
                     "{} isn't the tool's and {} exists already; merge them by hand first",
                     hook.path().display(),
                     chained.path().display()
-                ));
+                )));
             }
             fsguard::move_to(&hook, &chained)?;
             backup = Some(chained.path().to_path_buf());
@@ -456,12 +505,15 @@ pub fn install_post_checkout(
     }
     let scope = format!("hooks:{}", crate::ledger::key(dir.path()));
     let label = probe_label();
-    let text = post_checkout_script(lords_exe, args, home, &label);
+    let text = post_checkout_script(lords_exe, args, home, &label, true);
+    let mut unreached = false;
     // Written, proven, recorded: the ledger save is the last step that can still be undone (review r1, R1-02).
     let done = put_hook(&mut ledger, &hook, &text, &scope)
         .and_then(|()| {
-            post_checkout_reaches_new_worktree(repo, home, &label)
-                .map_err(|why| refusal(repo, &dir, &why))
+            post_checkout_reaches_new_worktree(repo, home, &label).map_err(|why| {
+                unreached = true;
+                refusal(repo, &dir, &why)
+            })
         })
         .and_then(|()| ledger.save(home));
     if let Err(why) = done {
@@ -477,9 +529,11 @@ pub fn install_post_checkout(
                 (None, Some(_)) => fsguard::move_to(&chained, &hook),
                 (None, None) => Ok(()),
             });
+        let path = hook.path().display();
         return Err(match undone {
-            Ok(()) => format!("{why}; {} is as it was", hook.path().display()),
-            Err(e) => format!("{why}; putting {} back failed: {e}", hook.path().display()),
+            Ok(()) if unreached => Refused::Unreached(format!("{why}; {path} is as it was")),
+            Ok(()) => Refused::Failed(format!("{why}; {path} is as it was")),
+            Err(e) => Refused::Failed(format!("{why}; putting {path} back failed: {e}")),
         });
     }
     if let Some(aside) = earlier {
@@ -496,6 +550,7 @@ pub fn install_post_checkout(
         backup,
         global_hooks_path: None,
         via: hooks_path(repo).map(|(path, _)| path),
+        config: None,
     })
 }
 
@@ -619,7 +674,5 @@ fn refusal(repo: &Path, dir: &Root, why: &str) -> String {
         ),
         _ => format!("it doesn't run {} for a new worktree", hook.display()),
     };
-    format!(
-        "core.hooksPath = {path} ({scope}): {case} ({why}); no post-checkout installed; core.hooksPath and what it runs are left as they are"
-    )
+    format!("core.hooksPath = {path} ({scope}): {case} ({why})")
 }
