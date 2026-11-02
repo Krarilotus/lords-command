@@ -15,6 +15,7 @@ No source you can name? Then it is not yet a spec; ask, or state the behaviour t
 **The test must fail without the change and pass with it.** Record both outcomes in your report. A test that passes either way proves nothing; delete or rewrite it.
 - **By default, commit the test before the fix.** Its failure on the pre-fix tree is the red evidence, and the fix commit shows it green. Where a fleet job or CI exists, let it run only the new or changed tests against the parent tree.
 - **Mutation after the fact is the fallback** (undo the fix in a copy and rerun the test), only for a test written after its fix. Say in your report why it came after.
+- **A red counts only when it fails at the answer.** The test checks the answer itself before any secondary field (a cause, a message, a count of warnings), and the red run fails at that check. A red that fails earlier, say because a cause is missing, never reaches the answer and proves nothing about it.
 
 ## A test is tautological - rewrite it - when
 - the expected value is computed by the code under test, or copied from its output without an independent source;
