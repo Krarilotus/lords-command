@@ -883,9 +883,11 @@ fn copied_stacks(env: &Env, n: &str) -> [String; 4] {
     ["--public-stack".into(), arg("pub"), "--private-stack".into(), arg("priv")]
 }
 
-// Spec (sol-loop r1, S1; design note H4: a refused install leaves the hooks dir as it was): a re-install refused by
-// its probe (a local hooks path that runs nothing, set after the first install) keeps the tool's earlier hook, byte
-// for byte, though the new one would differ (the stacks are named at other paths), and the ledger as it was.
+// Spec (sol-loop r1, S1, and r2, S2; design note H1, H4: only the hook this install wrote may answer its probe, and a
+// refused install leaves the hooks dir as it was): after a first install, the real dispatcher forwards to another dir
+// holding a copy of that earlier hook; a re-install is refused, as the copy isn't the hook it writes, and keeps the
+// tool's earlier hook, byte for byte, though the new one would differ (the stacks are named at other paths), and the
+// ledger as it was.
 #[test]
 fn a_refused_reinstall_keeps_the_tools_earlier_hook() {
     let env = Env::new();
@@ -906,10 +908,12 @@ fn a_refused_reinstall_keeps_the_tools_earlier_hook() {
     };
     let before = (names(&hooks), fs::read(hooks.join("post-checkout")).unwrap());
     let recorded = fs::read(&ledger).unwrap();
-    let silent = d.join("silent");
-    fs::create_dir_all(&silent).unwrap();
-    fs::write(silent.join("post-checkout"), "#!/bin/sh\nexit 0\n").unwrap();
-    env.git(&repo, &["config", "core.hooksPath", silent.to_str().unwrap()]);
+    let stale = d.join("stale");
+    fs::create_dir_all(&stale).unwrap();
+    fs::copy(hooks.join("post-checkout"), stale.join("post-checkout")).unwrap();
+    let guard = real_dispatcher(&d.join("guard"));
+    env.git(&repo, &["config", "core.hooksPath", guard.to_str().unwrap()]);
+    env.git(&repo, &["config", "attributionGuard.previousHooksPath", stale.to_str().unwrap()]);
 
     let o = install_post_checkout(&env, &repo, &copied_stacks(&env, "2"));
     assert!(!o.status.success() && !text(&o).contains("back failed"), "{}", text(&o));
