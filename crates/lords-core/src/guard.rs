@@ -38,21 +38,25 @@ struct Word {
     vars: Vec<(bool, bool)>,
 }
 
-/// The simple command being read: its words so far and the word in progress, which is no argument when it is a
-/// here-string's data (`data`).
+/// The simple command being read: its words so far and the word in progress. After `<<<` (`data`), the next word to
+/// start is the here-string's data, no argument; its variables are kept apart (`dropped`), for an enclosing
+/// substitution still counts them.
 #[derive(Default)]
 struct Simple {
     words: Vec<Word>,
     word: Word,
     started: bool,
     data: bool,
+    dropped: Vec<(bool, bool)>,
 }
 
 impl Simple {
     fn end_word(&mut self) {
         if self.started {
             let word = std::mem::take(&mut self.word);
-            if !std::mem::take(&mut self.data) {
+            if std::mem::take(&mut self.data) {
+                self.dropped.extend(word.vars);
+            } else {
                 self.words.push(word);
             }
             self.started = false;
@@ -61,6 +65,7 @@ impl Simple {
 
     fn end(&mut self, out: &mut Vec<Vec<Word>>) {
         self.end_word();
+        self.data = false;
         if !self.words.is_empty() {
             out.push(std::mem::take(&mut self.words));
         }
@@ -88,8 +93,14 @@ fn commands(command: &str) -> Vec<Vec<Word>> {
 }
 
 /// Reads commands from `c[*i]` into `out`, to the end or, inside a substitution, to its `close` (`)` or a backtick)
-/// outside any quotes and subshells it opened; `*i` is then past it.
-fn list(c: &[char], i: &mut usize, close: Option<char>, out: &mut Vec<Vec<Word>>) {
+/// outside any quotes and subshells it opened; `*i` is then past it. Returns the variables of the here-string words
+/// it read, which are no command's words.
+fn list(
+    c: &[char],
+    i: &mut usize,
+    close: Option<char>,
+    out: &mut Vec<Vec<Word>>,
+) -> Vec<(bool, bool)> {
     let mut s = Simple::default();
     let (mut single, mut double) = (false, false);
     // Whether the character before this one was an active redirection operator (`>` or `<`, unquoted and unescaped):
@@ -217,11 +228,8 @@ fn list(c: &[char], i: &mut usize, close: Option<char>, out: &mut Vec<Vec<Word>>
             // read); no body follows, and the command goes on (review r1, BG-R1-01; sol-loop r3, R2).
             '<' if !double && c[*i..].starts_with(&['<', '<', '<']) => {
                 s.end_word();
-                (s.started, s.data) = (true, true);
+                s.data = true;
                 *i += 3;
-                while matches!(c.get(*i), Some(' ' | '\t')) {
-                    *i += 1;
-                }
                 continue;
             }
             // A heredoc (`<<`, `<<-`): its body starts after this line.
@@ -264,6 +272,7 @@ fn list(c: &[char], i: &mut usize, close: Option<char>, out: &mut Vec<Vec<Word>>
     s.end(out);
     // An unterminated `${`, `$'` or delimiter steps past the end; the caller's slice must not (sol-loop r1, S1).
     *i = (*i).min(c.len());
+    s.dropped
 }
 
 /// A substitution opened at `c[start]`, read from `c[*i]` to past its `close`: its commands go to `out`; the word it
@@ -277,9 +286,10 @@ fn substitution(
     out: &mut Vec<Vec<Word>>,
 ) {
     let first = out.len();
-    list(c, i, Some(close), out);
+    let dropped = list(c, i, Some(close), out);
     word.text.extend(&c[start..*i]);
     word.vars.extend(out[first..].iter().flatten().flat_map(|w| w.vars.iter().copied()));
+    word.vars.extend(dropped);
 }
 
 /// A heredoc's delimiter, read from `c[*i]` just past `<<`: quotes and backslashes removed, as Bash compares it.
