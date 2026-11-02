@@ -256,7 +256,8 @@ fn list(
                 if ch == '\n' && !heredocs.is_empty() {
                     *i += 1;
                     for h in std::mem::take(&mut heredocs) {
-                        heredoc_body(c, i, &h, out);
+                        let dropped = heredoc_body(c, i, &h, out);
+                        s.dropped.extend(dropped);
                     }
                     continue;
                 }
@@ -348,8 +349,14 @@ fn as_received(body: &[char]) -> Vec<char> {
 }
 
 /// A heredoc's body, from `c[*i]` at a line's start to past the line that is its delimiter (or the end). Data, skipped,
-/// unless the command it feeds runs it: then its commands go to `out`, read as that command receives them.
-fn heredoc_body(c: &[char], i: &mut usize, h: &Heredoc, out: &mut Vec<Vec<Word>>) {
+/// unless the command it feeds runs it: then its commands go to `out`, read as that command receives them, and the
+/// variables of its here-string words are returned, as `list` returns them (sol-loop r5, P1).
+fn heredoc_body(
+    c: &[char],
+    i: &mut usize,
+    h: &Heredoc,
+    out: &mut Vec<Vec<Word>>,
+) -> Vec<(bool, bool)> {
     let mut body = Vec::new();
     while *i < c.len() {
         let end = c[*i..].iter().position(|x| *x == '\n').map_or(c.len(), |p| *i + p);
@@ -364,10 +371,11 @@ fn heredoc_body(c: &[char], i: &mut usize, h: &Heredoc, out: &mut Vec<Vec<Word>>
         body.extend(line);
         body.push('\n');
     }
-    if h.runs {
-        let body = if h.quoted { body } else { as_received(&body) };
-        list(&body, &mut 0, None, out);
+    if !h.runs {
+        return Vec::new();
     }
+    let body = if h.quoted { body } else { as_received(&body) };
+    list(&body, &mut 0, None, out)
 }
 
 /// The commands that run a heredoc's body: shells, and `ssh`, which gives it to the remote shell.
