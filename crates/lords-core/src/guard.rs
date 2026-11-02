@@ -736,8 +736,8 @@ fn here_string_opens(c: &[char], i: usize) -> bool {
 }
 
 /// Whether `out` ends with a variable that an `=` after it assigns to (`$page`, `${page}`, `$env:X`, the `+` of `+=`)
-/// where a statement starts, after only casts and further targets (`[string[]]$p`, `$a, $b`; sol-loop r2, S4, S8;
-/// review r1, D16-R1-02): PowerShell runs the command on its right-hand side.
+/// where a statement starts, after only casts (`[string[,]]$p`) and further targets each with its comma (`$a, $b`;
+/// sol-loop r2, S4, S8; review r1, D16-R1-02, its sol-loop R1, R2): PowerShell runs the command on its right side.
 fn assigns(out: &str) -> bool {
     let t = out.trim_end_matches([' ', '\t', '+', '-', '*', '/', '%', '?']);
     let var = if t.ends_with('}') {
@@ -748,7 +748,18 @@ fn assigns(out: &str) -> bool {
     };
     let Some(k) = var else { return false };
     let start = t[..k].rfind([';', '\n', '(', '&', '|']).map_or(0, |b| b + 1);
-    t[start..k].split([' ', '\t', ',']).all(|w| w.is_empty() || w.starts_with(['$', '[']))
+    let (mut depth, mut rest) = (0usize, String::new());
+    for ch in t[start..k].chars() {
+        match ch {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => rest.push(ch),
+            _ => {}
+        }
+    }
+    let rest = rest.trim_end_matches([' ', '\t']);
+    (rest.is_empty() || rest.ends_with(','))
+        && rest.split([' ', '\t', ',']).all(|w| w.is_empty() || w.starts_with('$'))
 }
 
 /// The page one simple command would have git open, if any (design note §1, from git's source at v2.56.0): D1 `git
