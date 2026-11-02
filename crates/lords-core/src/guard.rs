@@ -244,6 +244,8 @@ fn list(c: &[char], i: &mut usize, close: Option<char>, out: &mut Vec<Vec<Word>>
         *i += 1;
     }
     s.end(out);
+    // An unterminated `${`, `$'` or delimiter steps past the end; the caller's slice must not (sol-loop r1, S1).
+    *i = (*i).min(c.len());
 }
 
 /// A substitution opened at `c[start]`, read from `c[*i]` to past its `close`: its commands go to `out`; the word it
@@ -275,6 +277,8 @@ fn heredoc(c: &[char], i: &mut usize, runs: bool) -> Heredoc {
             Some(q) if ch == q => quote = None,
             Some(_) => delim.push(ch),
             None if ch == '\'' || ch == '"' => quote = Some(ch),
+            // `$'EOF'` and `$"EOF"`: the `$` is quoting, not part of the delimiter (sol-loop r1, S5).
+            None if ch == '$' && matches!(c.get(*i + 1), Some('\'' | '"')) => {}
             None if ch == '\\' => {
                 *i += 1;
                 delim.extend(c.get(*i));
@@ -391,7 +395,13 @@ const PREFIXES: [Prefix; 8] = [
     prefix("nohup", "", &[], "", false),
     prefix("env", "uCS", &["unset", "chdir", "split-string"], "", false),
     prefix("xargs", "adEILnPs", &[], "", false),
-    prefix("sudo", "ugCDprtTU", &[], "elvVK", false),
+    prefix(
+        "sudo",
+        "ugCDprtTU",
+        &["user", "group", "chdir", "host", "prompt", "role", "type", "other-user", "close-from"],
+        "elvVK",
+        false,
+    ),
     prefix("timeout", "ks", &["kill-after", "signal"], "", true),
 ];
 
