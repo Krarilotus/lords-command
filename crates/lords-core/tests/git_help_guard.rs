@@ -293,6 +293,8 @@ fn powershell_code_in_quoted_subexpressions_and_any_assignment() {
         "Write-Host \"help: $($page = git help config; $page)\"",
         "Write-Host \"$(if ($true) {git help config})\"",
         "[string[]]$page = git help config",
+        "[string[,]]$page = git help config",
+        "[System.Collections.Generic.Dictionary[string,object]]$p = git help config",
         "$a, $b = git help config",
     ] {
         assert_eq!(denied(command), [true, true], "{command}");
@@ -302,6 +304,7 @@ fn powershell_code_in_quoted_subexpressions_and_any_assignment() {
         "Write-Host \"`$($page = git help config)\"",
         "Write-Host \"see git help config\"",
         "Write-Host \"$($env:USERNAME) ran git help config\"",
+        "$cmd = 'Write-Output'; & $cmd $name=git help config",
     ] {
         assert_eq!(denied(command), [false, false], "{command}");
     }
