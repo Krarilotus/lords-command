@@ -222,6 +222,10 @@ pub(super) fn plan(stacks: &Stacks, private: &Stack, opts: &Options) -> Result<P
             .any(|f| *f == rel || f.strip_prefix(&rel).is_some_and(|r| r.starts_with('/')))
         {
             kept(&mut item, "the repo tracks it (or a file below it) now, and uninstall never touches a tracked file");
+            // A kept instruction file all the same: it holds what it names (sol-loop repair r1, U1).
+            if matches!(slot, Slot::AdapterFile(_)) {
+                kept_files.push(at.path().to_path_buf());
+            }
             plan.items.push(item);
             continue;
         }
