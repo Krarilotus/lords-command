@@ -3190,15 +3190,20 @@ fn apply_items<'a>(
     installed: &mut dyn FnMut(&Path),
 ) -> Result<(), String> {
     for item in changing.iter().copied() {
+        let mut put = false;
         let result = match item.class {
-            Class::Owner => owner_update(item, run, installed),
+            Class::Owner => owner_update(item, run, &mut |p: &Path| {
+                put = true;
+                installed(p)
+            }),
             Class::Tool => tool_change(item, ledger).and_then(|()| ledger.save(&plan.home)),
         };
-        applied.backups = run.dir.as_ref().map(|d| d.path().to_path_buf());
-        result?;
-        if item.codex_lords.is_some() {
+        // A Codex hooks file in place is settled, whatever failed after it went in (review r1, R1-02).
+        if put && item.codex_lords.is_some() {
             wrote.push(item);
         }
+        applied.backups = run.dir.as_ref().map(|d| d.path().to_path_buf());
+        result?;
         // The check after each action (design: Ownership boundary, "Operating assumption"; Sol review r3, R3-05).
         if item.action != Action::Forget {
             fsguard::verify_inside(&item.path, &item.root).map_err(|e| {
