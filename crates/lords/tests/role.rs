@@ -674,10 +674,20 @@ fn paths_folds_the_places_not_in_use_into_one_line() {
     }
 
     // Review r1, R1-03, its witness: a session opened in the aged worktree (Lords' session hook records it, as Claude
-    // Code's SessionStart runs it), with no git write, makes that place in use: its rows are listed, nothing folds.
-    let ev = serde_json::json!({"hook_event_name": "SessionStart", "session_id": "s-old",
-        "cwd": d.join("wt-old/sub"), "source": "startup", "transcript_path": "x"});
+    // Code's SessionStart runs it), with no git write, makes that place in use: its rows are listed, nothing folds. Its
+    // cwd names the worktree through an alias, a junction or symlink (sol-loop repair r1, R1-03).
     fs::create_dir_all(d.join("wt-old/sub")).unwrap();
+    #[cfg(windows)]
+    let o = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(d.join("alias"))
+        .arg(d.join("wt-old"))
+        .output();
+    #[cfg(unix)]
+    let o = std::os::unix::fs::symlink(d.join("wt-old"), d.join("alias"));
+    assert!(o.is_ok() && d.join("alias/sub").is_dir(), "{o:?}");
+    let ev = serde_json::json!({"hook_event_name": "SessionStart", "session_id": "s-old",
+        "cwd": d.join("alias/sub"), "source": "startup", "transcript_path": "x"});
     assert!(run(&d.join("home"), d, &["guard", "session"], &ev.to_string(), &[]).status.success());
     let o = lords(d, &[&["paths"][..], &stacks].concat(), &[]);
     let out = String::from_utf8_lossy(&o.stdout).into_owned();

@@ -843,6 +843,11 @@ fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
             assert!(env.git(&repo, &args).status.success(), "{name}: git {args:?}");
         }
     }
+    // Sol-loop repair r1, R1-01: the include refuses before anything is written, so a missing hooks dir stays missing.
+    fs::remove_dir_all(&hooks).unwrap();
+    env.git(&repo, &["config", "includeIf.gitdir:**/worktrees/.path", "linked-hooks.inc"]);
+    assert!(!install_post_checkout(&env, &repo, &stacks).status.success());
+    assert!(!hooks.exists(), "no hooks dir made");
 }
 
 /// Every file in `dir`, by name, with its bytes, sorted.
