@@ -55,6 +55,41 @@ fn unset(file: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Puts `command` in as the hook's, then the event (an event without a command makes every hook run fail), each in
+/// place where it is set, so an earlier entry put back is what it was.
+fn put(file: &Path, command: &str) -> Result<(), String> {
+    git_file(file, &[&format!("{SECTION}.command"), command])?;
+    git_file(file, &[&format!("{SECTION}.event"), "post-checkout"])
+}
+
+/// The command of Lords' entry (`entries`); Lords' entry always has one.
+fn command_of(entry: &[u8]) -> String {
+    let text = String::from_utf8_lossy(entry).into_owned();
+    let found = text.split('\0').find_map(|e| e.strip_prefix(&format!("{SECTION}.command\n")));
+    found.unwrap_or_default().to_string()
+}
+
+/// A failure's rollback (C7): where `file` differs from `before`, `undo`, then whether it is byte for byte as before.
+fn back(
+    file: &Path,
+    before: &Option<Vec<u8>>,
+    undo: impl FnOnce() -> Result<(), String>,
+) -> String {
+    let at = file.display();
+    let now = fsguard::read(file).and_then(|now| {
+        if now == *before {
+            Ok(now)
+        } else {
+            undo().and_then(|()| fsguard::read(file))
+        }
+    });
+    match now {
+        Ok(now) if now == *before => format!("{at} is as it was"),
+        Ok(_) => format!("{at} differs from before, outside what Lords wrote"),
+        Err(u) => format!("putting {at} back failed: {u}"),
+    }
+}
+
 /// Whether the ledger records a config hook for `repo`: it then stays the repo's route (C6).
 pub(super) fn recorded(repo: &Path, ledger: &Ledger) -> Result<bool, String> {
     Ok(ledger.owned.get(&key(&file(repo)?)).is_some_and(|o| o.kind == "config"))
@@ -91,9 +126,7 @@ pub(super) fn install(
         (Some(b), Some(sha))
             if b.iter().filter(|&&c| c == 0).count() == scopes.len() && fsguard::sha(b) == sha =>
         {
-            let text = String::from_utf8_lossy(b).into_owned();
-            text.split('\0')
-                .find_map(|e| e.strip_prefix(&format!("{SECTION}.command\n")).map(str::to_string))
+            Some(command_of(b))
         }
         _ => {
             let mut s = scopes.clone();
@@ -113,9 +146,7 @@ pub(super) fn install(
         "lords_post_checkout() {{\n{}}}\nlords_post_checkout",
         script.strip_prefix("#!/bin/sh\n").unwrap_or(&script)
     );
-    // The command before the event: an event without a command makes every hook run fail.
-    let done = git_file(&file, &[&format!("{SECTION}.command"), &command])
-        .and_then(|()| git_file(&file, &[&format!("{SECTION}.event"), "post-checkout"]))
+    let done = put(&file, &command)
         .and_then(|()| post_checkout_reaches_new_worktree(repo, home, &label))
         .and_then(|()| {
             let now = entries(&file)?.ok_or("its entry is gone")?;
@@ -130,16 +161,11 @@ pub(super) fn install(
             ledger.save(home)
         });
     if let Err(e) = done {
-        let undone = match &earlier {
-            Some(old) => git_file(&file, &[&format!("{SECTION}.command"), old]),
+        let undo = || match &earlier {
+            Some(old) => put(&file, old),
             None => unset(&file),
         };
-        let at = file.display();
-        return Err(match undone.and_then(|()| fsguard::read(&file)) {
-            Ok(now) if now == before => format!("{e}; {at} is as it was"),
-            Ok(_) => format!("{e}; {at} differs from before, outside what Lords wrote"),
-            Err(u) => format!("{e}; putting {at} back failed: {u}"),
-        });
+        return Err(format!("{e}; {}", back(&file, &before, undo)));
     }
     Ok(Installed {
         hook: file,
@@ -152,7 +178,9 @@ pub(super) fn install(
 
 /// `lords uninstall`'s config hooks (C8), each the ledger records for `repo` (for every repo where `None`): an entry that
 /// still holds what Lords wrote goes, with its record; one that is gone or changed loses its record, and a changed one
-/// stays as it is; one that can't be read stays, with its record. Only `apply` changes anything. One line each.
+/// stays as it is; one that can't be read stays, with its record. Only `apply` changes anything. One line each. All or
+/// nothing, as install is (review r1, D14b-R1-01): the ledger is saved first, so a save that fails leaves every entry as
+/// it was; a removal that fails after it puts its entry back as a refused install does, and its record.
 pub fn uninstall(home: &Path, repo: Option<&str>, apply: bool) -> Result<Vec<String>, String> {
     let _lock = if apply { Some(ApplyLock::take(home, 60)?) } else { None };
     let mut ledger = Ledger::load(home)?;
@@ -162,22 +190,17 @@ pub fn uninstall(home: &Path, repo: Option<&str>, apply: bool) -> Result<Vec<Str
         .filter(|o| o.scope.strip_prefix(SCOPE).is_some_and(|n| repo.is_none_or(|r| r == n)))
         .cloned()
         .collect();
-    let mut lines = Vec::new();
+    let (mut lines, mut going) = (Vec::new(), Vec::new());
     for o in &mine {
         let file = PathBuf::from(&o.root);
         let what = format!("{SECTION} in {}", file.display());
-        let line = match entries(&file) {
-            Ok(None) => "gone already; its ledger record goes",
-            Ok(Some(b)) if fsguard::sha(&b) == o.sha => {
-                match apply.then(|| unset(&file)).transpose() {
-                    Ok(_) => "Lords', unchanged: it goes",
-                    Err(e) => {
-                        lines.push(format!("{what}: can't remove it ({e}); left, with its record"));
-                        continue;
-                    }
-                }
+        let line = match entries(&file).and_then(|e| fsguard::read(&file).map(|b| (e, b))) {
+            Ok((None, _)) => "gone already; its ledger record goes",
+            Ok((Some(entry), before)) if fsguard::sha(&entry) == o.sha => {
+                going.push((o, file.clone(), before, command_of(&entry)));
+                "Lords', unchanged: it goes"
             }
-            Ok(Some(_)) => "changed since Lords wrote it: left as it is, and no longer the tool's (its record goes)",
+            Ok(_) => "changed since Lords wrote it: left as it is, and no longer the tool's (its record goes)",
             Err(e) => {
                 lines.push(format!("{what}: can't check it ({e}); left as it is, with its record"));
                 continue;
@@ -186,7 +209,23 @@ pub fn uninstall(home: &Path, repo: Option<&str>, apply: bool) -> Result<Vec<Str
         ledger.forget(&o.path());
         lines.push(format!("{what}: {line}"));
     }
-    if apply && !mine.is_empty() {
+    if !apply || mine.is_empty() {
+        return Ok(lines);
+    }
+    ledger.save(home)?;
+    let mut kept = false;
+    for (o, file, before, old) in going {
+        if let Err(e) = unset(&file) {
+            let said = back(&file, &before, || put(&file, &old));
+            ledger.owned.insert(key(&file), o.clone());
+            kept = true;
+            lines.push(format!(
+                "{SECTION} in {}: can't remove it ({e}); {said}, with its record",
+                file.display()
+            ));
+        }
+    }
+    if kept {
         ledger.save(home)?;
     }
     Ok(lines)
