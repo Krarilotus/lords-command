@@ -117,15 +117,19 @@ impl Adapter for ClaudeCode {
 
     /// A child's start goes in one hook, one read (fix check r2, FC1), with sync's tool home and the deadline the
     /// guard's waits end inside (`guard::CHILD_HOOK_TIMEOUT_SECS`; fix check r2, FC5); a launched session's role start
-    /// alike (F10).
+    /// alike (F10), naming its harness, whose place file the start goes beside (F10-R1-03).
     fn guard_hooks(&self, exe: &str, guard: &str, home: &str) -> Vec<serde_json::Value> {
         if guard != "child" && guard != "role" {
             return vec![
                 serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard] }),
             ];
         }
+        let mut args = vec!["guard", guard, "--home", home];
+        if guard == "role" {
+            args.extend(["--adapter", self.id()]);
+        }
         vec![
-            serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard, "--home", home], "timeout": crate::guard::CHILD_HOOK_TIMEOUT_SECS }),
+            serde_json::json!({ "type": "command", "command": exe, "args": args, "timeout": crate::guard::CHILD_HOOK_TIMEOUT_SECS }),
         ]
     }
 
@@ -181,12 +185,16 @@ impl Adapter for Codex {
     /// with PowerShell, where a line starting with a quoted path is no command (design note 2026-11-02-lords-role-at-
     /// launch, H8, H9): there it is PowerShell's call, `& 'exe' …`, each path a literal string.
     fn guard_hooks(&self, exe: &str, guard: &str, home: &str) -> Vec<serde_json::Value> {
-        let line = if cfg!(windows) {
+        let mut line = if cfg!(windows) {
             let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
             format!("& {} guard {guard} --home {}", lit(exe), lit(home))
         } else {
             format!("\"{exe}\" guard {guard} --home \"{home}\"")
         };
+        // The role hook names its harness, whose place file the start goes beside (F10-R1-03).
+        if guard == "role" {
+            line.push_str(" --adapter codex");
+        }
         vec![serde_json::json!({
             "type": "command",
             "command": line,

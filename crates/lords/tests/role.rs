@@ -46,6 +46,9 @@ impl Place {
         fs::create_dir_all(p.home()).unwrap();
         p.start("reviewer", "REVIEWER START.");
         p.start("coder", "CODER START.");
+        // Claude's place file, which a start goes beside (F10-R1-03; the session guard is Claude Code's).
+        fs::write(p.dir.path().join("place/CLAUDE.local.md"), format!("{BEGIN}\nplace\n{END}\n"))
+            .unwrap();
         p
     }
     fn home(&self) -> PathBuf {

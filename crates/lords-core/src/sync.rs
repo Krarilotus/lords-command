@@ -113,9 +113,10 @@ pub struct Item {
     /// Among them the child guard: apply checks the copy speaks this build's child protocol too (fix check r2, FC4).
     #[serde(skip)]
     pub(crate) names_child_guard: bool,
-    /// And the role guard: apply checks the copy speaks this build's role protocol (F10, design note D6).
+    /// And the role guard, for this adapter: apply checks the copy speaks this build's role protocol (F10, design
+    /// note D6).
     #[serde(skip)]
-    pub(crate) names_role_guard: bool,
+    pub(crate) names_role_guard: Option<&'static str>,
 }
 
 /// An item as plans show it (`--json`, the app): a redacted item without its texts.
@@ -254,7 +255,7 @@ impl Item {
             redacted: false,
             names_guard: None,
             names_child_guard: false,
-            names_role_guard: false,
+            names_role_guard: None,
         }
     }
 
@@ -368,17 +369,28 @@ fn guard_ready(place: &Contained) -> Result<(), String> {
 /// child hooks run (`process::guard_protocol`), so sync never names a copy in a hook whose arguments it refuses
 /// or whose answer is another protocol's. Checked when planning and again when applying. Read only.
 fn guard_speaks_child(place: &Contained, home: &Path) -> Result<(), String> {
-    guard_speaks(place, home, "child", crate::guard::CHILD_PROTOCOL)
+    guard_speaks(place, home, "child", &[], crate::guard::CHILD_PROTOCOL)
 }
 
-/// Whether the guard copy speaks this build's role protocol, asked as `guard_speaks_child` asks (design note D6).
-pub(crate) fn guard_speaks_role(place: &Contained, home: &Path) -> Result<(), String> {
-    guard_speaks(place, home, "role", crate::guard::ROLE_PROTOCOL)
+/// Whether the guard copy speaks this build's role protocol, asked as `guard_speaks_child` asks, with the role hook's
+/// harness as `adapter`'s hook names it (design note D6; F10-R1-03).
+pub(crate) fn guard_speaks_role(
+    place: &Contained,
+    home: &Path,
+    adapter: &str,
+) -> Result<(), String> {
+    guard_speaks(place, home, "role", &["--adapter", adapter], crate::guard::ROLE_PROTOCOL)
 }
 
 /// Whether the guard copy answers protocol `want` of guard `which` (`process::guard_protocol`).
-fn guard_speaks(place: &Contained, home: &Path, which: &str, want: u32) -> Result<(), String> {
-    let have = crate::process::guard_protocol(place.path(), which, home)
+fn guard_speaks(
+    place: &Contained,
+    home: &Path,
+    which: &str,
+    extra: &[&str],
+    want: u32,
+) -> Result<(), String> {
+    let have = crate::process::guard_protocol(place.path(), which, home, extra)
         .map_err(|e| format!("the guard copy's {which} protocol can't be told ({e})"));
     match have {
         Ok(Some(n)) if n == want => Ok(()),
@@ -1377,9 +1389,9 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
             return conflict(&t.name, &path, e);
         }
     }
-    let role = guards.iter().any(|g| g == "role");
-    if role {
-        if let Err(e) = guard_speaks_role(&guard, &pl.plan.home) {
+    let role = guards.iter().any(|g| g == "role").then(|| adapter.id());
+    if let Some(id) = role {
+        if let Err(e) = guard_speaks_role(&guard, &pl.plan.home, id) {
             return conflict(&t.name, &path, e);
         }
     }
@@ -2980,8 +2992,9 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
         if i.names_child_guard {
             guard_speaks_child(g, &plan.home).map_err(|e| format!("{e} (nothing was changed)"))?;
         }
-        if i.names_role_guard {
-            guard_speaks_role(g, &plan.home).map_err(|e| format!("{e} (nothing was changed)"))?;
+        if let Some(id) = i.names_role_guard {
+            guard_speaks_role(g, &plan.home, id)
+                .map_err(|e| format!("{e} (nothing was changed)"))?;
         }
     }
     let mut run = Run::new(&plan.home)?;

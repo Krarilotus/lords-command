@@ -103,14 +103,17 @@ pub(crate) fn guard_self_test(guard_copy: &Path) -> Result<(), String> {
 /// The protocol of guard `which` (`child`, `role`) in the guard copy (`guard::CHILD_PROTOCOL`, `guard::ROLE_PROTOCOL`),
 /// asked with exactly the arguments sync writes into its hook (`guard <which> --home <home>`, Claude Code's and Codex's
 /// alike) and the probe event on stdin (fix check r2, FC4): `None` when it answers anything else, as a copy from before
-/// that protocol does (no such guard, no `--home`, or no answer to the probe).
+/// that protocol does (no such guard, no `--home`, or no answer to the probe). `extra`: the hook's further arguments
+/// (the role hook's `--adapter ID`).
 pub(crate) fn guard_protocol(
     guard_copy: &Path,
     which: &str,
     home: &Path,
+    extra: &[&str],
 ) -> Result<Option<u32>, String> {
     let home = home.to_string_lossy();
-    let args = ["guard", which, "--home", &home];
+    let mut args = vec!["guard", which, "--home", &home];
+    args.extend(extra);
     let probe = format!("{{\"hook_event_name\":\"{}\"}}", crate::guard::CHILD_PROBE_EVENT);
     let what = format!("guard {which} probe");
     let (status, out) = run_guard(guard_copy, &args, probe.as_bytes(), &what)?;

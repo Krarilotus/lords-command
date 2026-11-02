@@ -44,7 +44,7 @@ usage:
   lords guard session   Claude's SessionStart hook: records the Lords files the session reads
   lords guard turn   Claude's UserPromptSubmit hook: the clock, and the Lords files changed since the session started
   lords guard child [--home DIR]   the SubagentStart hook: a native child starts with its role's start file in its place
-  lords guard role [--home DIR]   the UserPromptSubmit hook: a session whose launch names its role gets that role's start
+  lords guard role [--home DIR] [--adapter ID]   the UserPromptSubmit hook: a session gets the start of the role its launch names
   lords guard install [--home DIR]   install or update the guard copy the hooks run (sync never writes it)
   lords panel serve [--port N]   the window on another PC reads and edits these stacks through it (127.0.0.1:7879)
   lords panel add ALIAS --bridge DIR [--embedded] [--apply]   set a PC this one reaches as ALIAS up for the panel;
@@ -235,12 +235,28 @@ fn guard_rules(which: &str, a: Args) -> ExitCode {
 /// on stderr and exit 0.
 fn guard_child(which: &str, mut a: Args) -> ExitCode {
     let note = |line: &str| say_err(&format!("lords guard {which}: {line}"));
-    let usage = format!("usage `lords guard {which} [--home DIR]` (event on stdin)");
+    let usage = if which == "role" {
+        "usage `lords guard role [--home DIR] [--adapter ID]` (event on stdin)".to_string()
+    } else {
+        format!("usage `lords guard {which} [--home DIR]` (event on stdin)")
+    };
     let home = match a.value("--home") {
         Ok(h) => h.map(PathBuf::from),
         Err(_) => {
             note(&usage);
             return ExitCode::SUCCESS;
+        }
+    };
+    // The harness the role hook runs for, whose place file its start goes beside (F10-R1-03).
+    let adapter = if which != "role" {
+        None
+    } else {
+        match a.value("--adapter") {
+            Ok(id) => id,
+            Err(_) => {
+                note(&usage);
+                return ExitCode::SUCCESS;
+            }
         }
     };
     if a.done().is_err() {
@@ -265,7 +281,8 @@ fn guard_child(which: &str, mut a: Args) -> ExitCode {
     let answer = if which == "role" {
         let delegated = std::env::var("T3CODE_THREAD_ID")
             .is_ok_and(|t| t.starts_with(lords_core::guard::DELEGATED_THREAD));
-        lords_core::guard::role_hook(&input, &lords_core::guard::RoleEnv { home, delegated })
+        let env = lords_core::guard::RoleEnv { home, delegated, adapter };
+        lords_core::guard::role_hook(&input, &env)
     } else {
         lords_core::guard::child_hook(&input, &home)
     };
