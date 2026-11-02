@@ -2433,7 +2433,8 @@ fn helper_guard(env: &Env, args: &[&str], vars: &[(&str, String)], event: &str) 
 // here this test process); it is refused, naming `delegate_task`, when `CLAUDE_PID` names a live process launched with
 // `--allowedTools mcp__t3-code__*`; a `CLAUDE_PID` that isn't a number or names no process, and a usage error, are
 // exit 0, nothing on stdout, a note naming the guard. The reader gives that process's arguments back as they were
-// passed (on Windows, the line Rust's quoting wrote: an independent writer).
+// passed (the line Rust's quoting wrote: an independent writer). On other systems than Windows no process is read
+// (§2): with a T3 thread a helper start goes through, with a note.
 #[test]
 fn the_helper_guard_tells_t3_from_a_cli_through_the_binary() {
     use std::process::Stdio;
@@ -2449,8 +2450,17 @@ fn the_helper_guard_tells_t3_from_a_cli_through_the_binary() {
         assert_eq!(o.status.code(), Some(0), "{what}: {}", text(o));
         assert!(o.stdout.is_empty() && o.stderr.is_empty(), "{what}: {}", text(o));
     };
+    let noted = |o: &Output, what: &str| {
+        assert_eq!(o.status.code(), Some(0), "{what}: {}", text(o));
+        assert!(o.stdout.is_empty(), "{what}: {}", text(o));
+        assert!(String::from_utf8_lossy(&o.stderr).contains("guard helper"), "{what}: {}", text(o));
+    };
     silent(&helper_guard(&env, guard, &[], &ev), "no T3 thread");
+    noted(&helper_guard(&env, &["guard", "helper", "extra"], &[], &ev), "a usage error");
     let me = pid(std::process::id().to_string());
+    if !cfg!(windows) {
+        return noted(&helper_guard(&env, guard, &[thread(), me], &ev), "no reader here");
+    }
     silent(&helper_guard(&env, guard, &[thread(), me], &ev), "a CLI from a T3 agent's shell");
     // A live process launched as T3 launches a session: the Codex stub waits on its stdin and ignores these arguments.
     let args = [
@@ -2488,15 +2498,8 @@ fn the_helper_guard_tells_t3_from_a_cli_through_the_binary() {
     gone.wait().unwrap();
     drop(gone);
     for p in ["x".to_string(), gone_pid.to_string()] {
-        let o = helper_guard(&env, guard, &[thread(), pid(p.clone())], &ev);
-        assert_eq!(o.status.code(), Some(0), "{p}: {}", text(&o));
-        assert!(o.stdout.is_empty(), "{p}: {}", text(&o));
-        assert!(String::from_utf8_lossy(&o.stderr).contains("guard helper"), "{p}: {}", text(&o));
+        noted(&helper_guard(&env, guard, &[thread(), pid(p.clone())], &ev), &p);
     }
-    let o = helper_guard(&env, &["guard", "helper", "extra"], &[], &ev);
-    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
-    assert!(o.stdout.is_empty(), "{}", text(&o));
-    assert!(String::from_utf8_lossy(&o.stderr).contains("guard helper"), "{}", text(&o));
 }
 
 // Spec: D16's brief: "probe whether Claude's `PowerShell` tool and Codex's shell tool reach a PreToolUse hook with the

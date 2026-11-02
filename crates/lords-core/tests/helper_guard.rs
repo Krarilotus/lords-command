@@ -298,14 +298,17 @@ fn a_windows_command_line_splits_as_its_program_reads_it() {
     assert_eq!(t3::session(Some("thread:x"), Some("1"), |_| Ok(argv)), Ok(true));
 }
 
-// Spec (design note §5.1, the reader: Windows `NtQueryInformationProcess`, Linux `/proc/<pid>/cmdline`; A10): this
-// test process's command line reads back as the arguments it was started with (std's own reading,
-// `std::env::args`); a process id no process has is an error, never an empty line.
+// Spec (design note §5.1, the reader: Windows `NtQueryInformationProcess`; §2: on other systems it reads nothing, so
+// the guard lets the call through; A10): on Windows this test process's command line reads back as the arguments it
+// was started with (std's own reading, `std::env::args`); elsewhere it is an error; a process id no process has is an
+// error, never an empty line.
 #[test]
 fn a_process_command_line_reads_back_as_started() {
-    if cfg!(any(windows, target_os = "linux")) {
-        let own: Vec<String> = std::env::args().collect();
-        assert_eq!(command_line(std::process::id()), Ok(own));
+    let own = command_line(std::process::id());
+    if cfg!(windows) {
+        assert_eq!(own, Ok(std::env::args().collect::<Vec<_>>()));
+    } else {
+        assert!(own.is_err(), "{own:?}");
     }
     assert!(command_line(u32::MAX).is_err());
 }

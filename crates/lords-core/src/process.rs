@@ -547,10 +547,10 @@ fn image_of(pid: u32) -> Option<std::path::PathBuf> {
     }
 }
 
-/// The arguments process `pid` (one of this user's) was started with, read only: on Windows its command line
-/// (`NtQueryInformationProcess`, `ProcessCommandLineInformation`) split as its program reads it (`split_command_line`),
-/// on Linux `/proc/<pid>/cmdline`. Every failure is an error. The helper guard's T3 test reads its session's process
-/// with it (t3.rs).
+/// The arguments process `pid` (one of this user's) was started with, read only: its command line
+/// (`NtQueryInformationProcess`, `ProcessCommandLineInformation`) split as its program reads it (`split_command_line`).
+/// Every failure is an error, and so is any other system than Windows, as for `running`. The helper guard's T3 test
+/// reads its session's process with it (t3.rs).
 #[cfg(windows)]
 pub fn command_line(pid: u32) -> Result<Vec<String>, String> {
     use windows_sys::Wdk::System::Threading::{
@@ -594,20 +594,9 @@ pub fn command_line(pid: u32) -> Result<Vec<String>, String> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(not(windows))]
 pub fn command_line(pid: u32) -> Result<Vec<String>, String> {
-    let raw = crate::fsguard::read_bytes(format!("/proc/{pid}/cmdline"))
-        .map_err(|e| format!("process {pid}: {e}"))?;
-    if raw.is_empty() {
-        return Ok(Vec::new());
-    }
-    let args = raw.strip_suffix(&[0u8]).unwrap_or(&raw);
-    Ok(args.split(|b| *b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect())
-}
-
-#[cfg(not(any(windows, target_os = "linux")))]
-pub fn command_line(pid: u32) -> Result<Vec<String>, String> {
-    Err(format!("process {pid}: command lines are read on Windows and Linux only"))
+    Err(format!("process {pid}: command lines are read on Windows only"))
 }
 
 /// A Windows command line as the arguments its program reads, by the C runtime's rules (Microsoft Learn, "Parsing C++
