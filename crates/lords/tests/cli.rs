@@ -2355,6 +2355,150 @@ fn sync_registers_the_time_guard_and_the_binary_answers() {
     assert!(String::from_utf8_lossy(&o.stderr).contains("guard time"), "{}", text(&o));
 }
 
+// Spec (design note 2026-11-02-lords-native-helper-guard §2: "A guard `helper` on `PreToolUse`, registered by sync like
+// the others: Claude: matcher on the native helper tool names (`Agent`, `Task`)"; the Lords owner, 3 Nov: until H8/H9
+// are checked live "the guard does nothing in Codex"; A4: the plan names the matcher, so a rename shows; I5: the other
+// guards' entries stay): with `guards = ["rm", "helper"]` sync writes the rm entry and a `PreToolUse` entry `Agent|Task`
+// running `guard helper`, the plan says so, `lords check` accepts the target; a Codex hooks target asking for `helper`
+// is refused and its file isn't written.
+#[test]
+fn sync_registers_the_helper_guard_for_claude_code_only() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (public, private) = (d.join("pub"), d.join("priv"));
+    fs::create_dir_all(&public).unwrap();
+    fs::create_dir_all(&private).unwrap();
+    fs::create_dir_all(d.join("home/.claude-balanced")).unwrap();
+    fs::create_dir_all(d.join("home/.codex")).unwrap();
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    let claude = "[[targets]]\nname = \"balanced settings\"\nadapter = \"claude\"\nkind = \"settings\"\npath = \"~/.claude-balanced/settings.json\"\nguards = [\"rm\", \"helper\"]\n";
+    let head = "name = \"priv\"\nvisibility = \"private\"\n";
+    fs::write(private.join("stack.toml"), format!("{head}{claude}")).unwrap();
+    assert!(env.git(&private, &["init", "-q"]).status.success());
+    env.git(&private, &["add", "-A"]);
+    env.git(&private, &["commit", "-q", "-m", "start"]);
+    let stacks =
+        ["--public-stack", public.to_str().unwrap(), "--private-stack", private.to_str().unwrap()];
+    assert!(env.lords(d, &["guard", "install"]).status.success());
+    let o = env.lords(d, &[&["sync", "--user"][..], &stacks].concat());
+    let added = "Lords hook added: the helper guard (PreToolUse, Agent|Task)";
+    assert!(text(&o).contains(added), "{}", text(&o));
+    let o = env.lords(d, &[&["sync", "--user", "--apply"][..], &stacks].concat());
+    assert!(o.status.success(), "{}", text(&o));
+    let named =
+        d.join("home/.lords-command/bin/lords-guard.exe").display().to_string().replace('\\', "/");
+    let lords =
+        |g: &str| serde_json::json!({"type": "command", "command": named, "args": ["guard", g]});
+    let v: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(d.join("home/.claude-balanced/settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        v["hooks"]["PreToolUse"],
+        serde_json::json!([
+            {"matcher": "Bash|PowerShell", "hooks": [lords("rm")]},
+            {"matcher": "Agent|Task", "hooks": [lords("helper")]},
+        ])
+    );
+    let out = text(&env.lords(d, &[&["check"][..], &stacks].concat()));
+    assert!(!out.contains("settings.json") && !out.contains("guards"), "{out}");
+    let codex = "[[targets]]\nname = \"codex hooks\"\nadapter = \"codex\"\nkind = \"settings\"\npath = \"~/.codex/hooks.json\"\nguards = [\"helper\"]\n";
+    fs::write(private.join("stack.toml"), format!("{head}{claude}{codex}")).unwrap();
+    env.git(&private, &["commit", "-q", "-a", "-m", "a helper guard for Codex"]);
+    let o = env.lords(d, &[&["sync", "--user", "--apply"][..], &stacks].concat());
+    assert!(!o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("runs no `helper` guard"), "{}", text(&o));
+    assert!(!d.join("home/.codex/hooks.json").exists(), "nothing written");
+}
+
+/// `lords guard <args>` with this event on stdin and, of the T3 test's variables (`T3CODE_THREAD_ID`, `CLAUDE_PID`),
+/// only `vars`: the session running these tests may carry its own, which never reach the guard here.
+fn helper_guard(env: &Env, args: &[&str], vars: &[(&str, String)], event: &str) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_lords"), env.dir.path());
+    c.args(args).env_remove("T3CODE_THREAD_ID").env_remove("CLAUDE_PID");
+    for (k, v) in vars {
+        c.env(k, v);
+    }
+    let mut c =
+        c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    c.stdin.take().unwrap().write_all(event.as_bytes()).unwrap();
+    c.wait_with_output().unwrap()
+}
+
+// Spec (design note 2026-11-02-lords-native-helper-guard §5.1, the choice; I1, I2, I4, A1, A2, A10; §2: "Outside T3 it
+// allows, always and silently"): through the binary, an `Agent` call goes through silently with no T3 thread (a plain
+// CLI) and with a thread whose `CLAUDE_PID` names a process launched without T3's tools (a CLI from a T3 agent's shell;
+// here this test process); it is refused, naming `delegate_task`, when `CLAUDE_PID` names a live process launched with
+// `--allowedTools mcp__t3-code__*`; a `CLAUDE_PID` that isn't a number or names no process, and a usage error, are
+// exit 0, nothing on stdout, a note naming the guard. The reader gives that process's arguments back as they were
+// passed (on Windows, the line Rust's quoting wrote: an independent writer).
+#[test]
+fn the_helper_guard_tells_t3_from_a_cli_through_the_binary() {
+    use std::process::Stdio;
+    let env = Env::new();
+    let d = env.dir.path();
+    let ev = serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": "Agent",
+        "tool_input": {"subagent_type": "general-purpose", "prompt": "p"}})
+    .to_string();
+    let guard = &["guard", "helper"][..];
+    let thread = || ("T3CODE_THREAD_ID", "thread:delegated-task:x".to_string());
+    let pid = |p: String| ("CLAUDE_PID", p);
+    let silent = |o: &Output, what: &str| {
+        assert_eq!(o.status.code(), Some(0), "{what}: {}", text(o));
+        assert!(o.stdout.is_empty() && o.stderr.is_empty(), "{what}: {}", text(o));
+    };
+    silent(&helper_guard(&env, guard, &[], &ev), "no T3 thread");
+    let me = pid(std::process::id().to_string());
+    silent(&helper_guard(&env, guard, &[thread(), me], &ev), "a CLI from a T3 agent's shell");
+    // A live process launched as T3 launches a session: the Codex stub waits on its stdin and ignores these arguments.
+    let args = [
+        "app-server",
+        "--allowedTools",
+        "mcp__t3-code__*",
+        "--tools",
+        "default",
+        "a b",
+        r#"x"y"#,
+        r"C:\dir with space\",
+        "",
+    ];
+    let mut t3 = env
+        .cmd(env!("CARGO_BIN_EXE_lords-codex-stub"), d)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let read = lords_core::process::command_line(t3.id());
+    let o = helper_guard(&env, guard, &[thread(), pid(t3.id().to_string())], &ev);
+    drop(t3.stdin.take());
+    t3.wait().unwrap();
+    let want: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    assert_eq!(read.map(|a| a.into_iter().skip(1).collect::<Vec<_>>()), Ok(want));
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{v}");
+    let reason = v["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
+    assert!(reason.contains("delegate_task"), "{reason}");
+    let mut gone = env.cmd("git", d).arg("--version").stdout(Stdio::null()).spawn().unwrap();
+    let gone_pid = gone.id();
+    gone.wait().unwrap();
+    drop(gone);
+    for p in ["x".to_string(), gone_pid.to_string()] {
+        let o = helper_guard(&env, guard, &[thread(), pid(p.clone())], &ev);
+        assert_eq!(o.status.code(), Some(0), "{p}: {}", text(&o));
+        assert!(o.stdout.is_empty(), "{p}: {}", text(&o));
+        assert!(String::from_utf8_lossy(&o.stderr).contains("guard helper"), "{p}: {}", text(&o));
+    }
+    let o = helper_guard(&env, &["guard", "helper", "extra"], &[], &ev);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    assert!(o.stdout.is_empty(), "{}", text(&o));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("guard helper"), "{}", text(&o));
+}
+
 // Spec: D16's brief: "probe whether Claude's `PowerShell` tool and Codex's shell tool reach a PreToolUse hook with the
 // command text. Cover each that does, with the same check" (design note 2026-11-02-lords-git-help-guard §2: both do;
 // Codex sends its commands as `Bash`, in PowerShell on Windows; §3: Codex runs the `rm` guard, its line on Windows

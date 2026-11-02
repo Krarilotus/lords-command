@@ -547,6 +547,17 @@ fn image_of(pid: u32) -> Option<std::path::PathBuf> {
     }
 }
 
+/// The arguments process `pid` was started with (the helper guard's T3 test, t3.rs). Not built yet: the tests come
+/// first.
+pub fn command_line(_pid: u32) -> Result<Vec<String>, String> {
+    Err("not built yet".into())
+}
+
+/// A Windows command line as the arguments its program reads. Not built yet: the tests come first.
+pub fn split_command_line(_line: &str) -> Vec<String> {
+    Vec::new()
+}
+
 /// Stops process `pid` alone, not its children (a bridge listener's live sessions are its children, and stay), and
 /// only while it is `image`: the check and the stop go through one open handle, so a pid reused by another program
 /// is never stopped.
