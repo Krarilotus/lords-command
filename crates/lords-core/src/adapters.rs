@@ -62,6 +62,10 @@ pub trait Adapter: Sync {
     fn guards(&self) -> &'static [&'static str] {
         &[]
     }
+    /// The rm hook's arguments after `guard rm`, which sync's probe asks with too (review r1, D16-R1-01).
+    fn rm_args(&self) -> &'static [&'static str] {
+        &[]
+    }
     /// The hook entries that run guard `guard` of Lords' copy `exe`: one.
     /// `home`: the tool home sync runs with, which `child` takes (its apply lock; repair 2 sol-loop r3, X1).
     fn guard_hooks(&self, exe: &str, guard: &str, _home: &str) -> Vec<serde_json::Value> {
@@ -183,6 +187,15 @@ impl Adapter for Codex {
         &["rm", "child", "role", "time"]
     }
 
+    /// Its shell commands, sent as `Bash`, are PowerShell's on Windows (git-help-guard design note, §2).
+    fn rm_args(&self) -> &'static [&'static str] {
+        if cfg!(windows) {
+            &["--shell", "powershell"]
+        } else {
+            &[]
+        }
+    }
+
     /// A command line, and the whole context passed on (`additionalContextLimit` 0): no parts. On Windows Codex runs it
     /// with PowerShell, where a line starting with a quoted path is no command (design note 2026-11-02-lords-role-at-
     /// launch, H8, H9): there it is PowerShell's call, `& 'exe' …`, each path a literal string. Only `child` and `role`
@@ -201,9 +214,8 @@ impl Adapter for Codex {
         if guard == "role" {
             line.push_str(" --adapter codex");
         }
-        // The shell commands it sends as `Bash` are PowerShell's on Windows (git-help-guard design note, §2).
-        if guard == "rm" && cfg!(windows) {
-            line.push_str(" --shell powershell");
+        if guard == "rm" {
+            line.extend(self.rm_args().iter().map(|a| format!(" {a}")));
         }
         vec![serde_json::json!({
             "type": "command",

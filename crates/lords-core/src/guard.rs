@@ -653,6 +653,8 @@ pub enum Shell {
 fn powershell_as_bash(text: &str) -> String {
     let c: Vec<char> = text.replace("\r\n", "\n").replace('\r', "\n").chars().collect();
     let (mut out, mut i, mut single, mut double) = (String::new(), 0, false, false);
+    // The open `$( … )`s: the string state each was opened in, and its open parentheses.
+    let mut subs: Vec<(bool, usize)> = Vec::new();
     while let Some(&ch) = c.get(i) {
         i += 1;
         if single {
@@ -673,7 +675,21 @@ fn powershell_as_bash(text: &str) -> String {
                 i = end;
             }
             '{' | '}' if !double => out.push(';'),
-            '(' if out.ends_with("$(") => out.push_str(" ("),
+            // `$( … )` is code, in a string too, to its `)` (review r1, D16-R1-02); `$((` holds a group.
+            '$' if c.get(i) == Some(&'(') => {
+                out.push_str(if c.get(i + 1) == Some(&'(') { "$( " } else { "$(" });
+                subs.push((double, 0));
+                (double, i) = (false, i + 1);
+            }
+            '(' | ')' if !double && !subs.is_empty() => {
+                let open = &mut subs.last_mut().expect("not empty").1;
+                match (ch, *open) {
+                    (')', 0) => double = subs.pop().expect("not empty").0,
+                    (')', n) => *open = n - 1,
+                    _ => *open += 1,
+                }
+                out.push(ch);
+            }
             '=' if !double && assigns(&out) => out.push_str("=;"),
             '`' => {
                 out.push('\\');
@@ -719,8 +735,9 @@ fn here_string_opens(c: &[char], i: usize) -> bool {
         && line.iter().take_while(|x| **x != '\n').all(|x| matches!(x, ' ' | '\t' | '\r'))
 }
 
-/// Whether `out` ends with a variable that an `=` after it assigns to (`$page`, `${page}`, `[string]$page`, `$env:X`,
-/// the `+` of `+=`) where a statement starts (sol-loop r2, S4, S8): PowerShell runs the command on its right-hand side.
+/// Whether `out` ends with a variable that an `=` after it assigns to (`$page`, `${page}`, `$env:X`, the `+` of `+=`)
+/// where a statement starts, after only casts and further targets (`[string[]]$p`, `$a, $b`; sol-loop r2, S4, S8;
+/// review r1, D16-R1-02): PowerShell runs the command on its right-hand side.
 fn assigns(out: &str) -> bool {
     let t = out.trim_end_matches([' ', '\t', '+', '-', '*', '/', '%', '?']);
     let var = if t.ends_with('}') {
@@ -729,11 +746,9 @@ fn assigns(out: &str) -> bool {
         let name = t.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':');
         (name.len() < t.len() && name.ends_with('$')).then(|| name.len() - 1)
     };
-    let Some(mut before) = var.map(|k| t[..k].trim_end_matches([' ', '\t'])) else { return false };
-    while let Some(cast) = before.strip_suffix(']').and_then(|b| b.rfind('[').map(|k| &b[..k])) {
-        before = cast.trim_end_matches([' ', '\t']);
-    }
-    before.is_empty() || before.ends_with([';', '\n', '(', '&', '|'])
+    let Some(k) = var else { return false };
+    let start = t[..k].rfind([';', '\n', '(', '&', '|']).map_or(0, |b| b + 1);
+    t[start..k].split([' ', '\t', ',']).all(|w| w.is_empty() || w.starts_with(['$', '[']))
 }
 
 /// The page one simple command would have git open, if any (design note §1, from git's source at v2.56.0): D1 `git
@@ -796,6 +811,10 @@ pub fn git_help(command: &str, shell: Shell) -> Option<String> {
     commands.iter().find_map(|words| help_topic(words))
 }
 
+/// The rm protocol this guard speaks, which sync checks in the installed copy with the rm hook's own arguments before it
+/// writes one (review r1, D16-R1-01): 1 is D16's, with git's help refused, `--shell` and the PowerShell tool.
+pub const RM_PROTOCOL: u32 = 1;
+
 /// The guard's answer to an event from Claude Code's Bash tool, or any tool whose text is Bash's (`shell_hook`).
 pub fn rm_hook(input: &str) -> String {
     shell_hook(input, Shell::Bash)
@@ -805,9 +824,12 @@ pub fn rm_hook(input: &str) -> String {
 /// (empty: the call goes on to the harness's own checks). A `Bash` tool's text is in `bash_tool` (`--shell`), a
 /// `PowerShell` tool's in PowerShell; any other tool, and input that isn't such an event, is let through, so the guard
 /// never stops a call it can't read. Bash text gets every check, PowerShell text git's help only: the `rm` fix is
-/// Bash syntax (design note 2026-11-02-lords-git-help-guard §3).
+/// Bash syntax (design note 2026-11-02-lords-git-help-guard §3). The probe event is answered with `RM_PROTOCOL`.
 pub fn shell_hook(input: &str, bash_tool: Shell) -> String {
     let Ok(ev) = serde_json::from_str::<Value>(input) else { return String::new() };
+    if ev["hook_event_name"] == CHILD_PROBE_EVENT {
+        return format!("lords guard rm {RM_PROTOCOL}");
+    }
     let shell = match ev["tool_name"].as_str() {
         Some("Bash") => bash_tool,
         Some("PowerShell") => Shell::PowerShell,
