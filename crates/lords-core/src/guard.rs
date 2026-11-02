@@ -390,23 +390,7 @@ const PREFIXES: [Prefix; 8] = [
     prefix("time", "fo", &["format", "output"], "", false),
     prefix("nohup", "", &[], "", false),
     prefix("env", "uCS", &["unset", "chdir", "split-string"], "", false),
-    prefix(
-        "xargs",
-        "adEILnPs",
-        &[
-            "arg-file",
-            "delimiter",
-            "eof",
-            "replace",
-            "max-lines",
-            "max-args",
-            "max-procs",
-            "max-chars",
-            "process-slot-var",
-        ],
-        "",
-        false,
-    ),
+    prefix("xargs", "adEILnPs", &[], "", false),
     prefix("sudo", "ugCDprtTU", &[], "elvVK", false),
     prefix("timeout", "ks", &["kill-after", "signal"], "", true),
 ];
@@ -449,94 +433,18 @@ pub fn unguarded_rm(command: &str) -> Option<String> {
     })
 }
 
-/// The git subcommands that can skip hooks (git 2.56, `git <cmd> -h`), each with its options: `-n` is `--no-verify`
-/// for `commit` and `am` only (`--no-stat` or `--dry-run` elsewhere); the options that take a value are known, so a
-/// value (`-m -nope`) is never read as an option.
-const HOOK_SKIPPERS: [(&str, Opts); 6] = [
-    (
-        "commit",
-        Opts {
-            short: "FmcCtU",
-            attached: "Su",
-            long: &[
-                "file",
-                "author",
-                "date",
-                "message",
-                "reedit-message",
-                "reuse-message",
-                "squash",
-                "fixup",
-                "trailer",
-                "template",
-                "cleanup",
-                "unified",
-                "inter-hunk-context",
-                "pathspec-from-file",
-            ],
-            hit: "n",
-        },
-    ),
-    (
-        "am",
-        Opts {
-            short: "Cp",
-            attached: "S",
-            long: &["quoted-cr", "whitespace", "directory", "exclude", "include", "patch-format"],
-            hit: "n",
-        },
-    ),
-    (
-        "merge",
-        Opts {
-            short: "mFsX",
-            attached: "S",
-            long: &["message", "file", "strategy", "strategy-option", "cleanup", "into-name"],
-            hit: "",
-        },
-    ),
-    (
-        "pull",
-        Opts {
-            short: "sXo",
-            attached: "Srj",
-            long: &[
-                "cleanup",
-                "strategy",
-                "strategy-option",
-                "upload-pack",
-                "depth",
-                "shallow-since",
-                "shallow-exclude",
-                "deepen",
-                "refmap",
-                "server-option",
-                "negotiation-restrict",
-                "negotiation-tip",
-                "negotiation-include",
-            ],
-            hit: "",
-        },
-    ),
-    (
-        "push",
-        Opts {
-            short: "o",
-            attached: "",
-            long: &["repo", "receive-pack", "exec", "push-option"],
-            hit: "",
-        },
-    ),
-    (
-        "rebase",
-        Opts {
-            short: "CxsX",
-            attached: "Sr",
-            long: &["onto", "trailer", "whitespace", "exec", "strategy", "strategy-option"],
-            hit: "",
-        },
-    ),
+/// The git subcommands that take `--no-verify` (git 2.56, `git <cmd> -h`).
+const HOOK_SKIPPERS: [&str; 6] = ["commit", "am", "merge", "pull", "push", "rebase"];
+
+/// Where `-n` is `--no-verify` too (it is `--no-stat` or `--dry-run` elsewhere), with the options that take a value,
+/// so a value (`-m -nope`) is never read as an option. On the other four, a value that is itself `--no-verify` is read
+/// as the option (cut 1, the Lords owner, 2 Nov).
+const DASH_N: [(&str, Opts); 2] = [
+    ("commit", Opts { short: "FmcCtU", attached: "Su", long: &["message", "file"], hit: "n" }),
+    ("am", Opts { short: "Cp", attached: "S", long: &[], hit: "n" }),
 ];
+
+const NO_OPTS: Opts = Opts { short: "", attached: "", long: &[], hit: "" };
 
 /// Git's own options that take the next word as their value (git 2.56, `git -h`).
 const GIT_VALUE_OPTIONS: [&str; 7] =
@@ -564,21 +472,6 @@ fn config_writes_hooks_path(args: &[Word]) -> bool {
     const VALUE: [&str; 9] =
         ["-f", "--file", "--blob", "-t", "--type", "--default", "--comment", "--value", "--url"];
     const WRITE: [&str; 4] = ["--unset", "--unset-all", "--add", "--replace-all"];
-    // The old form's other actions: none writes a key's value.
-    const OTHER: [&str; 12] = [
-        "--get",
-        "--get-all",
-        "--get-regexp",
-        "--get-urlmatch",
-        "-l",
-        "--list",
-        "--get-color",
-        "--get-colorbool",
-        "-e",
-        "--edit",
-        "--rename-section",
-        "--remove-section",
-    ];
     let (mut ops, mut write, mut other) = (Vec::new(), false, false);
     let mut i = 0;
     while let Some(w) = args.get(i).map(|w| w.text.as_str()) {
@@ -592,7 +485,8 @@ fn config_writes_hooks_path(args: &[Word]) -> bool {
         }
         i += usize::from(VALUE.contains(&w));
         write |= WRITE.contains(&w);
-        other |= OTHER.contains(&w);
+        // The old form's reads and its editor: none writes a key's value.
+        other |= w.starts_with("--get") || matches!(w, "-l" | "--list" | "-e" | "--edit");
     }
     match ops.as_slice() {
         ["set" | "unset", key, ..] => is_hooks_path(key),
@@ -631,7 +525,10 @@ fn skips_hooks(words: &[Word]) -> Option<String> {
     if sub == "config" {
         return config_writes_hooks_path(rest).then(|| "git config core.hooksPath".to_string());
     }
-    let (_, opts) = HOOK_SKIPPERS.iter().find(|(name, _)| *name == sub)?;
+    if !HOOK_SKIPPERS.contains(&sub) {
+        return None;
+    }
+    let opts = DASH_N.iter().find(|(name, _)| *name == sub).map_or(&NO_OPTS, |(_, o)| o);
     let mut j = 0;
     while let Some(w) = rest.get(j).map(|w| w.text.as_str()) {
         j += 1;

@@ -269,7 +269,6 @@ fn mentioning_a_hook_skip_passes() {
         "git commit -Sn -m x",
         "git commit --verify -m x",
         "git merge --no-verify-signatures topic",
-        "git merge -m --no-verify topic",
         "grep -rn -- --no-verify .",
         "rg \"core.hooksPath\"",
         "git grep -e --no-verify",
@@ -305,6 +304,14 @@ fn n_where_it_skips_no_hook_passes() {
     {
         passes(command);
     }
+}
+
+// Spec: cut 1 (the Lords owner, 2 Nov): option values are known only where `-n` is checked (commit, am). On merge,
+// pull, push and rebase a value that is itself `--no-verify` is read as the option: a refusal with its reason.
+#[test]
+fn an_option_value_is_known_only_where_n_is_checked() {
+    bypass_denied("git merge -m --no-verify topic");
+    passes("git commit -m --no-verify");
 }
 
 // Spec: the design note §4, boundary inputs: commands with nothing to run, and a git option missing its value, are
