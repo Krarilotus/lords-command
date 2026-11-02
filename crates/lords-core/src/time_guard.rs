@@ -10,7 +10,7 @@ use crate::fsguard;
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, Zoned};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// The tools the hook runs on, as an exact list (letters, digits, `_`, `-`, `|`) in both harnesses' matcher syntax:
@@ -175,29 +175,24 @@ fn patch_sections(patch: &str) -> Vec<(String, String)> {
 /// The clock times the guard objects to among `new`'s lines that aren't `old`'s, outside code: fenced blocks and inline
 /// code spans. `now`: the zoned clock; `None` skips F.
 pub fn findings(new: &str, old: &str, now: Option<&Zoned>) -> Vec<Finding> {
-    let kept: HashSet<&str> = old.lines().collect();
-    let mut fence: Option<(u8, usize)> = None;
+    // Each old line keeps as many copies of itself as the old text has (sol-loop r1, S4).
+    let mut kept: HashMap<&str, usize> = HashMap::new();
+    for line in old.lines() {
+        *kept.entry(line).or_default() += 1;
+    }
+    let prose = without_code(new);
     let mut out = Vec::new();
-    for line in new.lines() {
-        if let Some((c, n)) = fence_mark(line) {
-            match fence {
-                None => fence = Some((c, n)),
-                Some((fc, fnn)) if fc == c && n >= fnn && line.trim()[n..].is_empty() => {
-                    fence = None
-                }
-                _ => {}
-            }
-            continue;
+    for (line, plain) in new.lines().zip(prose.lines()) {
+        match kept.get_mut(line) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => line_findings(plain, now, &mut out),
         }
-        if fence.is_some() || kept.contains(line) {
-            continue;
-        }
-        line_findings(&without_code_spans(line), now, &mut out);
     }
     out
 }
 
-/// A fence line's character and length: up to three spaces, then three or more backticks or tildes.
+/// A fence line's character and length: up to three spaces, then three or more backticks or tildes; a backtick fence's
+/// info string holds no backtick (CommonMark 4.5), so `` ```x``` `` is a code span (sol-loop r1, S3).
 fn fence_mark(line: &str) -> Option<(u8, usize)> {
     let t = line.trim_start_matches(' ');
     if line.len() - t.len() > 3 {
@@ -205,15 +200,56 @@ fn fence_mark(line: &str) -> Option<(u8, usize)> {
     }
     let c = *t.as_bytes().first().filter(|c| **c == b'`' || **c == b'~')?;
     let n = t.bytes().take_while(|b| *b == c).count();
-    (n >= 3).then_some((c, n))
+    (n >= 3 && !(c == b'`' && t[n..].contains('`'))).then_some((c, n))
 }
 
-/// `line` with each inline code span (a run of backticks to the next run of the same length) blanked out; a run with
-/// no match stays as text.
-fn without_code_spans(line: &str) -> String {
-    let b = line.as_bytes();
-    let mut out = String::new();
-    let (mut i, mut from) = (0, 0);
+/// `text` with its code blanked to spaces, line ends kept: fenced blocks with their fence lines, and inline code spans
+/// (a run of backticks to the next run of the same length within a paragraph, so across a wrapped line; sol-loop r1,
+/// S2). A run with no match stays as text.
+fn without_code(text: &str) -> String {
+    let mut b = text.as_bytes().to_vec();
+    let blank = |b: &mut [u8]| b.iter_mut().filter(|c| **c != b'\n').for_each(|c| *c = b' ');
+    let (mut fence, mut para, mut at): (Option<(u8, usize)>, Option<usize>, usize) =
+        (None, None, 0);
+    for line in text.split_inclusive('\n') {
+        let (start, body) = (at, line.trim_end_matches(['\n', '\r']));
+        at += line.len();
+        let mark = fence_mark(body);
+        let code = match (fence, mark) {
+            (Some((fc, fnn)), Some((c, n)))
+                if fc == c && n >= fnn && body.trim()[n..].is_empty() =>
+            {
+                fence = None;
+                true
+            }
+            (Some(_), _) => true,
+            (None, Some(m)) => {
+                fence = Some(m);
+                true
+            }
+            (None, None) => false,
+        };
+        if code || body.trim().is_empty() {
+            if let Some(s) = para.take() {
+                blank_spans(&mut b[s..start], blank);
+            }
+            if code {
+                blank(&mut b[start..start + body.len()]);
+            }
+        } else {
+            para.get_or_insert(start);
+        }
+    }
+    if let Some(s) = para {
+        blank_spans(&mut b[s..], blank);
+    }
+    // Only whole characters were blanked, each byte to an ASCII space.
+    String::from_utf8(b).unwrap_or_default()
+}
+
+/// Blanks each code span in `b`, one paragraph.
+fn blank_spans(b: &mut [u8], blank: impl Fn(&mut [u8])) {
+    let mut i = 0;
     while i < b.len() {
         if b[i] != b'`' {
             i += 1;
@@ -222,29 +258,21 @@ fn without_code_spans(line: &str) -> String {
         let n = b[i..].iter().take_while(|c| **c == b'`').count();
         let mut j = i + n;
         let close = loop {
-            match b[j..].iter().position(|c| *c == b'`') {
-                None => break None,
-                Some(k) => {
-                    let at = j + k;
-                    let m = b[at..].iter().take_while(|c| **c == b'`').count();
-                    if m == n {
-                        break Some(at + m);
-                    }
-                    j = at + m;
-                }
+            let Some(k) = b[j..].iter().position(|c| *c == b'`') else { break None };
+            let m = b[j + k..].iter().take_while(|c| **c == b'`').count();
+            if m == n {
+                break Some(j + k + m);
             }
+            j += k + m;
         };
         match close {
             Some(end) => {
-                out.push_str(&line[from..i]);
-                out.push(' ');
-                (i, from) = (end, end);
+                blank(&mut b[i..end]);
+                i = end;
             }
             None => i += n,
         }
     }
-    out.push_str(&line[from..]);
-    out
 }
 
 /// A clock token at byte `i` of `b`: its end and its hour, minute and seconds parts. Not after or before a letter,
@@ -267,6 +295,11 @@ fn clock_at(b: &[u8], i: usize) -> Option<(usize, &[u8], &[u8])> {
     let minute = of(b"MmXx?", end + 1, 2)?;
     // A one-letter hour is a time only with a letter minute (`H:MM`); `H:25` cites line 25 of a source H.
     if hour.len() == 1 && !hour[0].is_ascii_digit() && minute.iter().any(u8::is_ascii_digit) {
+        return None;
+    }
+    // Digits a clock can't show there make no clock: `xx:80` is a port (sol-loop r1, S1).
+    let tens = |s: &[u8], max: u8| s.len() == 2 && s[0].is_ascii_digit() && s[0] > max;
+    if tens(hour, b'2') || tens(minute, b'5') {
         return None;
     }
     end += 3;
@@ -349,7 +382,7 @@ fn names_another_day(lower: &str, words: &[&str], now: &Zoned) -> bool {
         return true;
     }
     let b = lower.as_bytes();
-    let iso = (0..b.len().saturating_sub(9)).filter_map(|i| {
+    let mut iso = (0..b.len().saturating_sub(9)).filter_map(|i| {
         let s = &b[i..i + 10];
         let shape = s.iter().enumerate().all(|(k, c)| {
             if k == 4 || k == 7 {
@@ -358,11 +391,16 @@ fn names_another_day(lower: &str, words: &[&str], now: &Zoned) -> bool {
                 c.is_ascii_digit()
             }
         });
-        let n = |r: std::ops::Range<usize>| std::str::from_utf8(&s[r]).ok()?.parse::<i8>().ok();
-        shape.then(|| Some((n(5..7)?, n(8..10)?))).flatten()
+        let n = |r: std::ops::Range<usize>| std::str::from_utf8(&s[r]).ok()?.parse::<i16>().ok();
+        shape.then(|| Some((n(0..4)?, n(5..7)?, n(8..10)?))).flatten()
     });
+    // An ISO date names its year too (sol-loop r1, S5).
+    let date = (now.year(), i16::from(now.month()), i16::from(now.day()));
+    if iso.any(|d| d != date) {
+        return true;
+    }
     let day = |w: &str| w.parse::<i8>().ok().filter(|d| (1..=31).contains(d));
-    let spoken =
+    let mut spoken =
         words.windows(2).filter(|w| !w[0].is_empty() && !w[1].is_empty()).filter_map(|w| {
             match (day(w[0]), month(w[0]), day(w[1]), month(w[1])) {
                 (Some(d), _, _, Some(m)) => Some((m, d)),
@@ -375,5 +413,5 @@ fn names_another_day(lower: &str, words: &[&str], now: &Zoned) -> bool {
                 _ => None,
             }
         });
-    iso.chain(spoken).any(|d| d != today)
+    spoken.any(|d| d != today)
 }
