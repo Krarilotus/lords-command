@@ -1579,7 +1579,18 @@ fn guard_hooks(
     };
     let before = hooks.clone();
     let events = hooks.as_object_mut().expect("an object");
-    // Only Lords' own hooks go; their entry stays while it holds others (sol-loop r1, S2).
+    let entry = |g: &str, matcher: Option<&str>| {
+        let hooks = adapter.guard_hooks(&exe, g, &home);
+        match matcher {
+            Some(m) => serde_json::json!({ "matcher": m, "hooks": hooks }),
+            None => serde_json::json!({ "hooks": hooks }),
+        }
+    };
+    // Every hook keeps its event, group and handler index, which Codex keys trust by (design note
+    // 2026-11-02-lords-codex-trust, I3; D17): a wanted guard's hook is rewritten where Lords wrote it, in its own entry
+    // on its event, and a new one is appended. Any other hook of Lords' goes, and its entry with it once it held
+    // nothing else (sol-loop r1, S2): the one change that moves later hooks.
+    let mut placed = BTreeSet::new();
     for ev in GUARD_EVENTS {
         let Some(list) = events.get_mut(ev) else { continue };
         let Some(list) = list.as_array_mut() else {
@@ -1588,21 +1599,35 @@ fn guard_hooks(
             }
             continue;
         };
+        let mut emptied = Vec::new();
         for e in list.iter_mut() {
-            if let Some(hs) = e["hooks"].as_array_mut() {
-                hs.retain(|h| !ours(h));
+            let alone = match e["hooks"].as_array().map(Vec::as_slice) {
+                Some([h]) => adapter.guard_of(h, &exe),
+                _ => None,
+            };
+            let here = wanted.iter().find(|(g, event, _)| {
+                alone.as_deref() == Some(g.as_str()) && *event == ev && !placed.contains(g)
+            });
+            if let Some((g, _, matcher)) = here {
+                placed.insert(*g);
+                *e = entry(g, *matcher);
+                emptied.push(false);
+                continue;
             }
+            let Some(hs) = e.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+                emptied.push(false);
+                continue;
+            };
+            let held = hs.len();
+            hs.retain(|h| !ours(h));
+            emptied.push(held > 0 && hs.is_empty());
         }
-        list.retain(|e| e["hooks"].as_array().is_none_or(|hs| !hs.is_empty()));
+        let mut emptied = emptied.into_iter();
+        list.retain(|_| !emptied.next().unwrap_or(false));
     }
-    for (g, event, matcher) in wanted {
-        let hooks = adapter.guard_hooks(&exe, g, &home);
-        let entry = match matcher {
-            Some(m) => serde_json::json!({ "matcher": m, "hooks": hooks }),
-            None => serde_json::json!({ "hooks": hooks }),
-        };
-        let list = events.entry(event).or_insert(serde_json::json!([]));
-        list.as_array_mut().expect("a list, checked above").push(entry);
+    for (g, event, matcher) in wanted.iter().filter(|(g, ..)| !placed.contains(g)) {
+        let list = events.entry(*event).or_insert(serde_json::json!([]));
+        list.as_array_mut().expect("a list, checked above").push(entry(g, *matcher));
     }
     if hooks == before {
         return Ok(None);
