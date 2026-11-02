@@ -255,3 +255,24 @@ fn sol_loop_r1_forms() {
         passes_in("PowerShell", command);
     }
 }
+
+// Spec: sol-loop r2 (witnesses, probed with the binary): only an unquoted, unescaped `<` or `>` is a redirection, and
+// one at a word's end takes the next word as its target (S1, S7); in PowerShell an assignment is one only where a
+// statement starts, to `$name`, `${name}` or a cast variable (S4, S8).
+#[test]
+fn sol_loop_r2_forms() {
+    for command in ["git -c 'test.value=>' help config", "git -c a.b=\\< help config"] {
+        help_denied("Bash", command);
+    }
+    passes_in("Bash", "git help -a>commands.txt< /dev/null");
+    for command in [
+        "git -c 'test.value=>' help config",
+        "${page} = git help config",
+        "Get-Date; [string]$page = git help config",
+    ] {
+        help_denied("PowerShell", command);
+    }
+    for command in ["Write-Output $name=git help config", "Write-Output $name = git help config"] {
+        passes_in("PowerShell", command);
+    }
+}
