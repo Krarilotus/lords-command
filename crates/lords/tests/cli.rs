@@ -2066,7 +2066,8 @@ fn the_queue_guard_kills_the_clis_process_tree_at_its_deadline() {
 
 // Spec (brief, 30 Oct: "Registration goes through the settings target's existing `guards` list … `queue` becomes a
 // `Stop` entry. Foreign hook entries stay"; "SubagentStop … must not be registered"): with `guards = ["rm",
-// "queue"]` and the copy installed, sync names the copy in a `PreToolUse` Bash entry (`guard rm`) and in a `Stop` entry
+// "queue"]` and the copy installed, sync names the copy in a `PreToolUse` entry on Bash and PowerShell (`guard rm`;
+// D16's brief, design note 2026-11-02-lords-git-help-guard §3) and in a `Stop` entry
 // without a matcher (`guard queue`) after the user's own `Stop` hook, writes no `SubagentStop`, and the plan says what
 // it adds; `lords check` accepts the target; taking `queue` out of the list takes out only Lords' `Stop` hook.
 #[test]
@@ -2120,7 +2121,7 @@ fn sync_registers_the_queue_guard_as_a_stop_hook() {
     let theirs: serde_json::Value = serde_json::from_str(theirs).unwrap();
     assert_eq!(
         v["hooks"]["PreToolUse"],
-        serde_json::json!([{"matcher": "Bash", "hooks": [lords("rm")]}])
+        serde_json::json!([{"matcher": "Bash|PowerShell", "hooks": [lords("rm")]}])
     );
     assert_eq!(v["hooks"]["Stop"], serde_json::json!([theirs, {"hooks": [lords("queue")]}]));
     assert!(v["hooks"].get("SubagentStop").is_none(), "{v}");
@@ -2135,7 +2136,7 @@ fn sync_registers_the_queue_guard_as_a_stop_hook() {
     assert_eq!(v["hooks"]["Stop"], serde_json::json!([theirs]));
     assert_eq!(
         v["hooks"]["PreToolUse"],
-        serde_json::json!([{"matcher": "Bash", "hooks": [lords("rm")]}])
+        serde_json::json!([{"matcher": "Bash|PowerShell", "hooks": [lords("rm")]}])
     );
 }
 
@@ -2330,7 +2331,7 @@ fn sync_registers_the_time_guard_and_the_binary_answers() {
     assert_eq!(
         v["hooks"]["PreToolUse"],
         serde_json::json!([
-            {"matcher": "Bash", "hooks": [lords("rm")]},
+            {"matcher": "Bash|PowerShell", "hooks": [lords("rm")]},
             {"matcher": matcher, "hooks": [lords("time")]},
         ])
     );
@@ -2350,6 +2351,45 @@ fn sync_registers_the_time_guard_and_the_binary_answers() {
     assert_eq!(o.status.code(), Some(0), "{}", text(&o));
     assert!(o.stdout.is_empty(), "{}", text(&o));
     assert!(String::from_utf8_lossy(&o.stderr).contains("guard time"), "{}", text(&o));
+}
+
+// Spec: D16's brief: "probe whether Claude's `PowerShell` tool and Codex's shell tool reach a PreToolUse hook with the
+// command text. Cover each that does, with the same check" (design note 2026-11-02-lords-git-help-guard §2: both do;
+// Codex sends its commands as `Bash`, in PowerShell on Windows; §3: Codex runs the `rm` guard, its line on Windows
+// with `--shell powershell`). Through the binary: a form only PowerShell reads as git help is denied for the
+// PowerShell tool and under `--shell powershell`, not as Bash text; a bad `--shell` is a usage note, exit 0, nothing
+// on stdout.
+#[test]
+fn the_rm_guard_reads_powershell_for_its_tool_and_for_codex() {
+    let env = Env::new();
+    let exe = Path::new(env!("CARGO_BIN_EXE_lords"));
+    let codex = lords_core::adapters::get("codex").unwrap();
+    assert!(codex.guards().contains(&"rm"), "{:?}", codex.guards());
+    let line = codex.guard_hooks("C:/x/lords-guard.exe", "rm", "C:/h")[0]["command"].clone();
+    let want = if cfg!(windows) { "guard rm --shell powershell" } else { "guard rm" };
+    assert!(line.as_str().is_some_and(|l| l.ends_with(want)), "{line}");
+    // `"C:\tmp\"` ends its string in PowerShell, so `git help config` runs; in Bash the string never ends.
+    let ps = "Get-ChildItem \"C:\\tmp\\\"; git help config";
+    let event = |tool: &str, command: &str| {
+        serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": {"command": command}})
+            .to_string()
+    };
+    let denies = |o: &Output| String::from_utf8_lossy(&o.stdout).contains("\"deny\"");
+    for (args, tool, command, deny) in [
+        (&["guard", "rm", "--shell", "powershell"][..], "Bash", ps, true),
+        (&["guard", "rm"], "PowerShell", ps, true),
+        (&["guard", "rm"], "Bash", ps, false),
+        (&["guard", "rm", "--shell", "bash"], "Bash", "git help config", true),
+    ] {
+        let o = guard(&env, exe, args, &event(tool, command));
+        assert_eq!(o.status.code(), Some(0), "{args:?}: {}", text(&o));
+        assert_eq!(denies(&o), deny, "{args:?} {tool} `{command}`: {}", text(&o));
+    }
+    for args in [&["guard", "rm", "--shell"][..], &["guard", "rm", "--shell", "zsh"]] {
+        let o = guard(&env, exe, args, &event("Bash", "git help config"));
+        assert_eq!(o.status.code(), Some(0), "{args:?}: {}", text(&o));
+        assert!(o.stdout.is_empty() && !o.stderr.is_empty(), "{args:?}: {}", text(&o));
+    }
 }
 
 /// A repo `r` declared in a private stack with one rule, and its worktree `wts/one`, synced by the CLI: each holds
