@@ -43,6 +43,18 @@ fn git_file(file: &Path, args: &[&str]) -> Result<(), String> {
         .map(|_| ())
 }
 
+/// Takes Lords' keys out of `file`, the event first, each where it is set. Git drops the section only where that leaves
+/// it empty, so an owner's note in it stays (sol-loop r1, S1).
+fn unset(file: &Path) -> Result<(), String> {
+    let (dir, f) = (file.parent().unwrap_or(file), file.to_string_lossy());
+    for key in [format!("{SECTION}.event"), format!("{SECTION}.command")] {
+        if git::status(dir, &["config", "--file", &f, "--get-all", &key])? {
+            git_file(file, &["--unset-all", &key])?;
+        }
+    }
+    Ok(())
+}
+
 /// Whether the ledger records a config hook for `repo`: it then stays the repo's route (C6).
 pub(super) fn recorded(repo: &Path, ledger: &Ledger) -> Result<bool, String> {
     Ok(ledger.owned.get(&key(&file(repo)?)).is_some_and(|o| o.kind == "config"))
@@ -120,10 +132,7 @@ pub(super) fn install(
     if let Err(e) = done {
         let undone = match &earlier {
             Some(old) => git_file(&file, &[&format!("{SECTION}.command"), old]),
-            None if entries(&file).map_or(true, |e| e.is_some()) => {
-                git_file(&file, &["--remove-section", SECTION])
-            }
-            None => Ok(()),
+            None => unset(&file),
         };
         let at = file.display();
         return Err(match undone.and_then(|()| fsguard::read(&file)) {
@@ -160,7 +169,7 @@ pub fn uninstall(home: &Path, repo: Option<&str>, apply: bool) -> Result<Vec<Str
         let line = match entries(&file) {
             Ok(None) => "gone already; its ledger record goes",
             Ok(Some(b)) if fsguard::sha(&b) == o.sha => {
-                match apply.then(|| git_file(&file, &["--remove-section", SECTION])).transpose() {
+                match apply.then(|| unset(&file)).transpose() {
                     Ok(_) => "Lords', unchanged: it goes",
                     Err(e) => {
                         lines.push(format!("{what}: can't remove it ({e}); left, with its record"));
