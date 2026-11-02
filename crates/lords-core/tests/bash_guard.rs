@@ -174,6 +174,16 @@ fn a_here_string_is_one_word_of_data() {
     passes("git commit -F - <<< '--no-verify'");
     bypass_denied("git <<<message commit -F - --no-verify");
     rm_denied("echo <<< \"$(rm -rf $X)\"");
+    // The word may come after a line continuation; a command that ends first has none (sol-loop r4, Q1).
+    bypass_denied("git <<< \\\n  message commit --no-verify");
+    rm_denied("cat <<<\nrm -f $X");
+}
+
+// Spec: the design note §2: a variable inside a substitution in an `rm` operand counts, and a here-string's word inside
+// one is no exception (sol-loop r4, Q2: `cat` hands its value to the path).
+#[test]
+fn a_here_string_variable_counts_inside_a_substitution() {
+    rm_denied("rm -f \"$(cat <<< \"$OUT\")/file\"");
 }
 
 // Spec: review r1, BG-R1-02 (accepted): an unquoted heredoc fed to a shell is what that shell runs once the outer shell
