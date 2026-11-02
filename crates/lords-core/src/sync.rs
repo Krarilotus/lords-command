@@ -1640,7 +1640,7 @@ fn guard_hooks(
             continue;
         };
         let mut emptied = Vec::new();
-        for e in list.iter_mut() {
+        for (i, e) in list.iter_mut().enumerate() {
             let alone = match e["hooks"].as_array().map(Vec::as_slice) {
                 Some([h]) => adapter.guard_of(h, &exe),
                 _ => None,
@@ -1655,7 +1655,8 @@ fn guard_hooks(
                 continue;
             }
             // An entry Lords' hook shares with others: the hook is rewritten in its slot while the entry's matcher is its
-            // guard's (sol-loop r1, S1), and goes from there otherwise.
+            // guard's (sol-loop r1, S1); under another matcher, Lords' can't go on without moving the others' hooks, so
+            // the target is a conflict, before any write (review r1, R1-01).
             let shared = e["matcher"].as_str().map(str::to_string);
             let Some(hs) = e.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
                 emptied.push(false);
@@ -1668,12 +1669,23 @@ fn guard_hooks(
                     kept.push(h);
                     continue;
                 };
-                let slot = wanted.iter().find(|(g, event, m)| {
-                    **g == name && *event == ev && *m == shared.as_deref() && !placed.contains(g)
-                });
-                if let Some((g, ..)) = slot {
-                    placed.insert(*g);
-                    kept.extend(adapter.guard_hooks(&exe, g, &home));
+                let slot = wanted
+                    .iter()
+                    .find(|(g, event, _)| **g == name && *event == ev && !placed.contains(g));
+                match slot {
+                    Some((g, _, m)) if *m == shared.as_deref() => {
+                        placed.insert(*g);
+                        kept.extend(adapter.guard_hooks(&exe, g, &home));
+                    }
+                    Some((g, _, m)) => {
+                        let (has, wants) = (shared.as_deref(), m.unwrap_or("none"));
+                        return Err(format!(
+                            "`hooks.{ev}` entry {} holds Lords' {g} hook beside others' hooks under matcher {}, not Lords' {wants}; sync moves no one else's hook: give Lords' hook an entry of its own, or that entry Lords' matcher",
+                            i + 1,
+                            has.unwrap_or("none")
+                        ));
+                    }
+                    None => {}
                 }
             }
             emptied.push(held > 0 && kept.is_empty());
