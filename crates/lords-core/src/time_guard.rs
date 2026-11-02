@@ -2,8 +2,9 @@
 //! Agents wrote placeholder or invented clock times into notes and reports (system design C15: "tools stamp times,
 //! rendered once in Berlin"). An editor write to a Markdown or plain-text file, or an outgoing T3 message, is judged on
 //! the lines it adds: a placeholder clock time (`14:xx`, `HH:MM`) is denied (P); a real one more than 5 minutes after
-//! the clock, the same day, with no future marker on its line, is denied too (F). Code is never judged. Like every
-//! guard it fails open: input it can't read is let through.
+//! the clock, the same day, with no future marker on its line, gets a one-line reminder (F: as a denial it would have
+//! refused about 26 in 200 lines with times, mostly plans; design note §5). Code is never judged. Like every guard it
+//! fails open: input it can't read is let through.
 
 use crate::fsguard;
 use jiff::tz::TimeZone;
@@ -25,6 +26,10 @@ pub const MARKERS: [&str; 9] =
 /// How far after the clock a time may be before F objects, in minutes (the steer: "more than 5 minutes later").
 const AHEAD: i32 = 5;
 
+/// Past this many minutes after the clock an undated time is the evening before, written after midnight, not later
+/// today (measured: `23:50` written at `02:19`; design note §5).
+const SAME_DAY: i32 = 12 * 60;
+
 /// What a clock time in added text is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -41,37 +46,37 @@ pub struct Finding {
     pub token: String,
 }
 
-/// The hook's answer to one `PreToolUse` event: a denial naming the fix, or nothing. `now` and `zone`: the clock and the
-/// system's zone (no zone: no F check, as nothing says what "now" is there).
+/// The hook's answer to one `PreToolUse` event: a denial naming the fix (P), a one-line reminder that comes back with
+/// the tool's result (F), or nothing. `now` and `zone`: the clock and the system's zone (no zone: no F check, as nothing
+/// says what "now" is there).
 pub fn time_hook(input: &str, now: Timestamp, zone: Option<&TimeZone>) -> String {
     let Ok(ev) = serde_json::from_str::<Value>(input) else { return String::new() };
     let now = zone.map(|z| now.to_zoned(z.clone()));
     let found: Vec<Finding> =
         added(&ev).iter().flat_map(|(new, old)| findings(new, old, now.as_ref())).collect();
-    let reason = if let Some(f) = found.iter().find(|f| f.kind == Kind::Placeholder) {
-        format!(
+    if let Some(f) = found.iter().find(|f| f.kind == Kind::Placeholder) {
+        let reason = format!(
             "Lords: `{}` is a placeholder for a clock time. Write the real time: take it from the turn hook's `Berlin \
              HH:MM` line, or from the clock (PowerShell: `[TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTime]::\
              UtcNow, 'W. Europe Standard Time').ToString('HH:mm')`). A format example goes in backticks, as code.",
             f.token
-        )
-    } else if let (Some(f), Some(now)) = (found.first(), &now) {
-        format!(
-            "Lords: `{}` is more than {AHEAD} minutes after the time now ({}): write the real time from the clock, or \
-             mark it as a plan ({}).",
-            f.token,
-            crate::guard::clock_line(now.timestamp(), Some(now.time_zone())),
-            MARKERS.map(|m| if m == "eta" { "ETA" } else { m }).join(", ")
-        )
-    } else {
-        return String::new();
-    };
-    json!({ "hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "deny",
-        "permissionDecisionReason": reason,
-    } })
-    .to_string()
+        );
+        return json!({ "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        } })
+        .to_string();
+    }
+    let (Some(f), Some(now)) = (found.first(), &now) else { return String::new() };
+    let reminder = format!(
+        "Lords: `{}` is more than {AHEAD} minutes after the time now ({}): write the real time from the clock, or mark \
+         it as a plan ({}).",
+        f.token,
+        crate::guard::clock_line(now.timestamp(), Some(now.time_zone())),
+        MARKERS.map(|m| if m == "eta" { "ETA" } else { m }).join(", ")
+    );
+    json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": reminder } }).to_string()
 }
 
 /// The (new text, old text) pairs an event writes to a file in scope or sends: only the new text's lines that aren't
@@ -278,6 +283,10 @@ fn clock_at(b: &[u8], i: usize) -> Option<(usize, &[u8], &[u8])> {
         return None;
     }
     let minute = of(b"MmXx?", end + 1, 2)?;
+    // A one-letter hour is a time only with a letter minute (`H:MM`); `H:25` cites line 25 of a source H.
+    if hour.len() == 1 && !hour[0].is_ascii_digit() && minute.iter().any(u8::is_ascii_digit) {
+        return None;
+    }
     end += 3;
     if b.get(end) == Some(&b':') {
         of(b"SsXx?", end + 1, 2)?;
@@ -313,7 +322,8 @@ fn line_findings(line: &str, now: Option<&Zoned>, out: &mut Vec<Finding>) {
         if plan || other_day || h > 23 || m > 59 || unit_or_zone_follows(&lower[end..]) {
             continue;
         }
-        if h * 60 + m - (i32::from(now.hour()) * 60 + i32::from(now.minute())) > AHEAD {
+        let ahead = h * 60 + m - (i32::from(now.hour()) * 60 + i32::from(now.minute()));
+        if ahead > AHEAD && ahead <= SAME_DAY {
             out.push(Finding { kind: Kind::Future, token });
         }
     }

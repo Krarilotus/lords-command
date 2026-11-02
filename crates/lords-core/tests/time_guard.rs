@@ -254,7 +254,8 @@ fn plans_other_days_and_other_zones_are_not_flagged() {
     assert_eq!(future("00:05", "23:58"), Vec::<String>::new());
     // More than 12 hours ahead is the evening before, written after midnight (design note §5).
     assert_eq!(future("ran 23:50–23:56", "02:19"), Vec::<String>::new());
-    assert_eq!(future("at 14:20", "02:19"), ["14:20"]);
+    assert_eq!(future("at 14:00", "02:19"), ["14:00"]);
+    assert_eq!(future("at 14:20", "02:19"), Vec::<String>::new());
     assert_eq!(future("`14:00` in code", "08:00"), Vec::<String>::new());
     // Today's date named on the line keeps the check.
     assert_eq!(future("2 Nov, 14:00", "08:00"), ["14:00"]);
