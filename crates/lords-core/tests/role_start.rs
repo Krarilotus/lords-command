@@ -152,13 +152,14 @@ fn a_start_past_one_hook_is_written_and_noted() {
     assert!(!p.over_limit, "the plan holds");
 }
 
-// Spec (design note D1 and its §5 inputs; T3's `taskPrompt`, OrchestratorMcpService.ts:608: `Act as the ${role}
-// sub-agent for this task.\n\n${task}`, no prefix for `general`): the role is the first word after `Role:` on the
-// brief's first non-empty line (after T3's prefix), lower-cased, ignoring Markdown emphasis; else T3's role through
-// implementation → coder, review → reviewer, research → helper. A line further down, a word that can't be a file name,
-// or `Role:` alone names nothing; the brief's line wins over T3's role.
+// Spec (design note D1 as revised after review r1, F10-R1-01, and its §5 inputs; T3's `taskPrompt`,
+// OrchestratorMcpService.ts:608: `Act as the ${role} sub-agent for this task.\n\n${task}`, no prefix for `general`):
+// where T3's prefix is there, it alone decides: implementation → coder, review → reviewer, research → helper, any other
+// no role. Without it, the role is the first word after `Role:` on the prompt's first non-empty line, lower-cased,
+// ignoring a heading mark and Markdown emphasis but never a quote mark. A line further down, a word that can't be a file
+// name, or `Role:` alone names nothing.
 #[test]
-fn the_role_comes_from_the_briefs_first_line_or_t3s_role() {
+fn the_role_comes_from_t3s_prefix_or_else_the_briefs_own_first_line() {
     let t3 = |r: &str, task: &str| format!("Act as the {r} sub-agent for this task.\n\n{task}");
     let cases: Vec<(String, Option<&str>)> = vec![
         ("Role: reviewer\nReview this.".into(), Some("reviewer")),
@@ -187,16 +188,24 @@ fn the_role_comes_from_the_briefs_first_line_or_t3s_role() {
         (t3("design", "Sketch it."), None),
         (t3("test", "Test it."), None),
         (t3("review", ""), Some("reviewer")),
-        (t3("review", "Role: coder\nBuild it."), Some("coder")),
         (t3("implementation", "Role: ../x\nBuild it."), Some("coder")),
         ("Act as the review sub-agent.\n\nLook.".into(), None),
+        // Review r1, F10-R1-01 (the Lords owner's contract: "The launcher's signal (T3's prefix) wins over a `Role:`
+        // line. A `Role:` line counts only as the brief's own first line, and only when the launcher gave none"):
+        // T3's prefix decides, also when it names no Lords role; quoted text is never the brief's own line.
+        (t3("review", "Role: coder\nBuild it."), Some("reviewer")),
+        (t3("design", "Role: coder\nSketch it."), None),
+        ("> Role: coder\n> Implement the change.\n".into(), None),
+        (
+            t3(
+                "review",
+                "> Role: coder\n> Implement the change.\n\nReview whether this brief is safe to send.",
+            ),
+            Some("reviewer"),
+        ),
     ];
     for (prompt, want) in cases {
         let got = launch_role(&prompt).map(|l| l.role);
         assert_eq!(got.as_deref(), want, "{prompt:?}");
     }
-    let both = launch_role(&t3("review", "Role: coder\nBuild it.")).unwrap();
-    assert_eq!((both.role.as_str(), both.t3.as_deref()), ("coder", Some("reviewer")));
-    let brief = launch_role("Role: reviewer\n").unwrap();
-    assert_eq!(brief.t3, None);
 }

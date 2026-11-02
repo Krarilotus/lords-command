@@ -1,6 +1,7 @@
 //! Test support only: `codex app-server` as `lords paths` asks it (tests/role.rs), answering JSON-RPC on stdin as Codex
 //! 0.166 does (probe H4, design note 2026-11-02-lords-role-at-launch): `initialize`, then `hooks/list`, whose answer
-//! lists every command hook in `$CODEX_HOME/hooks.json` with the trust status `LORDS_STUB_TRUST` names. With `hang`, it
+//! lists every command hook in `$CODEX_HOME/hooks.json` with its event, enabled, and the trust status `LORDS_STUB_TRUST`
+//! names. With `hang`, it
 //! never answers `hooks/list`. It ends at the end of its input, as no real server does before it has answered.
 
 // Test support is outside the filesystem boundary (fsguard.rs), as the tests are.
@@ -29,11 +30,15 @@ fn main() {
                     .and_then(|t| serde_json::from_str(&t).ok())
                     .unwrap_or_default();
                 let mut listed = Vec::new();
-                for groups in hooks["hooks"].as_object().into_iter().flat_map(|o| o.values()) {
+                // Each hook under its event, named as Codex names it (`UserPromptSubmit` → `userPromptSubmit`).
+                for (event, groups) in hooks["hooks"].as_object().into_iter().flatten() {
+                    let mut name = event.clone();
+                    name[..1].make_ascii_lowercase();
                     for g in groups.as_array().into_iter().flatten() {
                         for h in g["hooks"].as_array().into_iter().flatten() {
                             listed.push(serde_json::json!({"command": h["command"], "handlerType": "command",
-                                "currentHash": "sha256:0", "trustStatus": trust}));
+                                "eventName": name, "enabled": true, "currentHash": "sha256:0",
+                                "trustStatus": trust}));
                         }
                     }
                 }

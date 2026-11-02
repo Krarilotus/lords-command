@@ -89,26 +89,34 @@ fn context(o: &Output) -> Option<String> {
 }
 
 // Spec (F10: "the role comes from a signal the launcher already gives, such as the brief's first line or T3's `role`,
-// read by the turn hook on the first prompt. The hook then adds that role's lines"; design note D3, D4; Claude Code's and
-// Codex's `UserPromptSubmit` take `hookSpecificOutput.additionalContext`): the first prompt naming a role gets that
-// role's start from the nearest `.lords`, without its marker lines; the same role named again in the session gets
-// nothing; another role named later gets that one's; another session gets it again; a prompt naming no role gets
-// nothing. T3's prefix names the role too, and where the brief's line differs the brief wins, said in one line.
+// read by the turn hook on the first prompt. The hook then adds that role's lines"; design note D3, D4; review r1,
+// F10-R1-01, the Lords owner's contract: "the session's role is fixed once, from the launch, and never from a later
+// prompt or from quoted text. The launcher's signal (T3's prefix) wins over a `Role:` line"; Claude Code's and Codex's
+// `UserPromptSubmit` take `hookSpecificOutput.additionalContext`): a session's first prompt naming a role gets that
+// role's start from the nearest `.lords`, without its marker lines, and no later prompt changes or repeats it, whatever
+// it names; another session gets its own. T3's prefix names the role, over a `Role:` line and over quoted text; a root
+// session whose first prompt names none gets none later either.
 #[test]
-fn the_role_guard_gives_the_named_roles_start_once_a_session() {
+fn the_role_guard_gives_the_launch_role_once_a_session() {
     let p = Place::new();
     assert_eq!(p.ask("s1", "Role: reviewer\nReview the diff.").as_deref(), Some("REVIEWER START."));
     assert_eq!(p.ask("s1", "Role: reviewer\nAnd again."), None, "once a session");
     assert_eq!(p.ask("s1", "Fix the finding."), None, "no role named");
-    assert_eq!(p.ask("s1", "Role: coder\nBuild it.").as_deref(), Some("CODER START."));
+    assert_eq!(p.ask("s1", "Role: coder\nBuild it."), None, "never from a later prompt");
     assert_eq!(p.ask("s2", "Role: reviewer\n").as_deref(), Some("REVIEWER START."));
     let t3 = "Act as the review sub-agent for this task.\n\nLook at it.";
     assert_eq!(p.ask("s3", t3).as_deref(), Some("REVIEWER START."));
-    let both =
-        p.ask("s4", "Act as the review sub-agent for this task.\n\nRole: coder\nBuild.").unwrap();
-    assert!(both.contains("CODER START.") && !both.contains("REVIEWER START."), "{both}");
-    assert_eq!(both.lines().count(), 2, "the start and one line: {both}");
-    assert!(both.contains("reviewer"), "names T3's role it overrules: {both}");
+    let both = p.ask("s4", "Act as the review sub-agent for this task.\n\nRole: coder\nBuild.");
+    assert_eq!(both.as_deref(), Some("REVIEWER START."), "the launcher's role wins");
+    let quoted = "Act as the review sub-agent for this task.\n\n> Role: coder\n> Implement the change.\n\nReview whether this brief is safe to send. Do not implement it.";
+    assert_eq!(
+        p.ask("s7", quoted).as_deref(),
+        Some("REVIEWER START."),
+        "quoted text names nothing"
+    );
+    assert_eq!(p.ask("s7", "> Role: coder\n> More."), None, "nor does a later quote");
+    assert_eq!(p.ask("s8", "Fix the bug."), None);
+    assert_eq!(p.ask("s8", "Role: coder\nBuild it."), None, "a root session's role is fixed too");
     // Sol-loop r1 S3: a record that can't be read (here a dir where the file goes) is no reason to give nothing.
     fs::create_dir_all(p.tool_home().join("guard/role/s6")).unwrap();
     assert_eq!(p.ask("s6", "Role: reviewer\n").as_deref(), Some("REVIEWER START."));
@@ -124,11 +132,11 @@ fn the_role_guard_gives_the_named_roles_start_once_a_session() {
 }
 
 // Spec (design note C2: a session that can't get its role's lines is told so at its first prompt, with the role file to
-// read, never left to look complete; C4: nothing for a session T3 didn't delegate and whose launch names no role): a
-// role with no start in the place, a start past one hook's 9,500 characters, and a delegated session (`T3CODE_THREAD_ID`
-// `thread:delegated-task:…`) whose launch names no role each get one line saying so, naming the role file to read where
-// there is a role, once; a root session naming no role gets nothing and leaves no record; a cwd in no place gets
-// nothing.
+// read, never left to look complete; C4: nothing said to a session T3 didn't delegate and whose launch names no role):
+// a role with no start in the place, a start past one hook's 9,500 characters, and a delegated session
+// (`T3CODE_THREAD_ID` `thread:delegated-task:…`) whose launch names no role (also T3's prefix naming none, whatever a
+// `Role:` line says: F10-R1-01) each get one line saying so, naming the role file to read where there is a role, once;
+// a root session naming no role gets nothing; a cwd in no place gets nothing.
 #[test]
 fn a_session_whose_role_cant_be_given_is_told_once() {
     let p = Place::new();
@@ -148,12 +156,11 @@ fn a_session_whose_role_cant_be_given_is_told_once() {
     assert_eq!(first.lines().count(), 1, "{first}");
     assert!(first.contains("no role") && first.contains("Role:"), "{first}");
     assert_eq!(context(&p.prompt("s3", &p.cwd(), "And this.", &delegated)), None, "once");
+    let design = "Act as the design sub-agent for this task.\n\nRole: coder\nSketch it.";
+    let none = context(&p.prompt("s6", &p.cwd(), design, &delegated)).unwrap();
+    assert!(none.contains("no role") && !none.contains("CODER START."), "{none}");
     let root = [("T3CODE_THREAD_ID", "thread:4a1b")];
     assert_eq!(context(&p.prompt("s4", &p.cwd(), "Fix the bug.", &root)), None);
-    assert!(
-        !p.tool_home().join("guard/role/s4").exists(),
-        "no record for a root session naming no role"
-    );
     let elsewhere = p.dir.path().join("elsewhere");
     fs::create_dir_all(&elsewhere).unwrap();
     assert_eq!(context(&p.prompt("s5", &elsewhere, "Role: reviewer\n", &delegated)), None);
@@ -175,22 +182,57 @@ fn the_session_guard_gives_the_role_again_after_a_compaction() {
     assert_eq!(start("s1", "startup"), None);
     assert_eq!(start("s1", "resume"), None, "a resumed session keeps its history");
     assert_eq!(start("s9", "compact"), None, "no role given");
+    // Review r1, F10-R1-04 (the Lords owner: "when giving the start fails for any reason, compaction included, the model
+    // gets the one-line fallback naming the role file in its context"): a start that can't be read (here a dir where
+    // the file goes), and a record that can't be read, each give one line in context; no role is invented.
+    let start_file = p.dir.path().join("place/.lords/start-reviewer.md");
+    fs::remove_file(&start_file).unwrap();
+    fs::create_dir(&start_file).unwrap();
+    let told = start("s1", "compact").unwrap_or_default();
+    assert!(told.contains("role-reviewer.md") && told.lines().count() == 1, "{told}");
+    fs::create_dir_all(p.tool_home().join("guard/role/s10")).unwrap();
+    let told = start("s10", "compact").unwrap_or_default();
+    assert!(told.contains("role-") && !told.contains("reviewer"), "{told}");
 }
 
-// Spec (design note D6, as for the child guard, fix check r2, FC4): asked with the hook's arguments and the probe
-// event, the guard answers its role protocol, 1.
+// Spec (review r1, F10-R1-03, the Lords owner: "complete means the whole start is present: the place file for that
+// adapter as well as the role's supplement. If either is missing or unreadable, the path is incomplete"; design note
+// C2): the hook knows its harness (`--adapter`, as sync writes it); where that harness's place file (`CLAUDE.local.md`,
+// `AGENTS.override.md`) isn't in the place, the session gets one line naming its role file instead of the supplement.
+#[test]
+fn a_start_is_given_only_beside_its_harnesss_place_file() {
+    let p = Place::new();
+    fs::write(p.dir.path().join("place/CLAUDE.local.md"), format!("{BEGIN}\nplace\n{END}\n"))
+        .unwrap();
+    let ask = |session: &str, adapter: &str| {
+        let ev = serde_json::json!({"hook_event_name": "UserPromptSubmit", "session_id": session,
+            "cwd": p.cwd(), "prompt": "Role: reviewer\nReview it.", "transcript_path": "x"});
+        let home = p.tool_home();
+        let args = ["guard", "role", "--home", home.to_str().unwrap(), "--adapter", adapter];
+        context(&run(&p.home(), &p.cwd(), &args, &ev.to_string(), &[]))
+    };
+    assert_eq!(ask("s1", "claude").as_deref(), Some("REVIEWER START."));
+    let told = ask("s2", "codex").unwrap_or_default();
+    assert!(told.contains("AGENTS.override.md") && told.contains("role-reviewer.md"), "{told}");
+    assert!(!told.contains("REVIEWER START.") && told.lines().count() == 1, "{told}");
+}
+
+// Spec (design note D6, as for the child guard, fix check r2, FC4): asked with the hook's arguments (its tool home and
+// its harness, F10-R1-03) and the probe event, the guard answers its role protocol, 1.
 #[test]
 fn the_guard_answers_the_probe_with_its_role_protocol() {
     let p = Place::new();
     let home = p.tool_home();
-    let o = run(
-        &p.home(),
-        &p.cwd(),
-        &["guard", "role", "--home", home.to_str().unwrap()],
-        r#"{"hook_event_name":"LordsGuardProbe"}"#,
-        &[],
-    );
-    assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "lords guard role 1", "{o:?}");
+    for adapter in ["claude", "codex"] {
+        let o = run(
+            &p.home(),
+            &p.cwd(),
+            &["guard", "role", "--home", home.to_str().unwrap(), "--adapter", adapter],
+            r#"{"hook_event_name":"LordsGuardProbe"}"#,
+            &[],
+        );
+        assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "lords guard role 1", "{o:?}");
+    }
 }
 
 /// Two stacks in `d`: a public one, and a private one, a git repo, with a repo `beta-core` at `checkout` and settings
@@ -282,14 +324,14 @@ fn sync_registers_the_role_guard_on_user_prompt_submit() {
     let read = |rel: &str| -> serde_json::Value {
         serde_json::from_str(&fs::read_to_string(d.join(rel)).unwrap()).unwrap()
     };
-    let hook = serde_json::json!({"type": "command", "command": copy, "args": ["guard", "role", "--home", tool_home], "timeout": 30});
+    let hook = serde_json::json!({"type": "command", "command": copy, "args": ["guard", "role", "--home", tool_home, "--adapter", "claude"], "timeout": 30});
     let v = read("home/.claude-balanced/settings.json");
     assert_eq!(v["hooks"]["UserPromptSubmit"], serde_json::json!([{"hooks": [hook]}]), "{v}");
     // On Windows Codex runs a hook's command with PowerShell (design note H9): PowerShell's call, literal paths.
     let line = if cfg!(windows) {
-        format!("& '{copy}' guard role --home '{tool_home}'")
+        format!("& '{copy}' guard role --home '{tool_home}' --adapter codex")
     } else {
-        format!("\"{copy}\" guard role --home \"{tool_home}\"")
+        format!("\"{copy}\" guard role --home \"{tool_home}\" --adapter codex")
     };
     let lords_hook = serde_json::json!({"type": "command", "command": line, "timeout": 30, "additionalContextLimit": 0});
     let v = read("home/.codex/hooks.json");
@@ -424,4 +466,82 @@ fn paths_marks_each_t3_delegated_path_complete_or_incomplete() {
     let (code, rows) = paths(d, &stacks, stub, "trusted");
     let wt = rows.iter().find(|r| r.1.contains("as reviewer") && r.1.contains("/wt"));
     assert!(code == Some(1) && wt.is_some_and(|r| r.0 == "incomplete"), "{rows:?}");
+}
+
+// Spec (review r1, F10-R1-02, the Lords owner: "`lords paths` reports a path complete only when the hook is registered
+// under the event that actually fires for that path"): a Lords role hook moved to `SessionStart`, in Claude's settings
+// and in Codex's hooks.json, leaves both paths incomplete, exit 1; so do Claude's hooks switched off
+// (`disableAllHooks`), with the hook where it belongs.
+#[test]
+fn paths_needs_the_role_hook_on_the_prompt_event() {
+    let d = TempDir::new().unwrap();
+    let d = d.path();
+    let stacks = stacks(d, "[\"role\"]", "[\"role\"]");
+    let stacks: Vec<&str> = stacks.iter().map(String::as_str).collect();
+    let stub = env!("CARGO_BIN_EXE_lords-codex-stub");
+    assert!(lords(d, &["guard", "install"], &[]).status.success());
+    assert!(lords(d, &[&["sync", "--apply"][..], &stacks].concat(), &[]).status.success());
+    assert_eq!(paths(d, &stacks, stub, "trusted").0, Some(0), "complete as synced");
+    let (claude, codex) =
+        (d.join("home/.claude-balanced/settings.json"), d.join("home/.codex/hooks.json"));
+    let read = |p: &Path| -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap()
+    };
+    let synced = read(&claude);
+    for f in [&claude, &codex] {
+        let mut v = read(f);
+        let entry = v["hooks"]["UserPromptSubmit"].take();
+        v["hooks"]["UserPromptSubmit"] = serde_json::json!([]);
+        v["hooks"]["SessionStart"] = entry;
+        fs::write(f, v.to_string()).unwrap();
+    }
+    let (code, rows) = paths(d, &stacks, stub, "trusted");
+    assert_eq!(code, Some(1), "{rows:?}");
+    assert_eq!(
+        (row(&rows, "claude").0.as_str(), row(&rows, "codex").0.as_str()),
+        ("incomplete", "incomplete"),
+        "{rows:?}"
+    );
+    let mut off = synced;
+    off["disableAllHooks"] = serde_json::json!(true);
+    fs::write(&claude, off.to_string()).unwrap();
+    let (_, rows) = paths(d, &stacks, stub, "trusted");
+    assert_eq!(row(&rows, "claude").0, "incomplete", "hooks switched off: {rows:?}");
+}
+
+// Spec (review r1, F10-R1-03, the Lords owner: "complete means the whole start is present: the place file for that
+// adapter as well as the role's supplement"; its witness, a supported adapter-filtered sync): after `sync --repo NAME
+// --adapter claude --apply`, the checkout has every role's start and CLAUDE.local.md, which carries a repo-wide line the
+// starts leave out, but no AGENTS.override.md: Codex's path there is incomplete, exit 1.
+#[test]
+fn paths_needs_each_harnesss_place_file_beside_the_starts() {
+    let d = TempDir::new().unwrap();
+    let d = d.path();
+    let stacks = stacks(d, "[\"role\"]", "[\"role\"]");
+    let stacks: Vec<&str> = stacks.iter().map(String::as_str).collect();
+    let rule = "---\nid: rule.wide\nkind: rule\ntitle: rule.wide\naudience: [all]\nscope: repo:beta-core\nstatus: active\nvisibility: private\norigin:\n  type: own\nstart: core\ncore: REPO-WIDE line.\n---\nWide.\n";
+    fs::create_dir_all(d.join("priv/repo/beta-core/rules")).unwrap();
+    fs::write(d.join("priv/repo/beta-core/rules/wide.md"), rule).unwrap();
+    git(d, &d.join("priv"), &["add", "-A"]);
+    git(d, &d.join("priv"), &["commit", "-q", "-m", "a repo-wide rule"]);
+    let stub = env!("CARGO_BIN_EXE_lords-codex-stub");
+    assert!(lords(d, &["guard", "install"], &[]).status.success());
+    assert!(lords(d, &[&["sync", "--user", "--apply"][..], &stacks].concat(), &[])
+        .status
+        .success());
+    let claude_only = ["sync", "--repo", "beta-core", "--adapter", "claude", "--apply"];
+    assert!(lords(d, &[&claude_only[..], &stacks].concat(), &[]).status.success());
+    let start = fs::read_to_string(d.join("checkout/.lords/start-reviewer.md")).unwrap();
+    let place = fs::read_to_string(d.join("checkout/CLAUDE.local.md")).unwrap();
+    assert!(!start.contains("REPO-WIDE line.") && place.contains("REPO-WIDE line."), "{start}");
+    assert!(!d.join("checkout/AGENTS.override.md").exists());
+    let (code, rows) = paths(d, &stacks, stub, "trusted");
+    assert_eq!(code, Some(1), "{rows:?}");
+    let missing =
+        rows.iter().find(|r| r.1.contains("AGENTS.override.md") && r.1.contains("beta-core"));
+    assert!(missing.is_some_and(|r| r.0 == "incomplete"), "{rows:?}");
+    assert!(
+        !rows.iter().any(|r| r.0 == "incomplete" && r.1.contains("CLAUDE.local.md")),
+        "{rows:?}"
+    );
 }
