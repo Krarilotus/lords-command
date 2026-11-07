@@ -6,6 +6,7 @@
 use super::{Action, Change, Class, ConflictKind, Dest, Item, Plan};
 use crate::fsguard::Root;
 use crate::ledger;
+use crate::stack::SafeAlso;
 use serde::{Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -178,19 +179,21 @@ pub(crate) fn record_place(o: &ledger::Owned) -> PlaceId {
 
 /// The planner's last step: each item's class, from the facts the planner checked and set on it (its action, class,
 /// conflict kind, destination, `gone` and `place_gone`), whether the plan has its complete view, and the roots the
-/// ledger records paths in. Notes are never read.
-pub(crate) fn classify(plan: &mut Plan, managed: &BTreeSet<String>) {
+/// ledger records paths in; and what the stack lets `--safe-only` apply besides (`[safe_only] applies`, by default
+/// nothing: the owner, 7 Nov, "make thigns more configurable"). Notes are never read.
+pub(crate) fn classify(plan: &mut Plan, managed: &BTreeSet<String>, also: &[SafeAlso]) {
     let complete = plan.complete.is_some();
     for i in &mut plan.items {
-        i.safety = class_of(i, managed, complete);
+        i.safety = class_of(i, managed, also, complete);
     }
 }
 
-fn class_of(i: &Item, managed: &BTreeSet<String>, complete: bool) -> Safety {
+fn class_of(i: &Item, managed: &BTreeSet<String>, also: &[SafeAlso], complete: bool) -> Safety {
     let need = Safety::NeedsOwner;
     // A tool-owned path below a root the plan verified, where apply acts (rule A).
     let tool = i.class == Class::Tool && i.change() == Change::ToolOwned;
     let owner_file = matches!(i.change(), Change::OwnerEdit | Change::ExcludeEdit);
+    let exclude = i.change() == Change::ExcludeEdit && also.contains(&SafeAlso::Exclude);
     match i.action {
         // Nothing written: a tracked file shown, or a path already as wanted.
         Action::InSync => Safety::Safe,
@@ -202,8 +205,11 @@ fn class_of(i: &Item, managed: &BTreeSet<String>, complete: bool) -> Safety {
         // And these only where nothing is.
         Action::Create | Action::Install if tool => match &i.dest {
             Dest::Tool(at) if managed.contains(&ledger::key(at.root().path())) => Safety::Safe,
+            _ if also.contains(&SafeAlso::NewPlace) => Safety::Safe,
             _ => need(Hold::NewPlace),
         },
+        // Sync's own lines in a checkout's git exclude, where the stack names them.
+        Action::Create | Action::Update if exclude => Safety::Safe,
         Action::Create | Action::Update if owner_file => need(Hold::OwnerFile),
         Action::Remove | Action::RemoveBlock => need(Hold::Removal),
         Action::Conflict => need(match i.conflict {

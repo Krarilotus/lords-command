@@ -2689,13 +2689,13 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
     // Their items are typed too, as the last step (D13); an uninstall creates nothing, so no place is new to it.
     if opts.uninstall && opts.place.is_some() {
         let mut p = place_uninstall::plan(stacks, private, opts)?;
-        safety::classify(&mut p, &BTreeSet::new());
+        safety::classify(&mut p, &BTreeSet::new(), &[]);
         return Ok(p);
     }
     // One dropped target's uninstall too: the stack no longer says where it was (D21).
     if opts.uninstall && opts.target.is_some() {
         let mut p = target_uninstall::plan(stacks, private, opts)?;
-        safety::classify(&mut p, &BTreeSet::new());
+        safety::classify(&mut p, &BTreeSet::new(), &[]);
         return Ok(p);
     }
     let ledger = Ledger::load(&opts.home)?;
@@ -2891,7 +2891,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
     }
     pl.plan.complete = complete;
     // The planner's last step, after every change to an item's action (D13): nothing types it again.
-    safety::classify(&mut pl.plan, &safety::managed(&pl.ledger));
+    safety::classify(&mut pl.plan, &safety::managed(&pl.ledger), &stacks.safe_only().applies);
     if opts.stage == Stage::SafeOnly {
         safety::safe_only(&mut pl.plan);
     }
