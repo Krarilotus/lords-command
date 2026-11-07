@@ -23,7 +23,7 @@ usage:
   lords privacy --message FILE [--staged] [--secrets-only]   a commit message (the commit-msg hook)
   lords privacy --history [--private-stack DIR]   every commit's message and patch (the pre-push check)
   lords privacy FILE...
-  lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit, pre-merge-commit and commit-msg hooks; in a stack repo also `check --stack` and a pre-push
+  lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit, pre-merge-commit and commit-msg hooks; in a stack repo also `check --stack`, a pre-push and a post-commit that runs `deliver`
   lords hash PATH
   lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--stage install] [--json] [--apply] [--deadline-ms N]
     (a write of Codex's hooks: trusts Lords' own through Codex's app-server, names each hook that isn't trusted, exit 1)
@@ -41,7 +41,8 @@ usage:
     sync wrote, with their records (a changed copy is kept with its record; exit codes as for --place)
   lords adopt [--list | PATH...]   record paths from before the ledger that hold exactly what sync writes there
   lords set-aside PATH... [--yes]   move paths that aren't the tool's into a new backup dir
-  (sync, uninstall, adopt, set-aside: --home DIR, the tool's own dir; default ~/.lords-command)
+  (sync, deliver, uninstall, adopt, set-aside: --home DIR, the tool's own dir; default ~/.lords-command)
+  (sync --apply also installs each declared repo's post-checkout hook, which runs `deliver` for a new worktree)
   lords hooks install --post-checkout [--repo DIR]   a new worktree gets its place files (`sync --place`)
   lords compose [--repo NAME [--role ROLE | --child | --child-whole]] [--adapter ID] [--json]   what a harness reads there, with sources
   lords show ID   an entry's whole text, which its core line stands for at start (without frontmatter)
@@ -627,6 +628,9 @@ fn cmd_deliver(mut a: Args) -> Result<bool, String> {
         println!("lords deliver {}", deliver::PROTOCOL);
         return Ok(true);
     }
+    // The commits a delivery makes itself (its store work) start no delivery: its stores' post-commit hook, which every
+    // such commit runs, exits at once with this set (design note C7).
+    std::env::set_var(deliver::MARKER, "1");
     let home = tool_home(&mut a)?;
     let on_commit = a.value("--on-commit")?.map(PathBuf::from);
     let repo = a.value("--repo")?;
@@ -738,6 +742,14 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         codex,
         new_worktree: false,
     };
+    // An apply of one place or of a safe-only plan writes this very plan: it is made under the lock it applies with,
+    // so no other writer's half-done apply is in it (F8, C5; D23). A full apply's own plans are made under its lock
+    // (`import_and_apply`); the one shown here is the dry run's.
+    let settings = stacks.delivery();
+    let lock = match apply && (opts.place.is_some() || safe_only) {
+        true => Some(sync::ApplyLock::wait(&opts.home, settings.lock_wait())??),
+        false => None,
+    };
     let plan = sync::plan(&stacks, &opts)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_default());
@@ -765,13 +777,27 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         }
         return Ok(whole);
     }
-    // One worktree (its post-checkout hook): only its files, no import or retiring, which commit to the stack. Nor
-    // does a safe-only plan: it lists that store work instead, and holds what isn't safe (D13).
-    let applied = match (&opts.place, safe_only) {
-        (Some(_), _) | (None, true) => sync::apply(&plan)?,
-        (None, false) => sync::import_and_apply(&p.public, p.private.as_deref(), &opts)?,
+    // One worktree: only its files, no import or retiring, which commit to the stack. Nor does a safe-only plan: it
+    // lists that store work instead, holds what isn't safe (D13), and writes place by place; what it held goes into the
+    // delivery's state where delivery is set up (F8, D5).
+    let applied = match lock {
+        Some(lock) => {
+            let applied = sync::apply_held(&plan, &lock).map_err(|e| e.to_string())?;
+            if safe_only {
+                lords_core::deliver::settle_safe_only(&opts.home, &settings, &plan, &applied)?;
+            }
+            applied
+        }
+        None => sync::import_and_apply(&p.public, p.private.as_deref(), &opts)?,
     };
     print_applied(&applied);
+    for h in &applied.held {
+        println!("\nheld {}, put back whole: {}", h.place, h.sync);
+        for i in &h.items {
+            println!("   {}  {}: {}", i.reason, i.path.display(), i.note);
+        }
+    }
+    let whole = whole && applied.held.is_empty();
     // A Codex hook that doesn't run never reads as success either (design note 2026-11-02-lords-codex-trust, §2.3).
     Ok(whole && applied.codex.is_empty())
 }
@@ -1354,9 +1380,20 @@ fn cmd_hooks(mut a: Args) -> Result<bool, String> {
         }
         return Ok(true);
     }
+    // A stack repo's post-commit delivers from the stacks given here, else config.txt's (F8, C1).
+    let cfg = Config::discover();
+    let public = a.value("--public-stack")?.map(PathBuf::from).or(cfg.public);
+    let private = a.value("--private-stack")?.map(PathBuf::from).or(cfg.private);
     a.done()?;
+    let abs = |p: PathBuf| std::path::absolute(&p).unwrap_or(p);
+    let stacks = hooks::SyncArgs {
+        repo: String::new(),
+        public_stack: public.map(abs),
+        private_stack: private.map(abs),
+    };
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let installed = hooks::install(&repo, &exe, secrets_only, force, &sync::default_home()?)?;
+    let home = sync::default_home()?;
+    let installed = hooks::install_with(&repo, &exe, secrets_only, force, &home, &stacks)?;
     for r in &installed {
         println!("installed {}", r.hook.display());
         if let Some(b) = &r.backup {

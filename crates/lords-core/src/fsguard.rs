@@ -1389,6 +1389,74 @@ pub fn move_to(from: &impl Place, to: &Contained) -> Result<(), String> {
     move_to_at(from.place(), &to.path)
 }
 
+// F8's place transaction (design note Harness/notes/2026-11-07-lords-f8-delivery.md §4 D3, D4; F8 §15 M1): a file's next
+// version is staged beside it (`sibling` "new"), its current one linked beside it as a backup (`link_as` to `sibling`
+// "old", the same file object, so an edit made in place shows in it), and the staged one renamed over it
+// (`rename_over`), so a reader finds the old file or the new one, never none. The checks and the undo are the caller's
+// (`sync::places`).
+
+/// A fresh name beside `p` in its dir, `.<name>.lords-<what>-…`, below the same root.
+pub fn sibling(p: &Contained, what: &str) -> Result<Contained, String> {
+    let name = beside(&p.path, what)?;
+    let name = name.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut parts = p.parts.clone();
+    parts.pop();
+    parts.push(Part::new(&name)?);
+    Ok(p.root.join(&parts))
+}
+
+/// Every `.<name>.lords-<what>-…` beside `p` (what `sibling` names), below the same root.
+pub fn siblings(p: &Contained, what: &str) -> Result<Vec<Contained>, String> {
+    let (Some(dir), Some(name)) = (p.path.parent(), p.path.file_name()) else {
+        return Ok(Vec::new());
+    };
+    let prefix = format!(".{}.lords-{what}-", name.to_string_lossy());
+    let mut found = Vec::new();
+    for e in list_dir(dir)? {
+        let Some(n) = e.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+        if n.starts_with(&prefix) {
+            let mut parts = p.parts.clone();
+            parts.pop();
+            parts.push(Part::new(&n)?);
+            found.push(p.root.join(&parts));
+        }
+    }
+    Ok(found)
+}
+
+/// The file at `from` gets the second name `to`, where nothing may be.
+pub fn link_as(from: &Contained, to: &Contained) -> Result<(), String> {
+    check(&from.path)?;
+    check(&to.path)?;
+    link_in(&from.path, &to.path).map_err(|e| format!("{}: {e}", to.path.display()))
+}
+
+/// Renames the file `from` over `to` in one step that replaces what is at `to`. While a reader holds `to` open without
+/// delete sharing, Windows refuses it: it is tried again every 50 ms until `deadline`, then refused with that error.
+pub fn rename_over(
+    from: &Contained,
+    to: &Contained,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    check(&from.path)?;
+    check(&to.path)?;
+    loop {
+        match fs::rename(&from.path, &to.path) {
+            Ok(()) => return check(&to.path),
+            Err(e)
+                if (e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(32))
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50))
+            }
+            Err(e) => {
+                return Err(format!("{}: {e} (a reader may hold it open)", to.path.display()))
+            }
+        }
+    }
+}
+
 /// Puts an executable at `p` that is the tool's alone: written and synced as a staged `.exe` beside it, run there by
 /// `verify`, then renamed over `p`. A copy that fails `verify` is removed and `p` keeps what it had. One a running
 /// process holds, which Windows won't replace (os error 5) but lets be renamed, goes aside first, its name recording the

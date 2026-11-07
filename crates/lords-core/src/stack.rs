@@ -325,6 +325,34 @@ impl Stack {
                 w[0]
             ));
         }
+        // No two targets at one path, or one inside the other: an item of both could be applied for one and held for
+        // the other (D24; F8, design note C8).
+        let at: Vec<(&str, String)> = manifest
+            .targets
+            .iter()
+            .map(|t| (t.name.as_str(), crate::ledger::key(&crate::config::expand_home(&t.path))))
+            .collect();
+        for (i, (a, pa)) in at.iter().enumerate() {
+            for (b, pb) in &at[i + 1..] {
+                let inside =
+                    |x: &str, y: &str| y.starts_with(&format!("{}/", x.trim_end_matches('/')));
+                if pa == pb || inside(pa, pb) || inside(pb, pa) {
+                    return Err(format!(
+                        "{}: targets `{a}` and `{b}` are at one path, or one lies inside the other; give each its own",
+                        manifest_path.display()
+                    ));
+                }
+            }
+        }
+        if let Some(d) = &manifest.delivery {
+            d.state_parts().map_err(|e| {
+                format!(
+                    "{}: [delivery] state = {:?}: a path below the tool home, in plain parts ({e})",
+                    manifest_path.display(),
+                    d.state
+                )
+            })?;
+        }
         let mut stack =
             Stack { root: root.to_path_buf(), manifest, entries: Vec::new(), problems: Vec::new() };
         if stack.visibility() == Visibility::Public {

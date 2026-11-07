@@ -2736,15 +2736,18 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
     }
     // One place's uninstall has its own planner: nothing is wanted there, and the ledger alone decides (PI-13).
     // Their items are typed too, as the last step (D13); an uninstall creates nothing, so no place is new to it.
+    let lock_wait = LockWait(stacks.delivery().lock_wait());
     if opts.uninstall && opts.place.is_some() {
         let mut p = place_uninstall::plan(stacks, private, opts)?;
         safety::classify(&mut p, &BTreeSet::new(), &[]);
+        p.lock_wait = lock_wait;
         return Ok(p);
     }
     // One dropped target's uninstall too: the stack no longer says where it was (D21).
     if opts.uninstall && opts.target.is_some() {
         let mut p = target_uninstall::plan(stacks, private, opts)?;
         safety::classify(&mut p, &BTreeSet::new(), &[]);
+        p.lock_wait = lock_wait;
         return Ok(p);
     }
     let ledger = Ledger::load(&opts.home)?;
@@ -2755,6 +2758,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
             home: opts.home.clone(),
             ledger_revision: ledger.revision(),
             codex: opts.codex.clone(),
+            lock_wait,
             ..Plan::default()
         },
         ledger,
@@ -2939,12 +2943,53 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         )),
     }
     pl.plan.complete = complete;
+    // Each declared repo's post-checkout hook, as this build writes it (F8, C3): `sync --apply` installs what isn't.
+    if !opts.uninstall && !opts.user_only && opts.place.is_none() {
+        pl.plan.hooks = repo_hooks(stacks, private, opts, &pl.ledger);
+    }
+    // A new worktree, from its post-checkout hook, is a place Lords manages for its own plan (F8, D-4).
+    let mut managed = safety::managed(&pl.ledger);
+    if let (true, Some(one), Some(repo)) = (opts.new_worktree, &opts.place, &opts.repo) {
+        if let Some(Ok((roots, _, _))) = pl.checkouts.get(repo) {
+            managed.extend(
+                roots.iter().filter(|r| same_place(r.path(), one)).map(|r| ledger::key(r.path())),
+            );
+        }
+    }
     // The planner's last step, after every change to an item's action (D13): nothing types it again.
-    safety::classify(&mut pl.plan, &safety::managed(&pl.ledger), &stacks.safe_only().applies);
+    safety::classify(&mut pl.plan, &managed, &stacks.safe_only().applies);
     if opts.stage == Stage::SafeOnly {
         safety::safe_only(&mut pl.plan);
     }
     Ok(pl.plan)
+}
+
+/// The post-checkout hook of each declared repo in scope that has worktrees and a checkout (F8, C3), as
+/// `hooks::post_checkout_state` finds it against what sync writes there: the guard copy (D-3) running `deliver` with
+/// these stacks into this home. Read only. A checkout git can't read is left out: the plan's own conflict for it says
+/// why.
+fn repo_hooks(
+    stacks: &Stacks,
+    private: &Stack,
+    opts: &Options,
+    ledger: &Ledger,
+) -> Vec<crate::hooks::RepoHook> {
+    let Ok(exe) = guard_place(&opts.home) else { return Vec::new() };
+    let mut hooks = Vec::new();
+    for (name, repo) in &private.manifest.repos {
+        if opts.repo.as_deref().is_some_and(|r| r != name) || !repo.worktrees {
+            continue;
+        }
+        let Some(first) = repo.checkouts.first().map(|c| expand_home(c)) else { continue };
+        let args = crate::hooks::sync_args(stacks, name);
+        let Ok(state) =
+            crate::hooks::post_checkout_state(&first, ledger, exe.path(), &args, &opts.home)
+        else {
+            continue;
+        };
+        hooks.push(crate::hooks::RepoHook { repo: name.clone(), checkout: first, state });
+    }
+    hooks
 }
 
 /// The install stage (design-simplification-r6, staged first use): of a plan, only tool-owned paths and each
@@ -3378,6 +3423,39 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
 pub fn apply_between(plan: &Plan, mut installed: impl FnMut(&Path)) -> Result<Applied, String> {
     // The refusal rules a dry run reports too (`Plan::applies`).
     plan.applies().map_err(|e| format!("{e} (nothing was changed)"))?;
+    if !plan.items.iter().any(|i| i.changes() && i.action != Action::RetireEntry) {
+        return Ok(Applied::default());
+    }
+    // One lock over everything this apply changes, waited for as the stacks set (F8, C5); every check first, then the
+    // changes (rm-guard review r1, R7). Apply never writes the guard copy (`lords guard install` does).
+    let lock = ApplyLock::wait(&plan.home, plan.lock_wait.0)??;
+    applied_under(plan, &lock, &mut installed, &mut |_, _| {}).map_err(|e| e.to_string())
+}
+
+/// `apply` under a lock the caller holds since before it planned (F8, C5): so no other writer can have changed what the
+/// plan read. A safe-only plan is written place by place, each whole or not at all (`places`).
+pub fn apply_held(plan: &Plan, lock: &ApplyLock) -> Result<Applied, Refused> {
+    apply_held_between(plan, lock, &mut |_, _| {})
+}
+
+/// `apply_held`, calling `between` at each `Step` with the place it concerns.
+#[doc(hidden)]
+pub fn apply_held_between(
+    plan: &Plan,
+    lock: &ApplyLock,
+    between: &mut dyn FnMut(Step, &Path),
+) -> Result<Applied, Refused> {
+    applied_under(plan, lock, &mut |_| {}, between)
+}
+
+/// `apply`'s checks and changes, under the apply lock `_lock`.
+fn applied_under(
+    plan: &Plan,
+    _lock: &ApplyLock,
+    installed: &mut dyn FnMut(&Path),
+    between: &mut dyn FnMut(Step, &Path),
+) -> Result<Applied, Refused> {
+    plan.applies().map_err(|e| format!("{e} (nothing was changed)"))?;
     let changing: Vec<&Item> =
         plan.items.iter().filter(|i| i.changes() && i.action != Action::RetireEntry).collect();
     if changing.is_empty() {
@@ -3391,21 +3469,19 @@ pub fn apply_between(plan: &Plan, mut installed: impl FnMut(&Path)) -> Result<Ap
             Dest::None => None,
         };
         if at.is_some_and(|a| ledger::key(a) != ledger::key(&i.path)) {
-            return Err(format!(
+            return Err(Refused::Other(format!(
                 "{}: not the place the plan built for it; plan again (nothing was changed)",
                 i.path.display()
-            ));
+            )));
         }
     }
-    // One lock over everything this apply changes; every check first, then the changes (rm-guard review r1, R7). Apply
-    // never writes the guard copy (`lords guard install` does).
-    let _lock = ApplyLock::take(&plan.home, 60)?;
     let mut ledger = Ledger::load(&plan.home)?;
     if ledger.revision() != plan.ledger_revision {
-        return Err(
-            "the ledger changed since the plan (another sync?); plan again (nothing was changed)"
-                .into(),
-        );
+        return Err(Refused::LedgerChanged);
+    }
+    // A safe-only plan (D13) is written place by place, each place checked and put back whole on its own (F8, C4).
+    if plan.held.is_some() {
+        return places::apply(plan, &mut ledger, between).map_err(Refused::Other);
     }
     // The ledger covers only tool-owned paths; a plan is current only if its tool destinations and the owner files it
     // changes are as it saw them too (rm-guard fix checks r2, r3, R7). Checked here, under the lock, before anything
@@ -3416,10 +3492,10 @@ pub fn apply_between(plan: &Plan, mut installed: impl FnMut(&Path)) -> Result<Ap
     for i in changing.iter().filter(|i| i.class == Class::Owner) {
         let now = fsguard::read_text(&i.path)?.map(|t| fsguard::sha(t.as_bytes()));
         if now != i.have {
-            return Err(format!(
+            return Err(Refused::Other(format!(
                 "{} changed since the plan (another sync?); plan again (nothing was changed)",
                 i.path.display()
-            ));
+            )));
         }
     }
     for i in &changing {
@@ -3440,15 +3516,8 @@ pub fn apply_between(plan: &Plan, mut installed: impl FnMut(&Path)) -> Result<Ap
     let mut run = Run::new(&plan.home)?;
     let mut applied = Applied::default();
     let mut wrote = Vec::new();
-    let result = apply_items(
-        &changing,
-        plan,
-        &mut run,
-        &mut ledger,
-        &mut applied,
-        &mut wrote,
-        &mut installed,
-    );
+    let result =
+        apply_items(&changing, plan, &mut run, &mut ledger, &mut applied, &mut wrote, installed);
     // Codex's trust for each of its hooks files written, whatever came after it (design note
     // 2026-11-02-lords-codex-trust, I1).
     for item in wrote {
@@ -3464,31 +3533,15 @@ pub fn apply_between(plan: &Plan, mut installed: impl FnMut(&Path)) -> Result<Ap
         applied.codex.extend(lines);
     }
     applied.backups = run.dir.as_ref().map(|d| d.path().to_path_buf());
-    match result {
+    let applied = match result {
         Err(e) if !applied.codex.is_empty() => Err(format!(
             "{e}; and {} Codex hook(s) not trusted: {}",
             applied.codex.len(),
             applied.codex.join("; ")
         )),
         r => r.map(|()| applied),
-    }
-}
-
-/// `apply` under a lock the caller holds since before it planned (F8, C5): so no other writer can have changed what the
-/// plan read. A safe-only plan is written place by place, each whole or not at all (`places`).
-pub fn apply_held(plan: &Plan, lock: &ApplyLock) -> Result<Applied, Refused> {
-    apply_held_between(plan, lock, &mut |_, _| {})
-}
-
-/// `apply_held`, calling `between` at each `Step` with the place it concerns.
-#[doc(hidden)]
-pub fn apply_held_between(
-    plan: &Plan,
-    lock: &ApplyLock,
-    between: &mut dyn FnMut(Step, &Path),
-) -> Result<Applied, Refused> {
-    let _ = (plan, lock, between);
-    Err(Refused::Other("not built yet".into()))
+    };
+    applied.map_err(Refused::Other)
 }
 
 /// `apply`'s changes, item by item; `wrote` gets each Codex hooks file written.
@@ -4007,6 +4060,10 @@ pub fn import_and_apply_between(
     between: impl FnOnce(),
 ) -> Result<Applied, String> {
     let stacks = Stacks::load(public, private)?;
+    let settings = stacks.delivery();
+    // One writer from the first plan to the last change (F8, C5; D23): a plan that will be applied is never made beside
+    // another writer's half-done apply, and a delivery its own store commits start waits for this one.
+    let lock = ApplyLock::wait(&opts.home, settings.lock_wait())??;
     let first = plan(&stacks, opts)?;
     if let Some(c) = first.items.iter().find(|i| i.action == Action::Conflict) {
         return Err(format!(
@@ -4019,7 +4076,6 @@ pub fn import_and_apply_between(
     let mut done = Vec::new();
     // The install stage imports and retires nothing.
     if opts.stage == Stage::Full {
-        let _lock = ApplyLock::take(&opts.home, 60)?;
         if let Some(p) = &stacks.private {
             if !p.manifest.memory_stores.is_empty() {
                 for r in crate::ops::import(p, None, true)? {
@@ -4038,14 +4094,71 @@ pub fn import_and_apply_between(
             ));
         }
     }
-    // A fresh plan, always: what a plan read reaches beyond the stacks (a tracked `AGENTS.md`, the git index), and any
-    // of it can change while this waited for the lock; apply checks only each item's destination and the ledger
-    // (sync perf review r1, R2). Planning is about 30 s on the real stacks since this branch.
-    let last = plan(&Stacks::load(public, private)?, opts)?;
-    let mut applied = apply(&last)?;
+    // A fresh plan, always, under the same lock: what a plan read reaches beyond the stacks (a tracked `AGENTS.md`, the
+    // git index), and any of it can change after the first plan; apply checks only each item's destination and the
+    // ledger (sync perf review r1, R2).
+    let stacks = Stacks::load(public, private)?;
+    let last = plan(&stacks, opts)?;
+    let mut applied = apply_held(&last, &lock).map_err(|e| e.to_string())?;
     done.append(&mut applied.done);
+    // Each declared repo's post-checkout hook, from the guard copy (F8, C3, D-3); then what this resolved leaves the
+    // delivery's state (D5). Neither changes what was applied.
+    let hooks = match opts.stage {
+        Stage::Full => repo_hooks_in(&last, &stacks, &opts.home, &lock),
+        _ => Vec::new(),
+    };
+    for (repo, r) in &hooks {
+        done.push(match r {
+            Ok(line) => format!("post-checkout of repo {repo}: {line}"),
+            Err(why) => format!("post-checkout of repo {repo}: not installed: {why}"),
+        });
+    }
+    if opts.stage == Stage::Full {
+        if let Err(e) = crate::deliver::settle_by_hand(&opts.home, &settings, &last, &hooks) {
+            done.push(format!("the delivery state couldn't be updated: {e}"));
+        }
+    }
     applied.done = done;
     Ok(applied)
+}
+
+/// `sync --apply`'s repo hooks (F8, C3): each the plan found missing or in an earlier form is installed from the guard
+/// copy, while the copy answers `deliver`'s protocol, under the caller's lock: one line each, or why not.
+fn repo_hooks_in(
+    plan: &Plan,
+    stacks: &Stacks,
+    home: &Path,
+    lock: &ApplyLock,
+) -> Vec<(String, Result<String, String>)> {
+    use crate::hooks::HookState;
+    let todo: Vec<&crate::hooks::RepoHook> = plan
+        .hooks
+        .iter()
+        .filter(|h| matches!(h.state, HookState::Missing | HookState::Outdated))
+        .collect();
+    if todo.is_empty() {
+        return Vec::new();
+    }
+    let copy = guard_place(home).and_then(|c| {
+        match crate::process::deliver_protocol(c.path()) {
+            Ok(Some(n)) if n == crate::deliver::PROTOCOL => Ok(c),
+            Ok(_) => Err(format!(
+                "the guard copy doesn't run `deliver` (protocol {}): run `lords guard install`, then sync again",
+                crate::deliver::PROTOCOL
+            )),
+            Err(e) => Err(format!("{e}: run `lords guard install`, then sync again")),
+        }
+    });
+    todo.into_iter()
+        .map(|h| {
+            let r = copy.clone().and_then(|c| {
+                let args = crate::hooks::sync_args(stacks, &h.repo);
+                crate::hooks::install_post_checkout_held(&h.checkout, c.path(), &args, home, lock)
+                    .map(|i| format!("installed in {}", i.hook.display()))
+            });
+            (h.repo.clone(), r)
+        })
+        .collect()
 }
 
 /// Whether every line of `tracked` appears in `file`, in order (other lines may come between).

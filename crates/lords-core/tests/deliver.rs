@@ -546,6 +546,9 @@ fn store_work_is_its_own_commit_and_a_refused_one_is_put_back() {
     let f = Fixture::new();
     let mem = f.path("memory");
     fs::create_dir_all(&mem).unwrap();
+    // A note before the first sync, so its import commits the store's defaults file with it: an import of no note writes
+    // that file and commits nothing, which leaves the store uncommitted (older than F8).
+    fs::write(mem.join("note-zero.md"), "---\nname: note zero\n---\nA first note.\n").unwrap();
     let store = format!(
         "[[memory_stores]]\nname = \"agent\"\npath = '{}'\nscope = \"global\"\n",
         mem.display()

@@ -469,12 +469,48 @@ fn import_stores(
                 rep.added.len(),
                 rep.changed.len()
             );
-            rep.commit = git::commit(&private.root, &[rel(&private.root, &dest)], &msg)?;
+            match git::commit(&private.root, &[rel(&private.root, &dest)], &msg) {
+                Ok(c) => rep.commit = c,
+                Err(e) => {
+                    // A refused commit takes its files back (D6), so the store is as it was and nothing waits on it
+                    // (F8, design note C7: a delivery imports with no one looking).
+                    let back =
+                        put_back(&private.root, &dest, &rep, wrote_defaults.then_some(&defaults));
+                    return Err(format!(
+                        "store `{}`: its import's commit failed ({e}); {back}",
+                        s.name
+                    ));
+                }
+            }
         }
         rep.wrote |= write && (!rep.added.is_empty() || !rep.changed.is_empty());
         reports.push(rep);
     }
     Ok(reports)
+}
+
+/// One store's import after its commit failed (D6): its paths unstaged, each file it changed back as HEAD has it (git
+/// held it unmodified before, `git_keeps`), each it added gone, and the defaults file too where it wrote one. What
+/// became of them, in words.
+fn put_back(root: &Path, dest: &Path, rep: &Imported, defaults: Option<&PathBuf>) -> String {
+    let done = (|| -> Result<(), String> {
+        let arg = |p: &Path| rel(root, p).to_string_lossy().into_owned();
+        git::run(root, &["reset", "-q", "--", &arg(dest)])?;
+        for name in &rep.changed {
+            git::run(root, &["checkout", "-q", "--", &arg(&dest.join(name))])?;
+        }
+        for p in rep.added.iter().map(|n| dest.join(n)).chain(defaults.cloned()) {
+            fsguard::delete_file(&stack_place(root, &p)?)?;
+        }
+        Ok(())
+    })();
+    match done {
+        Ok(()) => "its files are back as they were".into(),
+        Err(e) => format!(
+            "its files couldn't all be put back ({e}); `git status` in {} shows what is left",
+            root.display()
+        ),
+    }
 }
 
 // ---------------------------------------------------------------- promote

@@ -551,6 +551,12 @@ fn post_checkout_repo(env: &Env) -> (PathBuf, PathBuf, [String; 4]) {
         "--private-stack".to_string(),
         private.display().to_string(),
     ];
+    // Synced once by hand, as a repo Lords manages is: its git exclude, which its worktrees share, holds Lords' lines. A
+    // new worktree's delivery is safe-only (F8, brief item 2) and never edits that owner file (D13 R1), so a repo never
+    // synced holds its new worktrees, named in the delivery's state.
+    let args: Vec<&str> = stacks.iter().map(String::as_str).collect();
+    let o = env.lords(d, &[&["sync", "--repo", "r", "--apply"][..], &args].concat());
+    assert!(o.status.success(), "{}", text(&o));
     (repo, d.join("wts"), stacks)
 }
 

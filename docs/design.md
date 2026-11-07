@@ -478,6 +478,23 @@ nothing; `"new-place"` (files where nothing is, in a declared place the ledger r
 accepts. A destination several places share, a checkout's git exclude that its worktrees read too, is never applied
 this way: its wanted edit holds every place that reads it.
 
+**Delivery** (F8). A commit in a store's own checkout reaches every place with nobody running a command: `lords hooks
+install` gives a stack repo a post-commit hook that starts `lords deliver --on-commit` in the background (never in a
+linked worktree, never for a delivery's own commits, which run with `LORDS_DELIVERING` set). A delivery takes the apply
+lock before it plans, refuses a store whose stack dir holds anything uncommitted, imports memory and retires ended
+entries as their own commits, then plans `--safe-only` for the whole machine and applies it place by place: each
+place's items are checked again and staged beside their paths, then swapped in one by one (a file by one rename over
+it, never absent), and a check or write that fails puts the place's earlier items back, so a place is fully current or
+untouched. `sync --apply` gives each declared repo with worktrees a post-checkout hook that runs the guard copy's
+`deliver --new-worktree` for a new worktree: the same safe-only path for that one place, whose creates count as safe
+there; a place git doesn't list yet is tried again after a pause. Whatever a delivery held, or why it failed, goes into
+one state file in the tool home, with the sync by hand that resolves each place, and `lords paths` shows it: a held
+place is stale for every role there, and every role is stale while the stores moved past the last delivery. Every
+sync that applies plans under the lock it applies with, so none plans against another's half-done apply. The stack's
+`[delivery]` sets which stores' commits deliver (`on_commit`), the lock wait, the attempts and their pause, the
+deadline no attempt or plan starts past, whether a delivery does store work, and where the state file is. Two targets
+at one path, or one inside the other, don't load.
+
 **The changeover, once and with a human:** the 3a place files, the old `~/.codex/skills` copies and any other path
 from before the ledger are listed by `lords adopt --list`. Adopting a file records it only if it is byte for byte what
 sync would write now (`lords adopt PATH...`). Anything else goes by `lords set-aside PATH... --yes`, which moves it

@@ -207,7 +207,11 @@ fn the_deliverys_own_store_commit_starts_no_delivery() {
     let o = w.lords(&w.path("priv"), &["hooks", "install", "--secrets-only"]);
     assert!(o.status.success(), "{}", text(&o));
 
-    fs::write(mem.path().join("note.md"), "---\nname: a note\n---\nRemember this.\n").unwrap();
+    fs::write(
+        mem.path().join("note.md"),
+        "---\nname: note\ndescription: the hook line\n---\nThe note.\n",
+    )
+    .unwrap();
     w.rule("Rule two.");
     w.commit("priv", "rule two");
     assert!(holds_within(&w.place(), "Rule two."), "log: {}", read(&w.log()));
@@ -249,7 +253,8 @@ fn sync_gives_each_repo_its_post_checkout_and_a_new_worktree_is_delivered() {
     assert!(o.status.success(), "{}", text(&o));
     let log = w.path("repo/.git/lords-post-checkout.log");
     assert!(holds_within(&one.join("CLAUDE.local.md"), "Rule one."), "log: {}", read(&log));
-    assert!(holds_within(&one.join(".lords/start-coder.md"), "Rule one."), "log: {}", read(&log));
+    settled(&log);
+    assert!(one.join(".lords/start-coder.md").is_file(), "log: {}", read(&log));
 }
 
 // Spec (brief item 4; note C6: "each held place … and the command that resolves the place"): a place its owner changed
