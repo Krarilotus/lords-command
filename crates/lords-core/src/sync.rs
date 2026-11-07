@@ -1439,20 +1439,16 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
         Ok(g) => g,
         Err(e) => return conflict(&t.name, &path, e),
     };
-    // Sync never writes the guard copy (`lords guard install` does): a hook names it only while it is there and
-    // answers; otherwise the hook is left out (or taken out) and the target says why.
-    let mut not_ready = None;
-    let guards: &[String] = if t.guards.is_empty() {
-        &[]
-    } else {
-        match guard_ready(&guard) {
-            Ok(()) => &t.guards,
-            Err(why) => {
-                not_ready = Some(why);
-                &[]
-            }
+    // Sync never writes the guard copy (`lords guard install` does): a target naming guards is planned only from a copy
+    // that is there and answers. Any other is a conflict naming the fix, its settings as they are, never planned as if
+    // it named none, which took Lords' hooks out for good, even after an install put the copy back (review r1, R1-02).
+    // Every settings item apply writes for such a target names the copy, so apply checks it again under the lock.
+    let guards: &[String] = &t.guards;
+    if !guards.is_empty() {
+        if let Err(why) = guard_ready(&guard) {
+            return conflict(&t.name, &path, why);
         }
-    };
+    }
     // A copy that answers but can't run a guard the target names, or refuses this build's child hooks, is refused, with
     // the hooks it has kept (D20; fix check r2, FC4): taking them out would leave the harness without the guards that
     // still work.
@@ -1509,7 +1505,6 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
     let mut item =
         owner_file_item(&t.name, &path, Dest::Owner(owner), proposed, &Composed::default());
     item.redacted = true;
-    item.notes.extend(not_ready);
     item.names_guard = (!guards.is_empty()).then(|| guard.clone());
     item.names_guards = guards.to_vec();
     item.names_child_guard = child;
