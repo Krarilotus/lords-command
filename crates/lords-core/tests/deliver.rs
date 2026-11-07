@@ -364,6 +364,59 @@ fn an_owner_edit_during_a_delivery_holds_the_whole_place() {
     }
 }
 
+// Spec (sol-loop r2 S5; C4: a place is fully current or untouched): an owner's edit to a file of a place that the
+// delivery leaves as it is (an in-sync skill copy), made after the plan, while an earlier place is written, holds that
+// place whole when its turn comes: its place files keep their old text, and the edit stays.
+#[test]
+fn an_edit_to_an_in_sync_file_before_its_place_is_written_holds_the_place() {
+    let f = Fixture::new();
+    let (a, b) = delivered_once(&f, "");
+    let skill = "priv/repo/beta-core/skills/demo";
+    f.write(
+        &format!("{skill}/SKILL.md"),
+        "---\nname: demo\ndescription: the demo skill\n---\nSteps.\n",
+    );
+    f.write(
+        &format!("{skill}/lords.yaml"),
+        "id: skill.demo\nkind: skill\ntitle: demo\naudience: [all]\nscope: repo:beta-core\nstatus: active\nvisibility: private\norigin:\n  type: own\n",
+    );
+    commit(&f, "priv", "a skill");
+    import_and_apply(&f.pub_root(), Some(&f.priv_root()), &f.opts()).unwrap();
+    let skill_b = b.join(".claude/skills/demo/SKILL.md");
+    assert!(skill_b.is_file(), "the fixture's skill copy");
+    rule(&f, "Rule two.\n");
+    commit(&f, "pub", "rule two");
+    let r =
+        run_at(&f, Step::Staged, 1, Some(&a), || fs::write(&skill_b, "My own steps.\n").unwrap())
+            .unwrap();
+    assert!(files(&a).iter().all(|t| t.contains("Rule two.")), "a is delivered: {r:?}");
+    assert!(files(&b).iter().all(|t| t.contains("Rule one.")), "b is held whole: {r:?}");
+    assert_eq!(read(&skill_b), "My own steps.\n");
+    assert!(held_at(&r.state, &b).is_some(), "{:?}", r.state);
+}
+
+// Spec (sol-loop r2 S4; K4: only committed text reaches agents): a store file written while the delivery planned, even
+// put back as it was (a stack edit whose commit was refused), may have been read uncommitted: the delivery plans again,
+// from what the store holds then, and delivers that.
+#[test]
+fn a_store_file_written_while_the_delivery_planned_is_planned_again() {
+    let f = Fixture::new();
+    let (a, b) = delivered_once(&f, "");
+    rule(&f, "Rule two.\n");
+    commit(&f, "pub", "rule two");
+    let file = f.path("pub/global/rules/r.md");
+    let committed_text = read(&file);
+    let r = run_at(&f, Step::Planned, 1, None, || {
+        fs::write(&file, "a draft").unwrap();
+        fs::write(&file, &committed_text).unwrap();
+    })
+    .unwrap();
+    assert_eq!(r.attempts, 2, "{r:?}");
+    for p in [&a, &b] {
+        assert!(files(p).iter().all(|t| t.contains("Rule two.")), "{r:?}");
+    }
+}
+
 // Spec (F8 §15.2 A3, A4; note A3, A4): when a reader holds a place's second file open so it can't be replaced, the swap
 // is tried again until `lock_wait_secs`, then the place's first file is put back, so the place stays whole at its old
 // text and the state holds it (`write-refused`); once the reader lets go, the next delivery brings it current, with

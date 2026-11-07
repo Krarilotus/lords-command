@@ -291,10 +291,20 @@ fn deliver_and_paths_name_a_held_place_with_the_command_that_resolves_it() {
     };
     assert!(held(&out), "{out}");
 
+    // An install stage of the place resolves nothing (it skips a place with a conflict whole), so the entry stays
+    // (sol-loop r2 S12).
+    let repo = w.path("repo");
+    let place = repo.to_str().unwrap();
+    let o = w.lords(
+        w.dir.path(),
+        &["sync", "--repo", "r", "--place", place, "--stage", "install", "--apply"],
+    );
+    let out = text(&w.lords(w.dir.path(), &["paths"]));
+    assert!(held(&out), "{}\n{out}", text(&o));
+
     // Resolved as the entry says: the owner's file goes, and the sync by hand it names puts the place right, which the
     // state then no longer holds (sol-loop r1 S7).
     fs::remove_file(w.place()).unwrap();
-    let repo = w.path("repo");
     let o = w.lords(
         w.dir.path(),
         &["sync", "--repo", "r", "--place", repo.to_str().unwrap(), "--apply"],
