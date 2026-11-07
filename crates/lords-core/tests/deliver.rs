@@ -583,6 +583,85 @@ fn store_work_is_its_own_commit_and_a_refused_one_is_put_back() {
     assert!(r.state.store_work.iter().any(|w| w.what.contains("agent")), "{:?}", r.state);
 }
 
+// Spec (sol-loop r1 S1; C7; D6): a refused import puts back only what it wrote: a copy someone edited while the store's
+// commit hook ran (here the hook itself, as an owner would) keeps the edit, and the delivery's state says it was left.
+#[test]
+fn a_refused_import_leaves_an_edit_made_during_its_commit() {
+    let f = Fixture::new();
+    let mem = f.path("memory");
+    fs::create_dir_all(&mem).unwrap();
+    fs::write(mem.join("note-zero.md"), "---\nname: note zero\n---\nA first note.\n").unwrap();
+    let store = format!(
+        "[[memory_stores]]\nname = \"agent\"\npath = '{}'\nscope = \"global\"\n",
+        mem.display()
+    );
+    delivered_once(&f, &store);
+    f.write(
+        "priv/.git/hooks/pre-commit",
+        "#!/bin/sh\necho 'Mine.' >> global/memory/agent/note-two.md\nexit 1\n",
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let refuse = f.path("priv/.git/hooks/pre-commit");
+        fs::set_permissions(refuse, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(mem.join("note-two.md"), "---\nname: note two\n---\nAnother note.\n").unwrap();
+    rule(&f, "Rule two.\n");
+    commit(&f, "pub", "rule two");
+    let r = run(&f);
+    let copy = f.path("priv/global/memory/agent/note-two.md");
+    assert!(read(&copy).contains("Mine."), "the edit stays: {r:?}");
+    let s = format!("{:?}", state(&f));
+    assert!(s.contains("left as it is"), "{s}");
+}
+
+// Spec (sol-loop r1 S8; C7): a memory store the delivery can't read is held store work, with the command that imports
+// it, never left out of the state.
+#[test]
+fn a_memory_store_that_cant_be_read_is_held_store_work() {
+    let f = Fixture::new();
+    let gone = f.path("no-such-memory");
+    let store = format!(
+        "[[memory_stores]]\nname = \"gone\"\npath = '{}'\nscope = \"global\"\n",
+        gone.display()
+    );
+    delivered_once(&f, "");
+    let toml = format!("{}{store}", fs::read_to_string(f.path("priv/stack.toml")).unwrap());
+    f.write("priv/stack.toml", &toml);
+    commit(&f, "priv", "a store that isn't there");
+    let r = run(&f).unwrap();
+    let held = r.state.store_work.iter().find(|w| w.what.contains("memory import"));
+    let held = held.unwrap_or_else(|| panic!("held: {:?}", r.state));
+    assert_eq!(held.command, "lords import", "{held:?}");
+}
+
+// Spec (sol-loop r1 S6; C3: "each declared repo … gets Lords' post-checkout hook"): a repo declared with two independent
+// clones gets a hook in each: the plan lists one per git common dir, and a declared worktree of one of them adds none.
+#[test]
+fn every_clone_of_a_repo_gets_its_post_checkout() {
+    let f = Fixture::new();
+    rule(&f, "Rule one.\n");
+    for c in ["a", "b"] {
+        f.write(&format!("{c}/README.md"), "a place\n");
+        f.git_init(c);
+    }
+    git(&f.path("a"), &["worktree", "add", "-q", "../a-wt", "-b", "wt"]);
+    f.write("pub/stack.toml", &format!("name = \"pub\"\nvisibility = \"public\"\n{ROLES}"));
+    let list: Vec<String> =
+        ["a", "b", "a-wt"].iter().map(|c| format!("'{}'", f.path(c).display())).collect();
+    f.write(
+        "priv/stack.toml",
+        &format!(
+            "name = \"priv\"\nvisibility = \"private\"\n{ROLES}[projects.beta]\n[repos.beta-core]\nproject = \"beta\"\ncheckouts = [{}]\n",
+            list.join(", ")
+        ),
+    );
+    let p = lords_core::sync::plan(&f.stacks(), &f.opts()).unwrap();
+    let at: Vec<String> = p.hooks.iter().map(|h| key(&h.checkout)).collect();
+    assert_eq!(at, [key(&f.path("a")), key(&f.path("b"))], "{:?}", p.hooks);
+}
+
 // Spec (brief item 6, D24: "the stack load refuses two targets whose paths are the same or nested"): two targets at one
 // path, or one inside the other, fail the load naming both; siblings load.
 #[test]

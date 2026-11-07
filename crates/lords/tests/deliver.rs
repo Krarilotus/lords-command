@@ -234,6 +234,14 @@ fn sync_gives_each_repo_its_post_checkout_and_a_new_worktree_is_delivered() {
     let copy = w.path("home/.lords-command/bin/lords-guard.exe");
     let o = w.cmd(&copy).args(["deliver", "--protocol"]).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "lords deliver 1", "{}", text(&o));
+    // The dry run says what `--apply` will do to the hook (sol-loop r1 S11).
+    let o = w.lords(w.dir.path(), &["sync"]);
+    assert!(
+        text(&o).contains("post-checkout of repo r") && text(&o).contains("missing"),
+        "{}",
+        text(&o)
+    );
+    assert!(!w.path("repo/.git/hooks/post-checkout").exists(), "a dry run writes no hook");
 
     let o = w.lords(w.dir.path(), &["sync", "--apply"]);
     let hook = w.path("repo/.git/hooks/post-checkout");
@@ -278,8 +286,20 @@ fn deliver_and_paths_name_a_held_place_with_the_command_that_resolves_it() {
     let o = w.lords(w.dir.path(), &["paths"]);
     let out = text(&o);
     assert_eq!(o.status.code(), Some(1), "{out}");
-    assert!(
-        out.lines().any(|l| l.starts_with("stale") && l.contains("lords sync --repo r --place")),
-        "{out}"
+    let held = |out: &str| {
+        out.lines().any(|l| l.starts_with("stale") && l.contains("lords sync --repo r --place"))
+    };
+    assert!(held(&out), "{out}");
+
+    // Resolved as the entry says: the owner's file goes, and the sync by hand it names puts the place right, which the
+    // state then no longer holds (sol-loop r1 S7).
+    fs::remove_file(w.place()).unwrap();
+    let repo = w.path("repo");
+    let o = w.lords(
+        w.dir.path(),
+        &["sync", "--repo", "r", "--place", repo.to_str().unwrap(), "--apply"],
     );
+    assert!(read(&w.place()).contains("Rule two."), "{}", text(&o));
+    let out = text(&w.lords(w.dir.path(), &["paths"]));
+    assert!(!held(&out), "{out}");
 }
