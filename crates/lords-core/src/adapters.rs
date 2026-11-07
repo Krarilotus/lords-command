@@ -71,13 +71,33 @@ pub trait Adapter: Sync {
     fn guard_hooks(&self, exe: &str, guard: &str, _home: &str) -> Vec<serde_json::Value> {
         vec![serde_json::json!({ "type": "command", "command": exe, "args": ["guard", guard] })]
     }
-    /// The guard a hook entry runs, when it runs Lords' copy `exe` (`guard_hook`): a user's own hook, whatever its
-    /// args, is never Lords'.
-    fn guard_of(&self, hook: &serde_json::Value, exe: &str) -> Option<String> {
-        hook["command"]
-            .as_str()
-            .is_some_and(|c| c.replace('\\', "/").eq_ignore_ascii_case(exe))
-            .then(|| hook["args"][1].as_str().unwrap_or("").to_string())
+    /// The hooks an earlier Lords build wrote for guard `guard` that this one writes otherwise: Lords' own too, so sync
+    /// rewrites or takes them out (D18; design note 2026-11-07-lords-delivery-integrity §1, from each form's commit).
+    fn earlier_hooks(&self, _exe: &str, _guard: &str, _home: &str) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    /// The guard a hook entry runs, when it is a hook a Lords build rendered for copy `exe` and tool home `home`: its
+    /// command, byte for byte, is that of one `guard_hooks` or `earlier_hooks` gives for one of this adapter's guards
+    /// (D18). Only the command decides (`type`, `command`, `args`): the other fields of Lords' hook are Lords'. Any
+    /// other hook, whatever it runs, is never Lords'.
+    fn guard_of(&self, hook: &serde_json::Value, exe: &str, home: &str) -> Option<String> {
+        fn command(h: &serde_json::Value) -> [Option<&serde_json::Value>; 3] {
+            [h.get("type"), h.get("command"), h.get("args")]
+        }
+        let have = command(hook);
+        have[1]?.as_str()?;
+        let lords = |g: &str| {
+            let mut hooks = self.guard_hooks(exe, g, home);
+            hooks.extend(self.earlier_hooks(exe, g, home));
+            hooks.iter().any(|h| command(h) == have)
+        };
+        self.guards().iter().copied().find(|g| lords(g)).map(str::to_string)
+    }
+    /// Whether a hook runs Lords' copy `exe` by the test earlier builds took for Lords' own (its command the copy's
+    /// path, `/` for `\`, in any case): one that isn't Lords' (`guard_of`) is named in the plan, as sync no longer
+    /// claims it (D18).
+    fn runs_copy(&self, hook: &serde_json::Value, exe: &str) -> bool {
+        hook["command"].as_str().is_some_and(|c| c.replace('\\', "/").eq_ignore_ascii_case(exe))
     }
     /// What a settings plan that adds a guard hook says, where the harness runs it only after a step of its own.
     fn guard_note(&self) -> Option<&'static str> {
@@ -135,6 +155,24 @@ impl Adapter for ClaudeCode {
         vec![
             serde_json::json!({ "type": "command", "command": exe, "args": args, "timeout": crate::guard::CHILD_HOOK_TIMEOUT_SECS }),
         ]
+    }
+
+    /// The child hook as `1060e8d` wrote it (no args after its name), as `2d07833`'s three part hooks did (`--part N`)
+    /// and `3cd9d8a`'s with the tool home; the role hook before `6210174` named its harness.
+    fn earlier_hooks(&self, exe: &str, guard: &str, home: &str) -> Vec<serde_json::Value> {
+        let hook = |args: Vec<&str>| serde_json::json!({ "type": "command", "command": exe, "args": args });
+        match guard {
+            "child" => {
+                let mut v = vec![hook(vec!["guard", "child"])];
+                for n in ["1", "2", "3"] {
+                    v.push(hook(vec!["guard", "child", "--part", n]));
+                    v.push(hook(vec!["guard", "child", "--part", n, "--home", home]));
+                }
+                v
+            }
+            "role" => vec![hook(vec!["guard", "role", "--home", home])],
+            _ => Vec::new(),
+        }
     }
 
     fn repo_skills_dir(&self) -> Option<&'static str> {
@@ -227,16 +265,33 @@ impl Adapter for Codex {
         })]
     }
 
-    /// The guard's name: the word after `guard` (its options follow), in either form `guard_hooks` writes or wrote
-    /// (an earlier build's `"exe" guard …` too, so sync replaces it).
-    fn guard_of(&self, hook: &serde_json::Value, exe: &str) -> Option<String> {
-        let line = hook["command"].as_str()?.replace('\\', "/");
+    /// The lines earlier builds wrote: the child hook as `1060e8d` did (`"exe" guard child`) and with the tool home
+    /// (`3cd9d8a`), and the role hook before it named its harness (`c9097ea`'s quoted form, `13994de`'s PowerShell call).
+    fn earlier_hooks(&self, exe: &str, guard: &str, home: &str) -> Vec<serde_json::Value> {
+        let hook = |line: String| serde_json::json!({ "type": "command", "command": line });
+        let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        match guard {
+            "child" => vec![
+                hook(format!("\"{exe}\" guard child")),
+                hook(format!("\"{exe}\" guard child --home \"{home}\"")),
+            ],
+            "role" => vec![
+                hook(format!("\"{exe}\" guard role --home \"{home}\"")),
+                hook(format!("& {} guard role --home {}", lit(exe), lit(home))),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The test earlier builds took for Lords' own: a line starting with the copy's quoted path and `guard`, in either
+    /// form `guard_hooks` writes, `/` for `\`, in any case.
+    fn runs_copy(&self, hook: &serde_json::Value, exe: &str) -> bool {
+        let Some(line) = hook["command"].as_str().map(|l| l.replace('\\', "/")) else {
+            return false;
+        };
         let quoted =
             [format!("\"{exe}\" guard "), format!("& '{}' guard ", exe.replace('\'', "''"))];
-        let prefix = quoted
-            .iter()
-            .find(|p| line.get(..p.len()).is_some_and(|head| head.eq_ignore_ascii_case(p)))?;
-        Some(line[prefix.len()..].split_whitespace().next().unwrap_or("").to_string())
+        quoted.iter().any(|p| line.get(..p.len()).is_some_and(|head| head.eq_ignore_ascii_case(p)))
     }
 
     fn guard_note(&self) -> Option<&'static str> {

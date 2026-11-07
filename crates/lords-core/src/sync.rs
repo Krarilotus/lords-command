@@ -1469,7 +1469,8 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
         }
         item.codex_lords = Some(lords);
     }
-    let names = |h: &serde_json::Value| guard_names(h, adapter, guard.path());
+    item.notes.extend(not_lords(&before_hooks, adapter, guard.path(), &pl.plan.home));
+    let names = |h: &serde_json::Value| guard_names(h, adapter, guard.path(), &pl.plan.home);
     let changed = hooks.as_ref().map(|h| (names(&before_hooks), names(h)));
     if let (Some((before, after)), Some(why)) = (&changed, adapter.guard_note()) {
         if after.iter().any(|g| !before.contains(g)) {
@@ -1524,24 +1525,52 @@ pub(crate) fn lords_hooks(
 const GUARD_EVENTS: [&str; 5] =
     ["PreToolUse", "Stop", "SessionStart", "UserPromptSubmit", "SubagentStart"];
 
-/// The names of Lords' guard hooks (`guard <name>` run from `guard`) a settings `hooks` value holds, each once (settings
-/// an earlier build of the child guard wrote hold it as three hooks, one per part).
+/// The names of Lords' guard hooks (`Adapter::guard_of`, for copy `guard` and tool home `home`) a settings `hooks` value
+/// holds, each once (settings an earlier build of the child guard wrote hold it as three hooks, one per part).
 pub(crate) fn guard_names(
     hooks: &serde_json::Value,
     adapter: &dyn Adapter,
     guard: &Path,
+    home: &Path,
 ) -> Vec<String> {
-    let exe = adapters::slashes(guard);
+    let (exe, home) = (adapters::slashes(guard), adapters::slashes(home));
     let mut names: Vec<String> = GUARD_EVENTS
         .iter()
         .filter_map(|ev| hooks[*ev].as_array())
         .flatten()
         .filter_map(|e| e["hooks"].as_array())
         .flatten()
-        .filter_map(|h| adapter.guard_of(h, &exe))
+        .filter_map(|h| adapter.guard_of(h, &exe, &home))
         .collect();
     names.dedup();
     names
+}
+
+/// Where a settings `hooks` value holds a hook that runs the guard copy but isn't Lords' (`Adapter::runs_copy`, not
+/// `Adapter::guard_of`), by event, entry and hook, never by its text (it may hold a credential; rm-guard review r1, R6):
+/// sync leaves each as it is and says so (D18).
+fn not_lords(
+    hooks: &serde_json::Value,
+    adapter: &dyn Adapter,
+    guard: &Path,
+    home: &Path,
+) -> Vec<String> {
+    let (exe, home) = (adapters::slashes(guard), adapters::slashes(home));
+    let mut found = Vec::new();
+    for ev in GUARD_EVENTS {
+        for (i, e) in hooks[ev].as_array().into_iter().flatten().enumerate() {
+            for (j, h) in e["hooks"].as_array().into_iter().flatten().enumerate() {
+                if adapter.runs_copy(h, &exe) && adapter.guard_of(h, &exe, &home).is_none() {
+                    found.push(format!(
+                        "`hooks.{ev}` entry {}, hook {}: runs Lords' guard copy but isn't a hook Lords writes, so sync leaves it as it is",
+                        i + 1,
+                        j + 1
+                    ));
+                }
+            }
+        }
+    }
+    found
 }
 
 /// What a settings plan shows: what Lords changes there, never the settings' text (rm-guard review r1, R6).
@@ -1578,8 +1607,8 @@ fn settings_summary(
 /// The settings' `hooks` with one Lords guard per name in the target's `guards`, each on its event (`guard_event`), or
 /// `None` when they already hold exactly those. A guard runs the `lords` that syncs, in the adapter's form
 /// (`Adapter::guard_hook`: Claude Code's exec form, `command` and `args`, no shell, as `lords hooks install` does for
-/// git hooks; Codex's command line). A hook entry is Lords' when it runs Lords' copy (`Adapter::guard_of`); any other
-/// entry stays as it is, and so does every event Lords writes no guard to.
+/// git hooks; Codex's command line). A hook is Lords' when its command is one a Lords build rendered for this copy and
+/// home (`Adapter::guard_of`; D18); any other hook stays as it is, and so does every event Lords writes no guard to.
 fn guard_hooks(
     guards: &[String],
     adapter: &dyn Adapter,
@@ -1588,11 +1617,11 @@ fn guard_hooks(
     home: &Path,
 ) -> Result<Option<serde_json::Value>, String> {
     let current = settings.get("hooks").cloned().unwrap_or(serde_json::Value::Null);
-    // Lords' hook: one that runs Lords' guard copy, the only command Lords writes (sol-loop r1, S1). A user's own hook,
-    // whatever its args, is never Lords'.
+    // Lords' hook: one whose command is byte for byte one a Lords build rendered for this copy and home (D18; sol-loop
+    // r1, S1). Any other hook, whatever it runs, is never Lords'.
     let exe = adapters::slashes(guard);
     let home = adapters::slashes(home);
-    let ours = |h: &serde_json::Value| adapter.guard_of(h, &exe).is_some();
+    let ours = |h: &serde_json::Value| adapter.guard_of(h, &exe, &home).is_some();
     let lords_entry =
         |e: &serde_json::Value| e["hooks"].as_array().is_some_and(|hs| hs.iter().any(&ours));
     let has_lords = GUARD_EVENTS
@@ -1647,7 +1676,7 @@ fn guard_hooks(
         let mut emptied = Vec::new();
         for (i, e) in list.iter_mut().enumerate() {
             let alone = match e["hooks"].as_array().map(Vec::as_slice) {
-                Some([h]) => adapter.guard_of(h, &exe),
+                Some([h]) => adapter.guard_of(h, &exe, &home),
                 _ => None,
             };
             let here = wanted.iter().find(|(g, event, _)| {
@@ -1670,7 +1699,7 @@ fn guard_hooks(
             let held = hs.len();
             let mut kept = Vec::with_capacity(held);
             for h in hs.drain(..) {
-                let Some(name) = adapter.guard_of(&h, &exe) else {
+                let Some(name) = adapter.guard_of(&h, &exe, &home) else {
                     kept.push(h);
                     continue;
                 };
