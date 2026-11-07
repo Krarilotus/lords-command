@@ -26,11 +26,12 @@ pub fn session(
 }
 
 /// Whether `argv` lists T3's tools in `--allowedTools` (or `--allowed-tools`): its values up to the next flag, each a
-/// comma- or space-separated list (`claude -h`, 2.1.316). A prompt or a settings value naming them doesn't count.
+/// comma- or space-separated list of permission rules (`claude -h`, 2.1.316). A prompt or a settings value naming them
+/// doesn't count, nor does a rule's specifier (sol-loop r1, S1), nor anything after `--`, which ends the options (S2).
 fn launched_with_t3_tools(argv: &[String]) -> bool {
     let mut lists = Vec::new();
     let mut taking = false;
-    for a in argv.iter().skip(1) {
+    for a in argv.iter().skip(1).take_while(|a| *a != "--") {
         if let Some(v) =
             a.strip_prefix("--allowedTools=").or_else(|| a.strip_prefix("--allowed-tools="))
         {
@@ -44,5 +45,24 @@ fn launched_with_t3_tools(argv: &[String]) -> bool {
             lists.push(a);
         }
     }
-    lists.iter().flat_map(|l| l.split([',', ' '])).any(|t| t.starts_with(T3_TOOLS))
+    lists.iter().any(|l| names_t3_tool(l))
+}
+
+/// Whether a list of permission rules names one of T3's tools: its rules part at commas and blanks outside
+/// parentheses, and a rule's tool is what comes before its specifier (`Bash(git log *)`: `Bash`; Claude Code's
+/// permission rule syntax, `Tool` or `Tool(specifier)`).
+fn names_t3_tool(list: &str) -> bool {
+    let (mut depth, mut tool, mut found) = (0usize, String::new(), false);
+    for c in list.chars().chain([',']) {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' | ' ' | '\t' if depth == 0 => {
+                found |= std::mem::take(&mut tool).starts_with(T3_TOOLS)
+            }
+            c if depth == 0 => tool.push(c),
+            _ => {}
+        }
+    }
+    found
 }
