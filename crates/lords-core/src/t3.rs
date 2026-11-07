@@ -2,11 +2,12 @@
 //! §5.1: H6, with H2 as prefilter). T3 sets `T3CODE_THREAD_ID` for the sessions it starts, but a CLI run from one of
 //! their shells inherits it, and `CLAUDE_CODE_ENTRYPOINT=t3-code` with it, so neither says T3 started this session.
 //! What does: Claude Code names its own process in `CLAUDE_PID` for each hook and shell it runs (a nested CLI names its
-//! own), and T3 launches every Claude Code session with its tools in `--allowedTools` (`mcp__t3-code__*`; 56 of 56 on
-//! 2 Nov). A process's arguments are its launcher's, never inherited.
+//! own), and T3 launches every Claude Code session with its tools allowed, `--allowedTools mcp__t3-code__*` (56 of 56
+//! on 2 Nov, 32 of 32 on 7 Nov). A process's arguments are its launcher's, never inherited.
 
-/// What T3's launch lists in `--allowedTools`: its MCP server's tools.
-const T3_TOOLS: &str = "mcp__t3-code__";
+/// T3's flag as T3 writes it, two arguments: the only form that counts (sol-loop r2; design note §5.4). Reading the
+/// `--allowedTools` list more widely was fooled by a permission rule's specifier and by another option's value.
+const T3_FLAG: [&str; 2] = ["--allowedTools", "mcp__t3-code__*"];
 
 /// Whether a hook runs for a session T3 started. `thread` and `claude_pid`: the hook's `T3CODE_THREAD_ID` and
 /// `CLAUDE_PID`; `argv_of`: a process's arguments (`process::command_line`). Without a thread it is `Ok(false)` and
@@ -25,44 +26,10 @@ pub fn session(
     Ok(launched_with_t3_tools(&argv_of(pid)?))
 }
 
-/// Whether `argv` lists T3's tools in `--allowedTools` (or `--allowed-tools`): its values up to the next flag, each a
-/// comma- or space-separated list of permission rules (`claude -h`, 2.1.316). A prompt or a settings value naming them
-/// doesn't count, nor does a rule's specifier (sol-loop r1, S1), nor anything after `--`, which ends the options (S2).
+/// Whether `argv` holds `T3_FLAG`, its two arguments side by side, before `--`, which ends the options (sol-loop r1,
+/// S2). Any other spelling of the flag goes quiet (A11).
 fn launched_with_t3_tools(argv: &[String]) -> bool {
-    let mut lists = Vec::new();
-    let mut taking = false;
-    for a in argv.iter().skip(1).take_while(|a| *a != "--") {
-        if let Some(v) =
-            a.strip_prefix("--allowedTools=").or_else(|| a.strip_prefix("--allowed-tools="))
-        {
-            lists.push(v);
-            taking = false;
-        } else if a == "--allowedTools" || a == "--allowed-tools" {
-            taking = true;
-        } else if a.starts_with('-') {
-            taking = false;
-        } else if taking {
-            lists.push(a);
-        }
-    }
-    lists.iter().any(|l| names_t3_tool(l))
-}
-
-/// Whether a list of permission rules names one of T3's tools: its rules part at commas and blanks outside
-/// parentheses, and a rule's tool is what comes before its specifier (`Bash(git log *)`: `Bash`; Claude Code's
-/// permission rule syntax, `Tool` or `Tool(specifier)`).
-fn names_t3_tool(list: &str) -> bool {
-    let (mut depth, mut tool, mut found) = (0usize, String::new(), false);
-    for c in list.chars().chain([',']) {
-        match c {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            ',' | ' ' | '\t' if depth == 0 => {
-                found |= std::mem::take(&mut tool).starts_with(T3_TOOLS)
-            }
-            c if depth == 0 => tool.push(c),
-            _ => {}
-        }
-    }
-    found
+    let options: Vec<&str> =
+        argv.iter().skip(1).map(String::as_str).take_while(|a| *a != "--").collect();
+    options.windows(2).any(|pair| pair == T3_FLAG)
 }
