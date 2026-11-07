@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 mod place_uninstall;
+mod target_uninstall;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -486,6 +487,9 @@ pub struct Options {
     pub home: PathBuf,
     /// Plan the removal of every tool-owned path in scope that still matches its ledger record (`lords uninstall`).
     pub uninstall: bool,
+    /// With `uninstall`: only the records of this one target the stack no longer declares (`lords uninstall --target`;
+    /// D21).
+    pub target: Option<String>,
     /// What the apply may do: everything, or the install stage only.
     pub stage: Stage,
     /// The Codex an apply that writes Codex's hooks asks to trust Lords' own and reads trust back from (design note
@@ -2626,6 +2630,10 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
     // One place's uninstall has its own planner: nothing is wanted there, and the ledger alone decides (PI-13).
     if opts.uninstall && opts.place.is_some() {
         return place_uninstall::plan(stacks, private, opts);
+    }
+    // One dropped target's uninstall too: the stack no longer says where it was (D21).
+    if opts.uninstall && opts.target.is_some() {
+        return target_uninstall::plan(stacks, private, opts);
     }
     let ledger = Ledger::load(&opts.home)?;
     let mut pl = Planner {

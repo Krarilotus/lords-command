@@ -31,6 +31,8 @@ usage:
   lords uninstall [--user | --repo NAME] [--apply]   remove the tool's paths that still match its ledger
   lords uninstall --repo NAME --place DIR [--apply] [--json]   one checkout or worktree's recorded copies
     (a changed copy is kept with its record; exit 0 no record of the place remains, 1 one does, 2 refused or stopped)
+  lords uninstall --target NAME [--apply]   a target the stack no longer declares: its copies that still hold what
+    sync wrote, with their records (a changed copy is kept with its record; exit codes as for --place)
   lords adopt [--list | PATH...]   record paths from before the ledger that hold exactly what sync writes there
   lords set-aside PATH... [--yes]   move paths that aren't the tool's into a new backup dir
   (sync, uninstall, adopt, set-aside: --home DIR, the tool's own dir; default ~/.lords-command)
@@ -629,8 +631,17 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     }
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
     let codex = lords_core::codex_trust::Codex::found(deadline);
-    let opts =
-        sync::Options { repo, user_only, adapter, place, home, uninstall: false, stage, codex };
+    let opts = sync::Options {
+        repo,
+        user_only,
+        adapter,
+        place,
+        home,
+        uninstall: false,
+        target: None,
+        stage,
+        codex,
+    };
     let plan = sync::plan(&stacks, &opts)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_default());
@@ -790,8 +801,48 @@ fn uninstall_place(a: &mut Args, dir: &Path, run: &mut PlaceRun) -> Result<bool,
     Ok(run.remaining.as_ref().is_some_and(Vec::is_empty))
 }
 
+/// `lords uninstall --target NAME`: one target the stack no longer declares, its copies that still hold what their
+/// records say (D21, design note 2026-11-07-lords-delivery-integrity §3). `Ok(true)` when no record of the target
+/// remains (a dry run: would remain), `Ok(false)` while one does.
+fn uninstall_target(a: &mut Args, name: String) -> Result<bool, String> {
+    let home = tool_home(a)?;
+    let apply = a.flag("--apply");
+    let p = paths(a)?;
+    a.done()?;
+    let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    let opts = sync::Options {
+        target: Some(name.clone()),
+        home,
+        uninstall: true,
+        ..sync::Options::default()
+    };
+    let plan = sync::plan(&stacks, &opts)?;
+    print_plan(&plan);
+    let left = if apply {
+        let done = sync::apply(&plan);
+        if let Ok(applied) = &done {
+            print_applied(applied);
+        }
+        done?;
+        // What the ledger still records of the target, read back with a fresh plan.
+        sync::plan(&stacks, &opts)
+            .map_err(|e| format!("applied, but target {name} couldn't be read back: {e}"))?
+            .items
+            .len()
+    } else {
+        plan.items.iter().filter(|i| i.action == sync::Action::Report).count()
+    };
+    let head =
+        if apply { "applied" } else { "dry run: nothing changed (`--apply` acts); after it" };
+    match left {
+        0 => println!("{head}: no record of target {name} remains"),
+        n => println!("{head}: {n} record(s) of target {name} remain, each kept with its path"),
+    }
+    Ok(left == 0)
+}
+
 /// `lords uninstall`: removes every tool-owned path in scope that still matches its ledger record; with `--place`,
-/// one checkout or worktree's (`uninstall_place`).
+/// one checkout or worktree's (`uninstall_place`); with `--target`, one dropped target's (`uninstall_target`).
 fn cmd_uninstall(mut a: Args) -> Result<bool, String> {
     let json = a.flag("--json");
     // A bad `--place` is a refusal too, which `--json` gives as its one object (sol-loop r1 S2).
@@ -819,6 +870,9 @@ fn cmd_uninstall(mut a: Args) -> Result<bool, String> {
     }
     if json {
         return Err("--json goes with --place: it is one place's result".into());
+    }
+    if let Some(name) = a.value("--target")? {
+        return uninstall_target(&mut a, name);
     }
     let home = tool_home(&mut a)?;
     let apply = a.flag("--apply");

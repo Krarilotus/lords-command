@@ -299,6 +299,35 @@ fn uninstall_target_removes_only_a_dropped_targets_unchanged_copies() {
     assert_eq!(o.status.code(), Some(2), "a declared target: {}", text(&o));
 }
 
+// Spec (design note §3, I21, A21-7: "a target has one dir: records naming two refuse the whole run (a false record)"; Sol
+// review r3, R3-03: a well-formed but false record must never make sync remove a path outside every target): a ledger
+// record of the dropped target under another dir, holding just what it says, refuses the run, exit 2, and nothing is
+// removed, neither there nor in the target's own dir. Written after its fix: before `--target` every call was refused.
+#[test]
+fn uninstall_target_refuses_records_naming_two_dirs() {
+    let h = Home::new(&["a"], "");
+    let old = h.path("home/old");
+    h.declare(&skills_target("old skills", &old));
+    assert!(h.stacked(&["sync", "--user", "--apply"]).status.success());
+    h.declare("");
+    h.write("home/elsewhere/x/SKILL.md", "not a copy of Lords'\n");
+    // A record forged by hand into the ledger (format 2): the dir `x` under another root, its tree hash as it is now.
+    let (root, path) = (h.path("home/elsewhere"), h.path("home/elsewhere/x"));
+    let sha = lords_core::fsguard::tree_sha(&lords_core::fsguard::read_tree(&path).unwrap());
+    let file = lords_core::ledger::file(&h.path("home/.lords-command"));
+    let mut ledger = fs::read_to_string(&file).unwrap();
+    ledger.push_str(&format!(
+        "\n[owned.'{}']\nroot = '{}'\nparts = ['x']\nkind = 'dir'\nsha = '{sha}'\nscope = 'target:old skills'\n",
+        lords_core::ledger::key(&path),
+        root.display()
+    ));
+    fs::write(&file, ledger).unwrap();
+    let before = (files(&old), files(&root));
+    let o = h.stacked(&["uninstall", "--target", "old skills", "--apply"]);
+    assert_eq!((files(&old), files(&root)), before, "{}", text(&o));
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+}
+
 // Spec (the Lords owner's brief, 7 Nov: "`guard install` while the guard copy is busy: today it fails with os error 5
 // when a hook run holds `lords-guard.exe`. Windows lets a running image be renamed, so rename the busy copy aside, copy,
 // and remove the aside copies once they're free. It must never leave no guard in place"; design note §4, I4, A4-1,

@@ -1098,6 +1098,13 @@ impl Root {
         Root::at(dir)
     }
 
+    /// A dropped target's dir, as the ledger records it (`lords uninstall --target`; D21): the stack names it no longer,
+    /// so it is the ledger's word, checked as every root is (absolute, no link on the way). Only a copy below it that
+    /// holds what its record says is ever removed.
+    pub fn recorded(dir: &Path) -> Result<Root, String> {
+        Root::at(dir.to_path_buf())
+    }
+
     /// A workspace's dir.
     pub fn workspace(w: &crate::stack::Workspace) -> Result<Root, String> {
         Root::at(crate::config::expand_home(&w.path))
