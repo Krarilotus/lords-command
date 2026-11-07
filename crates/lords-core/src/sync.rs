@@ -463,12 +463,22 @@ pub fn install_guard(home: &Path, from: &Path) -> Result<bool, String> {
     let _lock = ApplyLock::take(home, 60)?;
     let place = guard_place(home)?;
     fsguard::create_dir_all(&Root::home(home)?.join(&[Part::new("bin")?]))?;
-    match guard_bytes(&place)? {
+    let wrote = match guard_bytes(&place)? {
         Some(have) if have == bytes => {
             crate::process::guard_self_test(place.path()).map(|()| false)
         }
         _ => fsguard::install_exe(&place, &bytes, crate::process::guard_self_test).map(|()| true),
-    }
+    }?;
+    // Earlier copies a hook ran while an install set them aside go once free (design note
+    // 2026-11-07-lords-delivery-integrity §4); `guard_aside` counts those still running.
+    fsguard::sweep_busy(&place)?;
+    Ok(wrote)
+}
+
+/// How many earlier guard copies `install_guard` set aside are still there, a process running each: those free now
+/// are deleted first (`fsguard::sweep_busy`).
+pub fn guard_aside(home: &Path) -> Result<usize, String> {
+    fsguard::sweep_busy(&guard_place(home)?)
 }
 
 #[derive(Clone, Debug, Default)]

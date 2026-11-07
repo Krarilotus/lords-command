@@ -1390,7 +1390,11 @@ pub fn move_to(from: &impl Place, to: &Contained) -> Result<(), String> {
 }
 
 /// Puts an executable at `p` that is the tool's alone: written and synced as a staged `.exe` beside it, run there by
-/// `verify`, then renamed over `p`. A copy that fails `verify` is removed and `p` keeps what it had.
+/// `verify`, then renamed over `p`. A copy that fails `verify` is removed and `p` keeps what it had. One a running
+/// process holds, which Windows won't replace (os error 5) but lets be renamed, goes aside first (`.<name>.lords-busy-…`)
+/// and is deleted once free, here or by `sweep_busy` (design note 2026-11-07-lords-delivery-integrity §4): `p` never
+/// lacks a copy but between those two renames, or when the second fails and the old copy can't go back, which the error
+/// then names.
 pub fn install_exe(
     p: &impl Place,
     bytes: &[u8],
@@ -1408,10 +1412,51 @@ pub fn install_exe(
         let _ = delete_file_at(&staged);
         return Err(e);
     }
-    fs::rename(&staged, path).map_err(|e| {
+    let Err(busy) = fs::rename(&staged, path) else { return Ok(()) };
+    let refused = |e: String| {
         let _ = delete_file_at(&staged);
-        format!("{}: {e} (a session running it holds it; sync again)", path.display())
-    })
+        format!("{}: {e}", path.display())
+    };
+    // Nothing there (or it can't be told): the rename failed for another reason, and nothing is moved.
+    if nothing_at(path).unwrap_or(true) {
+        return Err(refused(busy.to_string()));
+    }
+    let aside = beside(path, "busy").map_err(refused)?;
+    if let Err(e) = fs::rename(path, &aside) {
+        return Err(refused(format!("{busy}; and it can't be set aside ({e})")));
+    }
+    if let Err(e) = fs::rename(&staged, path) {
+        let back = move_back_at(&aside, path);
+        let _ = delete_file_at(&staged);
+        return Err(match back {
+            Ok(()) => format!("{}: {e}", path.display()),
+            Err(b) => format!(
+                "{}: {e}; and the old copy couldn't go back ({b}): it is at {}",
+                path.display(),
+                aside.display()
+            ),
+        });
+    }
+    // Still running, it stays for the next `sweep_busy`.
+    let _ = delete_file_at(&aside);
+    Ok(())
+}
+
+/// Deletes each copy `install_exe` set aside beside `p` (`.<name>.lords-busy-…`, a plain file) that is free now; one a
+/// process still runs stays. Gives how many stay. Nothing else is touched: no other name, no dir, no link.
+pub fn sweep_busy(p: &impl Place) -> Result<usize, String> {
+    let path = p.place();
+    check(path)?;
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return Ok(0) };
+    let prefix = format!(".{}.lords-busy-", name.to_string_lossy());
+    let mut left = 0;
+    for f in list_dir(dir)? {
+        let ours = f.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&prefix));
+        if ours && kind_here(&f) == Ok(Kind::File) && fs::remove_file(&f).is_err() {
+            left += 1;
+        }
+    }
+    Ok(left)
 }
 
 /// Replaces a file that is the tool's alone, keeping its attributes or refusing.

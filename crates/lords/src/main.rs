@@ -459,12 +459,16 @@ fn guard_install(mut a: Args) -> ExitCode {
         a.done()?;
         let me = std::env::current_exe().map_err(|e| e.to_string())?;
         let wrote = lords_core::sync::install_guard(&home, &me)?;
-        Ok((lords_core::sync::guard_place(&home)?.path().to_path_buf(), wrote))
+        let aside = lords_core::sync::guard_aside(&home)?;
+        Ok((lords_core::sync::guard_place(&home)?.path().to_path_buf(), wrote, aside))
     });
     match done {
-        Ok((place, wrote)) => {
+        Ok((place, wrote, aside)) => {
             let what = if wrote { "installed" } else { "already current" };
             say(&format!("guard {what}: {} (passes its self-test)", place.display()));
+            if aside > 0 {
+                say(&format!("{aside} earlier copy(ies) still run beside it, set aside; the next `lords guard install` removes them"));
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
