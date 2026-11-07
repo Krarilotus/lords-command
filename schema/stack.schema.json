@@ -120,6 +120,14 @@
         "additionalProperties": false
       }
     },
+    "safe_only": {
+      "type": "object",
+      "description": "what `lords sync --safe-only` applies with no one looking besides what is always safe",
+      "properties": {
+        "applies": { "type": "array", "items": { "enum": ["new-place", "exclude"] }, "default": [], "description": "\"new-place\": tool-owned files where nothing is, in a declared place where the ledger records nothing yet; \"exclude\": sync's own lines in a checkout's git exclude. Default none: both hold their place for a sync by hand" }
+      },
+      "additionalProperties": false
+    },
     "child_role": { "type": "string", "description": "the role a native subagent (one a session starts itself) starts as: each place's `.lords/child.md` carries that role's lines its place's file doesn't, which the `child` guard gives it" },
     "require_core": { "type": "boolean", "default": false, "description": "`check` refuses an entry of this stack that has neither a core line nor `start: detail` (intent, memory and in-repo skills need none)" }
   },

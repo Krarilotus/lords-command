@@ -152,6 +152,28 @@ pub struct Manifest {
     /// Per adapter id: how its place files are composed and measured (design: Sync, place files per adapter).
     #[serde(default)]
     pub place_files: BTreeMap<String, PlaceFiles>,
+    /// What `lords sync --safe-only` applies besides what is always safe (design: Sync, the safe-only stage).
+    #[serde(default)]
+    pub safe_only: Option<SafeOnly>,
+}
+
+/// stack.toml `[safe_only]` (D13; the owner, 7 Nov: "make thigns more configurable").
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeOnly {
+    /// Default none. Only the two that can't overwrite or remove an owner's bytes can be named.
+    #[serde(default)]
+    pub applies: Vec<SafeAlso>,
+}
+
+/// What a stack may let `--safe-only` apply besides what is always safe.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SafeAlso {
+    /// Tool-owned files where nothing is, in a declared place where the ledger records nothing yet.
+    NewPlace,
+    /// Sync's own lines in a checkout's git exclude, its one edit there (backed up).
+    Exclude,
 }
 
 /// One adapter's place files (stack.toml `[place_files.<adapter>]`).
@@ -187,6 +209,15 @@ impl Stacks {
             .chain([&self.public])
             .find_map(|s| s.manifest.place_files.get(adapter))
             .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The safe-only setting: the private stack's, else the public stack's, else the default (nothing more).
+    pub fn safe_only(&self) -> SafeOnly {
+        self.private
+            .iter()
+            .chain([&self.public])
+            .find_map(|s| s.manifest.safe_only.clone())
             .unwrap_or_default()
     }
 }

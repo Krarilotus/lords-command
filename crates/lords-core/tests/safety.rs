@@ -539,6 +539,30 @@ fn an_edit_after_planning_is_refused_and_kept() {
     assert_eq!(read(&b.join("CLAUDE.local.md")), "Edited after the plan.\n");
 }
 
+// Spec (the owner, 7 Nov 17:16, intent item 10: "make thigns more configurable, no harded coded shit that will bite
+// later and we would need to adjust manually again"; note §11b): what `--safe-only` applies besides what is always safe
+// is the stack's `[safe_only] applies`, by default nothing more. Naming "new-place" and "exclude" delivers a declared
+// checkout Lords hasn't written to, its git exclude lines included, with no one looking; any other value is refused
+// when the stack loads, as only those two can't overwrite or remove an owner's bytes.
+#[test]
+fn the_stack_names_what_safe_only_also_applies() {
+    let f = Fixture::new();
+    let (a, b) = synced(&f);
+    let c = checkout(&f, "c");
+    manifest(&f, &[&a, &b, &c], "[safe_only]\napplies = [\"new-place\", \"exclude\"]\n");
+    assert_eq!(class(&full(&f), &c.join("CLAUDE.local.md")), Safety::Safe);
+    assert_eq!(class(&full(&f), &c.join(".git/info/exclude")), Safety::Safe);
+    let p = safe_only(&f);
+    assert!(held(&p).is_empty(), "{:?}", held(&p));
+    apply(&p).unwrap();
+    assert!(read(&c.join("CLAUDE.local.md")).contains("Rule one."));
+    assert!(read(&c.join(".git/info/exclude")).contains("/CLAUDE.local.md"));
+
+    manifest(&f, &[&a, &b, &c], "[safe_only]\napplies = [\"removal\"]\n");
+    let s = lords_core::Stacks::load(&f.pub_root(), Some(&f.priv_root()));
+    assert!(s.is_err(), "only new-place and exclude may be named");
+}
+
 // Spec (note D3; sol-loop r1 S1): a place is held whole only where the plan sees all of it, so the planner itself
 // refuses a safe-only plan of one adapter's files, whoever calls it: otherwise a checkout whose Codex file its owner
 // changed would get Claude's file and `.lords` updated.
