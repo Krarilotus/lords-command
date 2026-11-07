@@ -538,3 +538,18 @@ fn an_edit_after_planning_is_refused_and_kept() {
     assert!(apply(&p).is_err());
     assert_eq!(read(&b.join("CLAUDE.local.md")), "Edited after the plan.\n");
 }
+
+// Spec (note D3; sol-loop r1 S1): a place is held whole only where the plan sees all of it, so the planner itself
+// refuses a safe-only plan of one adapter's files, whoever calls it: otherwise a checkout whose Codex file its owner
+// changed would get Claude's file and `.lords` updated.
+#[test]
+fn a_safe_only_plan_of_part_of_a_place_is_refused() {
+    let f = Fixture::new();
+    let (a, _) = synced(&f);
+    fs::write(a.join("AGENTS.override.md"), "My own text.\n").unwrap();
+    rule(&f, "Rule two.\n");
+    let opts = Options { stage: Stage::SafeOnly, adapter: Some("claude".into()), ..f.opts() };
+    let p = plan(&f.stacks(), &opts);
+    let kept = p.as_ref().map(|p| p.items.iter().map(|i| i.path.clone()).collect::<Vec<_>>());
+    assert!(p.as_ref().is_err_and(|e| e.contains("adapter")), "{kept:?}");
+}
