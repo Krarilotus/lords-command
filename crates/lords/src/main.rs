@@ -52,6 +52,7 @@ usage:
   lords guard time   the PreToolUse hook on editor writes to Markdown and text files and on T3 messages: refuses a
     placeholder clock time; reminds of one more than 5 minutes after the clock not marked as a plan
   lords guard install [--home DIR]   install or update the guard copy the hooks run (sync never writes it)
+  lords guard --guards   the guards this copy runs; sync names one in a hook only while the installed copy lists it
   lords panel serve [--port N]   the window on another PC reads and edits these stacks through it (127.0.0.1:7879)
   lords panel add ALIAS --bridge DIR [--embedded] [--apply]   set a PC this one reaches as ALIAS up for the panel;
     prints the exact targets on both PCs, and with --apply carries them out (backups first, the route checked last);
@@ -178,6 +179,12 @@ fn cmd_guard(mut a: Args) -> ExitCode {
                 .contains("\"deny\"");
         say(if ok { "ok" } else { "the guard let its witness through" });
         return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
+    }
+    // The guards this copy runs, which sync asks before it names one in a hook (D20): an earlier copy answers this with
+    // the rm usage note and nothing on stdout.
+    if a.flag("--guards") {
+        say(&format!("lords guards {}", lords_core::guard::GUARDS.join(" ")));
+        return ExitCode::SUCCESS;
     }
     let which = a.positional();
     if which.as_deref() == Some("install") {

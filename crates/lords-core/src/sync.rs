@@ -110,6 +110,9 @@ pub struct Item {
     /// A settings item whose hooks will name the guard copy: apply checks it is there and answers before it writes.
     #[serde(skip)]
     pub(crate) names_guard: Option<Contained>,
+    /// The guards those hooks run: apply checks the copy still lists each (D20).
+    #[serde(skip)]
+    pub(crate) names_guards: Vec<String>,
     /// Among them the child guard: apply checks the copy speaks this build's child protocol too (fix check r2, FC4).
     #[serde(skip)]
     pub(crate) names_child_guard: bool,
@@ -261,6 +264,7 @@ impl Item {
             conflict: ConflictKind::Other,
             redacted: false,
             names_guard: None,
+            names_guards: Vec::new(),
             names_child_guard: false,
             names_role_guard: None,
             names_rm_guard: None,
@@ -375,6 +379,31 @@ fn guard_ready(place: &Contained) -> Result<(), String> {
         Some(_) => crate::process::guard_self_test(place.path())
             .map_err(|e| format!("guard not ready ({e}): run `lords guard install`")),
     }
+}
+
+/// Whether the guard copy runs every guard of `guards`, as it lists them (`process::guard_list`; D20, design note
+/// 2026-11-07-lords-delivery-integrity §2): an earlier copy answers a guard it doesn't know with a usage note and lets
+/// everything through, so sync never names one in a hook the copy can't run. Checked when planning and again when
+/// applying. Read only.
+fn guard_runs(place: &Contained, guards: &[String]) -> Result<(), String> {
+    let fix = "run `lords guard install`, then sync again; the hooks stay as they are";
+    let listed = crate::process::guard_list(place.path())
+        .map_err(|e| format!("the guards the guard copy runs can't be told ({e}): {fix}"))?
+        .ok_or_else(|| {
+            format!(
+                "the guard copy is from an earlier build and can't say which guards it runs: {fix}"
+            )
+        })?;
+    let missing: Vec<String> =
+        guards.iter().filter(|g| !listed.contains(g)).map(|g| format!("`{g}`")).collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the guard copy runs no {} guard (it runs: {}): {fix}",
+        missing.join(", "),
+        listed.join(", ")
+    ))
 }
 
 /// Whether the guard copy speaks this build's child protocol (fix check r2, FC4): asked with the very command line the
@@ -1403,8 +1432,14 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
             }
         }
     };
-    // A copy that answers but refuses this build's child hooks is refused, with the hooks it has kept (fix check r2,
-    // FC4): taking them out would leave the harness without the guards that still work.
+    // A copy that answers but can't run a guard the target names, or refuses this build's child hooks, is refused, with
+    // the hooks it has kept (D20; fix check r2, FC4): taking them out would leave the harness without the guards that
+    // still work.
+    if !guards.is_empty() {
+        if let Err(e) = guard_runs(&guard, guards) {
+            return conflict(&t.name, &path, e);
+        }
+    }
     let child = guards.iter().any(|g| g == "child");
     if child {
         if let Err(e) = guard_speaks_child(&guard, &pl.plan.home) {
@@ -1455,6 +1490,7 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
     item.redacted = true;
     item.notes.extend(not_ready);
     item.names_guard = (!guards.is_empty()).then(|| guard.clone());
+    item.names_guards = guards.to_vec();
     item.names_child_guard = child;
     item.names_role_guard = role;
     item.names_rm_guard = rm;
@@ -3189,6 +3225,7 @@ pub fn apply_between(plan: &Plan, mut installed: impl FnMut(&Path)) -> Result<Ap
     for i in &changing {
         let Some(g) = &i.names_guard else { continue };
         guard_ready(g).map_err(|e| format!("{e} (nothing was changed)"))?;
+        guard_runs(g, &i.names_guards).map_err(|e| format!("{e} (nothing was changed)"))?;
         if i.names_child_guard {
             guard_speaks_child(g, &plan.home).map_err(|e| format!("{e} (nothing was changed)"))?;
         }

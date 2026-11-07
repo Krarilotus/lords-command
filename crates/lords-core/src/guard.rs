@@ -826,6 +826,10 @@ pub fn git_help(command: &str, shell: Shell) -> Option<String> {
 /// writes one (review r1, D16-R1-01): 1 is D16's, with git's help refused, `--shell` and the PowerShell tool.
 pub const RM_PROTOCOL: u32 = 1;
 
+/// Every guard `lords guard` runs, as `lords guard --guards` lists them: sync registers a guard only while the installed
+/// copy lists it (D20; design note 2026-11-07-lords-delivery-integrity §2). The CLI dispatches each by this name.
+pub const GUARDS: [&str; 8] = ["rm", "queue", "session", "turn", "child", "role", "time", "helper"];
+
 /// The guard's answer to an event from Claude Code's Bash tool, or any tool whose text is Bash's (`shell_hook`).
 pub fn rm_hook(input: &str) -> String {
     shell_hook(input, Shell::Bash)
