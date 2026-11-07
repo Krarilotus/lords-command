@@ -270,17 +270,28 @@ fn when_t3_cant_be_told_the_call_goes_through_with_a_note() {
     assert_eq!(asked, 1);
 }
 
-// Spec (Microsoft Learn, "Parsing C++ command-line arguments", the examples table, which also holds for
-// `CommandLineToArgvW` after the program name; the program name is the text to the next space, or between quotes,
-// without escapes): a Windows command line splits into the arguments the started program sees.
+// Spec (Microsoft Learn, "Parsing C++ command-line arguments": the examples table and its rules, "Within a quoted
+// string, a pair of double quote marks is interpreted as a single escaped double quote mark", and for the program
+// name, "parts surrounded by double quote marks ... prevent interpretation of a space or tab character as the end of
+// the argument"; claude.exe 2.1.316 reads its own line by these rules where `CommandLineToArgvW` doesn't, design note
+// §5.3, probes Q1, Q2): a Windows command line splits into the arguments the started program sees.
 #[test]
 fn a_windows_command_line_splits_as_its_program_reads_it() {
-    let rows: [(&str, &[&str]); 7] = [
+    let rows: [(&str, &[&str]); 13] = [
         (r#"prog "abc" d e"#, &["prog", "abc", "d", "e"]),
         (r#"prog a\\b d"e f"g h"#, &["prog", r"a\\b", "de fg", "h"]),
         (r#"prog a\\\"b c d"#, &["prog", r#"a\"b"#, "c", "d"]),
         (r#"prog a\\\\"b c" d e"#, &["prog", r"a\\b c", "d", "e"]),
         (r#"prog a"b"" c d"#, &["prog", r#"ab" c d"#]),
+        // A doubled quote inside quotes is one quote, and the quotes go on (Q1).
+        (r#"prog a"b c"d "" x """ y """" z"#, &["prog", "ab cd", "", "x", "\" y \"\" z"]),
+        (r#"prog "a""b" "a"""b" a""b "#, &["prog", "a\"b", "a\"b a\"b "]),
+        // Seven quotes: one opens, three pairs are three quotes.
+        ("prog \"\"\"\"\"\"\"", &["prog", "\"\"\""]),
+        // In the program name a quote only opens and closes, and the name runs to a blank outside them (Q2).
+        (r#""C:\a b"c d"#, &[r"C:\a bc", "d"]),
+        (r#"C:\a"b c"d e"#, &[r"C:\ab cd", "e"]),
+        (r#"C:\x\"y" z"#, &[r"C:\x\y", "z"]),
         (
             r#""C:\Program Files\x\claude.exe" -p "a b""#,
             &[r"C:\Program Files\x\claude.exe", "-p", "a b"],
@@ -296,6 +307,76 @@ fn a_windows_command_line_splits_as_its_program_reads_it() {
     assert_eq!(argv[at + 1], "mcp__t3-code__*");
     assert_eq!(argv.last().unwrap(), r#"{"fastMode":false,"showThinkingSummaries":true}"#);
     assert_eq!(t3::session(Some("thread:x"), Some("1"), |_| Ok(argv)), Ok(true));
+}
+
+/// The arguments the real `CommandLineToArgvW` (shell32) reads in `line`: the splitter's oracle, in this test binary
+/// only (the Lords owner, 3 Nov: "Production never loads shell32").
+#[cfg(windows)]
+fn windows_argv(line: &str) -> Vec<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+    let wide: Vec<u16> = line.encode_utf16().chain([0]).collect();
+    let mut n = 0;
+    // SAFETY: a NUL-ended string that outlives the call; the array it returns holds `n` NUL-ended strings, each read
+    // up to its NUL, and is freed once, after the last read.
+    unsafe {
+        let argv = CommandLineToArgvW(wide.as_ptr(), &mut n);
+        assert!(!argv.is_null(), "{line:?}: {}", std::io::Error::last_os_error());
+        let args = (0..n as usize)
+            .map(|i| {
+                let p = *argv.add(i);
+                let len = (0..).take_while(|&j| *p.add(j) != 0).count();
+                String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
+            })
+            .collect();
+        LocalFree(argv.cast());
+        args
+    }
+}
+
+// Spec (the Lords owner, 3 Nov: "Test your splitter against the real `CommandLineToArgvW`, called from the test binary
+// only, over a table of quoting and backslash cases"): every line here splits as `CommandLineToArgvW` splits it. Not
+// the empty line, for which it gives this program's own path instead of reading the line, and not the two classes
+// where it and the C runtime differ and claude.exe reads its line as the C runtime does (a doubled quote inside
+// quotes; a quote in the program name before its end: design note §5.3, Q1, Q2), which the test above holds.
+#[cfg(windows)]
+#[test]
+fn the_splitter_reads_a_line_as_command_line_to_argv_does() {
+    let lines = [
+        // Backslashes: before a quote, 2n are n and the quote counts, 2n+1 are n and a literal quote; else literal.
+        r"prog a\b c\\d \\\e f\",
+        r#"prog a\"b c\\"d e" \\\"f\\\\"g h"#,
+        r#"prog a\\\\\"b "c\\\\\"d e" \"x"#,
+        r#"prog "C:\dir with space\\" x "C:\dir\" y" z"#,
+        r#"prog "tail\\\\""#,
+        // Quotes: open and close anywhere in an argument; empty and unbalanced ones.
+        r#"prog a"b c"d "" x "y z""#,
+        r#"prog "open to the end"#,
+        r#"prog "a b"c" d"#,
+        // Blanks: tabs, runs of them, trailing and leading ones.
+        "prog\ta\t\tb  c \t",
+        "  prog a",
+        // The program name: quoted, with backslashes, with a quote after its end.
+        r#""C:\Program Files\x\claude.exe" -p "a b""#,
+        r#""C:\x\\" y"#,
+        r#"C:\x\y "z"#,
+        // Not ASCII, and the launch the probe read.
+        "prog \"ä ö\" ü 😀",
+        T3_LAUNCH,
+    ];
+    let differ: Vec<String> = lines
+        .iter()
+        .map(|l| (l, split_command_line(l), windows_argv(l)))
+        .filter(|(_, ours, real)| ours != real)
+        .map(|(l, ours, real)| format!("{l}\n  ours {ours:?}\n  real {real:?}"))
+        .collect();
+    assert!(
+        differ.is_empty(),
+        "{} of {} lines differ:\n{}",
+        differ.len(),
+        lines.len(),
+        differ.join("\n")
+    );
 }
 
 // Spec (design note §5.1, the reader: Windows `NtQueryInformationProcess`; §2: on other systems it reads nothing, so
