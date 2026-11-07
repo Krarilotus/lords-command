@@ -30,6 +30,10 @@ usage:
   lords sync --safe-only [--user | --repo NAME [--place DIR]] [--json] [--apply]   only what needs no one: a place
     with anything else is held whole and named with why; no import or retirement (listed); exit 1 while a place is held
   lords sync --restore BACKUP_DIR   undo one apply's owner-file edits, each only while it holds what sync wrote
+  lords deliver [--on-commit DIR | --repo NAME --place DIR --new-worktree] [--home DIR]   the stores' committed
+    entries into every place (or one new worktree), safe-only, under the apply lock, place by place; what it held, or
+    why it failed, goes into the state file `lords paths` reads (exit 0 nothing held, 1 held, 2 failed). The stores'
+    post-commit and each repo's post-checkout hook run it. --protocol: the protocol this copy speaks
   lords uninstall [--user | --repo NAME] [--apply]   remove the tool's paths that still match its ledger
   lords uninstall --repo NAME --place DIR [--apply] [--json]   one checkout or worktree's recorded copies
     (a changed copy is kept with its record; exit 0 no record of the place remains, 1 one does, 2 refused or stopped)
@@ -613,6 +617,63 @@ fn print_held(plan: &sync::Plan, held: &sync::Held) {
     }
 }
 
+/// `lords deliver` (deliver.rs; F8): what changed, then each held place, repo hook, failure and piece of store work
+/// with the command that resolves it, and where the state file is. Exit 0 with nothing held, 1 with a place or a repo's
+/// hook held, 2 when the delivery failed (the state file says why, too).
+fn cmd_deliver(mut a: Args) -> Result<bool, String> {
+    use lords_core::deliver;
+    if a.flag("--protocol") {
+        a.done()?;
+        println!("lords deliver {}", deliver::PROTOCOL);
+        return Ok(true);
+    }
+    let home = tool_home(&mut a)?;
+    let on_commit = a.value("--on-commit")?.map(PathBuf::from);
+    let repo = a.value("--repo")?;
+    let place = a.value("--place")?.map(PathBuf::from);
+    let new_worktree = a.flag("--new-worktree");
+    let p = paths(&mut a)?;
+    a.done()?;
+    let mut opts = match (repo, place, new_worktree) {
+        (Some(r), Some(d), true) => deliver::Options::worktree(&home, &r, &d),
+        (None, None, false) => deliver::Options::whole(&home),
+        _ => return Err("--repo, --place and --new-worktree go together: one new worktree".into()),
+    };
+    if on_commit.is_some() && opts.worktree.is_some() {
+        return Err("--on-commit is a store commit's delivery, of the whole machine".into());
+    }
+    opts.on_commit = on_commit;
+    let r = deliver::run(&p.public, p.private.as_deref(), &opts)?;
+    for line in &r.done {
+        println!("{line}");
+    }
+    let s = &r.state;
+    for h in &s.places {
+        println!("held {}: {}", h.place, h.command);
+        for i in &h.items {
+            let note = if i.note.is_empty() { String::new() } else { format!(": {}", i.note) };
+            println!("   {}  {}{note}", i.reason, i.path);
+        }
+    }
+    for i in &s.everything {
+        println!("held everywhere: {}  {}: {}", i.reason, i.path, i.note);
+    }
+    for n in s.hooks.iter().chain(&s.store_work) {
+        println!("held {}: {}; {}", n.what, n.why, n.command);
+    }
+    if r.not_a_trigger {
+        println!("not delivered: [delivery] on_commit doesn't list this store");
+    } else if r.unchanged {
+        println!(
+            "delivered already: the stores' committed stacks are as the last delivery found them"
+        );
+    } else {
+        println!("delivered: {} change(s); {} place(s) held", r.done.len(), s.places.len());
+    }
+    println!("state: {}", r.file.display());
+    Ok(!r.holds())
+}
+
 /// A plan of the current config for every target and place: what `restore` and `set-aside` check paths against.
 fn whole_plan(a: &mut Args, home: PathBuf) -> Result<sync::Plan, String> {
     let p = paths(a)?;
@@ -675,6 +736,7 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         target: None,
         stage,
         codex,
+        new_worktree: false,
     };
     let plan = sync::plan(&stacks, &opts)?;
     if json {
@@ -1483,6 +1545,7 @@ fn main() -> ExitCode {
         "hooks" => cmd_hooks(a),
         "hash" => cmd_hash(a),
         "sync" => cmd_sync(a),
+        "deliver" => cmd_deliver(a),
         "compose" => cmd_compose(a),
         "show" => cmd_show(a),
         "uninstall" => cmd_uninstall(a),

@@ -48,6 +48,9 @@ pub enum Hold {
     IncompleteView,
     /// An ended temporary entry, retired with a commit in its stack: store work, which holds no place.
     Retirement,
+    /// The one place a plan was asked for isn't a checkout or worktree of its repo yet: a new worktree still being made
+    /// (F8, D22). A delivery tries it again.
+    NotReady,
     /// Not typed by the planner (`Item::new`'s default): held, never applied.
     Unclassified,
 }
@@ -72,6 +75,7 @@ impl std::fmt::Display for Hold {
             Hold::PlaceStillThere => "place-still-there",
             Hold::IncompleteView => "incomplete-view",
             Hold::Retirement => "retirement",
+            Hold::NotReady => "not-ready",
             Hold::Unclassified => "unclassified",
         })
     }
@@ -134,6 +138,8 @@ pub struct HeldItem {
 pub struct HeldPlace {
     pub place: PlaceId,
     pub items: Vec<HeldItem>,
+    /// The sync by hand that resolves it (F8, D5): its dry run says what each item wants, then `--apply`.
+    pub sync: String,
 }
 
 /// What `Stage::SafeOnly` left out (`Plan::held`).
@@ -216,6 +222,7 @@ fn class_of(i: &Item, managed: &BTreeSet<String>, also: &[SafeAlso], complete: b
             ConflictKind::ModifiedCopy => Hold::ChangedCopy,
             ConflictKind::OverLimit => Hold::OverLimit,
             ConflictKind::Other => Hold::Conflict,
+            ConflictKind::NotReady => Hold::NotReady,
         }),
         // A copy its owner changed that the stacks no longer want: it stays, and its record would go.
         Action::Forget if !i.gone => need(Hold::ChangedCopy),
@@ -244,7 +251,7 @@ pub(crate) fn safe_only(plan: &mut Plan) {
             held.everything.push(it);
         } else {
             for p in &i.places {
-                let place = HeldPlace { place: p.clone(), items: Vec::new() };
+                let place = HeldPlace { place: p.clone(), items: Vec::new(), sync: String::new() };
                 places.entry(p.key()).or_insert(place).items.push(it.clone());
             }
         }

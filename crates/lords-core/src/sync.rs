@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 mod place_uninstall;
+mod places;
 mod safety;
 mod target_uninstall;
 
@@ -202,6 +203,9 @@ pub(crate) enum ConflictKind {
     /// Every other conflict: a place that is missing or can't be read, a path that isn't the tool's, a config clash.
     #[default]
     Other,
+    /// The one place a plan was asked for (`Options::place`) isn't a checkout or worktree of its repo yet: a new
+    /// worktree still being made (F8, D22).
+    NotReady,
 }
 
 /// Where an item acts, as fsguard's changes take it.
@@ -348,6 +352,23 @@ pub struct Plan {
     /// What `Stage::SafeOnly` left out; `None` for any other stage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub held: Option<Held>,
+    /// How long an apply of this plan waits for the apply lock, and for a reader that blocks one of its swaps
+    /// (`[delivery] lock_wait_secs`).
+    #[serde(skip)]
+    pub lock_wait: LockWait,
+    /// Each declared repo's post-checkout hook, as this build writes it (F8, C3): what `sync --apply` installs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<crate::hooks::RepoHook>,
+}
+
+/// `Plan::lock_wait`: the stacks' `[delivery] lock_wait_secs`, or its default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LockWait(pub std::time::Duration);
+
+impl Default for LockWait {
+    fn default() -> LockWait {
+        LockWait(stack::Delivery::default().lock_wait())
+    }
 }
 
 /// What applying a plan releases besides its installs and updates: paths it removes, and ledger records it forgets
@@ -541,6 +562,9 @@ pub struct Options {
     /// The Codex an apply that writes Codex's hooks asks to trust Lords' own and reads trust back from (design note
     /// 2026-11-02-lords-codex-trust); none by default, and then every hook of that file is named as not known trusted.
     pub codex: crate::codex_trust::Codex,
+    /// With `place`: it is a worktree `git worktree add` just made (its post-checkout hook), so a safe-only plan counts
+    /// it as a place Lords manages, and its creates are safe (F8, D-4).
+    pub new_worktree: bool,
 }
 
 /// `~/.lords-command`, the tool's own dir on this machine.
@@ -2106,6 +2130,18 @@ pub(crate) fn checkouts(repo: &stack::Repo) -> Result<Checkouts, String> {
     }
     Ok((out, skipped, stale))
 }
+/// Whether `dir` lies under one of the repo's `worktree_roots` (every dir does where it names none), as `checkouts`
+/// decides it for a worktree git lists.
+fn under_roots(repo: &stack::Repo, dir: &Path) -> bool {
+    let d = norm(dir);
+    repo.worktree_roots.is_empty()
+        || repo
+            .worktree_roots
+            .iter()
+            .map(|r| norm(&expand_home(r)))
+            .any(|r| d == r || d.starts_with(&format!("{}/", r.trim_end_matches('/'))))
+}
+
 /// Where sync writes a place's files: a repo (its checkouts and worktrees) or a workspace (one dir, no git).
 struct Place<'a> {
     label: String,
@@ -2622,10 +2658,23 @@ fn repo_items(
     if let Some(one) = only_path {
         paths.retain(|p| same_place(p.path(), one));
         if paths.is_empty() {
-            pl.plan.notes.push(format!(
-                "repo {name}: {} is none of its checkouts or worktrees under worktree_roots",
-                display(one)
-            ));
+            // Skipped on purpose: a worktree git lists outside the repo's worktree roots, or a dir outside them.
+            if skipped.iter().any(|s| same_place(s, one)) || !under_roots(repo, one) {
+                pl.plan.notes.push(format!(
+                    "repo {name}: {} is none of its checkouts or worktrees under worktree_roots",
+                    display(one)
+                ));
+                return;
+            }
+            // Under its roots, but no checkout or worktree git lists yet: a new worktree still being made (F8, D22).
+            let mut item = conflict(
+                &format!("repo {name}"),
+                one,
+                "not a checkout or worktree of this repo yet (a new worktree still being made?)",
+            );
+            item.conflict = ConflictKind::NotReady;
+            item.places = vec![PlaceId::Dir(one.to_path_buf())];
+            pl.plan.items.push(item);
             return;
         }
     }
@@ -2945,29 +2994,78 @@ fn staged(plan: &mut Plan) {
 /// installation), and the readers that must not see one mid-swap (the child guard): `apply.lock` in the tool's home,
 /// held by an OS lock that ends with its holder however it ends (`fsguard::Lock`; fix check r2, FC5), waited for up to
 /// `secs` seconds, the deadline checked before each attempt. Released when dropped.
-pub(crate) struct ApplyLock(#[allow(dead_code)] fsguard::Lock);
+pub struct ApplyLock(#[allow(dead_code)] fsguard::Lock);
 
 impl ApplyLock {
     pub(crate) fn take(home: &Path, secs: u64) -> Result<ApplyLock, String> {
+        match ApplyLock::wait(home, std::time::Duration::from_secs(secs))? {
+            Ok(lock) => Ok(lock),
+            Err(busy) => Err(busy),
+        }
+    }
+
+    /// The lock, waiting at most `wait` for another holder (F8, C5); `Ok(Err(why))` when that holder keeps it past
+    /// then, naming it; `Err` when the lock can't be tried at all.
+    pub fn wait(
+        home: &Path,
+        wait: std::time::Duration,
+    ) -> Result<Result<ApplyLock, String>, String> {
         let root = Root::home(home)?;
         root.create()?;
         let lock = root.join(&[Part::new("apply.lock")?]);
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        let until = std::time::Instant::now() + wait;
         let step = std::time::Duration::from_millis(200);
         loop {
             match fsguard::try_lock(&lock, &format!("pid {}", crate::process::id()))? {
-                fsguard::TryLock::Held(l) => return Ok(ApplyLock(l)),
+                fsguard::TryLock::Held(l) => return Ok(Ok(ApplyLock(l))),
                 fsguard::TryLock::Busy(_) if std::time::Instant::now() + step < until => {
                     std::thread::sleep(step);
                 }
                 fsguard::TryLock::Busy(holder) => {
-                    return Err(format!(
+                    return Ok(Err(format!(
                         "another apply holds {} ({holder}); this build's lock ends with its holder, so one in an earlier build's form (\"pid N\") is that build's: if none is running, delete that file",
                         lock.path().display(),
-                    ))
+                    )))
                 }
             }
         }
+    }
+}
+
+/// Where a safe-only apply is (F8): for tests that must reach a point between two of its changes without timing, as
+/// an owner's edit, a reader or a kill would.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// A delivery's plan is made, under the lock it applies with; nothing is written yet.
+    Planned,
+    /// Every item of one place is checked and its new version staged beside it; nothing at its paths has changed.
+    Staged,
+    /// One item of the place is in, and its ledger record saved.
+    Swapped,
+}
+
+/// Why `apply_held` changed nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// The ledger changed since the plan (a writer outside the lock): plan again (F8, D22).
+    LedgerChanged,
+    Other(String),
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::LedgerChanged => f.write_str(
+                "the ledger changed since the plan (another sync?); plan again (nothing was changed)",
+            ),
+            Refused::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<String> for Refused {
+    fn from(e: String) -> Refused {
+        Refused::Other(e)
     }
 }
 
@@ -3063,6 +3161,8 @@ pub struct Applied {
     pub done: Vec<String>,
     pub backups: Option<PathBuf>,
     pub codex: Vec<String>,
+    /// A safe-only apply's places whose check or write failed: each put back whole and held, with why (F8, C4).
+    pub held: Vec<HeldPlace>,
 }
 
 fn stale(item: &Item, what: &str) -> String {
@@ -3372,6 +3472,23 @@ pub fn apply_between(plan: &Plan, mut installed: impl FnMut(&Path)) -> Result<Ap
         )),
         r => r.map(|()| applied),
     }
+}
+
+/// `apply` under a lock the caller holds since before it planned (F8, C5): so no other writer can have changed what the
+/// plan read. A safe-only plan is written place by place, each whole or not at all (`places`).
+pub fn apply_held(plan: &Plan, lock: &ApplyLock) -> Result<Applied, Refused> {
+    apply_held_between(plan, lock, &mut |_, _| {})
+}
+
+/// `apply_held`, calling `between` at each `Step` with the place it concerns.
+#[doc(hidden)]
+pub fn apply_held_between(
+    plan: &Plan,
+    lock: &ApplyLock,
+    between: &mut dyn FnMut(Step, &Path),
+) -> Result<Applied, Refused> {
+    let _ = (plan, lock, between);
+    Err(Refused::Other("not built yet".into()))
 }
 
 /// `apply`'s changes, item by item; `wrote` gets each Codex hooks file written.

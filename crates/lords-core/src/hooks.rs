@@ -18,8 +18,30 @@ pub mod config;
 pub const MARKER: &str = "# lords-command: privacy check";
 
 /// The hooks the tool installs: the only names a `hooks:` ledger record may have.
-pub const NAMES: [&str; 5] =
-    ["pre-commit", "pre-merge-commit", "commit-msg", "pre-push", "post-checkout"];
+pub const NAMES: [&str; 6] =
+    ["pre-commit", "pre-merge-commit", "commit-msg", "pre-push", "post-checkout", "post-commit"];
+
+/// A declared repo's post-checkout hook, as a plan finds it (F8, C3): what `sync --apply` installs or replaces.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RepoHook {
+    pub repo: String,
+    /// The checkout it is installed from: the repo's first declared one.
+    pub checkout: PathBuf,
+    pub state: HookState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", content = "why", rename_all = "kebab-case")]
+pub enum HookState {
+    /// Lords' hook, as this build writes it.
+    Current,
+    /// None recorded: `sync --apply` installs it.
+    Missing,
+    /// Lords' hook, unchanged since it was written, in another form than this build's: `sync --apply` replaces it.
+    Outdated,
+    /// Recorded, but changed since Lords wrote it, or it can't be read: never written, only named.
+    Changed(String),
+}
 
 /// The privacy hooks, which a commit or an automatic merge commit runs; `lords check` verifies each by its probe.
 pub const PRIVACY: [&str; 3] = ["pre-commit", "pre-merge-commit", "commit-msg"];
