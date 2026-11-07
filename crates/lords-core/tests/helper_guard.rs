@@ -31,11 +31,11 @@ fn session(
     (answer, read.into_inner())
 }
 
-// Spec (design note §5.1, the choice, H6 with H2): T3 iff `T3CODE_THREAD_ID` is set and the process `CLAUDE_PID` names
-// was launched with T3's tools in `--allowedTools` (`mcp__t3-code__…`); `claude -h` (2.1.316): "--allowedTools,
-// --allowed-tools <tools...> Comma or space-separated list of tool names to allow". A CLI started from a T3 agent's
-// shell (N1) inherits the thread but is its own process, launched without them (A2), whatever its prompt, settings or
-// permission rules say (A13); a T3 launch without the flag goes quiet (A11).
+// Spec (design note §5.1, the choice, H6 with H2, narrowed in sol-loop r2, §5.4): T3 iff `T3CODE_THREAD_ID` is set and
+// the process `CLAUDE_PID` names was launched with T3's own flag as T3 writes it, `--allowedTools` then
+// `mcp__t3-code__*`, two arguments before any `--` (56 of 56 T3 sessions on 2 Nov, 32 of 32 on 7 Nov). A CLI started
+// from a T3 agent's shell (N1) inherits the thread but is its own process, launched without that pair (A2), whatever
+// its prompt, settings, permission rules or other options' values say (A13); any other spelling goes quiet (A11).
 #[test]
 fn a_t3_launch_is_t3_and_a_cli_started_from_its_shell_is_not() {
     let t3_launch = words(
@@ -52,22 +52,29 @@ fn a_t3_launch_is_t3_and_a_cli_started_from_its_shell_is_not() {
     let s = |v: &[&str]| v.iter().map(|w| w.to_string()).collect::<Vec<_>>();
     let rows: Vec<(&str, Vec<String>, bool)> = vec![
         ("T3's launch", t3_launch, true),
-        ("`--allowedTools=`", eq_form, true),
-        ("`--allowed-tools`", s(&["claude", "--allowed-tools", "mcp__t3-code__*"]), true),
+        // The pair, whoever passes it: a nested CLI launched with T3's exact flag is refused (§5.1, residual).
+        (
+            "the pair late in the line",
+            s(&["claude", "-p", "x", "--allowedTools", "mcp__t3-code__*"]),
+            true,
+        ),
+        // Spellings T3 doesn't write go quiet (A11; sol-loop r2: a looser reading of the list was fooled twice).
+        ("`--allowedTools=`", eq_form, false),
+        ("`--allowed-tools`", s(&["claude", "--allowed-tools", "mcp__t3-code__*"]), false),
         (
             "a comma list",
             s(&["claude", "--allowedTools", "Bash,mcp__t3-code__delegate_task"]),
-            true,
+            false,
         ),
         (
             "a space list in one argument",
             s(&["claude", "--allowedTools", "Bash mcp__t3-code__*"]),
-            true,
+            false,
         ),
         (
             "a later value of the list",
             s(&["claude", "--allowedTools", "Bash", "mcp__t3-code__*", "-p"]),
-            true,
+            false,
         ),
         ("N1, a nested `claude -p`", nested, false),
         (
@@ -117,7 +124,34 @@ fn a_t3_launch_is_t3_and_a_cli_started_from_its_shell_is_not() {
         (
             "a Bash rule with blanks, then T3's tools",
             s(&["claude", "--allowedTools", "Bash(git log *),mcp__t3-code__*"]),
-            true,
+            false,
+        ),
+        // Sol-loop r2: a literal `)` inside the specifier (S1 still open), and another option's value that is T3's
+        // flag (S2b).
+        (
+            "a specifier holding `)`",
+            s(&[
+                "claude",
+                "-p",
+                "x",
+                "--allowedTools",
+                "Bash(printf ')' mcp__t3-code__delegate_task)",
+                "Agent",
+            ]),
+            false,
+        ),
+        (
+            "another option's value",
+            s(&[
+                "claude",
+                "-p",
+                "--allowedTools",
+                "Bash",
+                "Agent",
+                "--append-system-prompt",
+                "--allowedTools=mcp__t3-code__*",
+            ]),
+            false,
         ),
         // Sol-loop r1, S2 (`--` ends the options; what follows is the prompt).
         (
@@ -139,11 +173,16 @@ fn a_t3_launch_is_t3_and_a_cli_started_from_its_shell_is_not() {
             false,
         ),
     ];
-    for (what, argv, want) in rows {
-        let (answer, read) = session(Some("thread:delegated-task:x"), Some("4242"), &argv);
-        assert_eq!(answer, Ok(want), "{what}: {argv:?}");
-        assert_eq!(read, [4242], "{what}: the process CLAUDE_PID names, once");
-    }
+    // Every row's answer, then that the process CLAUDE_PID names was read once.
+    let wrong: Vec<String> = rows
+        .into_iter()
+        .filter_map(|(what, argv, want)| {
+            let (answer, read) = session(Some("thread:delegated-task:x"), Some("4242"), &argv);
+            let right = answer == Ok(want) && read == [4242];
+            (!right).then(|| format!("{what}: {answer:?}, want {want}, read {read:?}: {argv:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{} rows wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
 
 // Spec (design note I1, A1, A12; §5.1: "outside T3 the guard reads nothing more"): with no `T3CODE_THREAD_ID`, or an
