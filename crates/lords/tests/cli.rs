@@ -2486,13 +2486,15 @@ fn the_helper_guard_tells_t3_from_a_cli_through_the_binary() {
     let o = helper_guard(&env, guard, &[thread(), pid(t3.id().to_string())], &ev);
     drop(t3.stdin.take());
     t3.wait().unwrap();
-    let want: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-    assert_eq!(read.map(|a| a.into_iter().skip(1).collect::<Vec<_>>()), Ok(want));
+    // The answer first: the binary's denial, read without a panic, so a copy that answers nothing fails here (review
+    // r1, N2); then its exit code and reason, then the reader's own output.
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_default();
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{}", text(&o));
     assert_eq!(o.status.code(), Some(0), "{}", text(&o));
-    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{v}");
     let reason = v["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
     assert!(reason.contains("delegate_task"), "{reason}");
+    let want: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    assert_eq!(read.map(|a| a.into_iter().skip(1).collect::<Vec<_>>()), Ok(want));
     let mut gone = env.cmd("git", d).arg("--version").stdout(Stdio::null()).spawn().unwrap();
     let gone_pid = gone.id();
     gone.wait().unwrap();
