@@ -1593,8 +1593,10 @@ fn a_stale_plan_changes_nothing() {
 
 // Spec (orchestrator, 30 Oct: "`lords guard install` installs or updates the stable copy under its own lock. It
 // copies to a staged path, self-tests it, and renames it into place atomically"; "sync with no copy installed writes no
-// hook and says why"): before an install, sync leaves the hook out and names the fix; `lords guard install` puts the
-// copy there, and sync then names it in the settings; a staged copy an interrupted install left doesn't stop the next.
+// hook and says why"; revised by the Lords owner, 7 Nov, review r1 R1-02: "a copy that's missing, unreadable or doesn't
+// answer is a conflict naming `lords guard install`, never an empty list"): before an install, sync refuses, naming the
+// fix, and writes nothing; `lords guard install` puts the copy there, and sync then names it in the settings; a staged
+// copy an interrupted install left doesn't stop the next. With the copy gone, sync refuses again and the hook stays.
 #[test]
 fn sync_names_the_guard_only_once_it_is_installed() {
     let env = Env::new();
@@ -1623,10 +1625,11 @@ fn sync_names_the_guard_only_once_it_is_installed() {
         env.lords(d, &[&args[..], &stacks].concat())
     };
     let settings = || fs::read_to_string(d.join("home/.claude-balanced/settings.json")).unwrap();
-    // Not installed: no hook, and the plan says why.
+    // Not installed: refused, naming the fix, and nothing written.
     let o = sync(false);
     assert!(text(&o).contains("guard not installed: run `lords guard install`"), "{}", text(&o));
-    assert!(sync(true).status.success());
+    let o = sync(true);
+    assert!(!o.status.success(), "{}", text(&o));
     assert!(!settings().contains("lords-guard"), "{}", settings());
     // A staged copy an interrupted install left behind.
     let copy = d.join("home/.lords-command/bin/lords-guard.exe");
@@ -1646,11 +1649,13 @@ fn sync_names_the_guard_only_once_it_is_installed() {
     // A check of the synced settings reports no conflict for them.
     let out = text(&env.lords(d, &[&["check"][..], &stacks].concat()));
     assert!(!out.contains("settings.json"), "{out}");
-    // The copy gone: sync takes the hook out and says why; it never puts a copy back.
+    // The copy gone: sync refuses, naming the fix, and the hook stays; it never puts a copy back.
     fs::remove_file(&copy).unwrap();
+    let before = settings();
     let o = sync(true);
-    assert!(o.status.success(), "{}", text(&o));
-    assert!(!settings().contains("lords-guard") && !copy.exists(), "{}", settings());
+    assert_eq!(settings(), before, "{}", text(&o));
+    assert!(!o.status.success() && text(&o).contains("lords guard install"), "{}", text(&o));
+    assert!(!copy.exists());
 }
 
 // Spec (orchestrator, 30 Oct: "a one-line 'applies: yes/no (why)' in the `lords sync` dry-run output itself", with

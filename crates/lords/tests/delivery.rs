@@ -201,6 +201,42 @@ fn a_plan_whose_copy_was_swapped_for_an_older_one_changes_nothing() {
     assert!(r.as_ref().is_err_and(|e| e.contains("lords guard install")), "{r:?}");
 }
 
+// Spec (review r1, R1-02 and its schedule: an install holds the apply lock and has moved the old copy aside, a sync
+// plans, the install puts the copy back and lets go, the sync applies, and the time hook was gone; the Lords owner, 7
+// Nov: "a copy that's missing, unreadable or doesn't answer is a conflict naming `lords guard install`, never an empty
+// list"; design note §2, I20b, A20-10): a plan made while the copy was away is a conflict naming `lords guard install`,
+// apply refuses it, and the settings keep their time hook.
+#[test]
+fn a_plan_made_while_the_copy_was_away_takes_no_hook_out() {
+    use lords_core::fsguard::{self, Part, Root, TryLock};
+    let h = Home::new(&[], "");
+    let file = h.write("home/settings.json", "{}\n");
+    h.declare(&settings("claude", &file, "\"time\""));
+    let home = h.path("home/.lords-command");
+    lords_core::sync::install_guard(&home, Path::new(env!("CARGO_BIN_EXE_lords"))).unwrap();
+    let stacks = lords_core::Stacks::load(&h.path("pub"), Some(&h.path("priv"))).unwrap();
+    let opts =
+        lords_core::sync::Options { user_only: true, home: home.clone(), ..Default::default() };
+    lords_core::sync::apply(&lords_core::sync::plan(&stacks, &opts).unwrap()).unwrap();
+    let before = fs::read_to_string(&file).unwrap();
+    assert!(before.contains("\"time\""), "{before}");
+    // The install between its two renames: the apply lock held, the copy moved aside.
+    let lock = Root::home(&home).unwrap().join(&[Part::new("apply.lock").unwrap()]);
+    let TryLock::Held(held) = fsguard::try_lock(&lock, "an install").unwrap() else {
+        panic!("busy")
+    };
+    let aside = home.join("bin").join("held-aside.exe");
+    fs::rename(h.copy(), &aside).unwrap();
+    let plan = lords_core::sync::plan(&stacks, &opts).unwrap();
+    fs::rename(&aside, h.copy()).unwrap();
+    drop(held);
+    let r = lords_core::sync::apply(&plan);
+    assert_eq!(fs::read_to_string(&file).unwrap(), before, "{r:?}");
+    assert!(r.is_err(), "{r:?}");
+    let notes: Vec<&String> = plan.items.iter().flat_map(|i| &i.notes).collect();
+    assert!(notes.iter().any(|n| n.contains("lords guard install")), "{notes:?}");
+}
+
 // Spec (design note §2, I20: "a listed guard is one the copy's dispatcher runs"): `lords guard --guards` answers one
 // line, `lords guards` and the guards it runs, exit 0: every guard an adapter registers (`Adapter::guards`). Each of them
 // answers a usage error with its own usage note, naming it, exit 0 and nothing on stdout.
@@ -406,4 +442,67 @@ fn guard_install_replaces_a_copy_a_hook_is_running() {
     let o = h.lords(&["guard", "install"]);
     assert!(o.status.success() && text(&o).contains("already current"), "{}", text(&o));
     assert_eq!(names(), ["lords-guard.exe"], "{}", text(&o));
+}
+
+/// The rm guard run from the copy, waiting for its event on stdin: a hook holding the copy until its stdin closes.
+fn running_hook(h: &Home) -> std::process::Child {
+    use std::process::Stdio;
+    let mut c = h.cmd(&h.copy());
+    c.args(["guard", "rm"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+    c.spawn().unwrap()
+}
+
+// Spec (review r1, R1-01, witness 1: an owner's file `.lords-guard.exe.lords-busy-owner-notes.txt` was deleted by an
+// already-current install; the Lords owner, 7 Nov: "an aside is deleted only when Lords recorded it at creation and it
+// still holds exactly the bytes it moved aside. Any other candidate is kept and named"; design note §4, I4b, A4-10): a
+// file beside the guard copy that Lords never set aside, whatever its name, survives `lords guard install`, which names
+// it.
+#[test]
+fn guard_install_keeps_a_file_it_never_set_aside() {
+    let h = Home::new(&[], "");
+    assert!(h.lords(&["guard", "install"]).status.success());
+    let notes = h.copy().with_file_name(".lords-guard.exe.lords-busy-owner-notes.txt");
+    fs::write(&notes, "the owner's\n").unwrap();
+    let o = h.lords(&["guard", "install"]);
+    assert_eq!(fs::read_to_string(&notes).ok().as_deref(), Some("the owner's\n"), "{}", text(&o));
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains(".lords-guard.exe.lords-busy-owner-notes.txt"), "{}", text(&o));
+}
+
+// Spec (review r1, R1-01, witness 2: a copy Lords set aside while a hook ran it, its bytes replaced once the hook ended,
+// was deleted by the next install; as above, and I4b, A4-11): on Windows, where a running copy is set aside, that copy
+// with other bytes survives the next `lords guard install`, which names it.
+#[test]
+fn guard_install_keeps_a_set_aside_copy_whose_bytes_changed() {
+    if !cfg!(windows) {
+        return;
+    }
+    let h = Home::new(&[], "");
+    let lords = fs::read(env!("CARGO_BIN_EXE_lords")).unwrap();
+    fs::create_dir_all(h.copy().parent().unwrap()).unwrap();
+    fs::write(h.copy(), [&lords[..], b"B"].concat()).unwrap();
+    let mut hook = running_hook(&h);
+    let o = h.lords(&["guard", "install"]);
+    drop(hook.stdin.take());
+    hook.wait().unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let aside: Vec<PathBuf> = fs::read_dir(h.copy().parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name().unwrap().to_string_lossy().starts_with(".lords-guard.exe.lords-busy-")
+        })
+        .collect();
+    let [aside] = &aside[..] else { panic!("one set-aside copy: {aside:?}: {}", text(&o)) };
+    fs::write(aside, "the owner's now\n").unwrap();
+    let o = h.lords(&["guard", "install"]);
+    assert_eq!(
+        fs::read_to_string(aside).ok().as_deref(),
+        Some("the owner's now\n"),
+        "{}",
+        text(&o)
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let name = aside.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(text(&o).contains(&name), "{}", text(&o));
 }

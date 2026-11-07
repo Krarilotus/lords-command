@@ -660,8 +660,10 @@ fn a_settings_target_adds_the_exclude_and_keeps_the_rest() {
 
 // Spec (orchestrator, 30 Oct, after the rm-guard fix check r4: "The plan writes the Lords hook entry into settings only
 // if the copy is present and passes `guard --self-test` … If it isn't present, the plan reports … 'guard not installed:
-// run `lords guard install`' and doesn't write the hook"): with no copy, or one that can't run, the settings get no
-// Lords hook, the item says why, and an existing Lords hook is taken out, only that one, the user's own hooks kept.
+// run `lords guard install`' and doesn't write the hook"; revised by the Lords owner, 7 Nov, review r1 R1-02: "a copy
+// that's missing, unreadable or doesn't answer is a conflict naming `lords guard install`, never an empty list"): with no
+// copy, or one that can't run, the settings target is a conflict that names the fix, apply refuses it, and the settings
+// keep every hook, Lords' own included.
 #[test]
 fn a_settings_target_names_no_guard_that_isnt_installed() {
     let f = Fixture::new();
@@ -676,7 +678,7 @@ fn a_settings_target_names_no_guard_that_isnt_installed() {
     );
     let opts = Options { user_only: true, ..f.opts() };
     let p = plan(&f.stacks(), &opts).unwrap();
-    assert_eq!(p.items[0].action, Action::InSync, "{:?}", p.items[0]);
+    assert_eq!(p.items[0].action, Action::Conflict, "{:?}", p.items[0]);
     assert!(
         p.items[0]
             .notes
@@ -690,27 +692,25 @@ fn a_settings_target_names_no_guard_that_isnt_installed() {
     f.write("lords-home/bin/lords-guard.exe", "not a program");
     assert!(copy.exists(), "the fixture's tool home is lords-home");
     let p = plan(&f.stacks(), &opts).unwrap();
+    assert_eq!(p.items[0].action, Action::Conflict, "{:?}", p.items[0]);
     assert!(
         p.items[0].notes.iter().any(|n| n.contains("guard not ready")),
         "{:?}",
         p.items[0].notes
     );
-    // A Lords hook already there, its copy not ready: taken out, the user's kept.
+    // A Lords hook already there, its copy not ready: it stays, with the user's.
     let named = copy.display().to_string().replace('\\', "/");
     let lords = format!(
         r#"{{"matcher": "Bash", "hooks": [{{"type": "command", "command": "{named}", "args": ["guard", "rm"]}}]}}"#
     );
     fs::write(&settings, format!("{{\"hooks\": {{\"PreToolUse\": [{theirs}, {lords}]}}}}\n"))
         .unwrap();
+    let before = fs::read_to_string(&settings).unwrap();
     let p = plan(&f.stacks(), &opts).unwrap();
-    assert_eq!(p.items[0].action, Action::Update);
-    apply(&p).unwrap();
-    let v: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
-    assert_eq!(
-        v["hooks"]["PreToolUse"],
-        serde_json::json!([serde_json::from_str::<serde_json::Value>(theirs).unwrap()])
-    );
+    let r = apply(&p);
+    assert_eq!(fs::read_to_string(&settings).unwrap(), before, "{r:?}");
+    assert_eq!(p.items[0].action, Action::Conflict, "{:?}", p.items[0]);
+    assert!(r.is_err(), "{r:?}");
     assert_eq!(fs::read_to_string(&copy).unwrap(), "not a program", "sync never touches the copy");
 }
 
@@ -731,7 +731,8 @@ fn a_guard_install_that_fails_its_self_test_leaves_the_old_copy() {
 
 // Spec: rm-guard review r1, R6 (witness: a user hook carrying a token beside the settings sync edits; adding the guard
 // printed it in the plan's diff and `--json`): a settings plan reports what Lords changes there and never the settings'
-// text, in any output.
+// text, in any output. Its change here is an exclude: no guard copy can be installed in a core test, and a target naming
+// a guard without one is a conflict (review r1, R1-02), so `guards` here would only make it one.
 #[test]
 fn a_settings_plan_never_shows_the_settings_text() {
     let f = Fixture::new();
@@ -740,7 +741,7 @@ fn a_settings_plan_never_shows_the_settings_text() {
         "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"Write\",\"hooks\":[{\"type\":\"command\",\"command\":\"audit --token SYNTHETIC_SENTINEL\"}]}]},\n\"env\":{\"EXAMPLE_SECRET\":\"SYNTHETIC_ENV_SENTINEL\"}}\n",
     );
     let excluded = f.path("home/.claude/CLAUDE.md");
-    let extra = format!("exclude = ['{}']\nguards = ['rm']\n", excluded.display());
+    let extra = format!("exclude = ['{}']\n", excluded.display());
     with_targets(&f, &target("balanced settings", "claude", "settings", &settings, &extra));
     let p = plan(&f.stacks(), &Options { user_only: true, ..f.opts() }).unwrap();
     let item = &p.items[0];
@@ -784,8 +785,9 @@ fn only_lords_own_guard_hook_is_ever_taken_out() {
 }
 
 // Spec (as above, for the queue guard; brief, 30 Oct: "`queue` becomes a `Stop` entry. Foreign hook entries stay";
-// "SubagentStop … must not be registered"): with no copy installed, Lords' `Stop` hooks are taken out, the user's own
-// `Stop` hooks stay in their order (a shared entry keeps the user's hook), and `SubagentStop` is never touched.
+// "SubagentStop … must not be registered"): with no guard named any more, Lords' `Stop` hooks are taken out, the user's
+// own `Stop` hooks stay in their order (a shared entry keeps the user's hook), and `SubagentStop` is never touched.
+// (Until review r1, R1-02, a missing copy took them out too; that is now a conflict, so no copy is needed here.)
 #[test]
 fn a_lords_stop_hook_goes_and_the_users_stay() {
     let f = Fixture::new();
@@ -801,10 +803,7 @@ fn a_lords_stop_hook_goes_and_the_users_stay() {
             "{{\"hooks\":{{\"Stop\":[{theirs},{shared},{{\"hooks\":[{ours}]}}],\"SubagentStop\":{sub}}}}}\n"
         ),
     );
-    with_targets(
-        &f,
-        &target("balanced settings", "claude", "settings", &settings, "guards = ['queue']\n"),
-    );
+    with_targets(&f, &target("balanced settings", "claude", "settings", &settings, ""));
     let p = plan(&f.stacks(), &Options { user_only: true, ..f.opts() }).unwrap();
     apply(&p).unwrap();
     let v: serde_json::Value =
