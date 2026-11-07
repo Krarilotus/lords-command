@@ -478,27 +478,73 @@ fn store_work_is_listed_and_never_done() {
     assert_eq!(git(&f.priv_root(), &["status", "--porcelain"]), "", "nothing written in the store");
 }
 
+/// Every `[safe_only]` setting a stack has accepted, so a test can say what holds under each one a stack still accepts.
+const SETTINGS: [&str; 3] =
+    ["", "[safe_only]\napplies = [\"new-place\"]\n", "[safe_only]\napplies = [\"exclude\"]\n"];
+
+/// The private stack of `shared_checkouts`: checkout `m`, worktrees under `m/.wt`, and `more`.
+fn shared_manifest(f: &Fixture, m: &Path, more: &str) {
+    f.write(
+        "priv/stack.toml",
+        &format!(
+            "name = \"priv\"\nvisibility = \"private\"\n{ROLES}[projects.beta]\n[repos.beta-core]\nproject = \"beta\"\ndefault_role = \"coder\"\ncheckouts = ['{}']\nworktree_roots = ['{}']\n{more}",
+            m.display(),
+            m.join(".wt").display()
+        ),
+    );
+}
+
+/// Checkout `m` of repo `beta-core` and its linked worktree `m/.wt/n`, which share one git exclude, with a public rule
+/// and `more` in the private stack.toml, synced once by hand; `None` when the stack refuses `more`.
+fn shared_checkouts(f: &Fixture, more: &str) -> Option<(PathBuf, PathBuf)> {
+    rule(f, "Rule one.\n");
+    f.write("pub/stack.toml", &format!("name = \"pub\"\nvisibility = \"public\"\n{ROLES}"));
+    let m = checkout(f, "m");
+    git(&m, &["worktree", "add", "-q", ".wt/n", "-b", "n"]);
+    let n = m.join(".wt/n");
+    shared_manifest(f, &m, more);
+    lords_core::Stacks::load(&f.pub_root(), Some(&f.priv_root())).ok()?;
+    sync_by_hand(f);
+    assert!(read(&n.join("CLAUDE.local.md")).contains("Rule one."), "the fixture's worktree");
+    Some((m, n))
+}
+
+// Spec (review r1, R1-01; the Lords owner, 7 Nov 17:33: "A shared owner-file write (the common exclude) is then always
+// needs-owner, so it holds every place it lists"): under every setting a stack accepts, a safe-only plan never writes
+// the git exclude a checkout shares with its linked worktree. While an edit of it is wanted and the main checkout's
+// place file is its owner's, the worktree's files and the exclude stay as they were, and both places are held.
+#[test]
+fn a_shared_exclude_is_never_written_and_holds_every_reader() {
+    for setting in SETTINGS {
+        let f = Fixture::new();
+        let Some((m, n)) = shared_checkouts(&f, setting) else {
+            assert!(setting.contains("exclude"), "a setting refused: {setting:?}");
+            continue;
+        };
+        let exclude = m.join(".git/info/exclude");
+        fs::write(&exclude, "# Owner line\n").unwrap();
+        fs::write(m.join("CLAUDE.local.md"), "My owner text.\n").unwrap();
+        let files =
+            ["CLAUDE.local.md", "AGENTS.override.md", ".lords/role-coder.md"].map(|x| n.join(x));
+        let before = files.clone().map(|p| read(&p));
+        rule(&f, "Rule two.\n");
+        let p = safe_only(&f);
+        apply(&p).unwrap();
+        assert_eq!(files.clone().map(|p| read(&p)), before, "{setting:?}: the worktree's files");
+        assert_eq!(read(&exclude), "# Owner line\n", "{setting:?}: the shared exclude");
+        let mut both = vec![ledger::key(&m), ledger::key(&n)];
+        both.sort();
+        assert_eq!(held(&p), both, "{setting:?}");
+    }
+}
+
 // Spec (A1, A11): the git exclude a linked worktree shares with its main checkout holds both when its edit is wanted;
 // a worktree inside the main checkout's dir is a place of its own, so an owner-changed file in the main checkout
 // doesn't hold it.
 #[test]
 fn a_shared_exclude_holds_every_checkout_reading_it_and_a_nested_worktree_is_its_own_place() {
     let f = Fixture::new();
-    rule(&f, "Rule one.\n");
-    f.write("pub/stack.toml", &format!("name = \"pub\"\nvisibility = \"public\"\n{ROLES}"));
-    let m = checkout(&f, "m");
-    git(&m, &["worktree", "add", "-q", ".wt/n", "-b", "n"]);
-    let n = m.join(".wt/n");
-    f.write(
-        "priv/stack.toml",
-        &format!(
-            "name = \"priv\"\nvisibility = \"private\"\n{ROLES}[projects.beta]\n[repos.beta-core]\nproject = \"beta\"\ndefault_role = \"coder\"\ncheckouts = ['{}']\nworktree_roots = ['{}']\n",
-            m.display(),
-            m.join(".wt").display()
-        ),
-    );
-    sync_by_hand(&f);
-    assert!(read(&n.join("CLAUDE.local.md")).contains("Rule one."), "the fixture's worktree");
+    let (m, n) = shared_checkouts(&f, "").unwrap();
 
     let exclude = m.join(".git/info/exclude");
     let lines = read(&exclude);
@@ -540,27 +586,30 @@ fn an_edit_after_planning_is_refused_and_kept() {
 }
 
 // Spec (the owner, 7 Nov 17:16, intent item 10: "make thigns more configurable, no harded coded shit that will bite
-// later and we would need to adjust manually again"; note §11b): what `--safe-only` applies besides what is always safe
-// is the stack's `[safe_only] applies`, by default nothing more. Naming "new-place" and "exclude" delivers a declared
-// checkout Lords hasn't written to, its git exclude lines included, with no one looking; any other value is refused
-// when the stack loads, as only those two can't overwrite or remove an owner's bytes.
+// later and we would need to adjust manually again"; note §11b; the Lords owner, 7 Nov 17:33, after review r1: "Only
+// `new-place` remains, and `exclude` now fails the stack's load, with a message"): what `--safe-only` applies besides
+// what is always safe is the stack's `[safe_only] applies`, by default nothing more, and "new-place" is the one value:
+// a new worktree of a checkout Lords manages, whose shared exclude already holds sync's lines, gets its files with no
+// one looking. "exclude", a destination other places share, is refused when the stack loads, naming the value and
+// what may be named, and so is any other value.
 #[test]
 fn the_stack_names_what_safe_only_also_applies() {
     let f = Fixture::new();
-    let (a, b) = synced(&f);
-    let c = checkout(&f, "c");
-    manifest(&f, &[&a, &b, &c], "[safe_only]\napplies = [\"new-place\", \"exclude\"]\n");
-    assert_eq!(class(&full(&f), &c.join("CLAUDE.local.md")), Safety::Safe);
-    assert_eq!(class(&full(&f), &c.join(".git/info/exclude")), Safety::Safe);
+    let (m, _) = shared_checkouts(&f, "[safe_only]\napplies = [\"new-place\"]\n").unwrap();
+    git(&m, &["worktree", "add", "-q", ".wt/o", "-b", "o"]);
+    let o = m.join(".wt/o");
+    assert_eq!(class(&full(&f), &o.join("CLAUDE.local.md")), Safety::Safe);
     let p = safe_only(&f);
-    assert!(held(&p).is_empty(), "{:?}", held(&p));
     apply(&p).unwrap();
-    assert!(read(&c.join("CLAUDE.local.md")).contains("Rule one."));
-    assert!(read(&c.join(".git/info/exclude")).contains("/CLAUDE.local.md"));
+    assert!(read(&o.join("CLAUDE.local.md")).contains("Rule one."));
+    assert!(held(&p).is_empty(), "{:?}", held(&p));
 
-    manifest(&f, &[&a, &b, &c], "[safe_only]\napplies = [\"removal\"]\n");
-    let s = lords_core::Stacks::load(&f.pub_root(), Some(&f.priv_root()));
-    assert!(s.is_err(), "only new-place and exclude may be named");
+    for value in ["exclude", "removal"] {
+        shared_manifest(&f, &m, &format!("[safe_only]\napplies = [\"{value}\"]\n"));
+        let s = lords_core::Stacks::load(&f.pub_root(), Some(&f.priv_root()));
+        let e = s.err().unwrap_or_else(|| panic!("`{value}` is accepted"));
+        assert!(e.contains(value) && e.contains("new-place"), "{e}");
+    }
 }
 
 // Spec (note D3; sol-loop r1 S1): a place is held whole only where the plan sees all of it, so the planner itself

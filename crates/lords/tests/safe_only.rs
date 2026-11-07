@@ -113,6 +113,66 @@ fn text(o: &Output) -> String {
     format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))
 }
 
+/// A path as text in one spelling, as git and the config may each spell it.
+fn spelt(p: &str) -> String {
+    p.replace('\\', "/").to_lowercase()
+}
+
+// Spec (review r1, R1-02; the Lords owner, 7 Nov 17:33: "R1-02 with `--place N`: nothing written, held, exit 1"):
+// under every setting the stack accepts, `--safe-only --place` of a linked worktree whose git exclude its main checkout
+// shares writes nothing while an edit of that exclude is wanted and the main checkout's place file is its owner's: the
+// worktree's files and the exclude stay as they were, the worktree is named held, and the exit is 1.
+#[test]
+fn a_worktree_sharing_a_wanted_exclude_is_held_under_place() {
+    let settings =
+        ["", "[safe_only]\napplies = [\"new-place\"]\n", "[safe_only]\napplies = [\"exclude\"]\n"];
+    for setting in settings {
+        let env = Env::new();
+        env.write(
+            "pub/stack.toml",
+            "name = \"pub\"\nvisibility = \"public\"\nroles = [\"coder\"]\n",
+        );
+        env.rule("Rule one.\n");
+        let m = env.checkout("m");
+        env.git(&m, &["worktree", "add", "-q", ".wt/n", "-b", "n"]);
+        let n = m.join(".wt/n");
+        env.write(
+            "priv/stack.toml",
+            &format!(
+                "name = \"priv\"\nvisibility = \"private\"\nroles = [\"coder\"]\n[projects.beta]\n[repos.beta-core]\nproject = \"beta\"\ndefault_role = \"coder\"\ncheckouts = ['{}']\nworktree_roots = ['{}']\n{setting}",
+                m.display(),
+                m.join(".wt").display()
+            ),
+        );
+        let o = env.sync(&["--apply"]);
+        if o.status.code() == Some(2) && setting.contains("exclude") {
+            continue;
+        }
+        assert!(o.status.success(), "{setting:?}: {}", text(&o));
+        assert!(
+            read(&n.join("CLAUDE.local.md")).contains("Rule one."),
+            "{setting:?}: {}",
+            text(&o)
+        );
+        let exclude = m.join(".git/info/exclude");
+        fs::write(&exclude, "# Owner line\n").unwrap();
+        fs::write(m.join("CLAUDE.local.md"), "My owner text.\n").unwrap();
+        let files =
+            ["CLAUDE.local.md", "AGENTS.override.md", ".lords/role-coder.md"].map(|x| n.join(x));
+        let before = files.clone().map(|p| read(&p));
+        env.rule("Rule two.\n");
+
+        let place = n.to_string_lossy().into_owned();
+        let o = env.sync(&["--safe-only", "--repo", "beta-core", "--place", &place, "--apply"]);
+        let out = text(&o);
+        assert_eq!(files.clone().map(|p| read(&p)), before, "{setting:?}: {out}");
+        assert_eq!(read(&exclude), "# Owner line\n", "{setting:?}: {out}");
+        let held = out.lines().any(|l| l.starts_with("held") && spelt(l).contains(&spelt(&place)));
+        assert!(held, "{setting:?}: {out}");
+        assert_eq!(o.status.code(), Some(1), "{setting:?}: {out}");
+    }
+}
+
 fn read(p: &Path) -> String {
     fs::read_to_string(p).unwrap_or_default()
 }
