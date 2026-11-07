@@ -2679,6 +2679,12 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
     if opts.home.as_os_str().is_empty() {
         return Err("no tool home given (Options.home): sync reads its ledger there".into());
     }
+    // A place is held whole only where the plan sees all of it (D13, design note D3; sol-loop r1 S1).
+    if opts.stage == Stage::SafeOnly && opts.adapter.is_some() {
+        return Err(
+            "a safe-only plan holds a place whole, and an adapter filter plans part of it: drop --adapter".into()
+        );
+    }
     // One place's uninstall has its own planner: nothing is wanted there, and the ledger alone decides (PI-13).
     // Their items are typed too, as the last step (D13); an uninstall creates nothing, so no place is new to it.
     if opts.uninstall && opts.place.is_some() {

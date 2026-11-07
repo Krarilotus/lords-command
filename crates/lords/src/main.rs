@@ -663,13 +663,6 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
             lords_core::adapters::ids().join(", ")
         ));
     }
-    // A place is held whole only where the plan sees all of it (design note D3).
-    if safe_only && adapter.is_some() {
-        return Err(
-            "--safe-only holds a place whole, and --adapter plans part of it: drop --adapter"
-                .into(),
-        );
-    }
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
     let codex = lords_core::codex_trust::Codex::found(deadline);
     let opts = sync::Options {
