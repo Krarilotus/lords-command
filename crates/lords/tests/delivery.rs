@@ -1,6 +1,8 @@
 //! Delivery integrity through the binary (design note Harness/notes/2026-11-07-lords-delivery-integrity.md): sync claims
-//! no hook Lords didn't render (D18) and registers no guard the installed copy can't run (D20). Every child gets the
-//! fixture's home and git config, so no real home, setting or guard copy is read or touched.
+//! no hook Lords didn't render (D18) and registers no guard the installed copy can't run (D20); `lords uninstall
+//! --target` removes one dropped target's unchanged copies and nothing else (D21); `lords guard install` replaces a copy
+//! a hook is running (§4). Every child gets the fixture's home and git config, so no real home, setting or guard copy is
+//! read or touched.
 
 // Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -223,4 +225,128 @@ fn the_guard_copy_lists_the_guards_it_runs() {
         assert_eq!(o.status.code(), Some(0), "{g}: {}", text(&o));
         assert!(o.stdout.is_empty(), "{g}: {}", text(&o));
     }
+}
+
+fn skills_target(name: &str, dir: &Path) -> String {
+    format!(
+        "[[targets]]\nname = \"{name}\"\nadapter = \"claude\"\nkind = \"skills\"\npath = '{}'\n",
+        dir.display()
+    )
+}
+
+/// Every file below `dir` by its path there (`/` between parts), with its bytes.
+fn files(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for e in fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else {
+                let rel = p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+                out.insert(rel, fs::read(&p).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// The parts of each ledger record of `scope`, sorted.
+fn recorded(h: &Home, scope: &str) -> Vec<String> {
+    let ledger = lords_core::ledger::Ledger::load(&h.path("home/.lords-command")).unwrap();
+    let mut v: Vec<String> =
+        ledger.owned.values().filter(|o| o.scope == scope).map(|o| o.parts.join("/")).collect();
+    v.sort();
+    v
+}
+
+// Spec (D21, lords-wakeups.md: "It closes when sync can uninstall one dropped target … so the legacy `~/.codex/skills`
+// target goes and Codex sees one copy"; the Lords owner's brief, 7 Nov: "a way to remove one dropped target's recorded
+// paths, the ones that still hold exactly what Lords wrote, and nothing else"; design note §3, I21, A21-1, A21-4, A21-8):
+// for a target the stack no longer declares, `lords uninstall --target NAME --apply` removes each copy that holds what
+// its record says, with its record; keeps a changed copy with its record; forgets a gone one; and changes nothing else,
+// neither a dir of the owner's beside them nor another target's copies or records. Its dry run changes nothing; both
+// exit 1 while a record of the target remains. A target the stack declares is refused, exit 2, nothing changed.
+#[test]
+fn uninstall_target_removes_only_a_dropped_targets_unchanged_copies() {
+    let h = Home::new(&["a", "b", "c"], "");
+    let (old, new) = (h.path("home/old"), h.path("home/new"));
+    h.declare(&format!(
+        "{}{}",
+        skills_target("old skills", &old),
+        skills_target("new skills", &new)
+    ));
+    let o = h.stacked(&["sync", "--user", "--apply"]);
+    assert!(o.status.success() && old.join("a/SKILL.md").is_file(), "{}", text(&o));
+    h.declare(&skills_target("new skills", &new));
+    h.write("home/old/b/SKILL.md", "mine now\n");
+    fs::remove_dir_all(old.join("c")).unwrap();
+    h.write("home/old/mine/SKILL.md", "the owner's own\n");
+    let before = (files(&old), files(&new));
+    let dry = h.stacked(&["uninstall", "--target", "old skills"]);
+    assert_eq!((files(&old), files(&new)), before, "a dry run changes nothing: {}", text(&dry));
+    let o = h.stacked(&["uninstall", "--target", "old skills", "--apply"]);
+    let mut want = before.clone();
+    want.0.retain(|k, _| !k.starts_with("a/"));
+    assert_eq!((files(&old), files(&new)), want, "{}", text(&o));
+    assert_eq!(recorded(&h, "target:old skills"), ["b"], "{}", text(&o));
+    assert_eq!(recorded(&h, "target:new skills"), ["a", "b", "c"], "{}", text(&o));
+    assert_eq!(o.status.code(), Some(1), "b's record remains: {}", text(&o));
+    assert_eq!(dry.status.code(), Some(1), "{}", text(&dry));
+    let o = h.stacked(&["uninstall", "--target", "new skills", "--apply"]);
+    assert_eq!((files(&old), files(&new)), want, "{}", text(&o));
+    assert_eq!(o.status.code(), Some(2), "a declared target: {}", text(&o));
+}
+
+// Spec (the Lords owner's brief, 7 Nov: "`guard install` while the guard copy is busy: today it fails with os error 5
+// when a hook run holds `lords-guard.exe`. Windows lets a running image be renamed, so rename the busy copy aside, copy,
+// and remove the aside copies once they're free. It must never leave no guard in place"; design note §4, I4, A4-1,
+// A4-2): with the copy running (a hook waiting for its event), `lords guard install` of another build succeeds and the
+// copy's place holds that build; on Windows the running copy is set aside beside it while it runs. Once it has ended,
+// the next install finds the copy current and leaves the copy alone in its dir.
+#[test]
+fn guard_install_replaces_a_copy_a_hook_is_running() {
+    use std::process::Stdio;
+    let h = Home::new(&[], "");
+    let lords = fs::read(env!("CARGO_BIN_EXE_lords")).unwrap();
+    // Another build: a trailing byte, past what Windows loads.
+    let old = [&lords[..], b"B"].concat();
+    let bin = h.copy().parent().unwrap().to_path_buf();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(h.copy(), &old).unwrap();
+    let names = || {
+        let mut v: Vec<String> = fs::read_dir(&bin)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    // A hook running the copy: the rm guard, waiting for its event on stdin.
+    let mut running = h
+        .cmd(&h.copy())
+        .args(["guard", "rm"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let o = h.lords(&["guard", "install"]);
+    let (now, beside) = (fs::read(h.copy()).unwrap(), names());
+    let aside: Vec<Vec<u8>> = beside
+        .iter()
+        .filter(|n| n.starts_with(".lords-guard.exe.lords-busy-"))
+        .map(|n| fs::read(bin.join(n)).unwrap())
+        .collect();
+    drop(running.stdin.take());
+    running.wait().unwrap();
+    assert!(now == lords, "this build is in place: {}", text(&o));
+    assert!(o.status.success(), "{}", text(&o));
+    if cfg!(windows) {
+        assert!(aside == [old.clone()], "the running copy, set aside: {beside:?}");
+    }
+    let o = h.lords(&["guard", "install"]);
+    assert!(o.status.success() && text(&o).contains("already current"), "{}", text(&o));
+    assert_eq!(names(), ["lords-guard.exe"], "{}", text(&o));
 }
