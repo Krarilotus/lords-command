@@ -605,7 +605,9 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         }
         return Ok(true);
     }
+    let safe_only = a.flag("--safe-only");
     let stage = match a.value("--stage")?.as_deref() {
+        _ if safe_only => sync::Stage::SafeOnly,
         None | Some("full") => sync::Stage::Full,
         Some("install") => sync::Stage::Install,
         Some(other) => return Err(format!("--stage {other}: `install` or `full`")),

@@ -19,7 +19,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 mod place_uninstall;
+mod safety;
 mod target_uninstall;
+
+pub use safety::{Held, HeldItem, HeldPlace, Hold, PendingImport, PlaceId, Safety};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -132,6 +135,11 @@ pub struct Item {
     /// (`codex_trust::settle`).
     #[serde(skip)]
     pub(crate) codex_lords: Option<Vec<crate::codex_trust::Lords>>,
+    /// Whether it may be applied with no one looking (D13): set once, by the planner's last step (`safety::classify`).
+    pub safety: Safety,
+    /// The places it belongs to, as the planner made it there (D13): what `Stage::SafeOnly` holds whole. None for an
+    /// item of no place (an ended entry, a dead memory index).
+    pub places: Vec<PlaceId>,
 }
 
 /// An item as plans show it (`--json`, the app): a redacted item without its texts.
@@ -154,6 +162,9 @@ struct ItemOut {
     adoptable: bool,
     diff: String,
     notes: Vec<String>,
+    safety: Safety,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    places: Vec<PlaceId>,
 }
 
 impl From<Item> for ItemOut {
@@ -172,6 +183,8 @@ impl From<Item> for ItemOut {
             adoptable: i.adoptable,
             diff: i.diff,
             notes: i.notes,
+            safety: i.safety,
+            places: i.places,
         }
     }
 }
@@ -244,6 +257,10 @@ pub enum Stage {
     /// Only tool-owned paths (create, install, update, refresh) and each repo's git-exclude lines; no removal, no
     /// other owner file, no import or retirement; a place with a conflict is skipped whole.
     Install,
+    /// Only what may be applied with no one looking (D13, `Safety`): `Full`'s plan, with what the stacks no longer want
+    /// listed even without a complete view, so a place wanting a removal is held, never half updated; then only the
+    /// safe items of places that hold no other. Nothing is imported or retired. `Plan::held` says what was left out.
+    SafeOnly,
 }
 
 impl Item {
@@ -275,6 +292,8 @@ impl Item {
             names_role_guard: None,
             names_rm_guard: None,
             codex_lords: None,
+            safety: Safety::NeedsOwner(Hold::Unclassified),
+            places: Vec::new(),
         }
     }
 
@@ -319,6 +338,12 @@ pub struct Plan {
     /// The Codex apply asks about trust after it writes Codex's hooks (`Options::codex`).
     #[serde(skip)]
     pub codex: crate::codex_trust::Codex,
+    /// Memory stores with changes since their last import: store work only a sync by hand does (D13).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<PendingImport>,
+    /// What `Stage::SafeOnly` left out; `None` for any other stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held: Option<Held>,
 }
 
 /// What applying a plan releases besides its installs and updates: paths it removes, and ledger records it forgets
@@ -2820,12 +2845,16 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
     }
     match (opts.stage, &complete) {
         (Stage::Install, _) => staged(&mut pl.plan),
-        (Stage::Full, Some(_)) => pl.unwanted(),
-        (Stage::Full, None) => pl.plan.notes.push(format!(
+        (Stage::Full | Stage::SafeOnly, Some(_)) => pl.unwanted(),
+        (Stage::Full | Stage::SafeOnly, None) => pl.plan.notes.push(format!(
             "removal held: {why}, so nothing is removed or forgotten until both are none"
         )),
     }
     pl.plan.complete = complete;
+    safety::classify(&mut pl.plan, &safety::managed(&pl.ledger));
+    if opts.stage == Stage::SafeOnly {
+        safety::safe_only(&mut pl.plan);
+    }
     Ok(pl.plan)
 }
 
