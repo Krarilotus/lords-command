@@ -476,8 +476,10 @@ pub fn install_guard(home: &Path, from: &Path) -> Result<bool, String> {
 }
 
 /// How many earlier guard copies `install_guard` set aside are still there, a process running each: those free now
-/// are deleted first (`fsguard::sweep_busy`).
+/// are deleted first (`fsguard::sweep_busy`), under the apply lock, so never one another install set aside and may
+/// still move back (sol-loop r1, S3).
 pub fn guard_aside(home: &Path) -> Result<usize, String> {
+    let _lock = ApplyLock::take(home, 60)?;
     fsguard::sweep_busy(&guard_place(home)?)
 }
 
