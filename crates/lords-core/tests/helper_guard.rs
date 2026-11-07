@@ -34,8 +34,8 @@ fn session(
 // Spec (design note §5.1, the choice, H6 with H2): T3 iff `T3CODE_THREAD_ID` is set and the process `CLAUDE_PID` names
 // was launched with T3's tools in `--allowedTools` (`mcp__t3-code__…`); `claude -h` (2.1.316): "--allowedTools,
 // --allowed-tools <tools...> Comma or space-separated list of tool names to allow". A CLI started from a T3 agent's
-// shell (N1) inherits the thread but is its own process, launched without them (A2), whatever its prompt or settings
-// say (A13); a T3 launch without the flag goes quiet (A11).
+// shell (N1) inherits the thread but is its own process, launched without them (A2), whatever its prompt, settings or
+// permission rules say (A13); a T3 launch without the flag goes quiet (A11).
 #[test]
 fn a_t3_launch_is_t3_and_a_cli_started_from_its_shell_is_not() {
     let t3_launch = words(
@@ -98,6 +98,44 @@ fn a_t3_launch_is_t3_and_a_cli_started_from_its_shell_is_not() {
         (
             "the flag's value is the next flag",
             s(&["claude", "--allowedTools", "--tools", "mcp__t3-code__*"]),
+            false,
+        ),
+        // Sol-loop r1, S1 (Claude Code's permission rules, `Tool` or `Tool(specifier)`, its docs: `--allowedTools
+        // "Bash(git log *)" "Read"`): a rule's specifier is part of the rule, not a tool.
+        (
+            "a Bash rule whose command names the tool",
+            s(&[
+                "claude",
+                "-p",
+                "x",
+                "--allowedTools",
+                "Bash(echo mcp__t3-code__delegate_task)",
+                "Agent",
+            ]),
+            false,
+        ),
+        (
+            "a Bash rule with blanks, then T3's tools",
+            s(&["claude", "--allowedTools", "Bash(git log *),mcp__t3-code__*"]),
+            true,
+        ),
+        // Sol-loop r1, S2 (`--` ends the options; what follows is the prompt).
+        (
+            "a prompt after `--`",
+            s(&[
+                "claude",
+                "-p",
+                "--allowedTools",
+                "Bash",
+                "Agent",
+                "--",
+                "--allowedTools=mcp__t3-code__*",
+            ]),
+            false,
+        ),
+        (
+            "the flag and its value after `--`",
+            s(&["claude", "-p", "--", "--allowedTools", "mcp__t3-code__*"]),
             false,
         ),
     ];
