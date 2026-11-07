@@ -193,7 +193,6 @@ fn class_of(i: &Item, managed: &BTreeSet<String>, also: &[SafeAlso], complete: b
     // A tool-owned path below a root the plan verified, where apply acts (rule A).
     let tool = i.class == Class::Tool && i.change() == Change::ToolOwned;
     let owner_file = matches!(i.change(), Change::OwnerEdit | Change::ExcludeEdit);
-    let exclude = i.change() == Change::ExcludeEdit && also.contains(&SafeAlso::Exclude);
     match i.action {
         // Nothing written: a tracked file shown, or a path already as wanted.
         Action::InSync => Safety::Safe,
@@ -208,8 +207,9 @@ fn class_of(i: &Item, managed: &BTreeSet<String>, also: &[SafeAlso], complete: b
             _ if also.contains(&SafeAlso::NewPlace) => Safety::Safe,
             _ => need(Hold::NewPlace),
         },
-        // Sync's own lines in a checkout's git exclude, where the stack names them.
-        Action::Create | Action::Update if exclude => Safety::Safe,
+        // An owner file, a checkout's git exclude among them: no setting makes its edit safe. The exclude is the one
+        // destination several places share (a checkout and its worktrees read it), so its wanted edit holds every
+        // reader it lists, and no safe-only plan writes it (review r1, R1-01, R1-02).
         Action::Create | Action::Update if owner_file => need(Hold::OwnerFile),
         Action::Remove | Action::RemoveBlock => need(Hold::Removal),
         Action::Conflict => need(match i.conflict {

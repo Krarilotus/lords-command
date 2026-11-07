@@ -474,7 +474,9 @@ or without a complete view, a retirement). `sync --json` shows it on each item, 
 --safe-only [--apply]` applies only `safe` and `safe-forget` items, and a place holding any other is held whole and
 named with its reasons; a conflict of no place holds every place. It imports and retires nothing: it lists that store
 work. It exits 1 while a place is held. The stack's `[safe_only] applies` names what it applies besides, by default
-nothing: `"new-place"` and `"exclude"` (sync's own lines in a checkout's git exclude) are the only two it accepts.
+nothing; `"new-place"` (files where nothing is, in a declared place the ledger records nothing in) is the one value it
+accepts. A destination several places share, a checkout's git exclude that its worktrees read too, is never applied
+this way: its wanted edit holds every place that reads it.
 
 **The changeover, once and with a human:** the 3a place files, the old `~/.codex/skills` copies and any other path
 from before the ledger are listed by `lords adopt --list`. Adopting a file records it only if it is byte for byte what

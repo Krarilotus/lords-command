@@ -161,7 +161,8 @@ pub struct Manifest {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SafeOnly {
-    /// Default none. Only the two that can't overwrite or remove an owner's bytes can be named.
+    /// Default none. Only what can't overwrite or remove an owner's bytes, and writes no destination other places share,
+    /// can be named (review r1: a checkout's git exclude, which its worktrees read too, can't).
     #[serde(default)]
     pub applies: Vec<SafeAlso>,
 }
@@ -172,8 +173,6 @@ pub struct SafeOnly {
 pub enum SafeAlso {
     /// Tool-owned files where nothing is, in a declared place where the ledger records nothing yet.
     NewPlace,
-    /// Sync's own lines in a checkout's git exclude, its one edit there (backed up).
-    Exclude,
 }
 
 /// One adapter's place files (stack.toml `[place_files.<adapter>]`).

@@ -124,7 +124,7 @@
       "type": "object",
       "description": "what `lords sync --safe-only` applies with no one looking besides what is always safe",
       "properties": {
-        "applies": { "type": "array", "items": { "enum": ["new-place", "exclude"] }, "default": [], "description": "\"new-place\": tool-owned files where nothing is, in a declared place where the ledger records nothing yet; \"exclude\": sync's own lines in a checkout's git exclude. Default none: both hold their place for a sync by hand" }
+        "applies": { "type": "array", "items": { "enum": ["new-place"] }, "default": [], "description": "\"new-place\": tool-owned files where nothing is, in a declared place where the ledger records nothing yet. Default none: such a place is held for a sync by hand. A destination other places share, such as a checkout's git exclude, can't be named" }
       },
       "additionalProperties": false
     },
