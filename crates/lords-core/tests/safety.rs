@@ -190,8 +190,9 @@ fn an_owner_file_edit_needs_the_owner() {
     let (a, b) = synced(&f);
     fs::write(a.join(".git/info/exclude"), "").unwrap();
     let mine = f.write("home/.claude/CLAUDE.md", "My own line.\n");
+    // Its reader's role, so its block carries `rule.r` (a rule for some roles) and the file wants an edit.
     let target = format!(
-        "[[targets]]\nname = \"user\"\nadapter = \"claude\"\nkind = \"instructions\"\npath = '{}'\n",
+        "[[targets]]\nname = \"user\"\nadapter = \"claude\"\nkind = \"instructions\"\npath = '{}'\nroles = [\"coder\"]\n",
         mine.display()
     );
     manifest(&f, &[&a, &b], &target);
