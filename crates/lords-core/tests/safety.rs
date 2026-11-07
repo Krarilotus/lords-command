@@ -577,18 +577,27 @@ fn a_shared_exclude_holds_every_checkout_reading_it_and_a_nested_worktree_is_its
     assert_eq!(read(&m.join("CLAUDE.local.md")), "My own text.\n");
 }
 
-// Spec (A13: an owner edit after planning is caught by apply's own checks): a safe-only plan applied after the owner
-// changed one of its files refuses, and the owner's text stays.
+// Spec (A13: an owner edit after planning is caught by apply's own checks; F8's C4, which closes this note's §8
+// residual "an apply refused part way can leave a place half written"): a safe-only plan applied after the owner
+// changed one of its files holds that file's place whole, put back as it was (`write-refused`), and the owner's text
+// stays; the other place is written. Before F8 the whole apply refused here.
 #[test]
-fn an_edit_after_planning_is_refused_and_kept() {
+fn an_edit_after_planning_holds_its_place_and_is_kept() {
     let f = Fixture::new();
-    let (_, b) = synced(&f);
+    let (a, b) = synced(&f);
     rule(&f, "Rule two.\n");
     let p = safe_only(&f);
     assert!(keeps_below(&p, &b));
     fs::write(b.join("CLAUDE.local.md"), "Edited after the plan.\n").unwrap();
-    assert!(apply(&p).is_err());
+    let applied = apply(&p).unwrap();
     assert_eq!(read(&b.join("CLAUDE.local.md")), "Edited after the plan.\n");
+    assert!(read(&b.join("AGENTS.override.md")).contains("Rule one."), "held whole");
+    assert!(read(&a.join("CLAUDE.local.md")).contains("Rule two."), "the other place is written");
+    let held = |h: &lords_core::sync::HeldPlace| {
+        matches!(&h.place, lords_core::sync::PlaceId::Dir(d) if ledger::key(d) == ledger::key(&b))
+            && h.items.iter().all(|i| i.reason == Hold::WriteRefused)
+    };
+    assert!(applied.held.iter().any(held), "{:?}", applied.held);
 }
 
 // Spec (the owner, 7 Nov 17:16, intent item 10: "make thigns more configurable, no harded coded shit that will bite
