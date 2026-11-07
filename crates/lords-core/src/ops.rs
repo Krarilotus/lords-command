@@ -403,7 +403,7 @@ fn import_stores(
         let defaults = dest.join(DEFAULTS);
         let mut wrote_defaults = false;
         // Each file this import writes, the hash of what it wrote, and whether git held one there before (`put_back`).
-        let mut written: Vec<(PathBuf, String, bool)> = Vec::new();
+        let mut written: Vec<(PathBuf, Vec<u8>, bool)> = Vec::new();
         if write && !defaults.exists() {
             let audience =
                 if s.audience.is_empty() { "all".to_string() } else { s.audience.join(", ") };
@@ -413,7 +413,7 @@ fn import_stores(
             );
             git_keeps(&defaults)?;
             stack_write(&private.root, &defaults, text.as_bytes())?;
-            written.push((defaults.clone(), fsguard::sha(text.as_bytes()), false));
+            written.push((defaults.clone(), text.as_bytes().to_vec(), false));
             wrote_defaults = true;
         }
         let mut rep =
@@ -442,7 +442,7 @@ fn import_stores(
                     if write {
                         git_keeps(&target)?;
                         stack_write(&private.root, &target, incoming.as_bytes())?;
-                        written.push((target.clone(), fsguard::sha(incoming.as_bytes()), false));
+                        written.push((target.clone(), incoming.as_bytes().to_vec(), false));
                     }
                     rep.added.push(name);
                 }
@@ -454,7 +454,7 @@ fn import_stores(
                         if write {
                             git_keeps(&target)?;
                             stack_write(&private.root, &target, merged.as_bytes())?;
-                            written.push((target.clone(), fsguard::sha(merged.as_bytes()), true));
+                            written.push((target.clone(), merged.as_bytes().to_vec(), true));
                         }
                         rep.changed.push(name);
                     }
@@ -495,19 +495,28 @@ fn import_stores(
 
 /// One store's import after its commit failed (D6): its paths unstaged, then each file it wrote that still holds what
 /// it wrote back as HEAD has it (git held it unmodified before, `git_keeps`), or gone where it was new; a file edited
-/// since stays as it is, and is named (sol-loop r1 S1). What became of them, in words.
-fn put_back(root: &Path, dest: &Path, written: &[(PathBuf, String, bool)]) -> String {
+/// since stays as it is, and is named (sol-loop r1 S1). Each is compared and swapped in one step (`fsguard`'s
+/// compare-and-swap), so a save that lands meanwhile is never lost (r2 S1). What became of them, in words.
+fn put_back(root: &Path, dest: &Path, written: &[(PathBuf, Vec<u8>, bool)]) -> String {
     let mut kept = Vec::new();
     let done = (|| -> Result<(), String> {
-        let arg = |p: &Path| rel(root, p).to_string_lossy().into_owned();
+        let arg = |p: &Path| rel(root, p).to_string_lossy().replace('\\', "/");
         git::run(root, &["reset", "-q", "--", &arg(dest)])?;
         for (p, wrote, tracked) in written {
-            if fsguard::read(p)?.map(|b| fsguard::sha(&b)).as_ref() != Some(wrote) {
-                kept.push(p.display().to_string());
-            } else if *tracked {
-                git::run(root, &["checkout", "-q", "--", &arg(p)])?;
-            } else {
-                fsguard::delete_file(&stack_place(root, p)?)?;
+            let place = stack_place(root, p)?;
+            let back = match tracked {
+                // HEAD's version as a checkout writes it (its filters applied), in place of exactly what was written.
+                true => git::bytes(root, &["cat-file", "--filters", &format!("HEAD:./{}", arg(p))])
+                    .and_then(|head| fsguard::replace_file_if(&place, wrote, &head)),
+                false => fsguard::move_aside(&place).and_then(|aside| {
+                    match fsguard::read(aside.path()) {
+                        Ok(Some(b)) if b == *wrote => aside.delete(),
+                        _ => Err(aside.back_after("changed since the import wrote it".into())),
+                    }
+                }),
+            };
+            if let Err(e) = back {
+                kept.push(format!("{} ({e})", p.display()));
             }
         }
         Ok(())

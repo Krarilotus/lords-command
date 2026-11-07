@@ -783,14 +783,16 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     let applied = match lock {
         Some(lock) => {
             let applied = sync::apply_held(&plan, &lock).map_err(|e| e.to_string())?;
-            match safe_only {
-                true => {
+            match (safe_only, opts.stage) {
+                (true, _) => {
                     lords_core::deliver::settle_safe_only(&opts.home, &settings, &plan, &applied)?
                 }
-                // The place a held entry names is resolved by this very command (sol-loop r1 S7).
-                false => {
+                // The place a held entry names is resolved by this very command (sol-loop r1 S7); an install stage
+                // removes nothing and skips a place with a conflict, so it resolves nothing (r2 S12).
+                (false, sync::Stage::Full) => {
                     lords_core::deliver::settle_by_hand(&opts.home, &settings, &plan, &[], false)?
                 }
+                (false, _) => {}
             }
             applied
         }

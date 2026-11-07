@@ -285,6 +285,21 @@ fn committed(dirs: &[&Path]) -> Result<Vec<StoreTree>, String> {
     Ok(trees)
 }
 
+/// Whether a file git tracks in a store's stack dir was written at or after `since` (sol-loop r2 S4): a write put back
+/// before the next status leaves no other trace.
+fn written_since(dirs: &[&Path], since: std::time::SystemTime) -> Result<bool, String> {
+    for d in dirs {
+        for f in git(d, &["ls-files", "-z"])?.split('\0').filter(|f| !f.is_empty()) {
+            match fsguard::modified(d.join(f)) {
+                Ok(t) if t >= since => return Ok(true),
+                Ok(_) => {}
+                Err(e) => return Err(format!("{}: {e}", d.join(f).display())),
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Whether a commit in `dir` starts a delivery: `dir` is the checkout of a store `[delivery] on_commit` lists.
 fn triggers(public: &Path, private: Option<&Path>, dir: &Path, settings: &Delivery) -> bool {
     let at = |root: &Path| {
@@ -587,6 +602,9 @@ fn attempt(
                 }
             }
         }
+        if Instant::now() > deadline {
+            return Err(past("the stores' check ended"));
+        }
         if settings.store_work {
             let (done, held) = store_work(public, private);
             // Its commits moved a store's tree; one it couldn't make may have left a store unclean (a file someone
@@ -608,7 +626,12 @@ fn attempt(
     if Instant::now() > deadline {
         return Err(past("the store work ended"));
     }
+    // Every store file written from here on was perhaps read half way (sol-loop r2 S4).
+    let loading = std::time::SystemTime::now();
     let stacks = Stacks::load(public, private)?;
+    if Instant::now() > deadline {
+        return Err(past("the stacks' load ended"));
+    }
     let (repo, place) = match &opts.worktree {
         Some((r, p)) => (Some(r.clone()), Some(p.clone())),
         None => (None, None),
@@ -625,13 +648,17 @@ fn attempt(
     if Instant::now() > deadline {
         return Err(past("planning ended"));
     }
-    // What was planned is what the stores committed: a store edited or committed while it loaded is planned again, so
-    // no uncommitted text is delivered under a committed tree (K4; sol-loop r1 S4).
-    if opts.worktree.is_none() && committed(&dirs)? != trees {
-        let why = "a store's committed stack moved while the delivery planned";
+    between(Step::Planned, home);
+    // What was planned is what the stores committed: a store edited or committed while it loaded, or a file written
+    // since the load began, even put back (a stack edit whose commit was refused), is planned again, so no uncommitted
+    // text is delivered under a committed tree (K4; sol-loop r1 S4, r2 S4).
+    if opts.worktree.is_none() && (committed(&dirs)? != trees || written_since(&dirs, loading)?) {
+        let why = "a store's stack changed while the delivery planned";
         return Ok(Next::Again { pause: false, why: why.into() });
     }
-    between(Step::Planned, home);
+    if Instant::now() > deadline {
+        return Err(past("the stores' check after planning ended"));
+    }
     let not_ready = plan.held.iter().flat_map(|h| &h.places).flat_map(|p| &p.items);
     if let Some(i) = not_ready.clone().find(|i| i.reason == Hold::NotReady) {
         return Ok(Next::Again { pause: true, why: i.note.clone() });

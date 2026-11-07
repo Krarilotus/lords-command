@@ -170,6 +170,10 @@ pub(super) fn apply(
             applied.held.push(held(&place, &items, why));
             continue;
         }
+        if let Some(why) = in_sync_changed(plan, &items) {
+            applied.held.push(held(&place, &items, why));
+            continue;
+        }
         let at = place_path(&place);
         match one_place(&plan.home, ledger, &items, &at, plan.lock_wait.0, between) {
             Ok(done) => applied.done.extend(done),
@@ -187,6 +191,20 @@ pub(super) fn apply(
         applied.held.push(held(&place, &[item], why));
     }
     Ok(applied)
+}
+
+/// Why a place's file the plan leaves as it is (in sync) no longer holds what the plan read, if one doesn't: an edit
+/// since the plan, before any of the place's files is written, holds the place whole like an edit of a file it writes
+/// (sol-loop r2 S5).
+fn in_sync_changed(plan: &Plan, items: &[&Item]) -> Option<String> {
+    let keys: Vec<String> = items.iter().flat_map(|i| &i.places).map(PlaceId::key).collect();
+    let in_place = |i: &&Item| i.places.iter().any(|p| keys.contains(&p.key()));
+    let kept = plan.items.iter().filter(|i| i.action == Action::InSync).filter(in_place);
+    kept.filter(|i| matches!(i.dest, Dest::Tool(_))).find_map(|i| match hash(&i.path) {
+        Ok(h) if h == i.have => None,
+        Ok(_) => Some(format!("{}: changed since the plan; the place is held", i.path.display())),
+        Err(e) => Some(e),
+    })
 }
 
 /// One place's transaction (module doc): its changes as lines, or why it was held or stopped.
