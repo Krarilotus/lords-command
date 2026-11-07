@@ -466,6 +466,18 @@ and the place it belongs to (a user target with its shared `via` file, a repo, a
 it there. Under `sync --apply` stack edits run under the same lock, after the
 plan is known to apply.
 
+**The safe-only stage** (D13). The planner's last step gives every item one class, from what it checked: `safe` (a
+tool-owned path whose disk still matches its record, or a create where nothing is in a place the ledger records a path
+in), `safe-forget` (the record of a gone path whose place is gone too, from a complete view), or `needs-owner` with a
+reason (an owner file, a new place, a removal, a changed or unchecked copy, a conflict, a forget in a place still there
+or without a complete view, a retirement). `sync --json` shows it on each item, with the item's places. `lords sync
+--safe-only [--apply]` applies only `safe` and `safe-forget` items, and a place holding any other is held whole and
+named with its reasons; a conflict of no place holds every place. It imports and retires nothing: it lists that store
+work. It exits 1 while a place is held. The stack's `[safe_only] applies` names what it applies besides, by default
+nothing; `"new-place"` (files where nothing is, in a declared place the ledger records nothing in) is the one value it
+accepts. A destination several places share, a checkout's git exclude that its worktrees read too, is never applied
+this way: its wanted edit holds every place that reads it.
+
 **The changeover, once and with a human:** the 3a place files, the old `~/.codex/skills` copies and any other path
 from before the ledger are listed by `lords adopt --list`. Adopting a file records it only if it is byte for byte what
 sync would write now (`lords adopt PATH...`). Anything else goes by `lords set-aside PATH... --yes`, which moves it
