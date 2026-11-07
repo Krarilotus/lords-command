@@ -111,6 +111,10 @@ pub struct Item {
     /// A settings item whose hooks will name the guard copy: apply checks it is there and answers before it writes.
     #[serde(skip)]
     pub(crate) names_guard: Option<Contained>,
+    /// A forget planned because nothing was at the record's path: apply forgets it only while nothing is (sol-loop r2,
+    /// S4). A forget of a copy the owner changed (`Planner::unwanted`) acts whatever is there.
+    #[serde(skip)]
+    pub(crate) gone: bool,
     /// The guards those hooks run: apply checks the copy still lists each (D20).
     #[serde(skip)]
     pub(crate) names_guards: Vec<String>,
@@ -265,6 +269,7 @@ impl Item {
             conflict: ConflictKind::Other,
             redacted: false,
             names_guard: None,
+            gone: false,
             names_guards: Vec::new(),
             names_child_guard: false,
             names_role_guard: None,
@@ -1103,7 +1108,10 @@ impl Planner<'_> {
                 Ok(_) => Some(String::new()),
             };
             match now {
-                None => item.notes.push("gone already; its ledger record goes".into()),
+                None => {
+                    item.gone = true;
+                    item.notes.push("gone already; its ledger record goes".into())
+                }
                 Some(h) if h == o.sha => {
                     item.action = Action::Remove;
                     item.notes.push("sync's, unchanged, and no longer wanted here: deleted".into());
@@ -3066,6 +3074,13 @@ fn owner_update(
 /// fix check r3, R7: validate everything first, then act); `tool_change` runs it again and checks the content when it
 /// acts, for what changes later.
 fn tool_current(item: &Item, ledger: &Ledger) -> Result<(), String> {
+    // A record planned to go because nothing was at its path goes only while nothing is (sol-loop r2, S4).
+    if item.action == Action::Forget
+        && item.gone
+        && fsguard::kind(&item.path)? != fsguard::Kind::Missing
+    {
+        return Err(stale(item, "something is at its path again"));
+    }
     let Dest::Tool(place) = &item.dest else { return Ok(()) };
     match item.action {
         Action::Create | Action::Install
@@ -3086,6 +3101,7 @@ fn tool_current(item: &Item, ledger: &Ledger) -> Result<(), String> {
 
 fn tool_change(item: &Item, ledger: &mut Ledger) -> Result<(), String> {
     if item.action == Action::Forget {
+        tool_current(item, ledger)?;
         ledger.forget(&item.path);
         return Ok(());
     }

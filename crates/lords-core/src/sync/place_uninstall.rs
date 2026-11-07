@@ -241,6 +241,7 @@ pub(super) fn plan(stacks: &Stacks, private: &Stack, opts: &Options) -> Result<P
             Err(e) => kept(&mut item, &format!("can't check it ({e})")),
             Ok(fsguard::Kind::Missing) => {
                 item.action = Action::Forget;
+                item.gone = true;
                 item.notes.push("gone already; its ledger record goes".into());
             }
             Ok(fsguard::Kind::Dir) if o.kind == "dir" => match fsguard::read_tree(&path) {
