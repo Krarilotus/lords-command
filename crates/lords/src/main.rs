@@ -466,8 +466,8 @@ fn guard_install(mut a: Args) -> ExitCode {
         Ok((place, wrote, aside)) => {
             let what = if wrote { "installed" } else { "already current" };
             say(&format!("guard {what}: {} (passes its self-test)", place.display()));
-            if aside > 0 {
-                say(&format!("{aside} earlier copy(ies) still run beside it, set aside; the next `lords guard install` removes them"));
+            for kept in &aside {
+                say(&format!("beside it: {kept}"));
             }
             ExitCode::SUCCESS
         }

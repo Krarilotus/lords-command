@@ -1391,10 +1391,10 @@ pub fn move_to(from: &impl Place, to: &Contained) -> Result<(), String> {
 
 /// Puts an executable at `p` that is the tool's alone: written and synced as a staged `.exe` beside it, run there by
 /// `verify`, then renamed over `p`. A copy that fails `verify` is removed and `p` keeps what it had. One a running
-/// process holds, which Windows won't replace (os error 5) but lets be renamed, goes aside first (`.<name>.lords-busy-…`)
-/// and is deleted once free, here or by `sweep_busy` (design note 2026-11-07-lords-delivery-integrity §4): `p` never
-/// lacks a copy but between those two renames, or when the second fails and the old copy can't go back, which the error
-/// then names.
+/// process holds, which Windows won't replace (os error 5) but lets be renamed, goes aside first, its name recording the
+/// hash of the bytes it holds (`.<name>.lords-busy-<sha256>-…`), and is deleted once free and only while it still holds
+/// them, here or by `sweep_busy` (design note 2026-11-07-lords-delivery-integrity §4, I4b): `p` never lacks a copy but
+/// between those two renames, or when the second fails and the old copy can't go back, which the error then names.
 pub fn install_exe(
     p: &impl Place,
     bytes: &[u8],
@@ -1421,7 +1421,9 @@ pub fn install_exe(
     if nothing_at(path).unwrap_or(true) {
         return Err(refused(busy.to_string()));
     }
-    let aside = beside(path, "busy").map_err(refused)?;
+    // Lords' record of the copy it sets aside: the hash of its bytes, in its name (review r1, R1-01).
+    let held = fs::read(path).map(|b| sha(&b)).map_err(|e| refused(e.to_string()))?;
+    let aside = beside(path, &format!("busy-{held}")).map_err(refused)?;
     if let Err(e) = fs::rename(path, &aside) {
         return Err(refused(format!("{busy}; and it can't be set aside ({e})")));
     }
@@ -1438,25 +1440,55 @@ pub fn install_exe(
         });
     }
     // Still running, it stays for the next `sweep_busy`.
-    let _ = delete_file_at(&aside);
+    let _ = delete_if_holds(&aside, &held);
     Ok(())
 }
 
-/// Deletes each copy `install_exe` set aside beside `p` (`.<name>.lords-busy-…`, a plain file) that is free now; one a
-/// process still runs stays. Gives how many stay. Nothing else is touched: no other name, no dir, no link.
-pub fn sweep_busy(p: &impl Place) -> Result<usize, String> {
+/// Deletes the file at `path` only while it holds bytes whose hash is `want`: it is moved to a fresh name first and
+/// hashed there, so nothing written to `path` after the check is deleted (as sync's removals do); otherwise it goes back,
+/// and why it stays comes back as the error.
+fn delete_if_holds(path: &Path, want: &str) -> Result<(), String> {
+    let at = move_aside_at(path)?;
+    let why = match fs::read(&at) {
+        Ok(b) if sha(&b) == want => match fs::remove_file(&at) {
+            Ok(()) => return Ok(()),
+            Err(e) => format!("can't be deleted yet ({e}): a process may still run it"),
+        },
+        Ok(_) => "holds other bytes than Lords set aside".to_string(),
+        Err(e) => format!("can't be read ({e})"),
+    };
+    Err(match move_back_at(&at, path) {
+        Ok(()) => why,
+        Err(back) => format!("{why}; and it couldn't go back ({back}): it is at {}", at.display()),
+    })
+}
+
+/// Deletes each copy `install_exe` set aside beside `p` that still holds the bytes whose hash its name records
+/// (`delete_if_holds`; review r1, R1-01). Every other file of that name's prefix stays, and comes back with why: a name
+/// with no hash (Lords never set it aside), other bytes, a copy a process still runs, anything but a plain file.
+pub fn sweep_busy(p: &impl Place) -> Result<Vec<String>, String> {
     let path = p.place();
     check(path)?;
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return Ok(0) };
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return Ok(Vec::new()) };
     let prefix = format!(".{}.lords-busy-", name.to_string_lossy());
-    let mut left = 0;
+    let mut kept = Vec::new();
     for f in list_dir(dir)? {
-        let ours = f.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&prefix));
-        if ours && kind_here(&f) == Ok(Kind::File) && fs::remove_file(&f).is_err() {
-            left += 1;
+        let Some(name) = f.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+        let Some(rest) = name.strip_prefix(&prefix) else { continue };
+        let hash = rest.get(..64).filter(|h| {
+            rest.as_bytes().get(64) == Some(&b'-')
+                && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        });
+        let gone = match (hash, kind_here(&f)) {
+            (None, _) => Err("its name records no hash, so Lords never set it aside".to_string()),
+            (Some(h), Ok(Kind::File)) => delete_if_holds(&f, h),
+            (Some(_), _) => Err("not a plain file".to_string()),
+        };
+        if let Err(why) = gone {
+            kept.push(format!("{}: {why}; kept", f.display()));
         }
     }
-    Ok(left)
+    Ok(kept)
 }
 
 /// Replaces a file that is the tool's alone, keeping its attributes or refusing.
