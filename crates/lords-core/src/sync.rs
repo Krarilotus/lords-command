@@ -2980,14 +2980,22 @@ fn repo_hooks(
         if opts.repo.as_deref().is_some_and(|r| r != name) || !repo.worktrees {
             continue;
         }
-        let Some(first) = repo.checkouts.first().map(|c| expand_home(c)) else { continue };
-        let args = crate::hooks::sync_args(stacks, name);
-        let Ok(state) =
-            crate::hooks::post_checkout_state(&first, ledger, exe.path(), &args, &opts.home)
-        else {
-            continue;
-        };
-        hooks.push(crate::hooks::RepoHook { repo: name.clone(), checkout: first, state });
+        // One hook per git common dir its declared checkouts have: every independent clone's worktrees get it (sol-loop
+        // r1 S6).
+        let mut seen = BTreeSet::new();
+        for checkout in repo.checkouts.iter().map(|c| expand_home(c)) {
+            let Ok(common) = crate::hooks::common_dir(&checkout) else { continue };
+            if !seen.insert(ledger::key(&common)) {
+                continue;
+            }
+            let args = crate::hooks::sync_args(stacks, name);
+            let Ok(state) =
+                crate::hooks::post_checkout_state(&checkout, ledger, exe.path(), &args, &opts.home)
+            else {
+                continue;
+            };
+            hooks.push(crate::hooks::RepoHook { repo: name.clone(), checkout, state });
+        }
     }
     hooks
 }
@@ -4107,14 +4115,15 @@ pub fn import_and_apply_between(
         Stage::Full => repo_hooks_in(&last, &stacks, &opts.home, &lock),
         _ => Vec::new(),
     };
-    for (repo, r) in &hooks {
+    for (h, r) in &hooks {
+        let what = crate::deliver::hook_what(h);
         done.push(match r {
-            Ok(line) => format!("post-checkout of repo {repo}: {line}"),
-            Err(why) => format!("post-checkout of repo {repo}: not installed: {why}"),
+            Ok(line) => format!("{what}: {line}"),
+            Err(why) => format!("{what}: not installed: {why}"),
         });
     }
     if opts.stage == Stage::Full {
-        if let Err(e) = crate::deliver::settle_by_hand(&opts.home, &settings, &last, &hooks) {
+        if let Err(e) = crate::deliver::settle_by_hand(&opts.home, &settings, &last, &hooks, true) {
             done.push(format!("the delivery state couldn't be updated: {e}"));
         }
     }
@@ -4129,7 +4138,7 @@ fn repo_hooks_in(
     stacks: &Stacks,
     home: &Path,
     lock: &ApplyLock,
-) -> Vec<(String, Result<String, String>)> {
+) -> Vec<(crate::hooks::RepoHook, Result<String, String>)> {
     use crate::hooks::HookState;
     let todo: Vec<&crate::hooks::RepoHook> = plan
         .hooks
@@ -4156,7 +4165,7 @@ fn repo_hooks_in(
                 crate::hooks::install_post_checkout_held(&h.checkout, c.path(), &args, home, lock)
                     .map(|i| format!("installed in {}", i.hook.display()))
             });
-            (h.repo.clone(), r)
+            (h.clone(), r)
         })
         .collect()
 }

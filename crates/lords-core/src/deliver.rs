@@ -324,6 +324,11 @@ fn state_place_of(h: &HeldPlace) -> StatePlace {
     }
 }
 
+/// A repo's post-checkout hook as the state and sync's lines name it: its repo and the checkout it is installed from.
+pub(crate) fn hook_what(h: &crate::hooks::RepoHook) -> String {
+    format!("post-checkout of repo {} ({})", h.repo, crate::adapters::slashes(&h.checkout))
+}
+
 /// The repos whose post-checkout hook a plan found other than as this build writes it (C3), with what resolves each.
 fn hook_notes(plan: &sync::Plan) -> Vec<StateNote> {
     use crate::hooks::HookState;
@@ -343,7 +348,7 @@ fn hook_notes(plan: &sync::Plan) -> Vec<StateNote> {
                 format!("put Lords' hook back or remove it, then {fix}"),
             ),
         };
-        notes.push(StateNote { what: format!("post-checkout of repo {}", h.repo), why, command });
+        notes.push(StateNote { what: hook_what(h), why, command });
     }
     notes
 }
@@ -381,15 +386,17 @@ pub fn settle_safe_only(
     update(home, settings, |s| scoped(s, plan, applied)).map(|_| ())
 }
 
-/// `sync --apply` by hand (F8, D5): a full apply wrote every item of its plan, so the places it saw leave the state
-/// (with a complete view only: without one, a wanted removal may still wait); the repos whose hooks it installed leave
-/// it, and the ones it couldn't go in, with why; its store work was done, so held store work goes. Only a state that is
-/// there is changed.
+/// A sync by hand of the full stage (F8, D5): it wrote every item of its plan, so the places it saw leave the state
+/// (with a complete view only: without one, a wanted removal may still wait); the repo hooks it installed leave it,
+/// and the ones it couldn't go in, with why; where it did store work (`store_work`: `sync --apply` of the whole
+/// machine or a repo, not `--place`), held store work goes. The scoped sync a held place names resolves it here too
+/// (sol-loop r1 S7). Only a state that is there is changed: a sync never sets delivery up.
 pub fn settle_by_hand(
     home: &Path,
     settings: &Delivery,
     plan: &sync::Plan,
-    hooks: &[(String, Result<String, String>)],
+    hooks: &[(crate::hooks::RepoHook, Result<String, String>)],
+    store_work: bool,
 ) -> Result<(), String> {
     if !state_place(home, settings)
         .and_then(|p| fsguard::kind(p.path()))
@@ -403,19 +410,20 @@ pub fn settle_by_hand(
             s.places.retain(|p| !seen.contains(&place_key(&p.place)));
         }
         let mut notes = hook_notes(plan);
-        for (repo, r) in hooks {
-            let what = format!("post-checkout of repo {repo}");
+        for (h, r) in hooks {
+            let what = hook_what(h);
             notes.retain(|n| n.what != what);
             if let Err(why) = r {
-                let command = format!("lords sync --repo {repo} --apply");
+                let command = format!("lords sync --repo {} --apply", h.repo);
                 notes.push(StateNote { what, why: why.clone(), command });
             }
         }
-        let planned: Vec<String> =
-            plan.hooks.iter().map(|h| format!("post-checkout of repo {}", h.repo)).collect();
+        let planned: Vec<String> = plan.hooks.iter().map(hook_what).collect();
         s.hooks.retain(|n| !planned.contains(&n.what));
         s.hooks.extend(notes);
-        s.store_work.clear();
+        if store_work {
+            s.store_work.clear();
+        }
         s
     })
     .map(|_| ())
@@ -434,14 +442,19 @@ fn store_work(public: &Path, private: Option<&Path>) -> (Vec<String>, Vec<StateN
         }
     };
     if let Some(p) = stacks.private.as_ref().filter(|p| !p.manifest.memory_stores.is_empty()) {
-        let pending: Vec<String> = crate::ops::import_preview(p, None)
-            .map(|rs| {
-                rs.into_iter()
-                    .filter(|r| !r.added.is_empty() || !r.changed.is_empty())
-                    .map(|r| r.store)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let pending: Vec<String> = match crate::ops::import_preview(p, None) {
+            Ok(rs) => rs
+                .into_iter()
+                .filter(|r| !r.added.is_empty() || !r.changed.is_empty())
+                .map(|r| r.store)
+                .collect(),
+            // A store that can't be read is held store work too, never left out (sol-loop r1 S8).
+            Err(why) => {
+                let command = "lords import".to_string();
+                held.push(StateNote { what: "memory import".into(), why, command });
+                Vec::new()
+            }
+        };
         if !pending.is_empty() {
             match crate::ops::import(p, None, true) {
                 Ok(rs) => done.extend(rs.iter().filter_map(|r| {
@@ -553,6 +566,16 @@ fn attempt(
     let home = &opts.home;
     let dirs: Vec<&Path> = std::iter::once(public).chain(private).collect();
     let (mut trees, mut held_work) = (Vec::new(), Vec::new());
+    // No attempt, store work or plan starts past the deadline (sol-loop r1 S9).
+    let past = |what: &str| {
+        format!(
+            "{what} past the delivery's deadline ([delivery] deadline_secs = {}); no place was written",
+            settings.deadline_secs
+        )
+    };
+    if Instant::now() > deadline {
+        return Err(past("the apply lock came"));
+    }
     if opts.worktree.is_none() {
         trees = committed(&dirs)?;
         if opts.on_commit.is_some() {
@@ -566,12 +589,24 @@ fn attempt(
         }
         if settings.store_work {
             let (done, held) = store_work(public, private);
-            if !done.is_empty() {
-                trees = committed(&dirs)?;
+            // Its commits moved a store's tree; one it couldn't make may have left a store unclean (a file someone
+            // edited meanwhile): then the delivery fails with why, the store work's own reasons named.
+            if !done.is_empty() || !held.is_empty() {
+                trees = committed(&dirs).map_err(|e| {
+                    let why: Vec<String> =
+                        held.iter().map(|n| format!("{}: {}", n.what, n.why)).collect();
+                    match why.is_empty() {
+                        true => e,
+                        false => format!("{e} (after the store work: {})", why.join("; ")),
+                    }
+                })?;
             }
             report.done.extend(done);
             held_work = held;
         }
+    }
+    if Instant::now() > deadline {
+        return Err(past("the store work ended"));
     }
     let stacks = Stacks::load(public, private)?;
     let (repo, place) = match &opts.worktree {
@@ -588,10 +623,13 @@ fn attempt(
     };
     let plan = sync::plan(&stacks, &sync_opts)?;
     if Instant::now() > deadline {
-        return Err(format!(
-            "planning ended past the delivery's deadline ({} s, [delivery] deadline_secs); nothing was written",
-            settings.deadline_secs
-        ));
+        return Err(past("planning ended"));
+    }
+    // What was planned is what the stores committed: a store edited or committed while it loaded is planned again, so
+    // no uncommitted text is delivered under a committed tree (K4; sol-loop r1 S4).
+    if opts.worktree.is_none() && committed(&dirs)? != trees {
+        let why = "a store's committed stack moved while the delivery planned";
+        return Ok(Next::Again { pause: false, why: why.into() });
     }
     between(Step::Planned, home);
     let not_ready = plan.held.iter().flat_map(|h| &h.places).flat_map(|p| &p.items);

@@ -783,8 +783,14 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     let applied = match lock {
         Some(lock) => {
             let applied = sync::apply_held(&plan, &lock).map_err(|e| e.to_string())?;
-            if safe_only {
-                lords_core::deliver::settle_safe_only(&opts.home, &settings, &plan, &applied)?;
+            match safe_only {
+                true => {
+                    lords_core::deliver::settle_safe_only(&opts.home, &settings, &plan, &applied)?
+                }
+                // The place a held entry names is resolved by this very command (sol-loop r1 S7).
+                false => {
+                    lords_core::deliver::settle_by_hand(&opts.home, &settings, &plan, &[], false)?
+                }
             }
             applied
         }
@@ -1135,6 +1141,17 @@ fn print_plan(plan: &sync::Plan) {
             "
 note: {n}"
         );
+    }
+    // Each declared repo's post-checkout hook that isn't as this build writes it (F8, C3; sol-loop r1 S11).
+    for h in &plan.hooks {
+        use lords_core::hooks::HookState;
+        let (repo, at) = (&h.repo, h.checkout.display());
+        match &h.state {
+            HookState::Current => {}
+            HookState::Missing => println!("\npost-checkout of repo {repo} ({at}): missing; `--apply` installs it from the guard copy"),
+            HookState::Outdated => println!("\npost-checkout of repo {repo} ({at}): an earlier form; `--apply` replaces it"),
+            HookState::Changed(why) => println!("\npost-checkout of repo {repo} ({at}): {why}; left as it is"),
+        }
     }
     let count =
         |f: &dyn Fn(&sync::Action) -> bool| plan.items.iter().filter(|i| f(&i.action)).count();

@@ -518,10 +518,17 @@ pub fn sync_args(stacks: &crate::stack::Stacks, repo: &str) -> SyncArgs {
     }
 }
 
+/// A checkout's git common dir, absolute: where its hooks and config are, shared by its worktrees.
+pub fn common_dir(checkout: &Path) -> Result<PathBuf, String> {
+    let common = git::run(checkout, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    Ok(PathBuf::from(common.trim()))
+}
+
 /// Where a declared repo's post-checkout hook stands against what this build writes there with `exe` and `args`
 /// (C3): read only. Lords' hook is found by its ledger record, in the hooks dir or as a config hook (D14b), and must
 /// still hold what the record says; its text, but for the probe label it was made with, is then this build's or not.
-/// An error where git can't tell the checkout's common dir or config.
+/// One that can't be read is `Changed`, with why (sol-loop r1 S10). An error only where git can't tell the checkout's
+/// common dir: the checkout's own conflict in the plan then says why.
 pub fn post_checkout_state(
     checkout: &Path,
     ledger: &Ledger,
@@ -529,10 +536,8 @@ pub fn post_checkout_state(
     args: &SyncArgs,
     home: &Path,
 ) -> Result<HookState, String> {
-    {
-        let common =
-            git::run(checkout, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
-        let common = PathBuf::from(common.trim());
+    let common = common_dir(checkout)?;
+    let found = (|| -> Result<HookState, String> {
         let cfg = common.join("config");
         if config::recorded(checkout, ledger)? {
             let recorded = ledger.owned.get(&config::key(&cfg)).map(|o| o.sha.clone());
@@ -571,7 +576,8 @@ pub fn post_checkout_state(
                 HookState::Changed(format!("{} changed since Lords wrote it", hook.display()))
             }
         })
-    }
+    })();
+    Ok(found.unwrap_or_else(|e| HookState::Changed(format!("can't be read ({e})"))))
 }
 
 /// What a post-checkout hook answers a probe with: its name and a token made for this install alone, so no other hook

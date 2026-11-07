@@ -34,13 +34,17 @@ struct Change<'a> {
     at: Option<Contained>,
     /// The new version, staged beside it.
     staged: Option<Contained>,
-    /// The old version beside it, once it is checked (`done`), until the place is through.
+    /// The old version beside it, from its link or move there (`old`), renamed `done` once checked, until the place is
+    /// through.
     backup: Option<Contained>,
     /// The hash of the new version, as staged.
     new: String,
     /// Its ledger record before.
     old: Option<Owned>,
+    /// The new version is at the path (or the record is forgotten).
     swapped: bool,
+    /// The old version beside it was checked to be the record's.
+    checked: bool,
 }
 
 /// Why a place wasn't written.
@@ -208,7 +212,7 @@ fn one_place(
     for k in 0..changes.len() {
         let deadline = Instant::now() + wait;
         if let Err(why) = swap(&mut changes[k], ledger, home, deadline) {
-            return Err(match undo(&mut changes, ledger, home) {
+            return Err(match undo(&mut changes, ledger, home, wait) {
                 Ok(()) => Stop::Held(why),
                 Err(left) => {
                     Stop::Broken(format!("{why}; and the place couldn't be put back whole: {left}"))
@@ -276,7 +280,18 @@ fn prepare<'a>(item: &'a Item, ledger: &Ledger) -> Result<Change<'a>, Stop> {
         }
         _ => {}
     }
-    Ok(Change { item, op, at, staged: None, backup: None, new: String::new(), old, swapped: false })
+    let new = String::new();
+    Ok(Change {
+        item,
+        op,
+        at,
+        staged: None,
+        backup: None,
+        new,
+        old,
+        swapped: false,
+        checked: false,
+    })
 }
 
 /// What a stopped run left beside `p` (module doc): staged versions and checked old ones go; an unchecked backup that
@@ -345,8 +360,9 @@ fn clear_staged(changes: &mut [Change]) {
     }
 }
 
-/// One item in (module doc): checked again as it goes, its ledger record saved after. On an error the path is as it was
-/// before this item, and nothing of it is left beside it.
+/// One item in (module doc): checked again as it goes, its ledger record saved after. Each step records what `undo`
+/// needs before the next one that can fail (sol-loop r1 S2): the old version's name beside the path, and whether the
+/// new one is in, so an error at any point is put back with the place.
 fn swap(c: &mut Change, ledger: &mut Ledger, home: &Path, deadline: Instant) -> Result<(), String> {
     let path = c.item.path.display().to_string();
     let changed = || {
@@ -360,59 +376,53 @@ fn swap(c: &mut Change, ledger: &mut Ledger, home: &Path, deadline: Instant) -> 
                 return Err(format!("{path}: something is at its path again"));
             }
             ledger.forget(&c.item.path);
+            c.swapped = true;
         }
         (Op::ReplaceFile, Some(at), Some(staged)) => {
             let backup = fsguard::sibling(at, "old")?;
             fsguard::link_as(at, &backup)?;
+            c.backup = Some(backup.clone());
             // Check 1: the file is still the record's.
             if hash(backup.path())? != have {
-                fsguard::delete_file(&backup)?;
                 return Err(changed());
             }
-            if let Err(e) = fsguard::rename_over(&staged, at, deadline) {
-                fsguard::delete_file(&backup)?;
-                return Err(e);
-            }
-            c.staged = None;
-            // Check 2: no edit in place landed between check 1 and the rename; if one did, its object goes back.
+            fsguard::rename_over(&staged, at, deadline)?;
+            (c.staged, c.swapped) = (None, true);
+            // Check 2: no edit in place landed between check 1 and the rename; if one did, `undo` puts its object back.
             if hash(backup.path())? != have {
-                fsguard::rename_over(&backup, at, deadline)?;
                 return Err(changed());
             }
             let done = fsguard::sibling(at, "done")?;
             fsguard::move_to(&backup, &done)?;
-            c.backup = Some(done);
+            (c.backup, c.checked) = (Some(done), true);
         }
         (Op::ReplaceDir, Some(at), Some(staged)) => {
             let backup = fsguard::sibling(at, "old")?;
             fsguard::move_to(at, &backup)?;
+            // The path is empty until the new tree is in; `undo` moves the old one back.
+            c.backup = Some(backup.clone());
             if hash(backup.path())? != have {
-                fsguard::move_to(&backup, at)?;
                 return Err(changed());
             }
-            if let Err(e) = fsguard::move_to(&staged, at) {
-                fsguard::move_to(&backup, at)?;
-                return Err(e);
-            }
-            c.staged = None;
+            fsguard::move_to(&staged, at)?;
+            (c.staged, c.swapped) = (None, true);
             let done = fsguard::sibling(at, "done")?;
             fsguard::move_to(&backup, &done)?;
-            c.backup = Some(done);
+            (c.backup, c.checked) = (Some(done), true);
         }
         (Op::CreateFile, Some(at), Some(staged)) => {
             // A link where nothing may be: refused if anything appeared since.
             fsguard::link_as(&staged, at)?;
+            c.swapped = true;
             fsguard::delete_file(&staged)?;
             c.staged = None;
         }
         (Op::CreateDir, Some(at), Some(staged)) => {
             fsguard::move_to(&staged, at)?;
-            c.staged = None;
+            (c.staged, c.swapped) = (None, true);
         }
         _ => return Err(format!("{path}: not staged")),
     }
-    // In from here: whatever fails after this is undone with the place's other items.
-    c.swapped = true;
     if let Some(at) = &c.at {
         if c.op != Op::Forget {
             ledger.record(at, kind, &c.new, &c.item.scope);
@@ -422,20 +432,25 @@ fn swap(c: &mut Change, ledger: &mut Ledger, home: &Path, deadline: Instant) -> 
     ledger.save(home)
 }
 
-/// Puts a place's swapped items back, last first (module doc): each path that holds what this transaction put there
-/// gets its old version back, or goes where it was created, and its ledger record is what it was; a path holding
-/// anything else was its owner's edit since, and stays for the next plan to hold. Every item is tried; the error lists
-/// what couldn't be put back.
-fn undo(changes: &mut [Change], ledger: &mut Ledger, home: &Path) -> Result<(), String> {
+/// Puts a place's items back, last first, from whatever step each reached (module doc; sol-loop r1 S2): a staged
+/// version goes; an old version beside its path goes back where the path is empty or holds what this transaction put
+/// there, and is dropped where it is only a second name of the file still at the path; a created path that holds what
+/// this put there goes; each put back gets its ledger record as it was. A path holding anything else is its owner's
+/// edit since, and stays, with the new record, for the next plan to hold; an old version a swap checked goes beside it,
+/// one it hadn't stays, which holds the place at the next transaction. Every item is tried, a rename blocked by a
+/// reader until `wait`; the error lists what couldn't be put back.
+fn undo(
+    changes: &mut [Change],
+    ledger: &mut Ledger,
+    home: &Path,
+    wait: Duration,
+) -> Result<(), String> {
     let mut left = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + wait;
     for c in changes.iter_mut().rev() {
         let mut one = || -> Result<(), String> {
             if let Some(s) = c.staged.take() {
                 remove(&s)?;
-            }
-            if !c.swapped {
-                return Ok(());
             }
             let (key, path, old) = (ledger::key(&c.item.path), c.item.path.clone(), c.old.clone());
             let restore = |l: &mut Ledger| match &old {
@@ -445,33 +460,47 @@ fn undo(changes: &mut [Change], ledger: &mut Ledger, home: &Path) -> Result<(), 
                 None => l.forget(&path),
             };
             let Some(at) = c.at.clone() else {
-                restore(ledger);
+                if c.swapped {
+                    restore(ledger);
+                }
+                c.swapped = false;
                 return Ok(());
             };
-            let ours = hash(at.path())?.as_deref() == Some(c.new.as_str());
-            match (c.op, c.backup.take()) {
-                (Op::Forget, _) => restore(ledger),
+            let now = hash(at.path())?;
+            let ours = c.swapped && now.as_deref() == Some(c.new.as_str());
+            let back = match (c.op, c.backup.take()) {
+                (Op::Forget, _) => c.swapped,
+                (Op::ReplaceFile | Op::ReplaceDir, Some(b)) if now.is_none() => {
+                    fsguard::move_to(&b, &at)?;
+                    true
+                }
                 (Op::ReplaceFile, Some(b)) if ours => {
                     fsguard::rename_over(&b, &at, deadline)?;
-                    restore(ledger);
+                    true
                 }
                 (Op::ReplaceDir, Some(b)) if ours => {
                     let aside = fsguard::sibling(&at, "new")?;
                     fsguard::move_to(&at, &aside)?;
                     fsguard::move_to(&b, &at)?;
                     remove(&aside)?;
-                    restore(ledger);
+                    true
+                }
+                (Op::ReplaceFile, Some(b)) if !c.swapped => {
+                    fsguard::delete_file(&b)?;
+                    false
                 }
                 (Op::CreateFile | Op::CreateDir, _) if ours => {
                     remove(&at)?;
-                    restore(ledger);
+                    true
                 }
-                // Its owner's version now: it stays, and so does its new record, for the next plan to hold.
-                (_, b) => {
-                    if let Some(b) = b {
-                        remove(&b)?;
-                    }
+                (_, Some(b)) if c.checked => {
+                    remove(&b)?;
+                    false
                 }
+                _ => false,
+            };
+            if back {
+                restore(ledger);
             }
             c.swapped = false;
             Ok(())
