@@ -3,10 +3,11 @@
 //! (`classify`), from facts it checked; `Stage::SafeOnly` then keeps only what is safe, place by place (`safe_only`).
 //! Nothing else decides either, and no note is ever read to decide.
 
-use super::Plan;
+use super::{Action, Change, Class, ConflictKind, Dest, Item, Plan};
+use crate::fsguard::Root;
 use crate::ledger;
 use serde::{Serialize, Serializer};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Whether an item may be applied with no one looking.
@@ -157,13 +158,97 @@ pub(crate) fn managed(ledger: &ledger::Ledger) -> BTreeSet<String> {
     ledger.owned.values().map(|o| ledger::key(Path::new(&o.root))).collect()
 }
 
-/// The planner's last step: each item's class, from what the planner checked.
+/// The place of an item a repo or workspace made: the deepest of its roots the item's path lies below (a worktree
+/// inside another checkout's dir is its own place), else the path itself (a conflict about the repo as a whole). Never
+/// the item's `root`: a conflict is made with its own path as its root (F8, H6).
+pub(crate) fn place_in(roots: &[Root], path: &Path) -> PlaceId {
+    let key = ledger::key(path);
+    let below = |r: &&Root| key.starts_with(&format!("{}/", ledger::key(r.path())));
+    let deepest = roots.iter().filter(below).max_by_key(|r| ledger::key(r.path()).len());
+    PlaceId::Dir(deepest.map_or(path, |r| r.path()).to_path_buf())
+}
+
+/// A ledger record's place: its target, or the root the ledger records it in.
+pub(crate) fn record_place(o: &ledger::Owned) -> PlaceId {
+    match o.scope.strip_prefix("target:") {
+        Some(name) => PlaceId::Target(name.to_string()),
+        None => PlaceId::Dir(PathBuf::from(&o.root)),
+    }
+}
+
+/// The planner's last step: each item's class, from the facts the planner checked and set on it (its action, class,
+/// conflict kind, destination, `gone` and `place_gone`), whether the plan has its complete view, and the roots the
+/// ledger records paths in. Notes are never read.
 pub(crate) fn classify(plan: &mut Plan, managed: &BTreeSet<String>) {
-    let _ = (plan, managed);
+    let complete = plan.complete.is_some();
+    for i in &mut plan.items {
+        i.safety = class_of(i, managed, complete);
+    }
+}
+
+fn class_of(i: &Item, managed: &BTreeSet<String>, complete: bool) -> Safety {
+    let need = Safety::NeedsOwner;
+    // A tool-owned path below a root the plan verified, where apply acts (rule A).
+    let tool = i.class == Class::Tool && i.change() == Change::ToolOwned;
+    let owner_file = matches!(i.change(), Change::OwnerEdit | Change::ExcludeEdit);
+    match i.action {
+        // Nothing written: a tracked file shown, or a path already as wanted.
+        Action::InSync => Safety::Safe,
+        Action::Report if i.class == Class::Owner => Safety::Safe,
+        // A tool-owned path reported: one the planner couldn't read or check (F8 sol-loop r3 S4).
+        Action::Report => need(Hold::Unchecked),
+        // The planner makes these only where the ledger's record matched the disk (`Planner::tool_file`, `tool_dir`).
+        Action::Update | Action::Refresh if tool => Safety::Safe,
+        // And these only where nothing is.
+        Action::Create | Action::Install if tool => match &i.dest {
+            Dest::Tool(at) if managed.contains(&ledger::key(at.root().path())) => Safety::Safe,
+            _ => need(Hold::NewPlace),
+        },
+        Action::Create | Action::Update if owner_file => need(Hold::OwnerFile),
+        Action::Remove | Action::RemoveBlock => need(Hold::Removal),
+        Action::Conflict => need(match i.conflict {
+            ConflictKind::ModifiedCopy => Hold::ChangedCopy,
+            ConflictKind::OverLimit => Hold::OverLimit,
+            ConflictKind::Other => Hold::Conflict,
+        }),
+        // A copy its owner changed that the stacks no longer want: it stays, and its record would go.
+        Action::Forget if !i.gone => need(Hold::ChangedCopy),
+        Action::Forget if !i.place_gone => need(Hold::PlaceStillThere),
+        Action::Forget if !complete => need(Hold::IncompleteView),
+        Action::Forget => Safety::SafeForget,
+        Action::RetireEntry => need(Hold::Retirement),
+        _ => need(Hold::Unclassified),
+    }
 }
 
 /// `Stage::SafeOnly`: keeps only the safe items of places that hold no other, and says what it left out
-/// (`Plan::held`).
+/// (`Plan::held`). Only `safety` and `places` decide: an item that needs the owner holds each of its places; one of no
+/// place holds every place, unless it is store work, which holds only itself (it changes no place's files, and no
+/// place's text waits on it).
 pub(crate) fn safe_only(plan: &mut Plan) {
-    plan.held = Some(Held::default());
+    let mut held = Held::default();
+    let mut places: BTreeMap<String, HeldPlace> = BTreeMap::new();
+    for i in &plan.items {
+        let Safety::NeedsOwner(reason) = i.safety else { continue };
+        let note = i.notes.first().cloned().unwrap_or_default();
+        let it = HeldItem { target: i.target.clone(), path: i.path.clone(), reason, note };
+        if reason.is_store_work() {
+            held.retirements.push(it);
+        } else if i.places.is_empty() {
+            held.everything.push(it);
+        } else {
+            for p in &i.places {
+                let place = HeldPlace { place: p.clone(), items: Vec::new() };
+                places.entry(p.key()).or_insert(place).items.push(it.clone());
+            }
+        }
+    }
+    let all = !held.everything.is_empty();
+    plan.items.retain(|i| {
+        matches!(i.safety, Safety::Safe | Safety::SafeForget)
+            && !all
+            && !i.places.iter().any(|p| places.contains_key(&p.key()))
+    });
+    held.places = places.into_values().collect();
+    plan.held = Some(held);
 }

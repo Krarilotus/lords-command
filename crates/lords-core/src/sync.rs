@@ -140,6 +140,9 @@ pub struct Item {
     /// The places it belongs to, as the planner made it there (D13): what `Stage::SafeOnly` holds whole. None for an
     /// item of no place (an ended entry, a dead memory index).
     pub places: Vec<PlaceId>,
+    /// A forget whose record's root, its checkout, worktree, workspace or target dir, is gone too (D13).
+    #[serde(skip)]
+    pub(crate) place_gone: bool,
 }
 
 /// An item as plans show it (`--json`, the app): a redacted item without its texts.
@@ -294,6 +297,7 @@ impl Item {
             codex_lords: None,
             safety: Safety::NeedsOwner(Hold::Unclassified),
             places: Vec::new(),
+            place_gone: false,
         }
     }
 
@@ -1094,6 +1098,8 @@ impl Planner<'_> {
             item.class = Class::Tool;
             item.scope = o.scope.clone();
             item.have = Some(o.sha.clone());
+            // The record's own place, as the ledger records it (D13): what its forget, removal or report holds.
+            item.places = vec![safety::record_place(&o)];
             // `check_ledger` let through only records in place, or whose path is gone (which only lose the record):
             // only a placed record can be removed, by construction (rule A); the others have nowhere to act.
             match self.placed(&o).ok().flatten() {
@@ -1135,6 +1141,9 @@ impl Planner<'_> {
             match now {
                 None => {
                     item.gone = true;
+                    // Its place gone too, its checkout or worktree removed: a forget no one need look at (D13). A root
+                    // that can't be checked isn't gone.
+                    item.place_gone = fsguard::kind(Path::new(&o.root)) == Ok(fsguard::Kind::Missing);
                     item.notes.push("gone already; its ledger record goes".into())
                 }
                 Some(h) if h == o.sha => {
@@ -2256,8 +2265,9 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
         ));
     }
     // The two root files are the only lines sync keeps in a repo's exclude file; its dirs ignore themselves.
-    // Each with a checkout it serves, from which git lists every worktree that shares it.
-    let mut excludes: Vec<(OwnerFile, PathBuf, Vec<String>)> = Vec::new();
+    // Each with a checkout it serves, from which git lists every worktree that shares it, and every checkout that
+    // reads it: its places (D13), since an edit there shows or hides paths in each of them.
+    let mut excludes: Vec<(OwnerFile, PathBuf, Vec<String>, Vec<PlaceId>)> = Vec::new();
     // A git that fails here is a conflict, never a repo without an exclude file (Sol review r5, decision 1). The
     // exclude file is the one git names for this verified checkout (rule A).
     let mut add_exclude = |root: &Root, what: &str| -> Result<(), String> {
@@ -2265,11 +2275,19 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
             return Ok(());
         }
         let ex = OwnerFile::exclude(root)?;
-        match excludes.iter_mut().find(|(e, _, _)| ledger::key(e.path()) == ledger::key(ex.path()))
-        {
-            Some((_, _, files)) if !files.iter().any(|f| f == what) => files.push(what.to_string()),
-            Some(_) => {}
-            None => excludes.push((ex, root.path().to_path_buf(), vec![what.to_string()])),
+        let at = PlaceId::Dir(root.path().to_path_buf());
+        match excludes.iter_mut().find(|(e, ..)| ledger::key(e.path()) == ledger::key(ex.path())) {
+            Some((_, _, files, places)) => {
+                if !files.iter().any(|f| f == what) {
+                    files.push(what.to_string());
+                }
+                if !places.contains(&at) {
+                    places.push(at);
+                }
+            }
+            None => {
+                excludes.push((ex, root.path().to_path_buf(), vec![what.to_string()], vec![at]))
+            }
         }
         Ok(())
     };
@@ -2506,47 +2524,12 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
         item.notes.extend(long_starts.iter().cloned());
         pl.plan.items.push(item);
     }
-    for (ex, checkout, files) in excludes {
+    for (ex, checkout, files, places) in excludes {
         pl.plan.owner_files.push(ex.clone());
-        let label = format!("{} (git exclude)", place.label);
-        let current = match fsguard::read_text(ex.path()) {
-            Ok(c) => c.unwrap_or_default(),
-            Err(e) => {
-                pl.plan.items.push(conflict(&label, ex.path(), e));
-                continue;
-            }
-        };
-        let proposed = excludes_text(&current, &files);
-        // The file is shared by every worktree of the repo: an edit that would show a path in any of their `git
-        // status` is planned as a conflict, whichever place asked for it (orchestrator, 26 Oct).
-        if proposed != current && !only_adds(&current, &proposed) {
-            match newly_shown(&checkout, &current, &proposed) {
-                Ok(shown) if shown.is_empty() => {}
-                Ok(shown) => {
-                    pl.plan.items.push(conflict(
-                        &label,
-                        ex.path(),
-                        format!(
-                            "the edit would show {} untracked path(s) in git status where this file is shared, e.g. {}; set them aside first (`lords set-aside`)",
-                            shown.len(),
-                            shown.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
-                        ),
-                    ));
-                    continue;
-                }
-                Err(e) => {
-                    pl.plan.items.push(conflict(&label, ex.path(), e));
-                    continue;
-                }
-            }
-        }
-        pl.plan.items.push(owner_file_item(
-            &label,
-            ex.path(),
-            Dest::Owner(ex.clone()),
-            proposed,
-            &Composed::default(),
-        ));
+        let mut item =
+            exclude_item(&format!("{} (git exclude)", place.label), &ex, &checkout, &files);
+        item.places = places;
+        pl.plan.items.push(item);
     }
     if place.workspace {
         return;
@@ -2585,6 +2568,35 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
         item.notes.push("tracked: changes by a commit on the repo's branch, never by sync; agents with a stack read the untracked files instead".into());
         pl.plan.items.push(item);
     }
+}
+
+/// A repo's git exclude file holding `files` among its lines: the owner file's one edit, or a conflict.
+fn exclude_item(label: &str, ex: &OwnerFile, checkout: &Path, files: &[String]) -> Item {
+    let current = match fsguard::read_text(ex.path()) {
+        Ok(c) => c.unwrap_or_default(),
+        Err(e) => return conflict(label, ex.path(), e),
+    };
+    let proposed = excludes_text(&current, files);
+    // The file is shared by every worktree of the repo: an edit that would show a path in any of their `git
+    // status` is planned as a conflict, whichever place asked for it (orchestrator, 26 Oct).
+    if proposed != current && !only_adds(&current, &proposed) {
+        match newly_shown(checkout, &current, &proposed) {
+            Ok(shown) if shown.is_empty() => {}
+            Ok(shown) => {
+                return conflict(
+                    label,
+                    ex.path(),
+                    format!(
+                        "the edit would show {} untracked path(s) in git status where this file is shared, e.g. {}; set them aside first (`lords set-aside`)",
+                        shown.len(),
+                        shown.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+                    ),
+                )
+            }
+            Err(e) => return conflict(label, ex.path(), e),
+        }
+    }
+    owner_file_item(label, ex.path(), Dest::Owner(ex.clone()), proposed, &Composed::default())
 }
 
 fn repo_items(
@@ -2668,12 +2680,17 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         return Err("no tool home given (Options.home): sync reads its ledger there".into());
     }
     // One place's uninstall has its own planner: nothing is wanted there, and the ledger alone decides (PI-13).
+    // Their items are typed too, as the last step (D13); an uninstall creates nothing, so no place is new to it.
     if opts.uninstall && opts.place.is_some() {
-        return place_uninstall::plan(stacks, private, opts);
+        let mut p = place_uninstall::plan(stacks, private, opts)?;
+        safety::classify(&mut p, &BTreeSet::new());
+        return Ok(p);
     }
     // One dropped target's uninstall too: the stack no longer says where it was (D21).
     if opts.uninstall && opts.target.is_some() {
-        return target_uninstall::plan(stacks, private, opts);
+        let mut p = target_uninstall::plan(stacks, private, opts)?;
+        safety::classify(&mut p, &BTreeSet::new());
+        return Ok(p);
     }
     let ledger = Ledger::load(&opts.home)?;
     let mut pl = Planner {
@@ -2698,12 +2715,15 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         match crate::ops::import_preview(private, None) {
             Ok(reports) => {
                 for r in reports.iter().filter(|r| !r.added.is_empty() || !r.changed.is_empty()) {
-                    pl.plan.notes.push(format!(
-                        "memory store {}: {} new, {} changed since the last import; --apply imports them (one commit) before writing",
-                        r.store,
-                        r.added.len(),
-                        r.changed.len()
-                    ));
+                    let (added, changed) = (r.added.len(), r.changed.len());
+                    pl.plan.imports.push(PendingImport { store: r.store.clone(), added, changed });
+                    // A safe-only plan imports nothing: it lists the import as store work instead (D13).
+                    if opts.stage != Stage::SafeOnly {
+                        pl.plan.notes.push(format!(
+                            "memory store {}: {added} new, {changed} changed since the last import; --apply imports them (one commit) before writing",
+                            r.store
+                        ));
+                    }
                 }
             }
             Err(e) => pl.plan.notes.push(format!("memory stores: {e}")),
@@ -2744,6 +2764,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
             }
             for i in &mut items[start..] {
                 i.units = vec![Unit::Target(t.name.clone())];
+                i.places = vec![PlaceId::Target(t.name.clone())];
             }
         }
         // Profiles sharing one `via` file plan it once, as part of each of them; different texts for one file
@@ -2768,6 +2789,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
                         }
                     }
                     k.units.extend(item.units);
+                    k.places.extend(item.places);
                 }
                 None => kept.push(item),
             }
@@ -2782,8 +2804,15 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
             }
             let start = pl.plan.items.len();
             repo_items(&mut pl, name, repo, opts.adapter.as_deref(), opts.place.as_deref());
+            let roots = match pl.checkouts.get(name) {
+                Some(Ok((roots, _, _))) => roots.clone(),
+                _ => Vec::new(),
+            };
             for i in &mut pl.plan.items[start..] {
                 i.units = vec![Unit::Repo(name.clone())];
+                if i.places.is_empty() {
+                    i.places = vec![safety::place_in(&roots, &i.path)];
+                }
             }
         }
         for (name, w) in &private.manifest.workspaces {
@@ -2793,8 +2822,10 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
             if opts.place.is_none() {
                 let start = pl.plan.items.len();
                 workspace_items(&mut pl, name, w, opts.adapter.as_deref());
+                let roots: Vec<Root> = Root::workspace(w).into_iter().collect();
                 for i in &mut pl.plan.items[start..] {
                     i.units = vec![Unit::Workspace(name.clone())];
+                    i.places = vec![safety::place_in(&roots, &i.path)];
                 }
             }
         }
@@ -2845,12 +2876,15 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
     }
     match (opts.stage, &complete) {
         (Stage::Install, _) => staged(&mut pl.plan),
-        (Stage::Full | Stage::SafeOnly, Some(_)) => pl.unwanted(),
-        (Stage::Full | Stage::SafeOnly, None) => pl.plan.notes.push(format!(
+        // A safe-only plan lists what isn't wanted even without a complete view, only so its place is held whole, never
+        // half updated (F8 sol-loop r1 S2): such a forget is classed `incomplete-view`, and a removal is never safe.
+        (Stage::Full, Some(_)) | (Stage::SafeOnly, _) => pl.unwanted(),
+        (Stage::Full, None) => pl.plan.notes.push(format!(
             "removal held: {why}, so nothing is removed or forgotten until both are none"
         )),
     }
     pl.plan.complete = complete;
+    // The planner's last step, after every change to an item's action (D13): nothing types it again.
     safety::classify(&mut pl.plan, &safety::managed(&pl.ledger));
     if opts.stage == Stage::SafeOnly {
         safety::safe_only(&mut pl.plan);

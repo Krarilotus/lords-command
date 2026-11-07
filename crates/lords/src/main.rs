@@ -27,6 +27,8 @@ usage:
   lords hash PATH
   lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--stage install] [--json] [--apply] [--deadline-ms N]
     (a write of Codex's hooks: trusts Lords' own through Codex's app-server, names each hook that isn't trusted, exit 1)
+  lords sync --safe-only [--user | --repo NAME [--place DIR]] [--json] [--apply]   only what needs no one: a place
+    with anything else is held whole and named with why; no import or retirement (listed); exit 1 while a place is held
   lords sync --restore BACKUP_DIR   undo one apply's owner-file edits, each only while it holds what sync wrote
   lords uninstall [--user | --repo NAME] [--apply]   remove the tool's paths that still match its ledger
   lords uninstall --repo NAME --place DIR [--apply] [--json]   one checkout or worktree's recorded copies
@@ -588,6 +590,29 @@ fn print_applied(applied: &sync::Applied) {
     }
 }
 
+/// What a safe-only plan left out (D13): each place held, with its items' reasons, then the store work it never does.
+fn print_held(plan: &sync::Plan, held: &sync::Held) {
+    let item = |i: &sync::HeldItem| {
+        let note = if i.note.is_empty() { String::new() } else { format!(": {}", i.note) };
+        println!("   {}  {}{note}", i.reason, i.path.display());
+    };
+    for p in &held.places {
+        println!("\nheld {}", p.place);
+        p.items.iter().for_each(item);
+    }
+    if !held.everything.is_empty() {
+        println!("\nheld everywhere, by what belongs to no place:");
+        held.everything.iter().for_each(item);
+    }
+    if !plan.imports.is_empty() || !held.retirements.is_empty() {
+        println!("\nstore work, which only `lords sync --apply` does:");
+        for m in &plan.imports {
+            println!("   memory store {}: {} new, {} changed", m.store, m.added, m.changed);
+        }
+        held.retirements.iter().for_each(item);
+    }
+}
+
 /// A plan of the current config for every target and place: what `restore` and `set-aside` check paths against.
 fn whole_plan(a: &mut Args, home: PathBuf) -> Result<sync::Plan, String> {
     let p = paths(a)?;
@@ -607,7 +632,10 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     }
     let safe_only = a.flag("--safe-only");
     let stage = match a.value("--stage")?.as_deref() {
-        _ if safe_only => sync::Stage::SafeOnly,
+        None if safe_only => sync::Stage::SafeOnly,
+        Some(_) if safe_only => {
+            return Err("--safe-only is a stage of its own: drop --stage".into());
+        }
         None | Some("full") => sync::Stage::Full,
         Some("install") => sync::Stage::Install,
         Some(other) => return Err(format!("--stage {other}: `install` or `full`")),
@@ -635,6 +663,13 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
             lords_core::adapters::ids().join(", ")
         ));
     }
+    // A place is held whole only where the plan sees all of it (design note D3).
+    if safe_only && adapter.is_some() {
+        return Err(
+            "--safe-only holds a place whole, and --adapter plans part of it: drop --adapter"
+                .into(),
+        );
+    }
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
     let codex = lords_core::codex_trust::Codex::found(deadline);
     let opts = sync::Options {
@@ -653,9 +688,13 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_default());
     } else {
         print_plan(&plan);
+        if let Some(held) = &plan.held {
+            print_held(&plan, held);
+        }
     }
-    // A place skipped because its file would be cut never reads as success, planned or applied.
-    let whole = !plan.over_limit;
+    // A place skipped because its file would be cut never reads as success, planned or applied; nor does a place a
+    // safe-only plan held (D13: exit 1), whichever reason held it.
+    let whole = !plan.over_limit && !plan.held.as_ref().is_some_and(sync::Held::holds);
     if !apply {
         if !json {
             match plan.applies() {
@@ -671,10 +710,11 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         }
         return Ok(whole);
     }
-    // One worktree (its post-checkout hook): only its files, no import or retiring, which commit to the stack.
-    let applied = match opts.place {
-        Some(_) => sync::apply(&plan)?,
-        None => sync::import_and_apply(&p.public, p.private.as_deref(), &opts)?,
+    // One worktree (its post-checkout hook): only its files, no import or retiring, which commit to the stack. Nor
+    // does a safe-only plan: it lists that store work instead, and holds what isn't safe (D13).
+    let applied = match (&opts.place, safe_only) {
+        (Some(_), _) | (None, true) => sync::apply(&plan)?,
+        (None, false) => sync::import_and_apply(&p.public, p.private.as_deref(), &opts)?,
     };
     print_applied(&applied);
     // A Codex hook that doesn't run never reads as success either (design note 2026-11-02-lords-codex-trust, §2.3).
