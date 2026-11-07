@@ -380,7 +380,10 @@ pub fn guard_place(home: &Path) -> Result<Contained, String> {
 /// Whether the guard copy is there and answers its self-test: what a settings plan needs before it names it in a hook,
 /// checked when planning and again when applying. Read only.
 fn guard_ready(place: &Contained) -> Result<(), String> {
-    match guard_bytes(place)? {
+    // One that can't be read, or checked, names the fix too (sol-loop repair r1, R2-02).
+    let read = guard_bytes(place)
+        .map_err(|e| format!("guard can't be read ({e}): run `lords guard install`"))?;
+    match read {
         None => Err("guard not installed: run `lords guard install`".into()),
         Some(_) => crate::process::guard_self_test(place.path())
             .map_err(|e| format!("guard not ready ({e}): run `lords guard install`")),
