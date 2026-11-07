@@ -127,6 +127,17 @@ pub(crate) fn guard_protocol(
     Ok(answer.filter(|_| status.success()))
 }
 
+/// The guards the guard copy runs, as `guard --guards` lists them (`guard::GUARDS`; D20): `None` when it lists none, as
+/// a copy from before that list answers (the rm usage note, nothing on stdout), or answers anything else.
+pub(crate) fn guard_list(guard_copy: &Path) -> Result<Option<Vec<String>>, String> {
+    let (status, out) = run_guard(guard_copy, &["guard", "--guards"], b"", "guard list")?;
+    let list = out
+        .trim()
+        .strip_prefix("lords guards ")
+        .map(|l| l.split_whitespace().map(str::to_string).collect::<Vec<_>>());
+    Ok(list.filter(|_| status.success()))
+}
+
 /// Asks `codex app-server` (Codex's own JSON-RPC over stdio) one question, with `codex_home` as its `CODEX_HOME`: it
 /// writes `requests`, one per line, keeps stdin open (the server ends at the end of its input without answering; probe
 /// H5, design note 2026-11-02-lords-role-at-launch), and gives the first line whose `id` is `id`, or why not: it can't

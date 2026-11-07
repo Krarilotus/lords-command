@@ -1593,8 +1593,10 @@ fn a_stale_plan_changes_nothing() {
 
 // Spec (orchestrator, 30 Oct: "`lords guard install` installs or updates the stable copy under its own lock. It
 // copies to a staged path, self-tests it, and renames it into place atomically"; "sync with no copy installed writes no
-// hook and says why"): before an install, sync leaves the hook out and names the fix; `lords guard install` puts the
-// copy there, and sync then names it in the settings; a staged copy an interrupted install left doesn't stop the next.
+// hook and says why"; revised by the Lords owner, 7 Nov, review r1 R1-02: "a copy that's missing, unreadable or doesn't
+// answer is a conflict naming `lords guard install`, never an empty list"): before an install, sync refuses, naming the
+// fix, and writes nothing; `lords guard install` puts the copy there, and sync then names it in the settings; a staged
+// copy an interrupted install left doesn't stop the next. With the copy gone, sync refuses again and the hook stays.
 #[test]
 fn sync_names_the_guard_only_once_it_is_installed() {
     let env = Env::new();
@@ -1623,10 +1625,11 @@ fn sync_names_the_guard_only_once_it_is_installed() {
         env.lords(d, &[&args[..], &stacks].concat())
     };
     let settings = || fs::read_to_string(d.join("home/.claude-balanced/settings.json")).unwrap();
-    // Not installed: no hook, and the plan says why.
+    // Not installed: refused, naming the fix, and nothing written.
     let o = sync(false);
     assert!(text(&o).contains("guard not installed: run `lords guard install`"), "{}", text(&o));
-    assert!(sync(true).status.success());
+    let o = sync(true);
+    assert!(!o.status.success(), "{}", text(&o));
     assert!(!settings().contains("lords-guard"), "{}", settings());
     // A staged copy an interrupted install left behind.
     let copy = d.join("home/.lords-command/bin/lords-guard.exe");
@@ -1646,11 +1649,13 @@ fn sync_names_the_guard_only_once_it_is_installed() {
     // A check of the synced settings reports no conflict for them.
     let out = text(&env.lords(d, &[&["check"][..], &stacks].concat()));
     assert!(!out.contains("settings.json"), "{out}");
-    // The copy gone: sync takes the hook out and says why; it never puts a copy back.
+    // The copy gone: sync refuses, naming the fix, and the hook stays; it never puts a copy back.
     fs::remove_file(&copy).unwrap();
+    let before = settings();
     let o = sync(true);
-    assert!(o.status.success(), "{}", text(&o));
-    assert!(!settings().contains("lords-guard") && !copy.exists(), "{}", settings());
+    assert_eq!(settings(), before, "{}", text(&o));
+    assert!(!o.status.success() && text(&o).contains("lords guard install"), "{}", text(&o));
+    assert!(!copy.exists());
 }
 
 // Spec (orchestrator, 30 Oct: "a one-line 'applies: yes/no (why)' in the `lords sync` dry-run output itself", with
@@ -2486,13 +2491,15 @@ fn the_helper_guard_tells_t3_from_a_cli_through_the_binary() {
     let o = helper_guard(&env, guard, &[thread(), pid(t3.id().to_string())], &ev);
     drop(t3.stdin.take());
     t3.wait().unwrap();
-    let want: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-    assert_eq!(read.map(|a| a.into_iter().skip(1).collect::<Vec<_>>()), Ok(want));
+    // The answer first: the binary's denial, read without a panic, so a copy that answers nothing fails here (review
+    // r1, N2); then its exit code and reason, then the reader's own output.
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_default();
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{}", text(&o));
     assert_eq!(o.status.code(), Some(0), "{}", text(&o));
-    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{v}");
     let reason = v["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
     assert!(reason.contains("delegate_task"), "{reason}");
+    let want: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    assert_eq!(read.map(|a| a.into_iter().skip(1).collect::<Vec<_>>()), Ok(want));
     let mut gone = env.cmd("git", d).arg("--version").stdout(Stdio::null()).spawn().unwrap();
     let gone_pid = gone.id();
     gone.wait().unwrap();

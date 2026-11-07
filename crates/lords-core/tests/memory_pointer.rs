@@ -284,3 +284,52 @@ fn a_kept_place_file_keeps_the_lords_files_it_names() {
         assert!(plan(&f.stacks(), &place).unwrap().items.is_empty(), "{named}: nothing remains");
     }
 }
+
+// Spec (memory-pointer fix check r1, FC1-01: "A kept instruction file saved as UTF-16 LE with a BOM retains its
+// pointer/role-files line, but the new lossy UTF-8 conversion misses both. Uninstall removes the unchanged `.lords` and
+// its record"; that package's design note §6b: a reading that fails holds `.lords`; design note
+// 2026-11-07-lords-delivery-integrity §5): a kept place file whose text isn't UTF-8, here UTF-16 (little-endian with a
+// BOM, and big-endian without one), still holds the `.lords` it names: both are kept, with their records, and what the
+// kept file names is still there after the apply.
+#[test]
+fn a_kept_place_file_that_isnt_utf8_still_holds_the_lords_files() {
+    for (setting, name, named) in
+        [(CODEX, "AGENTS.override.md", "memory-codex.md"), ("", "CLAUDE.local.md", "role-coder.md")]
+    {
+        for big_endian in [false, true] {
+            let (f, checkout) = place(&NOTES);
+            let manifest = f.read("priv/stack.toml");
+            f.write("priv/stack.toml", &format!("{manifest}{setting}"));
+            apply(&plan(&f.stacks(), &f.opts()).unwrap()).unwrap();
+            let (lords, kept) = (checkout.join(".lords"), checkout.join(name));
+            let text = fs::read_to_string(&kept).unwrap();
+            assert!(text.contains(&format!("{named}`")), "{text}");
+            let edited = text.replacen('\n', "\nmine, inside the block\n", 1);
+            let units = edited.encode_utf16();
+            let bytes: Vec<u8> = if big_endian {
+                units.flat_map(u16::to_be_bytes).collect()
+            } else {
+                [0xFF, 0xFE].into_iter().chain(units.flat_map(u16::to_le_bytes)).collect()
+            };
+            fs::write(&kept, bytes).unwrap();
+            let place = Options {
+                repo: Some("beta-core".into()),
+                place: Some(checkout.clone()),
+                uninstall: true,
+                ..f.opts()
+            };
+            let action = |p: &Plan, path: &Path| {
+                p.items
+                    .iter()
+                    .find(|i| ledger::key(&i.path) == ledger::key(path))
+                    .map(|i| i.action.clone())
+            };
+            let p = plan(&f.stacks(), &place).unwrap();
+            let what = format!("{named}, big-endian {big_endian}");
+            assert_eq!(action(&p, &lords), Some(Action::Report), "{what}: {:?}", p.items);
+            assert_eq!(action(&p, &kept), Some(Action::Report), "{what}: {:?}", p.items);
+            apply(&p).unwrap();
+            assert!(lords.join(named).exists(), "{what}");
+        }
+    }
+}

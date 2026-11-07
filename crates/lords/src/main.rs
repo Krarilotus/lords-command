@@ -31,6 +31,8 @@ usage:
   lords uninstall [--user | --repo NAME] [--apply]   remove the tool's paths that still match its ledger
   lords uninstall --repo NAME --place DIR [--apply] [--json]   one checkout or worktree's recorded copies
     (a changed copy is kept with its record; exit 0 no record of the place remains, 1 one does, 2 refused or stopped)
+  lords uninstall --target NAME [--apply]   a target the stack no longer declares: its copies that still hold what
+    sync wrote, with their records (a changed copy is kept with its record; exit codes as for --place)
   lords adopt [--list | PATH...]   record paths from before the ledger that hold exactly what sync writes there
   lords set-aside PATH... [--yes]   move paths that aren't the tool's into a new backup dir
   (sync, uninstall, adopt, set-aside: --home DIR, the tool's own dir; default ~/.lords-command)
@@ -52,6 +54,7 @@ usage:
   lords guard time   the PreToolUse hook on editor writes to Markdown and text files and on T3 messages: refuses a
     placeholder clock time; reminds of one more than 5 minutes after the clock not marked as a plan
   lords guard install [--home DIR]   install or update the guard copy the hooks run (sync never writes it)
+  lords guard --guards   the guards this copy runs; sync names one in a hook only while the installed copy lists it
   lords panel serve [--port N]   the window on another PC reads and edits these stacks through it (127.0.0.1:7879)
   lords panel add ALIAS --bridge DIR [--embedded] [--apply]   set a PC this one reaches as ALIAS up for the panel;
     prints the exact targets on both PCs, and with --apply carries them out (backups first, the route checked last);
@@ -178,6 +181,12 @@ fn cmd_guard(mut a: Args) -> ExitCode {
                 .contains("\"deny\"");
         say(if ok { "ok" } else { "the guard let its witness through" });
         return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
+    }
+    // The guards this copy runs, which sync asks before it names one in a hook (D20): an earlier copy answers this with
+    // the rm usage note and nothing on stdout.
+    if a.flag("--guards") {
+        say(&format!("lords guards {}", lords_core::guard::GUARDS.join(" ")));
+        return ExitCode::SUCCESS;
     }
     let which = a.positional();
     if which.as_deref() == Some("install") {
@@ -450,12 +459,16 @@ fn guard_install(mut a: Args) -> ExitCode {
         a.done()?;
         let me = std::env::current_exe().map_err(|e| e.to_string())?;
         let wrote = lords_core::sync::install_guard(&home, &me)?;
-        Ok((lords_core::sync::guard_place(&home)?.path().to_path_buf(), wrote))
+        let aside = lords_core::sync::guard_aside(&home)?;
+        Ok((lords_core::sync::guard_place(&home)?.path().to_path_buf(), wrote, aside))
     });
     match done {
-        Ok((place, wrote)) => {
+        Ok((place, wrote, aside)) => {
             let what = if wrote { "installed" } else { "already current" };
             say(&format!("guard {what}: {} (passes its self-test)", place.display()));
+            for kept in &aside {
+                say(&format!("beside it: {kept}"));
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -622,8 +635,17 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     }
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
     let codex = lords_core::codex_trust::Codex::found(deadline);
-    let opts =
-        sync::Options { repo, user_only, adapter, place, home, uninstall: false, stage, codex };
+    let opts = sync::Options {
+        repo,
+        user_only,
+        adapter,
+        place,
+        home,
+        uninstall: false,
+        target: None,
+        stage,
+        codex,
+    };
     let plan = sync::plan(&stacks, &opts)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_default());
@@ -783,8 +805,48 @@ fn uninstall_place(a: &mut Args, dir: &Path, run: &mut PlaceRun) -> Result<bool,
     Ok(run.remaining.as_ref().is_some_and(Vec::is_empty))
 }
 
+/// `lords uninstall --target NAME`: one target the stack no longer declares, its copies that still hold what their
+/// records say (D21, design note 2026-11-07-lords-delivery-integrity §3). `Ok(true)` when no record of the target
+/// remains (a dry run: would remain), `Ok(false)` while one does.
+fn uninstall_target(a: &mut Args, name: String) -> Result<bool, String> {
+    let home = tool_home(a)?;
+    let apply = a.flag("--apply");
+    let p = paths(a)?;
+    a.done()?;
+    let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    let opts = sync::Options {
+        target: Some(name.clone()),
+        home,
+        uninstall: true,
+        ..sync::Options::default()
+    };
+    let plan = sync::plan(&stacks, &opts)?;
+    print_plan(&plan);
+    let left = if apply {
+        let done = sync::apply(&plan);
+        if let Ok(applied) = &done {
+            print_applied(applied);
+        }
+        done?;
+        // What the ledger still records of the target, read back with a fresh plan.
+        sync::plan(&stacks, &opts)
+            .map_err(|e| format!("applied, but target {name} couldn't be read back: {e}"))?
+            .items
+            .len()
+    } else {
+        plan.items.iter().filter(|i| i.action == sync::Action::Report).count()
+    };
+    let head =
+        if apply { "applied" } else { "dry run: nothing changed (`--apply` acts); after it" };
+    match left {
+        0 => println!("{head}: no record of target {name} remains"),
+        n => println!("{head}: {n} record(s) of target {name} remain, each kept with its path"),
+    }
+    Ok(left == 0)
+}
+
 /// `lords uninstall`: removes every tool-owned path in scope that still matches its ledger record; with `--place`,
-/// one checkout or worktree's (`uninstall_place`).
+/// one checkout or worktree's (`uninstall_place`); with `--target`, one dropped target's (`uninstall_target`).
 fn cmd_uninstall(mut a: Args) -> Result<bool, String> {
     let json = a.flag("--json");
     // A bad `--place` is a refusal too, which `--json` gives as its one object (sol-loop r1 S2).
@@ -812,6 +874,9 @@ fn cmd_uninstall(mut a: Args) -> Result<bool, String> {
     }
     if json {
         return Err("--json goes with --place: it is one place's result".into());
+    }
+    if let Some(name) = a.value("--target")? {
+        return uninstall_target(&mut a, name);
     }
     let home = tool_home(&mut a)?;
     let apply = a.flag("--apply");

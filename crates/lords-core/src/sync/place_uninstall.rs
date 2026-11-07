@@ -241,6 +241,7 @@ pub(super) fn plan(stacks: &Stacks, private: &Stack, opts: &Options) -> Result<P
             Err(e) => kept(&mut item, &format!("can't check it ({e})")),
             Ok(fsguard::Kind::Missing) => {
                 item.action = Action::Forget;
+                item.gone = true;
                 item.notes.push("gone already; its ledger record goes".into());
             }
             Ok(fsguard::Kind::Dir) if o.kind == "dir" => match fsguard::read_tree(&path) {
@@ -291,17 +292,19 @@ pub(super) fn plan(stacks: &Stacks, private: &Stack, opts: &Options) -> Result<P
         plan.items.push(item);
     }
     // A kept instruction file holds the `.lords` files it names (the role-files line, the memory pointer): `.lords`, one
-    // record, stays with it (the Lords owner, 2 Nov, review r1 R1-01). A reading that fails holds it (design note §6b).
+    // record, stays with it (the Lords owner, 2 Nov, review r1 R1-01). A reading that fails holds it (design note §6b),
+    // and so does text that isn't UTF-8 or holds a NUL, whose names can't be read: UTF-16 (fix check r1, FC1-01), whose
+    // ASCII is valid UTF-8 with a NUL in every other byte where it has no BOM (sol-loop r1, S1).
     for i in role_dirs {
         let names: Option<Vec<String>> = fsguard::read_tree(&plan.items[i].path)
             .ok()
             .map(|t| t.into_keys().filter(|n| n != ".gitignore").collect());
         let holder = kept_files.iter().find(|f| match (fsguard::read(f), &names) {
             (Ok(None), _) => false,
-            (Ok(Some(b)), Some(names)) => {
-                let text = String::from_utf8_lossy(&b);
-                names.iter().any(|n| text.contains(n.as_str()))
-            }
+            (Ok(Some(b)), Some(names)) => match std::str::from_utf8(&b) {
+                Ok(text) if !text.contains('\0') => names.iter().any(|n| text.contains(n.as_str())),
+                _ => true,
+            },
             _ => true,
         });
         if let Some(f) = holder {
