@@ -7,7 +7,7 @@
 //! whole tree (`bounded`), and the window on another PC runs `ssh -N` for its forward while it is open (`Tunnel`).
 //! `lords paths` asks Codex's app-server which hooks it trusts (`codex_ask`; it reads), bounded the same way; sync asks it
 //! the same, and to trust Lords' own hooks after it wrote Codex's hooks file, which Codex's own writer does
-//! (codex_trust.rs).
+//! (codex_trust.rs). The helper guard reads the arguments its session's process was started with (`command_line`).
 
 // The door: the one place the resolved boundary lints allow (clippy.toml).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -544,6 +544,118 @@ fn image_of(pid: u32) -> Option<std::path::PathBuf> {
         let image = image_by_handle(h);
         CloseHandle(h);
         image
+    }
+}
+
+/// The arguments process `pid` (one of this user's) was started with, read only: its command line
+/// (`NtQueryInformationProcess`, `ProcessCommandLineInformation`) split as its program reads it (`split_command_line`).
+/// Every failure is an error, and so is any other system than Windows, as for `running`. The helper guard's T3 test
+/// reads its session's process with it (t3.rs).
+#[cfg(windows)]
+pub fn command_line(pid: u32) -> Result<Vec<String>, String> {
+    use windows_sys::Wdk::System::Threading::{
+        NtQueryInformationProcess, ProcessCommandLineInformation,
+    };
+    use windows_sys::Win32::Foundation::{CloseHandle, UNICODE_STRING};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    let header = std::mem::size_of::<UNICODE_STRING>();
+    // The answer: its header, then the line, at most 32,767 UTF-16 units (CreateProcess's limit) and its end.
+    let mut buf = vec![0u64; (header + 2 * 32_768).div_ceil(8)];
+    let (start, end) = (buf.as_ptr() as usize, buf.as_ptr() as usize + buf.len() * 8);
+    let why = |what: String| format!("process {pid}: {what}");
+    // SAFETY: a handle opened here and closed right after the one query; the buffer is this function's, aligned for
+    // the `UNICODE_STRING` the query writes at its start, and outlives every read of it; the string the header points
+    // at is read only once it lies whole inside the buffer, after the header.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return Err(why(std::io::Error::last_os_error().to_string()));
+        }
+        let mut got = 0u32;
+        let size = (buf.len() * 8) as u32;
+        let status = NtQueryInformationProcess(
+            h,
+            ProcessCommandLineInformation,
+            buf.as_mut_ptr().cast(),
+            size,
+            &mut got,
+        );
+        CloseHandle(h);
+        if status != 0 {
+            return Err(why(format!("its command line can't be read (NTSTATUS {status:#010x})")));
+        }
+        let line = &*buf.as_ptr().cast::<UNICODE_STRING>();
+        let (at, len) = (line.Buffer as usize, usize::from(line.Length));
+        if at < start + header || at % 2 != 0 || len % 2 != 0 || at + len > end {
+            return Err(why("its command line came back malformed".into()));
+        }
+        let units = std::slice::from_raw_parts(line.Buffer, len / 2);
+        Ok(split_command_line(&String::from_utf16_lossy(units)))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn command_line(pid: u32) -> Result<Vec<String>, String> {
+    Err(format!("process {pid}: command lines are read on Windows only"))
+}
+
+/// A Windows command line as the arguments its program reads, by the C runtime's rules (Microsoft Learn, "Parsing C++
+/// command-line arguments"; `CommandLineToArgvW` alike after the program name). The program name runs to the first
+/// space or tab outside quotes, and its quotes only open and close. After it, spaces and tabs outside quotes part
+/// arguments; `2n` backslashes before a quote are `n` and the quote opens or closes, `2n+1` are `n` and a literal quote;
+/// two quotes inside quotes are one; any other backslash is itself.
+pub fn split_command_line(line: &str) -> Vec<String> {
+    let mut chars = line.chars().peekable();
+    let blank = |c: char| c == ' ' || c == '\t';
+    if line.chars().all(blank) {
+        return Vec::new();
+    }
+    let (mut name, mut quoted) = (String::new(), false);
+    while let Some(&c) = chars.peek() {
+        if blank(c) && !quoted {
+            break;
+        }
+        chars.next();
+        if c == '"' {
+            quoted = !quoted;
+        } else {
+            name.push(c);
+        }
+    }
+    let mut args = vec![name];
+    loop {
+        while chars.next_if(|c| blank(*c)).is_some() {}
+        if chars.peek().is_none() {
+            return args;
+        }
+        let (mut arg, mut quoted) = (String::new(), false);
+        while let Some(&c) = chars.peek() {
+            if blank(c) && !quoted {
+                break;
+            }
+            chars.next();
+            match c {
+                '\\' => {
+                    let mut n = 1;
+                    while chars.next_if_eq(&'\\').is_some() {
+                        n += 1;
+                    }
+                    let before_quote = chars.peek() == Some(&'"');
+                    arg.extend(std::iter::repeat_n('\\', if before_quote { n / 2 } else { n }));
+                    if before_quote && n % 2 == 1 {
+                        chars.next();
+                        arg.push('"');
+                    }
+                }
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    chars.next();
+                    arg.push('"');
+                }
+                '"' => quoted = !quoted,
+                c => arg.push(c),
+            }
+        }
+        args.push(arg);
     }
 }
 

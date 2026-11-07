@@ -116,7 +116,7 @@ impl Adapter for ClaudeCode {
     }
 
     fn guards(&self) -> &'static [&'static str] {
-        &["rm", "queue", "session", "turn", "child", "role", "time"]
+        &["rm", "queue", "session", "turn", "child", "role", "time", "helper"]
     }
 
     /// A child's start goes in one hook, one read (fix check r2, FC1), with sync's tool home and the deadline the
@@ -183,6 +183,8 @@ impl Adapter for Codex {
     /// too: its `UserPromptSubmit` event and context are Claude's (design note 2026-11-02-lords-role-at-launch, H3).
     /// `time`: its `apply_patch` and MCP calls reach `PreToolUse` (design note 2026-11-02-lords-time-guard, §2). `rm`:
     /// its shell tool reaches `PreToolUse` as `Bash` with the command (design note 2026-11-02-lords-git-help-guard, §2).
+    /// No `helper` yet: whether its `spawn_agent` reaches `PreToolUse` is unprobed (design note
+    /// 2026-11-02-lords-native-helper-guard, §2, §5.1).
     fn guards(&self) -> &'static [&'static str] {
         &["rm", "child", "role", "time"]
     }

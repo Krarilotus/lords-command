@@ -1483,7 +1483,7 @@ fn settings_item(pl: &mut Planner, t: &Target, adapter: &dyn Adapter) -> Item {
 /// The hook event each guard runs on, and its matcher: `rm` before a shell call (Bash or PowerShell, an exact list in
 /// both harnesses; design note 2026-11-02-lords-git-help-guard §3), `queue` when a turn would end, `session`
 /// when a session starts, `turn` when a prompt does (never a native subagent's `SubagentStop`), `child` when a
-/// native subagent starts, and `time` before an editor write or a T3 message.
+/// native subagent starts, `time` before an editor write or a T3 message, and `helper` before a native helper starts.
 fn guard_event(name: &str) -> Option<(&'static str, Option<&'static str>)> {
     match name {
         "rm" => Some(("PreToolUse", Some("Bash|PowerShell"))),
@@ -1496,6 +1496,8 @@ fn guard_event(name: &str) -> Option<(&'static str, Option<&'static str>)> {
         "role" => Some(("UserPromptSubmit", None)),
         // An editor write or a T3 message (design note 2026-11-02-lords-time-guard, §2).
         "time" => Some(("PreToolUse", Some(crate::time_guard::MATCHER))),
+        // Claude Code's native helper tool (design note 2026-11-02-lords-native-helper-guard, §2).
+        "helper" => Some(("PreToolUse", Some(crate::helper_guard::MATCHER))),
         _ => None,
     }
 }
@@ -1602,7 +1604,9 @@ fn guard_hooks(
     let mut wanted = Vec::new();
     for g in guards {
         let (event, matcher) = guard_event(g).ok_or_else(|| {
-            format!("no guard `{g}`; there are: rm, queue, session, turn, child, role, time")
+            format!(
+                "no guard `{g}`; there are: rm, queue, session, turn, child, role, time, helper"
+            )
         })?;
         if !adapter.guards().contains(&g.as_str()) {
             return Err(format!(
