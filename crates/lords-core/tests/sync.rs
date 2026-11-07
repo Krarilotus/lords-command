@@ -714,6 +714,27 @@ fn a_settings_target_names_no_guard_that_isnt_installed() {
     assert_eq!(fs::read_to_string(&copy).unwrap(), "not a program", "sync never touches the copy");
 }
 
+// Spec (the Lords owner, 7 Nov, review r1 R1-02: "a copy that's missing, unreadable or doesn't answer is a conflict
+// naming `lords guard install`"; sol-loop repair r1, R2-02: a copy that can't be read named only its error): a copy that
+// can't be read, here because its dir is a link sync goes nowhere through, makes the target a conflict that names
+// `lords guard install` beside why.
+#[test]
+fn a_guard_copy_that_cant_be_read_names_the_install() {
+    let f = Fixture::new();
+    let settings = f.write("home/.claude-balanced/settings.json", "{}\n");
+    with_targets(
+        &f,
+        &target("balanced settings", "claude", "settings", &settings, "guards = ['rm']\n"),
+    );
+    f.write("elsewhere/lords-guard.exe", "a copy elsewhere");
+    dir_link(&f.home().join("bin"), &f.path("elsewhere"));
+    let p = plan(&f.stacks(), &Options { user_only: true, ..f.opts() }).unwrap();
+    let notes = p.items[0].notes.join("\n");
+    assert!(notes.contains("lords guard install"), "{notes}");
+    assert!(notes.contains("link"), "{notes}");
+    assert_eq!(p.items[0].action, Action::Conflict, "{:?}", p.items[0]);
+}
+
 // Spec (orchestrator, 30 Oct: "`lords guard install` … copies to a staged path, self-tests it, and renames it into place
 // atomically. A failure leaves the old copy untouched"): a copy that fails its self-test is never installed; the old
 // copy stays byte for byte, and no staged copy is left.
