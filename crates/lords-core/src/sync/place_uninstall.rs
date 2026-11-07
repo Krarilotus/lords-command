@@ -291,17 +291,18 @@ pub(super) fn plan(stacks: &Stacks, private: &Stack, opts: &Options) -> Result<P
         plan.items.push(item);
     }
     // A kept instruction file holds the `.lords` files it names (the role-files line, the memory pointer): `.lords`, one
-    // record, stays with it (the Lords owner, 2 Nov, review r1 R1-01). A reading that fails holds it (design note §6b).
+    // record, stays with it (the Lords owner, 2 Nov, review r1 R1-01). A reading that fails holds it (design note §6b),
+    // and so does text that isn't UTF-8, whose names can't be read (fix check r1, FC1-01: UTF-16).
     for i in role_dirs {
         let names: Option<Vec<String>> = fsguard::read_tree(&plan.items[i].path)
             .ok()
             .map(|t| t.into_keys().filter(|n| n != ".gitignore").collect());
         let holder = kept_files.iter().find(|f| match (fsguard::read(f), &names) {
             (Ok(None), _) => false,
-            (Ok(Some(b)), Some(names)) => {
-                let text = String::from_utf8_lossy(&b);
-                names.iter().any(|n| text.contains(n.as_str()))
-            }
+            (Ok(Some(b)), Some(names)) => match std::str::from_utf8(&b) {
+                Ok(text) => names.iter().any(|n| text.contains(n.as_str())),
+                Err(_) => true,
+            },
             _ => true,
         });
         if let Some(f) = holder {
