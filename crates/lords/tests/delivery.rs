@@ -328,6 +328,34 @@ fn uninstall_target_refuses_records_naming_two_dirs() {
     assert_eq!(o.status.code(), Some(2), "{}", text(&o));
 }
 
+// Spec (sol-loop r2, S4: "`uninstall --target NAME --apply` plans Forget for a missing recorded skill; before apply
+// obtains its lock, another process restores that skill with edited content … Apply drops its record"; design note §3,
+// I21: every record but a removed copy's or a gone path's stays with its path): a record planned to be forgotten
+// because nothing was at its path keeps its record once something is there by the apply, which refuses, changing
+// nothing.
+#[test]
+fn a_forget_whose_path_came_back_changes_nothing() {
+    let h = Home::new(&["a"], "");
+    let old = h.path("home/old");
+    h.declare(&skills_target("old skills", &old));
+    assert!(h.stacked(&["sync", "--user", "--apply"]).status.success());
+    h.declare("");
+    fs::remove_dir_all(old.join("a")).unwrap();
+    let stacks = lords_core::Stacks::load(&h.path("pub"), Some(&h.path("priv"))).unwrap();
+    let opts = lords_core::sync::Options {
+        target: Some("old skills".into()),
+        uninstall: true,
+        home: h.path("home/.lords-command"),
+        ..Default::default()
+    };
+    let plan = lords_core::sync::plan(&stacks, &opts).unwrap();
+    h.write("home/old/a/SKILL.md", "mine, back\n");
+    let r = lords_core::sync::apply(&plan);
+    assert_eq!(recorded(&h, "target:old skills"), ["a"], "{r:?}");
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(fs::read_to_string(old.join("a/SKILL.md")).unwrap(), "mine, back\n");
+}
+
 // Spec (the Lords owner's brief, 7 Nov: "`guard install` while the guard copy is busy: today it fails with os error 5
 // when a hook run holds `lords-guard.exe`. Windows lets a running image be renamed, so rename the busy copy aside, copy,
 // and remove the aside copies once they're free. It must never leave no guard in place"; design note §4, I4, A4-1,
