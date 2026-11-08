@@ -92,8 +92,10 @@ pub(crate) fn git_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result
 }
 
 /// Runs `<exe> guard --self-test` and requires it to print `ok` and exit 0 within 20 s: the copy a harness hook will
-/// run answers before sync names it (orchestrator, 30 Oct). A child past the deadline is killed.
-pub(crate) fn guard_self_test(guard_copy: &Path) -> Result<(), String> {
+/// run answers before sync names it (orchestrator, 30 Oct). A child past the deadline is killed. Public for tests only
+/// (tests/guard_exec.rs runs it at the moment a copy is held open, which `install_guard`'s reads before it can't fix).
+#[doc(hidden)]
+pub fn guard_self_test(guard_copy: &Path) -> Result<(), String> {
     let (status, out) = run_guard(guard_copy, &["guard", "--self-test"], b"", "guard self-test")?;
     if status.success() && out.trim() == "ok" {
         Ok(())
