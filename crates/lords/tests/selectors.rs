@@ -178,7 +178,7 @@ fn compose_by_a_selector_composes_the_selected_place() {
         "global/rules/o.md",
         &rule("o", "workspace:other", "Only the other place reads this."),
     );
-    for typed in ["HARNESS", env.path("Harness").to_str().unwrap()] {
+    for typed in ["WORK", env.path("Harness").to_str().unwrap()] {
         let o = env.lords_in(env.dir.path(), &["compose"], &["--repo", typed]);
         let out = String::from_utf8_lossy(&o.stdout).into_owned();
         assert!(o.status.success(), "compose --repo {typed}: {}", text(&o));
