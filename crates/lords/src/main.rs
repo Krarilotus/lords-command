@@ -24,6 +24,7 @@ usage:
   lords privacy --history [--private-stack DIR]   every commit's message and patch (the pre-push check)
   lords privacy FILE...
   lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit, pre-merge-commit and commit-msg hooks; in a stack repo also `check --stack`, a pre-push and a post-commit that runs `deliver`
+    (a stack repo checks by its stack's visibility: private, secrets only; public, the whole policy, and --secrets-only there is refused)
   lords hash PATH
   lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--stage install] [--json] [--apply] [--deadline-ms N]
     (a write of Codex's hooks: trusts Lords' own through Codex's app-server, names each hook that isn't trusted, exit 1)

@@ -148,6 +148,44 @@ fn is_stack_repo(repo: &Path) -> Result<bool, String> {
         .is_empty())
 }
 
+/// The `visibility` of the stack a repo tracks (`stack.toml` at its root, else `stack/stack.toml`), if it tracks one:
+/// the fact a stack repo's privacy mode is taken from (D28). A stack file that can't be read or names no visibility is
+/// an error, never a guess.
+fn stack_visibility(repo: &Path) -> Result<Option<String>, String> {
+    let listed =
+        git::run(repo, &["ls-files", "--full-name", "--", ":/stack.toml", ":/stack/stack.toml"])?;
+    let mut files: Vec<&str> = listed.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    files.sort_by_key(|f| f.matches('/').count());
+    let Some(rel) = files.first() else { return Ok(None) };
+    let top =
+        git::toplevel(repo).ok_or_else(|| format!("{}: not in a git repo", repo.display()))?;
+    let path = top.join(rel);
+    let text = fsguard::read_text(&path)?.ok_or_else(|| format!("{}: missing", path.display()))?;
+    let table: toml::Table =
+        toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    match table.get("visibility").and_then(|v| v.as_str()) {
+        Some(v) => Ok(Some(v.to_string())),
+        None => Err(format!(
+            "{}: names no visibility, so its hooks' privacy mode isn't known",
+            path.display()
+        )),
+    }
+}
+
+/// The privacy mode a repo's hooks check by (D28, the witness of 8 Nov: a reinstall without the flag switched the
+/// private store to the public policy): a private stack's, secrets only, whatever `flag` says; a public stack's, the
+/// whole policy, and `--secrets-only` there is refused before anything is written; a repo with no stack, `flag`.
+fn privacy_mode(repo: &Path, flag: bool) -> Result<bool, String> {
+    match (stack_visibility(repo)?, flag) {
+        (Some(v), _) if v == "private" => Ok(true),
+        (Some(v), true) => Err(format!(
+            "{}: its stack is {v}, so its hooks check the whole privacy policy: drop --secrets-only (nothing was installed)",
+            repo.display()
+        )),
+        (_, flag) => Ok(flag),
+    }
+}
+
 /// The commit-msg hook: git passes the message file as `$1`.
 pub fn commit_msg_script(lords_exe: &Path, secrets_only: bool, home: &Path) -> String {
     let exe = lords_exe.to_string_lossy().replace('\\', "/");
@@ -325,6 +363,8 @@ pub fn install_with(
     stacks: &SyncArgs,
 ) -> Result<Vec<Installed>, String> {
     let dir = hooks_dir(repo)?;
+    // The mode is the stack's, not the caller's (D28); a contradicting flag stops here, before the lock or a write.
+    let secrets_only = privacy_mode(repo, secrets_only)?;
     let _lock = ApplyLock::take(home, 60)?;
     let mut ledger = Ledger::load(home)?;
     let stack = is_stack_repo(repo)?;
