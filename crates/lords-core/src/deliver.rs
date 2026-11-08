@@ -581,28 +581,24 @@ fn attempt(
     if Instant::now() > deadline {
         return Err(past("the store work ended"));
     }
-    // A whole delivery loads what the stores committed as `trees`, from git's objects, never their checkouts: what it
-    // writes is what `trees` records (gap 11, design note §0e; K4 by construction).
-    let kept = match opts.worktree {
-        None => Some(
-            dirs.iter()
-                .zip(&trees)
-                .map(|(d, t)| capture::capture(d, &t.tree, git_limit))
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        Some(_) => None,
+    // A delivery loads what the stores committed, from git's objects, never their checkouts (gap 11, design note §0e;
+    // K4 by construction): a whole one the trees it records, a new worktree's the stores' committed trees now, without
+    // the whole delivery's refusal of a store that isn't clean (3c).
+    let at = match opts.worktree {
+        None => trees.clone(),
+        Some(_) => dirs.iter().map(|d| tree(d, git_limit)).collect::<Result<Vec<_>, _>>()?,
     };
+    let mut kept = dirs
+        .iter()
+        .zip(&at)
+        .map(|(d, t)| capture::capture(d, &t.tree, git_limit))
+        .collect::<Result<Vec<_>, _>>()?;
     if Instant::now() > deadline {
         return Err(past("the stores' capture ended"));
     }
     between(Step::Captured, home);
-    let stacks = match kept {
-        Some(mut k) => {
-            let public = k.remove(0);
-            Stacks::load_captured(public, k.pop(), true)?
-        }
-        None => Stacks::load(public, private)?,
-    };
+    let public = kept.remove(0);
+    let stacks = Stacks::load_captured(public, kept.pop(), true)?;
     if Instant::now() > deadline {
         return Err(past("the stacks' load ended"));
     }
