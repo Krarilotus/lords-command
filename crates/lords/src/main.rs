@@ -519,33 +519,82 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     let p = paths(&mut a);
     a.done()?;
     let cwd = std::env::current_dir().ok();
-    if by_stack && (public_only || stack_only) {
-        use lords_core::privacy::CheckoutStack;
-        let here = cwd.as_deref().map(lords_core::privacy::checkout_stack);
-        if public_only && here == Some(CheckoutStack::Is(Visibility::Private)) {
+    // A stack repo's hooks check the checkout they run in, as `checkout_stack` finds it, or refuse: a configured stack
+    // never stands in for it, since its entries aren't this checkout's and its allow-list isn't this checkout's
+    // (fix check r4, D28-R4-01; design note 2026-11-08-lords-d28-alias, "Fix check r4").
+    use lords_core::privacy::CheckoutStack;
+    let here = (by_stack && (public_only || stack_only)).then(|| match cwd.as_deref() {
+        Some(d) => lords_core::privacy::checkout_stack(d),
+        None => CheckoutStack::Unknown("the current dir can't be read".to_string()),
+    });
+    let not_checked = "so it isn't checked: no configured stack stands in for this checkout's";
+    match &here {
+        Some(CheckoutStack::Unknown(why)) => {
+            return Err(format!("this checkout's stack can't be told ({why}), {not_checked}"))
+        }
+        Some(CheckoutStack::Is(Visibility::Private)) if public_only => {
             println!(
                 "lords check: this checkout's stack is private, so it has no public tree to check"
             );
             return Ok(true);
         }
-        if stack_only && here == Some(CheckoutStack::None) {
+        Some(CheckoutStack::None) if stack_only => {
             println!("lords check: this checkout has no stack, so it has no entries to check");
             return Ok(true);
         }
+        _ => {}
     }
     let mut p = p?;
     // `--public` and `--stack` check the repo they run in (its hooks), not whatever config.txt points at.
     let top = cwd.and_then(|d| git::toplevel(&d));
-    if (public_only || stack_only) && !explicit {
-        if let Some(stack) =
-            top.as_ref().map(|t| t.join("stack")).filter(|s| s.join("stack.toml").is_file())
-        {
-            p.public = stack;
+    let own_public =
+        top.as_ref().map(|t| t.join("stack")).filter(|s| s.join("stack.toml").is_file());
+    let own_private = top.clone().filter(|t| t.join("stack.toml").is_file());
+    match &here {
+        // Proven to have no stack (the `--stack` case returned above): its own tree, under the public rules and the
+        // configured private stack's deny terms, never the configured public stack's allow-list or repo.
+        Some(CheckoutStack::None) => {
+            let top = top.ok_or_else(|| format!("git names no checkout here, {not_checked}"))?;
+            let private = p.private.as_deref().map(Stack::load).transpose()?;
+            let rules = Rules::public().with_private(private.as_ref())?;
+            let (scan, findings) = check::public_tree(&top, &rules)?;
+            print_findings(&findings, json);
+            if !json {
+                println!(
+                    "public: this checkout has no stack, so its own tree is checked: {} files scanned, {} not text",
+                    scan.files_scanned,
+                    scan.binary.len()
+                );
+            }
+            return Ok(!check::has_errors(&findings, strict));
         }
-    }
-    if stack_only && !explicit_private {
-        if let Some(t) = top.filter(|t| t.join("stack.toml").is_file()) {
-            p.private = Some(t);
+        Some(CheckoutStack::Is(v)) => {
+            let missing = |at: &str| {
+                format!("this checkout's stack is {v}, but {at} isn't on disk, {not_checked}")
+            };
+            if *v == Visibility::Public {
+                p.public = own_public.ok_or_else(|| missing("stack/stack.toml"))?;
+                if let Some(t) = own_private.filter(|_| stack_only) {
+                    p.private = Some(t);
+                }
+            } else {
+                p.private = Some(own_private.ok_or_else(|| missing("stack.toml"))?);
+                if let Some(s) = own_public {
+                    p.public = s;
+                }
+            }
+        }
+        _ => {
+            if (public_only || stack_only) && !explicit {
+                if let Some(stack) = own_public {
+                    p.public = stack;
+                }
+            }
+            if stack_only && !explicit_private {
+                if let Some(t) = own_private {
+                    p.private = Some(t);
+                }
+            }
         }
     }
     let private = p.private.as_deref().map(Stack::load).transpose()?;
