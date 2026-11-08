@@ -971,6 +971,129 @@ fn delete_tree_at(dir: &Path) -> Result<(), String> {
     fs::remove_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
 
+/// What `delete_if` did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Removal {
+    /// Nothing is at the path any more: it held `sha` and was removed, or nothing was there.
+    Gone,
+    /// It is where it was, as it was, and why: it holds something else, or a writer or a reader that doesn't share
+    /// delete holds it open.
+    Kept(String),
+}
+
+/// Removes the file or dir at `p` only while it holds `sha` (a file's bytes or a dir's tree hash), keeping it out of
+/// any writer's reach from the hash to the removal (F8 sol-loop r1, S1): it is moved to `aside` (a fresh name beside
+/// the place's path, which a stop leaves for the next apply to hold), every file under it is held open on Windows
+/// sharing read and delete but not write, so no writer can open it and one already there makes the hold fail; then
+/// it is hashed, `compared` runs, and only a match is removed, still held. Anything else goes back to `p` and is kept.
+/// One that can't go back (something is at `p` now) is an error naming `aside`, where it stays. Off Windows no lock
+/// keeps a writer out that already holds a file open: the residual fsguard's `replace_file_if` has too.
+pub fn delete_if(
+    p: &Contained,
+    aside: &Contained,
+    sha: &str,
+    dir: bool,
+    compared: &mut dyn FnMut(),
+) -> Result<Removal, String> {
+    let (path, to) = (&p.path, &aside.path);
+    match (kind(path)?, dir) {
+        (Kind::Missing, _) => return Ok(Removal::Gone),
+        (Kind::Dir, true) | (Kind::File, false) => {}
+        _ => return Ok(Removal::Kept(format!("{}: not the kind it was made as", path.display()))),
+    }
+    if let Err(e) = move_to_at(path, to) {
+        return Ok(Removal::Kept(e));
+    }
+    let back = |why: String| match move_back_at(to, path) {
+        Ok(()) => Ok(Removal::Kept(why)),
+        Err(e) => Err(format!("{why}; and it couldn't go back ({e}): it is at {}", to.display())),
+    };
+    let files = match files_under(to, dir) {
+        Ok(f) => f,
+        Err(e) => return back(e),
+    };
+    let mut held = Vec::new();
+    for f in &files {
+        match hold_unwritable(f) {
+            Ok(h) => held.push(h),
+            Err(e) => {
+                drop(held);
+                return back(e);
+            }
+        }
+    }
+    let now = match dir {
+        true => read_tree(to).map(|t| tree_sha(&t)),
+        false => fs::read(to).map(|b| self::sha(&b)).map_err(|e| format!("{}: {e}", to.display())),
+    };
+    match now {
+        Ok(now) if now == sha => {}
+        Ok(_) => {
+            drop(held);
+            return back(format!("{}: it holds something else now, so it is kept", path.display()));
+        }
+        Err(e) => {
+            drop(held);
+            return back(e);
+        }
+    }
+    compared();
+    // Each file goes while it is held; the dirs once the holdings are dropped.
+    for f in &files {
+        fs::remove_file(f).map_err(|e| format!("{}: {e}", f.display()))?;
+    }
+    drop(held);
+    if dir {
+        delete_tree_at(to)?;
+    }
+    Ok(Removal::Gone)
+}
+
+/// The files at or under `p` (a file, or a dir's every file, following no link).
+fn files_under(p: &Path, dir: bool) -> Result<Vec<PathBuf>, String> {
+    if !dir {
+        return Ok(vec![p.to_path_buf()]);
+    }
+    read_tree(p)?;
+    fn walk(d: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+        for e in fs::read_dir(d).map_err(|e| format!("{}: {e}", d.display()))? {
+            let p = e.map_err(|e| e.to_string())?.path();
+            let m = fs::symlink_metadata(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+            if is_link(&m) {
+                return Err(format!("{} became a link; stopped", p.display()));
+            } else if m.is_dir() {
+                walk(&p, out)?;
+            } else {
+                out.push(p);
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(p, &mut out)?;
+    Ok(out)
+}
+
+/// A file held open so no writer can open it (Windows: read and delete access, sharing read and delete only), or
+/// refused while a writer or a reader without delete sharing holds it. Nothing off Windows.
+fn hold_unwritable(p: &Path) -> Result<Holding, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // GENERIC_READ | DELETE; FILE_SHARE_READ | FILE_SHARE_DELETE.
+        let (access, share) = (0x8000_0000 | 0x0001_0000, 0x1 | 0x4);
+        match fs::OpenOptions::new().access_mode(access).share_mode(share).open(p) {
+            Ok(file) => Ok(Holding { _file: Some(file) }),
+            Err(e) => Err(format!("{}: {e} (another process holds it open)", p.display())),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = p;
+        Ok(Holding { _file: None })
+    }
+}
+
 /// Makes a file executable (Unix); a no-op elsewhere.
 fn make_executable_at(path: &Path) -> Result<(), String> {
     check(path)?;
