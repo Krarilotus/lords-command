@@ -408,6 +408,12 @@ fn guard_install_replaces_a_copy_a_hook_is_running() {
     let bin = h.copy().parent().unwrap().to_path_buf();
     fs::create_dir_all(&bin).unwrap();
     fs::write(h.copy(), &old).unwrap();
+    // An installed copy is executable (D27), and a hook runs it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(h.copy(), fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let names = || {
         let mut v: Vec<String> = fs::read_dir(&bin)
             .unwrap()

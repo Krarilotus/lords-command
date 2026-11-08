@@ -670,6 +670,19 @@ fn real_dispatcher(dir: &Path) -> PathBuf {
     dir.join("hooks")
 }
 
+/// Whether this git runs hooks from config (`hook.<name>.command`, Git 2.54 and later), which Lords' config hook needs
+/// (`hooks/config.rs`). Older git (2.43 on the Linux test host, D27) answers `git hook list` with its usage, exit 129,
+/// and Lords refuses a config hook there, naming the version: the config-hook tests then check that refusal, and that
+/// it changes nothing, in place of the config hook's own answers.
+fn git_has_config_hooks(env: &Env, repo: &Path) -> bool {
+    env.git(repo, &["hook", "list", "post-checkout"]).status.code() != Some(129)
+}
+
+/// On a git without config hooks: the refusal names the Git version a config hook needs.
+fn refused_for_its_git(has_config_hooks: bool, out: &str) -> bool {
+    !has_config_hooks && out.contains("2.54")
+}
+
 /// Writes a hook script at `p`, executable off Windows, as an owner's hook is for git to run it (D27).
 fn write_script(p: &Path, text: &str) {
     fs::write(p, text).unwrap();
@@ -849,8 +862,12 @@ fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
         let out = text(&o);
         eprintln!("{name}: {out}");
         assert!(!o.status.success(), "{name}: must be refused: {out}");
-        assert!(out.contains(says) && out.contains("post-checkout"), "{name}: {out}");
-        assert!(name == "include" || out.contains("set already (global"), "{name}: {out}");
+        let old_git = refused_for_its_git(git_has_config_hooks(&env, &repo), &out);
+        assert!(old_git || out.contains(says) && out.contains("post-checkout"), "{name}: {out}");
+        assert!(
+            old_git || name == "include" || out.contains("set already (global"),
+            "{name}: {out}"
+        );
         assert_eq!(local_config(&repo), local, "{name}: the local config is as it was");
         assert_eq!(listing(&hooks), before, "{name}: the hooks dir is as it was");
         assert_eq!(fs::read(&ledger).unwrap(), recorded, "{name}: the ledger is as it was");
@@ -945,8 +962,11 @@ fn a_refused_reinstall_keeps_the_tools_earlier_hook() {
 
     let o = install_post_checkout(&env, &repo, &copied_stacks(&env, "2"));
     let out = text(&o);
+    let old_git = refused_for_its_git(git_has_config_hooks(&env, &repo), &out);
     assert!(
-        !o.status.success() && !out.contains("back failed") && out.contains("stands in"),
+        !o.status.success()
+            && !out.contains("back failed")
+            && (old_git || out.contains("stands in")),
         "{out}"
     );
     assert_eq!((listing(&hooks), fs::read(&ledger).unwrap(), local_config(&repo)), before);
@@ -1026,6 +1046,12 @@ fn a_hooks_dir_that_isnt_reached_gets_a_config_hook_instead() {
 
     let o = install_post_checkout(&env, &repo, &stacks);
     let out = text(&o);
+    if !git_has_config_hooks(&env, &repo) {
+        // No config hook on this git: refused, naming the version, with nothing changed.
+        assert!(!o.status.success() && refused_for_its_git(false, &out), "{out}");
+        assert_eq!((listing(&hooks), local_config(&repo)), before);
+        return;
+    }
     assert!(
         o.status.success() && out.contains("relative") && out.contains("lords-post-checkout"),
         "{out}"
@@ -1097,13 +1123,20 @@ fn a_config_hook_that_cant_be_proven_is_refused_and_changes_nothing() {
         ("includeIf.gitdir:**/worktrees/.path", "hooks.inc", "includeif.gitdir"),
         ("hook.post-checkout.enabled", "false", "nor a config hook: `git hook run"),
     ];
+    let config_hooks = git_has_config_hooks(&env, &repo);
     for (key, value, says) in cases {
         env.git(&repo, &["config", key, value]);
         let before = state();
         let o = install_post_checkout(&env, &repo, &stacks);
-        assert!(!o.status.success() && text(&o).contains(says), "{key}: {}", text(&o));
+        let out = text(&o);
+        let said = out.contains(says) || refused_for_its_git(config_hooks, &out);
+        assert!(!o.status.success() && said, "{key}: {out}");
         assert_eq!(state(), before, "{key}: as it was");
         env.git(&repo, &["config", "--unset", key]);
+    }
+    // The rest is over Lords' own config hook, which this git can't run.
+    if !config_hooks {
+        return;
     }
 
     assert!(install_post_checkout(&env, &repo, &stacks).status.success());

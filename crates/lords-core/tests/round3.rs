@@ -7,7 +7,10 @@
 
 mod common;
 use common::*;
-use lords_core::sync::{self, Action};
+use lords_core::sync;
+// Only the Windows cases use it (D27: an unused import fails clippy elsewhere).
+#[cfg(windows)]
+use lords_core::sync::Action;
 use std::fs;
 use std::path::Path;
 
