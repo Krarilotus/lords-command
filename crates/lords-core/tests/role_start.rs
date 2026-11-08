@@ -81,7 +81,6 @@ fn each_role_gets_a_start_of_what_the_place_file_leaves_out() {
     for want in [
         "You start as a reviewer here",
         "at launch",
-        "role-reviewer.md",
         "- rule.verdicts: The verdicts line.",
         "- rule.tests: The tests line.",
         "The reviewer's half.",
@@ -98,6 +97,51 @@ fn each_role_gets_a_start_of_what_the_place_file_leaves_out() {
     let orchestrator = planned_in(&p, &dir, "start-orchestrator.md");
     assert!(orchestrator.contains("The lead's half."), "{orchestrator}");
     assert_eq!(planned_in(&p, &dir, "start-product.md"), "", "no start for product");
+}
+
+// Spec (the owner, 8 Nov, intent.owner-decisions-2026-11-08 item 11, his agreed reading: "absolute boundaries stay
+// absolute: his reserved decisions, credentials, history rewrites and the safety of the machines; every other rule is …
+// a guideline, not a protocol followed mechanically; an agent that departs from a rule says what it did and why"; and 9
+// Nov: rules "not super strict and guiding the agents not limiting their creative thinking"): the place's files and every
+// start say so, and none calls every line binding or sends the session to read its whole role file.
+#[test]
+fn the_rules_read_as_guidance_and_the_boundaries_stay_absolute() {
+    let (f, checkout) = place();
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    let dir = checkout.join(".lords");
+    let place_file = |name: &str| {
+        p.items
+            .iter()
+            .find(|i| i.path == checkout.join(name))
+            .and_then(|i| i.proposed.clone())
+            .unwrap_or_default()
+    };
+    let mut texts = vec![
+        ("CLAUDE.local.md".to_string(), place_file("CLAUDE.local.md")),
+        ("AGENTS.override.md".to_string(), place_file("AGENTS.override.md")),
+    ];
+    for role in ["orchestrator", "coder", "helper", "reviewer"] {
+        let name = format!("start-{role}.md");
+        texts.push((name.clone(), planned_in(&p, &dir, &name)));
+    }
+    for (name, text) in &texts {
+        assert!(!text.is_empty(), "{name} planned");
+        for want in [
+            "Boundaries (",
+            "credentials, history rewrites, machine safety) are absolute",
+            "guidance",
+        ] {
+            assert!(text.contains(want), "{name}: {want}:\n{text}");
+        }
+        assert!(!text.contains("binds") && !text.contains("bind you"), "{name}:\n{text}");
+    }
+    for role in ["orchestrator", "coder", "helper", "reviewer"] {
+        let start = planned_in(&p, &dir, &format!("start-{role}.md"));
+        assert!(
+            !start.contains(&format!("role-{role}.md")),
+            "start-{role}.md sends to the role file:\n{start}"
+        );
+    }
 }
 
 /// The core lines a composed file carries: each `- id…: text` line's text after the id and its label.
