@@ -2839,7 +2839,16 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
             if !private.manifest.repos.contains_key(r)
                 && !private.manifest.workspaces.contains_key(r)
             {
-                return Err(format!("no repo or workspace `{r}` in the private stack.toml"));
+                // The declared names, so the caller can run the command again without opening the stack (the master
+                // thread, 8 Nov: `--repo Harness` for the workspace `harness`).
+                let names: Vec<&str> = (private.manifest.repos.keys())
+                    .chain(private.manifest.workspaces.keys())
+                    .map(String::as_str)
+                    .collect();
+                return Err(format!(
+                    "no repo or workspace `{r}` in the private stack.toml; its names: {} (no --repo: every place)",
+                    names.join(", ")
+                ));
             }
         }
     }
