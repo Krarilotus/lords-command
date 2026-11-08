@@ -7,15 +7,25 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "Finish one agreed outcome at a time, keeping its blockers and boundary in view; new worthwhile work does not widen it, so list what you noticed but did not touch. End an investigation in adoption, a specific revision, rejection or an explicit deferral."
+core: "To finish what was agreed: keep its outcome, blockers and boundary in view; list worthwhile work you notice instead of widening into it, and end an investigation in adoption, a revision, rejection or an explicit deferral. A brief gives task, scope and needed context and points to rules instead of restating them."
 visibility: public
 evidence:
 - summary: Review fix checks that widened scope ran to 9-11 rounds; preparation work expanded without reducing uncertainty.
   date: 2026-10-25
+- summary: "(from rule.briefs-point-not-restate, merged 9 Nov) Rules restated in briefs drifted (one brief repeated a host rule five times); mandatory per-brief lines and report checklists added weight to every task."
+  date: 2026-10-25
 origin:
   type: own
-topics: [scope]
+topics: [scope, prompts, delegation]
 ---
-Keep the agreed outcome, what blocks it and where it ends in view, and finish one thing at a time. New worthwhile work
-doesn't widen the current task: list what you noticed but didn't touch. An investigation ends in adoption, a specific
-revision, rejection or an explicit deferral.
+**Purpose:** finish the outcome that was agreed, without drift that costs rounds and leaves work half done.
+
+**Default:** keep the agreed outcome, what blocks it and where it ends in view. New worthwhile work doesn't widen the
+current task: list what you noticed but didn't touch. An investigation ends in adoption, a specific revision,
+rejection or an explicit deferral. Independent outcomes may run side by side; each keeps its own boundary.
+
+A brief states the task, its scope and the context it needs, and points to the rules by reference instead of
+restating them. No mandatory boilerplate lines or report checklists in every brief.
+
+**When to depart:** work coupled to the outcome, where doing it now makes the result better or avoids redoing it, may
+join the task; tell whoever owns the scope what changed and why.
