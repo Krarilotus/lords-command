@@ -290,6 +290,31 @@ fn r5_05_restore_keeps_a_created_file_the_owner_marked() {
     }
 }
 
+// Spec (the Lords whole-project review of 9 Nov: "Restore checks a created owner file, then moves and deletes it without
+// checking the moved bytes … An intervening editor change can be deleted"; "use compare-and-preserve deletion"): a file
+// apply created, which someone writes between restore's check and its removal, is kept, with what they wrote.
+#[test]
+fn restore_keeps_a_created_file_written_while_it_restores() {
+    let f = Fixture::new();
+    f.write("pub/global/rules/r.md", &entry("rule.r", "global", "public", "", "Rule text.\n"));
+    let file = f.path("out/new.md");
+    declare(&f, &format!("[[targets]]\nname = \"t\"\nadapter = \"codex\"\nkind = \"instructions\"\npath = '{}'\n", file.display()));
+    let backups = sync::apply(&sync::plan(&f.stacks(), &f.opts()).unwrap())
+        .unwrap()
+        .backups
+        .expect("a backup");
+    let plan = sync::plan(&f.stacks(), &f.opts()).unwrap();
+    let mut wrote = false;
+    let steps = sync::restore_between(&plan, &backups, &mut |p| {
+        if p == file {
+            fs::write(&file, "my own words\n").unwrap();
+            wrote = true;
+        }
+    });
+    assert!(wrote, "the restore reached the created file: {steps:?}");
+    assert_eq!(fs::read_to_string(&file).ok().as_deref(), Some("my own words\n"), "{steps:?}");
+}
+
 // ---------------------------------------------------------------- guarantee 7: the effective hooks
 
 fn public_repo(f: &Fixture) {

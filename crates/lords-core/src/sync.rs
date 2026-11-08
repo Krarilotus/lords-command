@@ -3891,6 +3891,17 @@ impl<'a> Record<'a> {
 /// bytes are in the backup; the tool never guesses or skips a line (Sol review r7, R7-06/R7-07). Tool-owned paths aren't restored: sync regenerates them, or
 /// `lords uninstall` removes them. Returns one line per step.
 pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
+    restore_between(plan, backup_dir, &mut |_| {})
+}
+
+/// `restore`, calling `between` with each path it is about to put back or remove, once that path has been checked:
+/// for tests that must reach the moment between the check and the change, as a writer would.
+#[doc(hidden)]
+pub fn restore_between(
+    plan: &Plan,
+    backup_dir: &Path,
+    between: &mut dyn FnMut(&Path),
+) -> Result<Vec<String>, String> {
     let home = Root::home(&plan.home)?;
     let bdir = home.below(backup_dir).ok_or_else(|| {
         format!(
@@ -4000,6 +4011,7 @@ pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
                 })?;
                 // Checked again as it is replaced, like apply (rule C; R7-06).
                 fsguard::attrs(&path)?.keep().map_err(|e| format!("{}: {e}", path.display()))?;
+                between(&path);
                 let aside = fsguard::move_aside(&owner)?;
                 if fsguard::read(aside.path())?.is_some_and(|b| fsguard::sha(&b) == written) {
                     // The owner file's attributes as apply found them (Sol review r4, R4-03).
@@ -4025,6 +4037,7 @@ pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
                 )
             }
             Undo::Created { owner, written } if holds(&written)? => {
+                between(&path);
                 fsguard::move_aside(&owner)?.delete()?;
                 format!("removed {}", path.display())
             }
