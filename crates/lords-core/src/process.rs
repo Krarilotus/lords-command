@@ -390,7 +390,18 @@ fn tree_ends_with_this_process() -> Result<(), String> {
 
 /// Runs `git -C <dir> <args>` with `stdin` as its input (`hash-object --stdin`), within a minute. See `bounded`.
 pub(crate) fn git_input(dir: &Path, args: &[&str], stdin: Vec<u8>) -> Result<Output, String> {
-    bounded(command(dir, args), Some(stdin), Duration::from_secs(60))
+    git_input_bounded(dir, args, stdin, Duration::from_secs(60))
+}
+
+/// Runs `git -C <dir> <args>` with `stdin` as its input, and waits at most `deadline` (a store's capture: its blobs by
+/// `cat-file --batch`, within `[delivery] store_git_secs`). See `bounded`.
+pub(crate) fn git_input_bounded(
+    dir: &Path,
+    args: &[&str],
+    stdin: Vec<u8>,
+    deadline: Duration,
+) -> Result<Output, String> {
+    bounded(command(dir, args), Some(stdin), deadline)
         .map_err(|e| format!("git {}: {e}", args.join(" ")))
 }
 

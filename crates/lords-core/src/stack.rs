@@ -301,6 +301,9 @@ pub struct Stack {
     pub entries: Vec<Entry>,
     /// Problems found while loading (schema, placement, unreadable files).
     pub problems: Vec<Finding>,
+    /// The committed tree it was loaded from (`Stacks::load_captured`), which sync reads a skill's files from too;
+    /// `None` for a stack loaded from its dir on disk.
+    pub(crate) captured: Option<std::sync::Arc<crate::capture::Captured>>,
 }
 
 impl Stack {
@@ -364,8 +367,13 @@ impl Stack {
                 )
             })?;
         }
-        let mut stack =
-            Stack { root: root.to_path_buf(), manifest, entries: Vec::new(), problems: Vec::new() };
+        let mut stack = Stack {
+            root: root.to_path_buf(),
+            manifest,
+            entries: Vec::new(),
+            problems: Vec::new(),
+            captured: None,
+        };
         if stack.visibility() == Visibility::Public {
             stack.check_public_manifest(&manifest_path);
         }
@@ -971,12 +979,26 @@ impl Stacks {
     /// whether the declared repos' own skills are indexed from their checkouts, as `load` does; a start doesn't take
     /// them (gap 11 design note §0c.4), so the store commit check leaves them out.
     pub fn load_captured(
-        public: &crate::capture::Captured,
-        private: Option<&crate::capture::Captured>,
+        public: crate::capture::Captured,
+        private: Option<crate::capture::Captured>,
         repo_skills: bool,
     ) -> Result<Stacks, String> {
-        let private = private.map(|p| move || Stack::load_from(p.root(), p));
-        Self::load_with(|| Stack::load_from(public.root(), public), private, repo_skills)
+        fn kept(c: crate::capture::Captured) -> Result<Stack, String> {
+            let mut s = Stack::load_from(c.root(), &c)?;
+            s.captured = Some(std::sync::Arc::new(c));
+            Ok(s)
+        }
+        Self::load_with(|| kept(public), private.map(|p| move || kept(p)), repo_skills)
+    }
+
+    /// The committed tree `e`'s files are read from, where its stack was loaded from one and the entry is the
+    /// stack's own (a declared repo's skill is its checkout's).
+    pub(crate) fn captured_for(
+        &self,
+        e: &Entry,
+    ) -> Option<std::sync::Arc<crate::capture::Captured>> {
+        let own = !matches!(e.meta.origin, crate::model::Origin::InRepo { .. });
+        self.stack(e.stack).and_then(|s| s.captured.clone()).filter(|_| own)
     }
 
     /// Loads the public stack, checks it, then the private one, in that order (whose error comes first).

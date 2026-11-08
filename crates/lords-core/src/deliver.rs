@@ -5,6 +5,7 @@
 //! their pause, and the deadline no attempt or plan starts past. Nothing kills a delivery from inside, and its hooks
 //! start it without a deadline of their own (design note D-2).
 
+use crate::capture::{self, committed, git, tree};
 use crate::fsguard::{self, Contained, Kind, Part, Root};
 use crate::ledger::{self, Ledger};
 use crate::stack::{Delivery, Stacks, Store};
@@ -251,43 +252,6 @@ pub fn status(stacks: &Stacks, home: &Path) -> Status {
         }
     };
     Status::Read(state, why)
-}
-
-/// One git read of a store, stopped past `limit` (`[delivery] store_git_secs`).
-fn git(dir: &Path, args: &[&str], limit: Duration) -> Result<String, String> {
-    let out = crate::process::git_bounded(dir, args, limit)?;
-    if !out.status.success() {
-        return Err(format!(
-            "{}: git {} failed: {}",
-            dir.display(),
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// The git tree of the stack committed in `dir` (a store's stack dir, its repo's root or below it), keyed by the dir.
-fn tree(dir: &Path, limit: Duration) -> Result<StoreTree, String> {
-    Ok(StoreTree { stack: ledger::key(dir), tree: git(dir, &["rev-parse", "HEAD:./"], limit)? })
-}
-
-/// Each store's committed stack, refusing a store whose stack dir holds anything not committed: edited, untracked, or
-/// ignored, which the stack loads all the same (F8 K4; sol-loop r1 S1). Only committed entries, which passed the
-/// stores' commit hooks, reach agents.
-fn committed(dirs: &[&Path], limit: Duration) -> Result<Vec<StoreTree>, String> {
-    let mut trees = Vec::new();
-    for d in dirs {
-        let status = "--no-optional-locks status --porcelain --untracked-files=all --ignored -- .";
-        if !git(d, &status.split(' ').collect::<Vec<_>>(), limit)?.is_empty() {
-            return Err(format!(
-                "{} has uncommitted (edited, untracked or ignored) files in its stack, and a delivery takes committed entries only; nothing was written: the next commit delivers",
-                d.display()
-            ));
-        }
-        trees.push(tree(d, limit)?);
-    }
-    Ok(trees)
 }
 
 /// Whether a file git tracks in a store's stack dir was written at or after `since` (sol-loop r2 S4): a write put back
@@ -636,10 +600,30 @@ fn attempt(
     if Instant::now() > deadline {
         return Err(past("the store work ended"));
     }
+    // A whole delivery loads what the stores committed as `trees`, from git's objects, never their checkouts: what it
+    // writes is what `trees` records (gap 11, design note §0e; K4 by construction).
+    let kept = match opts.worktree {
+        None => Some(
+            dirs.iter()
+                .zip(&trees)
+                .map(|(d, t)| capture::capture(d, &t.tree, git_limit))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Some(_) => None,
+    };
+    if Instant::now() > deadline {
+        return Err(past("the stores' capture ended"));
+    }
     between(Step::Captured, home);
     // Every store file written from here on was perhaps read half way (sol-loop r2 S4).
     let loading = std::time::SystemTime::now();
-    let stacks = Stacks::load(public, private)?;
+    let stacks = match kept {
+        Some(mut k) => {
+            let public = k.remove(0);
+            Stacks::load_captured(public, k.pop(), true)?
+        }
+        None => Stacks::load(public, private)?,
+    };
     if Instant::now() > deadline {
         return Err(past("the stacks' load ended"));
     }

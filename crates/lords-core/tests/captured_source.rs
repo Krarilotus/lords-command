@@ -116,7 +116,7 @@ fn fixture() -> Fixture {
 }
 
 fn load_captured(f: &Fixture) -> Stacks {
-    Stacks::load_captured(&captured(&f.pub_root()), Some(&captured(&f.priv_root())), true).unwrap()
+    Stacks::load_captured(captured(&f.pub_root()), Some(captured(&f.priv_root())), true).unwrap()
 }
 
 // Spec (design note §0b.3 step 5: "every recorded path is the logical one by construction"; §0c.4: the loader's
@@ -156,7 +156,7 @@ fn nothing_is_read_from_the_checkout_once_captured() {
     std::fs::remove_file(f.path("priv/repo/beta-core/rules/r.md")).unwrap();
     std::fs::remove_file(f.path("pub/global/skills/review/SKILL.md")).unwrap();
     assert_ne!(loaded(&f.stacks()), before, "the checkout did change");
-    let kept = Stacks::load_captured(&public, Some(&private), true).unwrap();
+    let kept = Stacks::load_captured(public, Some(private), true).unwrap();
     assert_eq!(loaded(&kept), before);
 }
 
@@ -209,13 +209,13 @@ fn a_link_in_a_capture_is_refused_where_the_loader_touches_it() {
     let f = fixture();
     let mut c = captured(&f.pub_root());
     c.add_link("global/skills/review/linked").unwrap();
-    let kept = Stacks::load_captured(&c, None, false).unwrap();
+    let kept = Stacks::load_captured(c, None, false).unwrap();
     let review = kept.find("skill.review").unwrap();
     assert!(!review.files.iter().any(|p| p.ends_with("linked")), "{:?}", review.files);
     assert_eq!(review.files.len(), 4, "{:?}", review.files);
     let mut c = captured(&f.pub_root());
     c.add_link("global/templates").unwrap();
-    let err = Stacks::load_captured(&c, None, false).err().unwrap();
+    let err = Stacks::load_captured(c, None, false).err().unwrap();
     assert!(err.contains("a link in the captured stack"), "{err}");
 }
 

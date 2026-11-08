@@ -690,10 +690,14 @@ fn owner_block_item(
 /// the copy keeps itself out of git. A link anywhere in the skill's dir is an error: a copy would silently lack what
 /// it points at (Sol review r2, R2-23).
 pub fn skill_tree(src: &Path) -> Result<Tree, String> {
-    let mut tree = fsguard::read_tree(src)?;
+    fsguard::read_tree(src).map(skill_files)
+}
+
+/// What a skill's dir holds as its copy has it: without Lords' sidecar, and ignoring itself.
+fn skill_files(mut tree: Tree) -> Tree {
     tree.remove(stack::SIDECAR);
     tree.insert(".gitignore".into(), b"*\n".to_vec());
-    Ok(tree)
+    tree
 }
 
 /// What planning carries besides the stacks: the ledger, which tool-owned paths the plan wants, and which ledger
@@ -962,9 +966,17 @@ impl Planner<'_> {
     /// A skill's copy, read once per plan.
     fn tree_of(&mut self, e: &Entry) -> Result<std::sync::Arc<Tree>, String> {
         let src = e.meta_file.parent().expect("a sidecar has a dir").to_path_buf();
+        // A stack loaded from its committed tree gives its skills' files from that tree too (gap 11, §0e condition 2).
+        let kept = self.stacks.captured_for(e);
         self.trees
             .entry(e.id().to_string())
-            .or_insert_with(|| skill_tree(&src).map(std::sync::Arc::new))
+            .or_insert_with(|| {
+                let tree = match kept {
+                    Some(c) => c.tree(&src),
+                    None => fsguard::read_tree(&src),
+                };
+                tree.map(skill_files).map(std::sync::Arc::new)
+            })
             .clone()
     }
 
