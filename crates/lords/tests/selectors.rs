@@ -1,5 +1,5 @@
 //! `--repo` selectors and scopes end to end (gap 4b, design note Harness/notes/2026-11-08-lords-gap4b-selectors.md):
-//! a place is named by its key in any case, a path in it or its dir name, never by a guess between two; uninstall
+//! a place is named by its key in any case or a path in it, never by a guess between two nor by a dir name; uninstall
 //! takes a key only; a scoped plan names the declared places it leaves out. Child processes get an empty home and
 //! global git config, so no real home dir, user hook or setting is read or touched. Every run here is a dry run.
 
@@ -140,21 +140,17 @@ fn names_file(o: &Output, dir: &Path) -> bool {
     stdout.contains(&file.display().to_string().replace('\\', "/"))
 }
 
-// Spec (tool contract, L-select: "name a place by any form it would guess (case-insensitive key, path, directory
-// name)"; witness W-F8: `--repo Harness` for the workspace `harness`): the key in another case, the place's dir, a
-// dir inside it, `.` from inside it, and its dir name each select the place, for sync, sync --safe-only and compose;
-// the key it resolved to is said when it isn't what was typed.
+// Spec (tool contract, L-select: "name a place by any form it would guess (case-insensitive key, path …)", the dir
+// name taken out by the master thread after fix check r1 (8 Nov 10:49); witness W-F8: `--repo Harness` for the
+// workspace `harness`): the key in another case, the place's dir, a dir inside it and `.` from inside it each select
+// the place, for sync and sync --safe-only; the key it resolved to is said when it isn't what was typed.
 #[test]
-fn a_place_is_selected_by_its_key_in_any_case_a_path_or_its_dir_name() {
+fn a_place_is_selected_by_its_key_in_any_case_or_a_path() {
     let env = Env::new(&[("work", "Harness")]);
     let dir = env.path("Harness");
     fs::create_dir_all(dir.join("sub")).unwrap();
-    let typed = [
-        "WORK".to_string(),
-        dir.display().to_string(),
-        dir.join("sub").display().to_string(),
-        "harness".to_string(),
-    ];
+    let typed =
+        ["WORK".to_string(), dir.display().to_string(), dir.join("sub").display().to_string()];
     for t in &typed {
         let o = env.sync(&["--repo", t]);
         assert!(plans_place(&o, &dir), "--repo {t}: {}", text(&o));
@@ -254,15 +250,35 @@ fn a_repo_whose_worktrees_cant_be_listed_is_selected_by_its_checkout() {
     assert!(String::from_utf8_lossy(&o.stdout).contains("The plain repo's rule."), "{}", text(&o));
 }
 
-// Spec (design note S2, attacks A3, A5: never a guess between two): two places with the same dir name are refused
-// naming both candidates, while each key still resolves; of two nested places, a path resolves to the deepest that
-// holds it.
+// Spec (fix check r1 of gap 4b: a checkout and a worktree with one dir name selected the checkout; the master thread,
+// 8 Nov 10:49: "Drop rule 4, the folder-name match, entirely"): a dir name that is no key selects nothing, even where
+// it names a checkout or a worktree; a writing sync by it is refused and writes nothing anywhere.
 #[test]
-fn a_selector_matching_two_places_is_refused_naming_each_and_the_deepest_path_wins() {
-    let env = Env::new(&[("a", "x/same"), ("b", "y/same"), ("outer", "n"), ("inner", "n/in")]);
+fn a_dir_name_that_is_no_key_selects_nothing() {
+    let env = Env::new(&[("a", "x/same"), ("b", "y/same")]);
     let o = env.sync(&["--repo", "same"]);
     let out = text(&o);
-    assert!(!o.status.success() && out.contains("`a`") && out.contains("`b`"), "{out}");
+    assert!(!o.status.success() && out.contains("no repo or workspace `same`"), "{out}");
+    assert!(!names_file(&o, &env.path("x/same")) && !names_file(&o, &env.path("y/same")), "{out}");
+
+    let env = Env::new(&[]);
+    let main = env.repo("r", "same", &["same"]);
+    env.commit_private("global/rules/r.md", &rule("r", "repo:r", "The repo's rule."));
+    let worktree = env.path("wts/same");
+    // From a dir where `same` is no path (a path selects, A8 and F1).
+    let o = env.lords_in(&env.path("home"), &["sync"], &["--repo", "same", "--apply"]);
+    let out = text(&o);
+    assert!(!o.status.success() && out.contains("no repo or workspace `same`"), "{out}");
+    for d in [&main, &worktree] {
+        assert!(!d.join("AGENTS.override.md").exists(), "nothing written: {out}");
+    }
+}
+
+// Spec (design note S2, attack A3): of two nested places, a path resolves to the deepest that holds it, and each key
+// still resolves in any case.
+#[test]
+fn a_path_resolves_to_the_deepest_place_that_holds_it() {
+    let env = Env::new(&[("a", "x/same"), ("outer", "n"), ("inner", "n/in")]);
     assert!(plans_place(&env.sync(&["--repo", "A"]), &env.path("x/same")));
     fs::create_dir_all(env.path("n/in/deep")).unwrap();
     fs::create_dir_all(env.path("n/other")).unwrap();
