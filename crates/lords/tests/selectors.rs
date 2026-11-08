@@ -80,6 +80,44 @@ impl Env {
     fn sync(&self, args: &[&str]) -> Output {
         self.lords_in(self.dir.path(), &["sync"], args)
     }
+
+    fn git(&self, cwd: &Path, args: &[&str]) {
+        let o = self.cmd("git", cwd).args(args).output().unwrap();
+        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    /// Adds `text` to the private stack's `rel` and commits it.
+    fn commit_private(&self, rel: &str, text: &str) {
+        let p = self.path("priv").join(rel);
+        let before = fs::read_to_string(&p).unwrap_or_default();
+        self.write(&format!("priv/{rel}"), &format!("{before}{text}"));
+        self.git(&self.path("priv"), &["add", "-A"]);
+        self.git(&self.path("priv"), &["commit", "-q", "-m", "more"]);
+    }
+
+    /// A repo `key` at `rel` (one commit) with the worktrees `wts/<name>`, declared in the private stack with the
+    /// Codex adapter; its main checkout.
+    fn repo(&self, key: &str, rel: &str, worktrees: &[&str]) -> PathBuf {
+        let main = self.path(rel);
+        fs::create_dir_all(&main).unwrap();
+        self.git(&main, &["init", "-q"]);
+        self.write(&format!("{rel}/README"), "a repo\n");
+        self.git(&main, &["add", "-A"]);
+        self.git(&main, &["commit", "-q", "-m", "start"]);
+        for w in worktrees {
+            let at = self.path(&format!("wts/{w}"));
+            self.git(&main, &["worktree", "add", "-q", "-b", w, at.to_str().unwrap()]);
+        }
+        let decl =
+            format!("[repos.{key}]\ncheckouts = ['{}']\nadapters = [\"codex\"]\n", main.display());
+        self.commit_private("stack.toml", &decl);
+        main
+    }
+}
+
+/// A private rule for the place `scope` (`workspace:NAME` or `repo:NAME`) whose text is `body`.
+fn rule(id: &str, scope: &str, body: &str) -> String {
+    format!("---\nid: rule.{id}\nkind: rule\ntitle: {id}\naudience: [all]\nscope: {scope}\nstatus: active\nvisibility: private\norigin:\n  type: own\n---\n{body}\n")
 }
 
 fn text(o: &Output) -> String {
@@ -129,8 +167,91 @@ fn a_place_is_selected_by_its_key_in_any_case_a_path_or_its_dir_name() {
     // The exact key resolves as before, and nothing is said about it.
     let o = env.sync(&["--repo", "work"]);
     assert!(plans_place(&o, &dir) && !text(&o).contains("--repo work:"), "{}", text(&o));
-    let o = env.lords_in(env.dir.path(), &["compose"], &["--repo", "HARNESS", "--role", "coder"]);
-    assert!(String::from_utf8_lossy(&o.stderr).contains("`work`"), "compose: {}", text(&o));
+}
+
+// Spec (review 4b r1, F2): compose by a selector composes the selected place, not another, and an undeclared name is
+// refused naming the declared keys.
+#[test]
+fn compose_by_a_selector_composes_the_selected_place() {
+    let env = Env::new(&[("work", "Harness"), ("other", "Other")]);
+    env.commit_private(
+        "global/rules/w.md",
+        &rule("w", "workspace:work", "Only the work place reads this."),
+    );
+    env.commit_private(
+        "global/rules/o.md",
+        &rule("o", "workspace:other", "Only the other place reads this."),
+    );
+    for typed in ["HARNESS", env.path("Harness").to_str().unwrap()] {
+        let o = env.lords_in(env.dir.path(), &["compose"], &["--repo", typed]);
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(o.status.success(), "compose --repo {typed}: {}", text(&o));
+        assert!(out.contains("Only the work place reads this."), "{out}");
+        assert!(!out.contains("Only the other place reads this."), "{out}");
+    }
+    let o = env.lords_in(env.dir.path(), &["compose"], &["--repo", "elsewhere"]);
+    assert!(!o.status.success() && text(&o).contains("names: other, work"), "{}", text(&o));
+}
+
+// Spec (design note A1: the exact key first): an exact key that is also a dir below the cwd, inside another place,
+// selects the key's place.
+#[test]
+fn an_exact_key_wins_over_a_dir_of_that_name_below_the_cwd() {
+    let env = Env::new(&[("work", "Harness"), ("other", "Other")]);
+    let inside = env.path("Harness");
+    fs::create_dir_all(inside.join("other")).unwrap();
+    let o = env.lords_in(&inside, &["sync"], &["--repo", "other"]);
+    assert!(plans_place(&o, &env.path("Other")), "{}", text(&o));
+    assert!(!names_file(&o, &inside), "{}", text(&o));
+}
+
+// Spec (review 4b r1, F1: "a path selector keeps the matched place as the scope, the same as --place DIR"): a path in
+// one worktree scopes a writing sync, normal or safe-only, to that worktree; the repo's main checkout and its other
+// worktree stay untouched. A --place beside a path selector is refused, and nothing is written.
+#[test]
+fn a_path_in_one_worktree_scopes_a_writing_sync_to_that_worktree() {
+    let env = Env::new(&[]);
+    // A place with no records yet is safe to create in, so the safe-only apply writes too (D13's setting).
+    env.commit_private("stack.toml", "[safe_only]\napplies = [\"new-place\"]\n");
+    let main = env.repo("r", "r", &["a", "b"]);
+    env.commit_private("global/rules/r.md", &rule("r", "repo:r", "The repo's rule."));
+    let (a, b) = (env.path("wts/a"), env.path("wts/b"));
+    let file = |dir: &Path| dir.join("AGENTS.override.md");
+    fs::create_dir_all(a.join("sub")).unwrap();
+    fs::create_dir_all(b.join("sub")).unwrap();
+
+    let o = env.sync(&["--repo", a.join("sub").to_str().unwrap(), "--apply"]);
+    assert!(file(&a).exists(), "the worktree named is written: {}", text(&o));
+    assert!(!file(&b).exists() && !file(&main).exists(), "only it: {}", text(&o));
+
+    let o = env.sync(&["--safe-only", "--repo", b.to_str().unwrap(), "--apply"]);
+    assert!(file(&b).exists(), "safe-only, the worktree named is written: {}", text(&o));
+    assert!(!file(&main).exists(), "safe-only, only it: {}", text(&o));
+
+    let place = ["--place", main.to_str().unwrap()];
+    let o = env.sync(&[&["--repo", a.to_str().unwrap(), "--apply"][..], &place].concat());
+    assert!(!o.status.success() && text(&o).contains("--place"), "{}", text(&o));
+    assert!(!file(&main).exists(), "a refused run writes nothing: {}", text(&o));
+}
+
+// Spec (design note A8): a repo whose worktrees can't be listed (its checkout isn't a git repo) is still selected by
+// a path in its declared checkout.
+#[test]
+fn a_repo_whose_worktrees_cant_be_listed_is_selected_by_its_checkout() {
+    let env = Env::new(&[]);
+    let plain = env.path("Plain");
+    fs::create_dir_all(plain.join("sub")).unwrap();
+    let decl =
+        format!("[repos.plain]\ncheckouts = ['{}']\nadapters = [\"codex\"]\n", plain.display());
+    env.commit_private("stack.toml", &decl);
+    env.commit_private("global/rules/p.md", &rule("p", "repo:plain", "The plain repo's rule."));
+    let o = env.lords_in(
+        env.dir.path(),
+        &["compose"],
+        &["--repo", plain.join("sub").to_str().unwrap()],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("The plain repo's rule."), "{}", text(&o));
 }
 
 // Spec (design note S2, attacks A3, A5: never a guess between two): two places with the same dir name are refused
