@@ -445,24 +445,18 @@ fn guard_install_replaces_a_copy_a_hook_is_running() {
 /// The rm guard run from the copy, waiting for its event on stdin: a hook holding the copy until its stdin closes. A
 /// copy this test wrote a moment ago may still be held open for writing by a child another test thread started then
 /// (ETXTBSY off Windows; red run lords-test-linux-fafeb675-1794160088-460579 met it here): that refusal alone is tried
-/// again for up to 1 s, as `process::run_guard` does for the guard copy.
+/// again for up to 1 s, through the same `process::start_while_busy` as the guard copy's own start (review r1, R1-01:
+/// no start past the window, the last refusal kept).
 fn running_hook(h: &Home) -> std::process::Child {
     use std::process::Stdio;
-    let since = std::time::Instant::now();
-    loop {
+    use std::time::{Duration, Instant};
+    let spawn = || {
         let mut c = h.cmd(&h.copy());
         c.args(["guard", "rm"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
-        match c.spawn() {
-            Err(e)
-                if cfg!(unix)
-                    && e.kind() == std::io::ErrorKind::ExecutableFileBusy
-                    && since.elapsed() < std::time::Duration::from_secs(1) =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(20))
-            }
-            r => return r.unwrap(),
-        }
-    }
+        c.spawn()
+    };
+    let until = Instant::now() + Duration::from_secs(1);
+    lords_core::process::start_while_busy(spawn, until, Instant::now, std::thread::sleep).unwrap()
 }
 
 // Spec (review r1, R1-01, witness 1: an owner's file `.lords-guard.exe.lords-busy-owner-notes.txt` was deleted by an
