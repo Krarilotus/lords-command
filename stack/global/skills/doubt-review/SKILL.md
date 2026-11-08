@@ -7,7 +7,8 @@ description: For orchestrators and package leads only. Use before accepting a no
 
 Adapted from addyosmani/agent-skills, doubt-driven-development (MIT, (c) 2025 Addy Osmani).
 
-Not for mechanical changes, clear owner instructions, or one-line fixes.
+Not for mechanical changes, clear owner instructions, or one-line fixes. A package's own fresh review round already is
+this review for what it covered; add one only for a risk that review didn't cover, and say which.
 
 ## Steps
 1. **Claim** - for yourself, two lines: what you believe and why it matters. Can't write it that short? It's not a decision yet.

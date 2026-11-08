@@ -6,7 +6,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "Before a test, state its specified input/result and source; if none, ask or state user behaviour; use independent outcomes, rewrite tautologies; never delete, skip or loosen an existing test to pass. Report fail-without/pass-with; test-before-fix commits are default; mutation is a fallback only for tests written after their fix; report why the test came after; send wrong tests to the orchestrator."
+core: "So a test proves specified behaviour: state its input, observable result and source first, check the outcome independently of the code, and report fail-without and pass-with (the test committed before its fix by default; mutation only as a stated fallback). Never delete, skip or loosen an existing test to make a change pass; one that looks wrong goes to the orchestrator."
 visibility: public
 origin:
   type: adapted
