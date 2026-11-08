@@ -972,6 +972,8 @@ fn the_delivery_settings_have_defaults_and_keep_the_state_inside_the_home() {
     let d = f.stacks().delivery();
     let all = (d.lock_wait_secs, d.attempts, d.retry_pause_secs, d.deadline_secs, d.store_work);
     assert_eq!(all, (120, 3, 2, 600, true));
+    // The limits review r1 found fixed (note §14.4): settings, with the values they had as defaults.
+    assert_eq!((d.store_git_secs, d.state_lock_secs), (30, 10));
     assert_eq!(
         (d.state.as_str(), &d.on_commit[..]),
         ("state/delivery.json", &[Store::Public, Store::Private][..])

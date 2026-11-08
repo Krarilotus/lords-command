@@ -20,9 +20,6 @@ pub const MARKER: &str = "LORDS_DELIVERING";
 /// What `lords deliver --protocol` answers: sync names a copy in a git hook only while it answers this one.
 pub const PROTOCOL: u32 = 1;
 
-/// How long one git read of a store may take.
-const GIT_DEADLINE: Duration = Duration::from_secs(30);
-
 /// One delivery's scope and trigger.
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -170,7 +167,9 @@ fn update(
     fsguard::create_dir_all(&Root::home(home)?.join(&parts))?;
     parts.push(Part::new(&format!("{name}.lock"))?);
     let lock_at = Root::home(home)?.join(&parts);
-    let until = Instant::now() + Duration::from_secs(10);
+    // `[delivery] state_lock_secs` (review r1's non-blocker: no fixed limit).
+    let limit = Duration::from_secs(settings.state_lock_secs);
+    let until = Instant::now() + limit;
     let _lock = loop {
         match fsguard::try_lock(&lock_at, &format!("pid {}", crate::process::id()))? {
             fsguard::TryLock::Held(l) => break l,
@@ -178,7 +177,11 @@ fn update(
                 std::thread::sleep(Duration::from_millis(100))
             }
             fsguard::TryLock::Busy(h) => {
-                return Err(format!("{} is held past 10 s ({h})", lock_at.path().display()))
+                return Err(format!(
+                    "{} is held past [delivery] state_lock_secs = {} ({h})",
+                    lock_at.path().display(),
+                    settings.state_lock_secs
+                ))
             }
         }
     };
@@ -187,7 +190,7 @@ fn update(
     let text = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
     let staged = fsguard::sibling(&p, "new")?;
     fsguard::create_file(&staged, text.as_bytes())?;
-    if let Err(e) = fsguard::rename_over(&staged, &p, Instant::now() + Duration::from_secs(10)) {
+    if let Err(e) = fsguard::rename_over(&staged, &p, Instant::now() + limit) {
         let _ = fsguard::delete_file(&staged);
         return Err(e);
     }
@@ -237,7 +240,8 @@ pub fn status(stacks: &Stacks, home: &Path) -> Status {
         Some("no whole delivery yet: run `lords deliver`".into())
     } else {
         let dirs = std::iter::once(&stacks.public).chain(&stacks.private).map(|s| s.root.as_path());
-        match dirs.map(tree).collect::<Result<Vec<_>, _>>() {
+        let limit = Duration::from_secs(settings.store_git_secs);
+        match dirs.map(|d| tree(d, limit)).collect::<Result<Vec<_>, _>>() {
             Ok(now) if now == state.trees => None,
             Ok(_) => Some(
                 "a store's committed stack moved past the last delivery (a store's post-commit log is in its git dir): run `lords deliver`"
@@ -249,8 +253,9 @@ pub fn status(stacks: &Stacks, home: &Path) -> Status {
     Status::Read(state, why)
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = crate::process::git_bounded(dir, args, GIT_DEADLINE)?;
+/// One git read of a store, stopped past `limit` (`[delivery] store_git_secs`).
+fn git(dir: &Path, args: &[&str], limit: Duration) -> Result<String, String> {
+    let out = crate::process::git_bounded(dir, args, limit)?;
     if !out.status.success() {
         return Err(format!(
             "{}: git {} failed: {}",
@@ -263,33 +268,37 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 /// The git tree of the stack committed in `dir` (a store's stack dir, its repo's root or below it), keyed by the dir.
-fn tree(dir: &Path) -> Result<StoreTree, String> {
-    Ok(StoreTree { stack: ledger::key(dir), tree: git(dir, &["rev-parse", "HEAD:./"])? })
+fn tree(dir: &Path, limit: Duration) -> Result<StoreTree, String> {
+    Ok(StoreTree { stack: ledger::key(dir), tree: git(dir, &["rev-parse", "HEAD:./"], limit)? })
 }
 
 /// Each store's committed stack, refusing a store whose stack dir holds anything not committed: edited, untracked, or
 /// ignored, which the stack loads all the same (F8 K4; sol-loop r1 S1). Only committed entries, which passed the
 /// stores' commit hooks, reach agents.
-fn committed(dirs: &[&Path]) -> Result<Vec<StoreTree>, String> {
+fn committed(dirs: &[&Path], limit: Duration) -> Result<Vec<StoreTree>, String> {
     let mut trees = Vec::new();
     for d in dirs {
         let status = "--no-optional-locks status --porcelain --untracked-files=all --ignored -- .";
-        if !git(d, &status.split(' ').collect::<Vec<_>>())?.is_empty() {
+        if !git(d, &status.split(' ').collect::<Vec<_>>(), limit)?.is_empty() {
             return Err(format!(
                 "{} has uncommitted (edited, untracked or ignored) files in its stack, and a delivery takes committed entries only; nothing was written: the next commit delivers",
                 d.display()
             ));
         }
-        trees.push(tree(d)?);
+        trees.push(tree(d, limit)?);
     }
     Ok(trees)
 }
 
 /// Whether a file git tracks in a store's stack dir was written at or after `since` (sol-loop r2 S4): a write put back
 /// before the next status leaves no other trace.
-fn written_since(dirs: &[&Path], since: std::time::SystemTime) -> Result<bool, String> {
+fn written_since(
+    dirs: &[&Path],
+    since: std::time::SystemTime,
+    limit: Duration,
+) -> Result<bool, String> {
     for d in dirs {
-        for f in git(d, &["ls-files", "-z"])?.split('\0').filter(|f| !f.is_empty()) {
+        for f in git(d, &["ls-files", "-z"], limit)?.split('\0').filter(|f| !f.is_empty()) {
             match fsguard::modified(d.join(f)) {
                 Ok(t) if t >= since => return Ok(true),
                 Ok(_) => {}
@@ -591,8 +600,9 @@ fn attempt(
     if Instant::now() > deadline {
         return Err(past("the apply lock came"));
     }
+    let git_limit = Duration::from_secs(settings.store_git_secs);
     if opts.worktree.is_none() {
-        trees = committed(&dirs)?;
+        trees = committed(&dirs, git_limit)?;
         if opts.on_commit.is_some() {
             if let Some(s) = read(home, settings).ok().flatten() {
                 if s.trees == trees && s.failed.is_none() {
@@ -610,7 +620,7 @@ fn attempt(
             // Its commits moved a store's tree; one it couldn't make may have left a store unclean (a file someone
             // edited meanwhile): then the delivery fails with why, the store work's own reasons named.
             if !done.is_empty() || !held.is_empty() {
-                trees = committed(&dirs).map_err(|e| {
+                trees = committed(&dirs, git_limit).map_err(|e| {
                     let why: Vec<String> =
                         held.iter().map(|n| format!("{}: {}", n.what, n.why)).collect();
                     match why.is_empty() {
@@ -652,7 +662,9 @@ fn attempt(
     // What was planned is what the stores committed: a store edited or committed while it loaded, or a file written
     // since the load began, even put back (a stack edit whose commit was refused), is planned again, so no uncommitted
     // text is delivered under a committed tree (K4; sol-loop r1 S4, r2 S4).
-    if opts.worktree.is_none() && (committed(&dirs)? != trees || written_since(&dirs, loading)?) {
+    if opts.worktree.is_none()
+        && (committed(&dirs, git_limit)? != trees || written_since(&dirs, loading, git_limit)?)
+    {
         let why = "a store's stack changed while the delivery planned";
         return Ok(Next::Again { pause: false, why: why.into() });
     }

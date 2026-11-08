@@ -176,6 +176,10 @@ pub struct Delivery {
     pub retry_pause_secs: u64,
     /// From a delivery's start: no attempt, plan or place starts past it, and the lock wait ends at it.
     pub deadline_secs: u64,
+    /// How long one git read of a store may take before it is stopped.
+    pub store_git_secs: u64,
+    /// How long a delivery waits for the state file's lock, and tries the state file's rename while a reader blocks it.
+    pub state_lock_secs: u64,
     /// Whether a whole delivery first imports memory and retires ended entries, each as its own store commit.
     pub store_work: bool,
     /// The state file, relative to the tool home, in plain parts.
@@ -190,6 +194,8 @@ impl Default for Delivery {
             attempts: 3,
             retry_pause_secs: 2,
             deadline_secs: 600,
+            store_git_secs: 30,
+            state_lock_secs: 10,
             store_work: true,
             state: "state/delivery.json".into(),
         }

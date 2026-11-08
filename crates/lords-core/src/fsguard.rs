@@ -1424,6 +1424,65 @@ pub fn siblings(p: &Contained, what: &str) -> Result<Vec<Contained>, String> {
     Ok(found)
 }
 
+/// The sibling of `p` called `name`, below the same root: one a place transaction recorded making (F8 review r1,
+/// R1-01). Refused unless `name` is one `sibling` gives `p` (`.<name>.lords-<what>-…`), so a record can name nothing
+/// else.
+pub fn sibling_named(p: &Contained, name: &str) -> Result<Contained, String> {
+    let file = p.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let prefix = format!(".{file}.lords-");
+    let known = ["new-", "old-", "done-"].iter().any(|w| name.starts_with(&format!("{prefix}{w}")));
+    if !known || name.contains(['/', '\\']) {
+        return Err(format!("{name}: not a name a transaction gives beside {}", p.path.display()));
+    }
+    let mut parts = p.parts.clone();
+    parts.pop();
+    parts.push(Part::new(name)?);
+    Ok(p.root.join(&parts))
+}
+
+/// A file held open for a place transaction (F8 review r1, R1-02): while it is, Windows refuses any open that doesn't
+/// share delete, so no reader of that kind can come between the transaction's swaps or its undo. Off Windows it holds
+/// nothing: no reader blocks a rename there.
+pub struct Holding {
+    _file: Option<fs::File>,
+}
+
+/// Holds the file at `p` open with delete access, sharing read, write and delete (`Holding`). While a reader without
+/// delete sharing holds it, Windows refuses: tried again every 50 ms until `deadline`, then refused with that error, so
+/// such a reader is found before the transaction writes.
+pub fn hold_open(p: &Contained, deadline: std::time::Instant) -> Result<Holding, String> {
+    check(&p.path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // DELETE | FILE_READ_ATTRIBUTES; FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
+        let (access, share) = (0x0001_0000 | 0x0080, 0x7);
+        loop {
+            match fs::OpenOptions::new().access_mode(access).share_mode(share).open(&p.path) {
+                Ok(file) => return Ok(Holding { _file: Some(file) }),
+                Err(e)
+                    if (e.kind() == std::io::ErrorKind::PermissionDenied
+                        || e.raw_os_error() == Some(32))
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50))
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "{}: {e} (a reader holds it open without delete sharing)",
+                        p.path.display()
+                    ))
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = deadline;
+        Ok(Holding { _file: None })
+    }
+}
+
 /// The file at `from` gets the second name `to`, where nothing may be.
 pub fn link_as(from: &Contained, to: &Contained) -> Result<(), String> {
     check(&from.path)?;

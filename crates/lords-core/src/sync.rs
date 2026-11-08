@@ -3475,7 +3475,9 @@ fn applied_under(
     plan.applies().map_err(|e| format!("{e} (nothing was changed)"))?;
     let changing: Vec<&Item> =
         plan.items.iter().filter(|i| i.changes() && i.action != Action::RetireEntry).collect();
-    if changing.is_empty() {
+    // A safe-only plan goes on with nothing to change too: its apply clears and reports what stopped runs left beside
+    // its paths (F8 review r1, R1-03).
+    if changing.is_empty() && plan.held.is_none() {
         return Ok(Applied::default());
     }
     // The place an item acts on is the one the plan built for its path: an item altered since doesn't apply.

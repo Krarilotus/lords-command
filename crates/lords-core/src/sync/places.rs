@@ -4,17 +4,80 @@
 //! a place is fully current or untouched. A file's swap is one rename over it, so a reader finds the old file or the new
 //! one, never none; a dir's is two renames, absent between them.
 //!
-//! What a stopped run leaves beside a path (no journal: nothing kills a delivery from inside, design note D-2) is
-//! named by its kind: `new` (a staged version: only new bytes) and `done` (an old version a swap checked, Lords' own
-//! bytes) go at the place's next transaction; `old` (a backup a swap hadn't checked yet, which may hold an owner's edit)
-//! holds the place until someone looks.
+//! A transaction removes only what it recorded making (review r1, R1-01; design note §14.1): before it makes anything
+//! beside a path, every name it will make there (`new`, a staged version; `old`, the current version's second name;
+//! `done`, the old version once checked; a dir's `new` aside in an undo) goes into the record in the tool home, with
+//! the hash it will hold. A later apply, whatever its plan, removes each recorded path that still holds its hash; any
+//! other `.<name>.lords-*` beside a plan's path is kept as it is and holds its place (`left-beside`).
+//!
+//! On Windows every file a place publishes or replaces is held open from before its first swap to the end (R1-02,
+//! §14.2), so a reader that doesn't share delete is found while nothing is published, and none can come between a
+//! swap and its undo. A place's dirs go before its files: a dir's move is the one step such a reader can still refuse,
+//! and it then comes while no file is published (the stated limit of §14.2).
 
 use super::{Action, Applied, Dest, HeldItem, HeldPlace, Hold, Item, PlaceId, Plan, Step};
-use crate::fsguard::{self, Contained, Kind, Tree};
+use crate::fsguard::{self, Contained, Holding, Kind, Part, Root, Tree};
 use crate::ledger::{self, Ledger, Owned};
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// The record's file, in the tool home beside the ledger.
+pub const RECORD: &str = "place-transaction.json";
+
+/// What place transactions made beside the plans' paths and haven't removed yet, each written here before it is made.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Record {
+    made: Vec<Made>,
+}
+
+/// One path a transaction made beside `beside` (a plan item's path, in the ledger's form): its name, whether it is a
+/// dir, and the hash it holds as made.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Made {
+    beside: String,
+    name: String,
+    dir: bool,
+    sha: String,
+}
+
+fn record_file(home: &Path) -> Result<Contained, String> {
+    Ok(Root::home(home)?.join(&[Part::new(RECORD)?]))
+}
+
+/// The record; empty without a file. One that can't be read is an error, so nothing is removed by a guess (A18).
+fn read_record(home: &Path) -> Result<Record, String> {
+    let at = record_file(home)?;
+    match fsguard::read(at.path())? {
+        None => Ok(Record::default()),
+        Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            format!(
+                "{}: can't be read ({e}); nothing beside a place's files was removed: look at it, keep what you need beside the place files, and delete it",
+                at.path().display()
+            )
+        }),
+    }
+}
+
+/// The record written whole by one rename, or its file removed when it lists nothing.
+fn write_record(home: &Path, r: &Record, wait: Duration) -> Result<(), String> {
+    let at = record_file(home)?;
+    if r.made.is_empty() {
+        return match fsguard::kind(at.path())? {
+            Kind::Missing => Ok(()),
+            _ => fsguard::delete_file(&at),
+        };
+    }
+    let text = serde_json::to_vec_pretty(r).map_err(|e| e.to_string())?;
+    let staged = fsguard::sibling(&at, "new")?;
+    fsguard::create_file(&staged, &text)?;
+    if let Err(e) = fsguard::rename_over(&staged, &at, Instant::now() + wait) {
+        let _ = fsguard::delete_file(&staged);
+        return Err(e);
+    }
+    Ok(())
+}
 
 /// What one item does to its path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +97,9 @@ struct Change<'a> {
     at: Option<Contained>,
     /// The new version, staged beside it.
     staged: Option<Contained>,
+    /// The names this change makes beside its path, given before anything is made (`name`): the staged version, the
+    /// old version's, the checked old version's, a dir's aside for an undo; each with its record line.
+    names: Names,
     /// The old version beside it, from its link or move there (`old`), renamed `done` once checked, until the place is
     /// through.
     backup: Option<Contained>,
@@ -45,6 +111,16 @@ struct Change<'a> {
     swapped: bool,
     /// The old version beside it was checked to be the record's.
     checked: bool,
+}
+
+/// A change's names beside its path (`Change::names`).
+#[derive(Default)]
+struct Names {
+    new: Option<Contained>,
+    old: Option<Contained>,
+    done: Option<Contained>,
+    aside: Option<Contained>,
+    made: Vec<(Made, Contained)>,
 }
 
 /// Why a place wasn't written.
@@ -141,43 +217,34 @@ pub(super) fn apply(
     between: &mut dyn FnMut(Step, &Path),
 ) -> Result<Applied, String> {
     let mut applied = Applied::default();
-    let held = |place: &PlaceId, items: &[&Item], why: String| {
+    let held = |place: &PlaceId, items: &[&Item], reason: Hold, why: String| {
         let first = items[0];
-        let item = HeldItem {
-            target: first.target.clone(),
-            path: first.path.clone(),
-            reason: Hold::WriteRefused,
-            note: why,
-        };
+        let item =
+            HeldItem { target: first.target.clone(), path: first.path.clone(), reason, note: why };
         let sync = super::safety::sync_command(place, items);
         HeldPlace { place: place.clone(), items: vec![item], sync }
     };
-    // What stopped runs left beside the plan's paths, every item's, in sync or not, before any place is written: cleared,
-    // or the place held (module doc). Each dir is listed once.
-    let mut listed: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
-    let mut left: BTreeMap<String, (PlaceId, &Item, String)> = BTreeMap::new();
-    for i in &plan.items {
-        let Dest::Tool(at) = &i.dest else { continue };
-        if let Err(Stop::Held(why) | Stop::Broken(why)) = sweep(at, &mut listed) {
-            for p in &i.places {
-                left.entry(p.key()).or_insert_with(|| (p.clone(), i, why.clone()));
-            }
-        }
-    }
+    let wait = plan.lock_wait.0;
+    // What stopped runs left beside the plan's paths, every item's, in sync or not, before any place is written: what
+    // the record lists and still holds what it recorded goes; anything else holds its place (module doc). A record
+    // that can't be read stops the apply before anything is removed.
+    let mut left = sweep(plan, wait)?;
     for (place, items) in groups(plan) {
         let found = items.iter().flat_map(|i| &i.places).find_map(|p| left.remove(&p.key()));
         if let Some((_, _, why)) = found {
-            applied.held.push(held(&place, &items, why));
+            applied.held.push(held(&place, &items, Hold::LeftBeside, why));
             continue;
         }
         if let Some(why) = in_sync_changed(plan, &items) {
-            applied.held.push(held(&place, &items, why));
+            applied.held.push(held(&place, &items, Hold::WriteRefused, why));
             continue;
         }
         let at = place_path(&place);
-        match one_place(&plan.home, ledger, &items, &at, plan.lock_wait.0, between) {
+        match one_place(&plan.home, ledger, &items, &at, wait, between) {
             Ok(done) => applied.done.extend(done),
-            Err(Stop::Held(why)) => applied.held.push(held(&place, &items, why)),
+            Err(Stop::Held(why)) => {
+                applied.held.push(held(&place, &items, Hold::WriteRefused, why))
+            }
             Err(Stop::Broken(why)) => {
                 return Err(format!(
                 "{why}. Apply stopped there; {} change(s) were made before it, each place whole",
@@ -186,11 +253,103 @@ pub(super) fn apply(
             }
         }
     }
-    // A place with nothing to change but a backup no one has checked beside one of its paths: held, so it is named.
+    // A place with nothing to change but something left beside one of its paths: held, so it is named.
     for (_, (place, item, why)) in left {
-        applied.held.push(held(&place, &[item], why));
+        applied.held.push(held(&place, &[item], Hold::LeftBeside, why));
     }
     Ok(applied)
+}
+
+/// What stopped transactions left beside the plan's paths, each path once (module doc): a recorded path that still
+/// holds its recorded hash goes, with its line; one that's gone loses its line; what's left beside a path after that
+/// holds its places, by place key, with why. Record lines beside paths this plan doesn't see stay for a later one.
+fn sweep(
+    plan: &Plan,
+    wait: Duration,
+) -> Result<BTreeMap<String, (PlaceId, &Item, String)>, String> {
+    let mut record = read_record(&plan.home)?;
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut listed: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    let mut left: BTreeMap<String, (PlaceId, &Item, String)> = BTreeMap::new();
+    for i in &plan.items {
+        let Dest::Tool(at) = &i.dest else { continue };
+        let here = ledger::key(at.path());
+        if !seen.insert(here.clone()) {
+            continue;
+        }
+        let why = match clear_beside(at, &here, &record, &mut listed)
+            .and_then(|()| kept_beside(at, &mut listed))
+        {
+            Ok(None) => continue,
+            Ok(Some(why)) | Err(why) => why,
+        };
+        for p in &i.places {
+            left.entry(p.key()).or_insert_with(|| (p.clone(), i, why.clone()));
+        }
+    }
+    record.made.retain(|m| !seen.contains(&m.beside));
+    write_record(&plan.home, &record, wait)?;
+    Ok(left)
+}
+
+/// Removes each path the record lists beside `at` that still holds what it recorded, a file as a file and a dir as a
+/// dir; any other stays as it is. A dir it removed from is listed again.
+fn clear_beside(
+    at: &Contained,
+    here: &str,
+    record: &Record,
+    listed: &mut BTreeMap<PathBuf, Vec<String>>,
+) -> Result<(), String> {
+    for m in record.made.iter().filter(|m| m.beside == here) {
+        let s = fsguard::sibling_named(at, &m.name)?;
+        let same = match (fsguard::kind(s.path())?, m.dir) {
+            (Kind::Dir, true) | (Kind::File, false) => {
+                hash(s.path())?.as_deref() == Some(&m.sha[..])
+            }
+            _ => false,
+        };
+        if same {
+            remove(&s)?;
+            if let Some(dir) = at.path().parent() {
+                listed.remove(dir);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Why the place of `at` is held for what is still beside it with Lords' sibling name (`.<name>.lords-…`), if
+/// anything is: no record lists it holding what it recorded, so it may be its owner's, and stays as it is. Each dir is
+/// listed once.
+fn kept_beside(
+    at: &Contained,
+    listed: &mut BTreeMap<PathBuf, Vec<String>>,
+) -> Result<Option<String>, String> {
+    let (Some(dir), Some(name)) = (at.path().parent(), at.path().file_name()) else {
+        return Ok(None);
+    };
+    if !listed.contains_key(dir) {
+        let names = match fsguard::kind(dir)? {
+            Kind::Dir => fsguard::list_dir(dir)?
+                .iter()
+                .filter_map(|e| e.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        listed.insert(dir.to_path_buf(), names);
+    }
+    let prefix = format!(".{}.lords-", name.to_string_lossy());
+    let left: Vec<&String> = listed[dir].iter().filter(|n| n.starts_with(&prefix)).collect();
+    if left.is_empty() {
+        return Ok(None);
+    }
+    let names: Vec<String> = left.iter().map(|n| dir.join(n).display().to_string()).collect();
+    Ok(Some(format!(
+        "{} beside {}: no transaction recorded making it as it is, so it is kept; compare it with {}, keep what you need, and delete it",
+        names.join(", "),
+        at.path().display(),
+        at.path().display()
+    )))
 }
 
 /// Why a place's file the plan leaves as it is (in sync) no longer holds what the plan read, if one doesn't: an edit
@@ -220,9 +379,54 @@ fn one_place(
     for i in items {
         changes.push(prepare(i, ledger)?);
     }
+    // Dirs before files (module doc; §14.2, decided (a)): a dir's move is refused, if at all, while no file is in.
+    changes.sort_by_key(|c| !matches!(c.op, Op::ReplaceDir | Op::CreateDir));
+    // Every name beside a path, and its record line, before anything is made there (§14.1).
+    for c in &mut changes {
+        name(c)?;
+    }
+    let mut record = read_record(home)?;
+    record.made.extend(changes.iter().flat_map(|c| c.names.made.iter().map(|(m, _)| m.clone())));
+    write_record(home, &record, wait)?;
+    let result = transact(home, ledger, &mut changes, at, wait, between);
+    // What it made and removed leaves the record; what is still beside a path stays recorded, for the next apply. A
+    // line left by a record that couldn't be rewritten names a path that is gone, which the next apply drops.
+    if let Ok(mut record) = read_record(home) {
+        let gone: Vec<&Made> = changes
+            .iter()
+            .flat_map(|c| &c.names.made)
+            .filter(|(_, s)| matches!(fsguard::kind(s.path()), Ok(Kind::Missing)))
+            .map(|(m, _)| m)
+            .collect();
+        record.made.retain(|m| !gone.contains(&m));
+        let _ = write_record(home, &record, wait);
+    }
+    result
+}
+
+/// The transaction proper (module doc): staged; old versions linked beside their paths and every file it publishes or
+/// replaces held open; swapped one by one; the holdings dropped and the checked old versions removed. A failure before
+/// the first swap leaves the place untouched; one after it puts the place back (`undo`).
+fn transact(
+    home: &Path,
+    ledger: &mut Ledger,
+    changes: &mut [Change],
+    at: &Path,
+    wait: Duration,
+    between: &mut dyn FnMut(Step, &Path),
+) -> Result<Vec<String>, Stop> {
     for k in 0..changes.len() {
         if let Err(why) = stage(&mut changes[k]) {
-            clear_staged(&mut changes);
+            clear_staged(changes);
+            return Err(Stop::Held(why));
+        }
+    }
+    let deadline = Instant::now() + wait;
+    let mut holding: Vec<Holding> = Vec::new();
+    for k in 0..changes.len() {
+        if let Err(why) = ready(&mut changes[k], &mut holding, deadline) {
+            drop(holding);
+            unready(changes);
             return Err(Stop::Held(why));
         }
     }
@@ -230,7 +434,9 @@ fn one_place(
     for k in 0..changes.len() {
         let deadline = Instant::now() + wait;
         if let Err(why) = swap(&mut changes[k], ledger, home, deadline) {
-            return Err(match undo(&mut changes, ledger, home, wait) {
+            let undone = undo(changes, ledger, home, wait);
+            drop(holding);
+            return Err(match undone {
                 Ok(()) => Stop::Held(why),
                 Err(left) => {
                     Stop::Broken(format!("{why}; and the place couldn't be put back whole: {left}"))
@@ -239,17 +445,83 @@ fn one_place(
         }
         between(Step::Swapped, at);
     }
-    let mut left = Vec::new();
-    for c in &mut changes {
+    drop(holding);
+    // The place is through; a backup that couldn't go stays recorded, and the next apply removes it.
+    for c in changes.iter_mut() {
         if let Some(b) = c.backup.take() {
-            if let Err(e) = remove(&b) {
-                left.push(e);
-            }
+            let _ = remove(&b);
         }
     }
-    // The place is through; a backup that couldn't go is Lords' own old bytes, and the next transaction removes it.
-    let _ = left;
     Ok(changes.iter().map(|c| format!("{:?} {}", c.item.action, c.item.path.display())).collect())
+}
+
+/// A change's names beside its path, each fresh (`fsguard::sibling`), with the record line of each: the hash of the
+/// new version for its staged one and a dir's aside, the record's hash for the old version and the checked one.
+fn name(c: &mut Change) -> Result<(), String> {
+    let Some(at) = c.at.clone() else { return Ok(()) };
+    let dir = matches!(c.op, Op::ReplaceDir | Op::CreateDir);
+    let new = match (&c.item.tree, dir) {
+        (Some(t), true) => fsguard::tree_sha(t),
+        _ => fsguard::sha(c.item.proposed.as_deref().unwrap_or("").as_bytes()),
+    };
+    let have = c.item.have.clone().unwrap_or_default();
+    let beside = ledger::key(at.path());
+    let mut made = Vec::new();
+    let mut one = |what: &str, sha: &str| -> Result<Contained, String> {
+        let s = fsguard::sibling(&at, what)?;
+        let name =
+            s.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        made.push((Made { beside: beside.clone(), name, dir, sha: sha.to_string() }, s.clone()));
+        Ok(s)
+    };
+    let mut names = Names::default();
+    match c.op {
+        Op::Forget => return Ok(()),
+        Op::CreateFile | Op::CreateDir => names.new = Some(one("new", &new)?),
+        Op::ReplaceFile => {
+            names.new = Some(one("new", &new)?);
+            names.old = Some(one("old", &have)?);
+            names.done = Some(one("done", &have)?);
+        }
+        Op::ReplaceDir => {
+            names.new = Some(one("new", &new)?);
+            names.old = Some(one("old", &have)?);
+            names.done = Some(one("done", &have)?);
+            names.aside = Some(one("new", &new)?);
+        }
+    }
+    names.made = made;
+    c.names = names;
+    Ok(())
+}
+
+/// Before the first swap (§14.2): a file's old version gets its second name beside it, and every file the place will
+/// publish or replace is held open, each tried until `deadline`. A reader without delete sharing is found here.
+fn ready(c: &mut Change, holding: &mut Vec<Holding>, deadline: Instant) -> Result<(), String> {
+    match (c.op, &c.at) {
+        (Op::ReplaceFile, Some(at)) => {
+            let old = c.names.old.clone().ok_or("no name for the old version")?;
+            fsguard::link_as(at, &old)?;
+            c.backup = Some(old);
+            holding.push(fsguard::hold_open(at, deadline)?);
+        }
+        (Op::CreateFile, Some(_)) => {}
+        _ => return Ok(()),
+    }
+    if let Some(s) = &c.staged {
+        holding.push(fsguard::hold_open(s, deadline)?);
+    }
+    Ok(())
+}
+
+/// Undoes `ready` and `stage` when the place won't be swapped: staged versions and the old versions' second names go.
+fn unready(changes: &mut [Change]) {
+    clear_staged(changes);
+    for c in changes {
+        if let Some(b) = c.backup.take() {
+            let _ = fsguard::delete_file(&b);
+        }
+    }
 }
 
 /// An item's change, checked against the ledger and the disk now, under the lock (check 0), and its path cleared of
@@ -304,6 +576,7 @@ fn prepare<'a>(item: &'a Item, ledger: &Ledger) -> Result<Change<'a>, Stop> {
         op,
         at,
         staged: None,
+        names: Names::default(),
         backup: None,
         new,
         old,
@@ -312,55 +585,20 @@ fn prepare<'a>(item: &'a Item, ledger: &Ledger) -> Result<Change<'a>, Stop> {
     })
 }
 
-/// What a stopped run left beside `p` (module doc): staged versions and checked old ones go; an unchecked backup that
-/// holds what `p` holds is the same old version and goes too; any other holds the place. `listed`: each dir's names,
-/// read once, so a path with nothing beside it costs no more.
-fn sweep(p: &Contained, listed: &mut BTreeMap<PathBuf, Vec<String>>) -> Result<(), Stop> {
-    let (Some(dir), Some(name)) = (p.path().parent(), p.path().file_name()) else { return Ok(()) };
-    if !listed.contains_key(dir) {
-        let names = match fsguard::kind(dir)? {
-            Kind::Dir => fsguard::list_dir(dir)?
-                .iter()
-                .filter_map(|e| e.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .collect(),
-            _ => Vec::new(),
-        };
-        listed.insert(dir.to_path_buf(), names);
-    }
-    let prefix = format!(".{}.lords-", name.to_string_lossy());
-    if !listed[dir].iter().any(|n| n.starts_with(&prefix)) {
+/// The new version, staged beside the path, at the name `name` recorded for it.
+fn stage(c: &mut Change) -> Result<(), String> {
+    if c.at.is_none() || c.op == Op::Forget {
         return Ok(());
     }
-    for left in fsguard::siblings(p, "new")?.iter().chain(&fsguard::siblings(p, "done")?) {
-        remove(left)?;
-    }
-    for b in fsguard::siblings(p, "old")? {
-        if hash(b.path())? == hash(p.path())? && fsguard::kind(b.path())? == Kind::File {
-            fsguard::delete_file(&b)?;
-        } else {
-            return Err(Stop::Held(format!(
-                "a stopped change left {} beside it, which may hold an owner's edit: compare it with {}, keep what you need, and delete it",
-                b.path().display(),
-                p.path().display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// The new version, staged beside the path.
-fn stage(c: &mut Change) -> Result<(), String> {
-    let Some(at) = &c.at else { return Ok(()) };
+    let staged = c.names.new.clone().ok_or("no name for the staged version")?;
     match c.op {
         Op::ReplaceFile | Op::CreateFile => {
-            let staged = fsguard::sibling(at, "new")?;
             let bytes = c.item.proposed.as_deref().unwrap_or("").as_bytes();
             fsguard::create_file(&staged, bytes)?;
             c.new = fsguard::sha(bytes);
             c.staged = Some(staged);
         }
         Op::ReplaceDir | Op::CreateDir => {
-            let staged = fsguard::sibling(at, "new")?;
             let tree: &Tree = c.item.tree.as_deref().ok_or("a dir planned without its contents")?;
             c.staged = Some(staged.clone());
             c.new = fsguard::put_tree(&staged, tree)?;
@@ -397,9 +635,9 @@ fn swap(c: &mut Change, ledger: &mut Ledger, home: &Path, deadline: Instant) -> 
             c.swapped = true;
         }
         (Op::ReplaceFile, Some(at), Some(staged)) => {
-            let backup = fsguard::sibling(at, "old")?;
-            fsguard::link_as(at, &backup)?;
-            c.backup = Some(backup.clone());
+            // The old version's second name, given by `ready`.
+            let backup =
+                c.backup.clone().ok_or_else(|| format!("{path}: no old version beside it"))?;
             // Check 1: the file is still the record's.
             if hash(backup.path())? != have {
                 return Err(changed());
@@ -410,12 +648,12 @@ fn swap(c: &mut Change, ledger: &mut Ledger, home: &Path, deadline: Instant) -> 
             if hash(backup.path())? != have {
                 return Err(changed());
             }
-            let done = fsguard::sibling(at, "done")?;
+            let done = c.names.done.clone().ok_or_else(|| format!("{path}: no name for done"))?;
             fsguard::move_to(&backup, &done)?;
             (c.backup, c.checked) = (Some(done), true);
         }
         (Op::ReplaceDir, Some(at), Some(staged)) => {
-            let backup = fsguard::sibling(at, "old")?;
+            let backup = c.names.old.clone().ok_or_else(|| format!("{path}: no name for old"))?;
             fsguard::move_to(at, &backup)?;
             // The path is empty until the new tree is in; `undo` moves the old one back.
             c.backup = Some(backup.clone());
@@ -424,7 +662,7 @@ fn swap(c: &mut Change, ledger: &mut Ledger, home: &Path, deadline: Instant) -> 
             }
             fsguard::move_to(&staged, at)?;
             (c.staged, c.swapped) = (None, true);
-            let done = fsguard::sibling(at, "done")?;
+            let done = c.names.done.clone().ok_or_else(|| format!("{path}: no name for done"))?;
             fsguard::move_to(&backup, &done)?;
             (c.backup, c.checked) = (Some(done), true);
         }
@@ -497,7 +735,7 @@ fn undo(
                     true
                 }
                 (Op::ReplaceDir, Some(b)) if ours => {
-                    let aside = fsguard::sibling(&at, "new")?;
+                    let aside = c.names.aside.clone().ok_or("no name for the aside")?;
                     fsguard::move_to(&at, &aside)?;
                     fsguard::move_to(&b, &at)?;
                     remove(&aside)?;

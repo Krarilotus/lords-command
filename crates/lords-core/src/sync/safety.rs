@@ -54,6 +54,9 @@ pub enum Hold {
     /// A check or write at apply that failed, after the plan typed the place safe: the place was put back whole (F8,
     /// C4). Never the planner's.
     WriteRefused,
+    /// A path with Lords' sibling name beside a place's file that no place transaction recorded making, or one it
+    /// recorded that no longer holds what it recorded: kept as it is, for its owner to look at (F8 review r1, R1-01).
+    LeftBeside,
     /// Not typed by the planner (`Item::new`'s default): held, never applied.
     Unclassified,
 }
@@ -80,6 +83,7 @@ impl std::fmt::Display for Hold {
             Hold::Retirement => "retirement",
             Hold::NotReady => "not-ready",
             Hold::WriteRefused => "write-refused",
+            Hold::LeftBeside => "left-beside",
             Hold::Unclassified => "unclassified",
         })
     }
