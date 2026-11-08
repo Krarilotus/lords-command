@@ -1787,6 +1787,7 @@ dependencies = [
  "icu_normalizer",
  "jiff",
  "jsonschema",
+ "libc",
  "regex",
  "serde",
  "serde_json",

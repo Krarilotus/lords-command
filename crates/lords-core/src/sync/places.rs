@@ -765,10 +765,9 @@ fn undo(
                 // The published file goes only while it is still what this put there, held from the hash to the
                 // replacement (sol-loop r2, S4); an owner's write in between is kept, with the new record.
                 (Op::ReplaceFile, Some(b)) if ours => {
-                    let aside = fsguard::sibling(&at, "old")?;
                     let path = at.path().to_path_buf();
                     let compared = &mut || between(Step::Compared, &path);
-                    match fsguard::replace_if(&at, &b, &aside, &c.new, compared)? {
+                    match fsguard::replace_if(&at, &b, &c.new, compared)? {
                         fsguard::Removal::Gone => true,
                         fsguard::Removal::Kept(_) => false,
                     }

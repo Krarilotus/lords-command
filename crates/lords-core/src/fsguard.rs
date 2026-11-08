@@ -870,14 +870,20 @@ fn move_aside_at(path: &Path) -> Result<PathBuf, String> {
 fn move_back_at(from: &Path, to: &Path) -> Result<(), String> {
     check(from)?;
     check(to)?;
+    let occupied = || {
+        format!("{}: something is there now; {} keeps the old one", to.display(), from.display())
+    };
     if !nothing_at(to)? {
-        return Err(format!(
-            "{}: something is there now; {} keeps the old one",
-            to.display(),
-            from.display()
-        ));
+        return Err(occupied());
     }
-    fs::rename(from, to).map_err(|e| format!("{}: {e}", to.display()))
+    // Never replaces what appeared since the check (F8 sol-loop r3, S4); any other error is said as it is (S6).
+    match rename_noreplace(from, to) {
+        Ok(()) => Ok(()),
+        Err(Renamed::Occupied) => Err(occupied()),
+        Err(Renamed::Failed(e)) => {
+            Err(format!("{}: couldn't go back ({e}); {} keeps it", to.display(), from.display()))
+        }
+    }
 }
 
 /// Moves a file or dir to `to`, a new path (into a backup, say); nothing is overwritten.
@@ -890,7 +896,78 @@ fn move_to_at(from: &Path, to: &Path) -> Result<(), String> {
     if !nothing_at(to)? {
         return Err(format!("{} exists; nothing is overwritten", to.display()));
     }
-    fs::rename(from, to).map_err(|e| format!("{}: {e}", from.display()))
+    // The check above is for a plain answer; the move itself never replaces (F8 sol-loop r3, S4).
+    match rename_noreplace(from, to) {
+        Ok(()) => Ok(()),
+        Err(Renamed::Occupied) => Err(format!("{} exists; nothing is overwritten", to.display())),
+        Err(Renamed::Failed(e)) => Err(format!("{}: {e}", from.display())),
+    }
+}
+
+/// Why `rename_noreplace` or `exchange` didn't happen: something is at the target (`Occupied`), or another error,
+/// which isn't read as occupancy (F8 sol-loop r3, S6).
+#[derive(Debug)]
+pub enum Renamed {
+    Occupied,
+    Failed(String),
+}
+
+impl From<std::io::Error> for Renamed {
+    fn from(e: std::io::Error) -> Renamed {
+        match e.kind() {
+            std::io::ErrorKind::AlreadyExists => Renamed::Occupied,
+            _ => Renamed::Failed(e.to_string()),
+        }
+    }
+}
+
+/// Renames `from` to `to` in one step that refuses, never replaces, whatever is at `to`, even if it appeared just
+/// before (no check-then-rename, F8 sol-loop r3, S4): `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows,
+/// `renameat2(RENAME_NOREPLACE)` on Linux. Elsewhere, and on a filesystem without it, refused.
+fn rename_noreplace(from: &Path, to: &Path) -> Result<(), Renamed> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+        let wide = |p: &Path| p.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+        let (f, t) = (wide(from), wide(to));
+        // SAFETY: two NUL-terminated wide paths that live across the call; flags 0: never replace, same volume only.
+        let ok = unsafe { MoveFileExW(f.as_ptr(), t.as_ptr(), 0) };
+        match ok {
+            0 => Err(std::io::Error::last_os_error().into()),
+            _ => Ok(()),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        renameat2(from, to, libc::RENAME_NOREPLACE).map_err(Renamed::from)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (from, to);
+        Err(Renamed::Failed("no rename that refuses to replace on this system".into()))
+    }
+}
+
+/// Swaps what `a` and `b` name, in one step, both always naming something (`renameat2(RENAME_EXCHANGE)`; F8 sol-loop
+/// r3, S5). On a filesystem without it, refused, and nothing changes.
+#[cfg(target_os = "linux")]
+fn exchange(a: &Path, b: &Path) -> Result<(), Renamed> {
+    renameat2(a, b, libc::RENAME_EXCHANGE).map_err(Renamed::from)
+}
+
+#[cfg(target_os = "linux")]
+fn renameat2(from: &Path, to: &Path, flags: libc::c_uint) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let f = std::ffi::CString::new(from.as_os_str().as_bytes())?;
+    let t = std::ffi::CString::new(to.as_os_str().as_bytes())?;
+    // SAFETY: two NUL-terminated paths that live across the call, both relative to the cwd only if relative.
+    let r =
+        unsafe { libc::renameat2(libc::AT_FDCWD, f.as_ptr(), libc::AT_FDCWD, t.as_ptr(), flags) };
+    match r {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
 }
 
 /// Replaces the file at `path` (or puts it where nothing is): the old one moves aside, the new one goes in, and the
@@ -1056,56 +1133,99 @@ pub fn delete_if(
     Ok(Removal::Gone)
 }
 
-/// Puts the file `with` at `p` in place of the file there, only while that one holds `sha`, keeping it out of any
-/// writer's reach from the hash to the replacement as `delete_if` does (sol-loop r2, S4): `p`'s file is moved to
-/// `aside` (an `old` name, so a reader that finds `p` absent knows a replacement is under way) and held, hashed,
-/// `compared` runs, then `with` moves to `p` and the held file is removed. A file holding anything else, or one a
-/// writer holds, goes back. If something appeared at `p` meanwhile, that stays and the held file is removed, so
-/// nothing of anyone's is lost: `Kept`, with `with` where it was.
+/// Puts the file `with` at `p` in place of the file there, only while that one holds `sha`, with `p` naming a file at
+/// every moment and no owner's write lost (F8 sol-loop r2 S4, r3 S4–S6). `Gone`: `with` is at `p`, and the file it
+/// replaced is gone. `Kept`: `p` is as it was. An error: the put-back couldn't be done, and what is where is said.
+/// - Windows: `p` is held where it is, so no writer can open it (one already there makes the hold fail, `Kept`);
+///   hashed; `compared` runs; `with` replaces it in one rename, under the hold.
+/// - Linux: `with` and `p` swap names in one step (`exchange`), so `p` holds the old version at once; the file swapped
+///   out is hashed, and `compared` runs. Only what was published, exactly, is removed; anything else (an owner's
+///   write before the swap) swaps back. A filesystem without the swap refuses the put-back, and nothing changes.
+/// - Elsewhere refused, nothing changed: no race is taken in place of the primitive.
 pub fn replace_if(
     p: &Contained,
     with: &Contained,
-    aside: &Contained,
     sha: &str,
     compared: &mut dyn FnMut(),
 ) -> Result<Removal, String> {
-    let (path, to) = (&p.path, &aside.path);
+    let path = &p.path;
+    check(path)?;
+    check(&with.path)?;
     if kind(path)? != Kind::File {
         return Ok(Removal::Kept(format!("{}: not a file now, so it is kept", path.display())));
     }
-    if let Err(e) = move_to_at(path, to) {
-        return Ok(Removal::Kept(e));
-    }
-    let back = |why: String| match move_back_at(to, path) {
-        Ok(()) => Ok(Removal::Kept(why)),
-        Err(e) => Err(format!("{why}; and it couldn't go back ({e}): it is at {}", to.display())),
-    };
-    let held = match hold_unwritable(to) {
-        Ok(h) => h,
-        Err(e) => return back(e),
-    };
-    match fs::read(to).map(|b| self::sha(&b)) {
-        Ok(now) if now == sha => {}
-        Ok(_) => {
-            drop(held);
-            return back(format!("{}: it holds something else now, so it is kept", path.display()));
+    let holds = |at: &Path| fs::read(at).map(|b| self::sha(&b) == sha);
+    #[cfg(windows)]
+    {
+        let held = match hold_unwritable(path) {
+            Ok(h) => h,
+            Err(e) => return Ok(Removal::Kept(e)),
+        };
+        match holds(path) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(Removal::Kept(format!(
+                    "{}: it holds something else now",
+                    path.display()
+                )))
+            }
+            Err(e) => return Ok(Removal::Kept(format!("{}: {e}", path.display()))),
         }
-        Err(e) => {
-            drop(held);
-            return back(format!("{}: {e}", to.display()));
-        }
-    }
-    compared();
-    if let Err(e) = move_to_at(&with.path, path) {
-        // Something is at `p` now, put there after the comparison: it stays, and the held file (what this replaced)
-        // goes, since it holds exactly `sha`.
-        fs::remove_file(to).map_err(|e| format!("{}: {e}", to.display()))?;
+        compared();
+        // One rename that replaces: `p` names the published file until it names the old version.
+        let put = fs::rename(&with.path, path);
         drop(held);
-        return Ok(Removal::Kept(format!("{e}; what is at {} now is kept", path.display())));
+        put.map_err(|e| {
+            format!(
+                "{}: the old version couldn't be put back ({e}); it keeps what was published",
+                path.display()
+            )
+        })?;
+        Ok(Removal::Gone)
     }
-    fs::remove_file(to).map_err(|e| format!("{}: {e}", to.display()))?;
-    drop(held);
-    Ok(Removal::Gone)
+    #[cfg(target_os = "linux")]
+    {
+        match exchange(&with.path, path) {
+            Ok(()) => {}
+            Err(Renamed::Occupied | Renamed::Failed(_)) => {
+                return Err(format!(
+                    "{}: this filesystem can't swap two names in one step (renameat2 RENAME_EXCHANGE), so the old version isn't put back; it keeps what was published",
+                    path.display()
+                ))
+            }
+        }
+        // `with` now names what was at `p`.
+        match holds(&with.path) {
+            Ok(true) => {
+                compared();
+                match fs::remove_file(&with.path) {
+                    Ok(()) => Ok(Removal::Gone),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Removal::Gone),
+                    Err(e) => Err(format!("{}: {e}", with.path.display())),
+                }
+            }
+            _ => match exchange(&with.path, path) {
+                Ok(()) => Ok(Removal::Kept(format!(
+                    "{}: it held something else, so it stays",
+                    path.display()
+                ))),
+                Err(_) => Err(format!(
+                    "{}: it held something else, and it couldn't go back: it is at {}, and {} holds the old version",
+                    path.display(),
+                    with.path.display(),
+                    path.display()
+                )),
+            },
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (holds, compared);
+        Err(format!(
+            "{}: no atomic put-back on this system, so the old version isn't put back",
+            path.display()
+        ))
+    }
 }
 
 /// The files at or under `p`, and the dirs (`p` first, each before what is in it): a file alone, or a dir's whole
