@@ -766,7 +766,10 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             (None, Some(t)) => lines.push(format!("({t})")),
             (None, None) => {}
         }
-        for (i, l) in e.body.trim_matches('\n').lines().enumerate() {
+        // One text whichever line endings the file was checked out with (gap 11 r6, R5-F1): with CRLF a leading blank
+        // line is "\r\n", which `trim_matches('\n')` keeps, so normalize first, as `core_lines::show` does.
+        let body = e.body.replace("\r\n", "\n");
+        for (i, l) in body.trim_matches('\n').lines().enumerate() {
             lines.push(l.trim_end_matches('\r').to_string());
             out.sources.push(Source {
                 line: lines.len(),
