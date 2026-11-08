@@ -228,7 +228,7 @@ pub(super) fn apply(
     // What stopped runs left beside the plan's paths, every item's, in sync or not, before any place is written: what
     // the record lists and still holds what it recorded goes; anything else holds its place (module doc). A record
     // that can't be read stops the apply before anything is removed.
-    let mut left = sweep(plan, wait)?;
+    let mut left = sweep(plan, wait, between)?;
     for (place, items) in groups(plan) {
         let found = items.iter().flat_map(|i| &i.places).find_map(|p| left.remove(&p.key()));
         if let Some((_, _, why)) = found {
@@ -263,10 +263,11 @@ pub(super) fn apply(
 /// What stopped transactions left beside the plan's paths, each path once (module doc): a recorded path that still
 /// holds its recorded hash goes, with its line; one that's gone loses its line; what's left beside a path after that
 /// holds its places, by place key, with why. Record lines beside paths this plan doesn't see stay for a later one.
-fn sweep(
-    plan: &Plan,
+fn sweep<'p>(
+    plan: &'p Plan,
     wait: Duration,
-) -> Result<BTreeMap<String, (PlaceId, &Item, String)>, String> {
+    between: &mut dyn FnMut(Step, &Path),
+) -> Result<BTreeMap<String, (PlaceId, &'p Item, String)>, String> {
     let mut record = read_record(&plan.home)?;
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut listed: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
@@ -277,7 +278,7 @@ fn sweep(
         if !seen.insert(here.clone()) {
             continue;
         }
-        let why = match clear_beside(at, &here, &record, &mut listed)
+        let why = match clear_beside(at, &here, &record, &mut listed, between)
             .and_then(|()| kept_beside(at, &mut listed))
         {
             Ok(None) => continue,
@@ -299,6 +300,7 @@ fn clear_beside(
     here: &str,
     record: &Record,
     listed: &mut BTreeMap<PathBuf, Vec<String>>,
+    between: &mut dyn FnMut(Step, &Path),
 ) -> Result<(), String> {
     for m in record.made.iter().filter(|m| m.beside == here) {
         let s = fsguard::sibling_named(at, &m.name)?;
@@ -309,6 +311,7 @@ fn clear_beside(
             _ => false,
         };
         if same {
+            between(Step::Compared, s.path());
             remove(&s)?;
             if let Some(dir) = at.path().parent() {
                 listed.remove(dir);
@@ -416,7 +419,7 @@ fn transact(
     between: &mut dyn FnMut(Step, &Path),
 ) -> Result<Vec<String>, Stop> {
     for k in 0..changes.len() {
-        if let Err(why) = stage(&mut changes[k]) {
+        if let Err(why) = stage(&mut changes[k], between) {
             clear_staged(changes);
             return Err(Stop::Held(why));
         }
@@ -586,11 +589,12 @@ fn prepare<'a>(item: &'a Item, ledger: &Ledger) -> Result<Change<'a>, Stop> {
 }
 
 /// The new version, staged beside the path, at the name `name` recorded for it.
-fn stage(c: &mut Change) -> Result<(), String> {
+fn stage(c: &mut Change, between: &mut dyn FnMut(Step, &Path)) -> Result<(), String> {
     if c.at.is_none() || c.op == Op::Forget {
         return Ok(());
     }
     let staged = c.names.new.clone().ok_or("no name for the staged version")?;
+    between(Step::Creating, staged.path());
     match c.op {
         Op::ReplaceFile | Op::CreateFile => {
             let bytes = c.item.proposed.as_deref().unwrap_or("").as_bytes();

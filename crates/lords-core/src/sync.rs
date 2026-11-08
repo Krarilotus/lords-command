@@ -3104,6 +3104,11 @@ pub enum Step {
     Staged,
     /// One item of the place is in, and its ledger record saved.
     Swapped,
+    /// A path a stopped transaction recorded was found to hold its recorded hash, and is about to be removed; the path
+    /// given is that path (F8 sol-loop r1, S1).
+    Compared,
+    /// A staged version is about to be made at the path given, its fresh name beside a place's path (sol-loop r1, S2).
+    Creating,
 }
 
 /// Why `apply_held` changed nothing.

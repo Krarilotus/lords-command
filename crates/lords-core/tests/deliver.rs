@@ -652,15 +652,8 @@ fn an_unchecked_backup_holds_its_place_when_nothing_else_changes() {
 // next delivery, with nothing to change, removes exactly those and holds nothing.
 #[test]
 fn a_stop_after_the_last_swap_is_cleared_by_a_delivery_with_nothing_to_change() {
-    let last = swaps(|f| {
-        rule_two(f);
-    });
     let f = Fixture::new();
-    let (a, b) = rule_two(&f);
-    let stop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_at(&f, Step::Swapped, last, None, || panic!("stopped"))
-    }));
-    assert!(stop.is_err(), "the last swap ({last}) was reached");
+    let (a, b) = stopped_after_last_swap(&f);
     for p in [&a, &b] {
         assert!(files(p).iter().all(|t| t.contains("Rule two.")), "current after its last swap");
     }
@@ -686,6 +679,130 @@ fn a_transaction_record_that_cant_be_read_removes_nothing() {
     assert_eq!(read(&sibling), "Some bytes.\n", "{r:?}");
     let failed = state(&f).failed.unwrap_or_else(|| panic!("recorded: {r:?}"));
     assert!(failed.why.contains("place-transaction.json"), "{failed:?}");
+}
+
+/// Rule two delivered up to its last swap, then stopped: every place is current, with the transaction's recorded
+/// backups (`done`) still beside the files of the last place.
+fn stopped_after_last_swap(f: &Fixture) -> (PathBuf, PathBuf) {
+    let last = swaps(|f| {
+        rule_two(f);
+    });
+    let ab = rule_two(f);
+    let stop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_at(f, Step::Swapped, last, None, || panic!("stopped"))
+    }));
+    assert!(stop.is_err(), "the last swap ({last}) was reached");
+    ab
+}
+
+/// The first of `places` with a `done` backup of its `CLAUDE.local.md` beside it, and that backup.
+fn a_done_backup(places: [&Path; 2]) -> (PathBuf, PathBuf) {
+    for p in places {
+        let found =
+            leftovers(p).into_iter().find(|n| n.starts_with(".CLAUDE.local.md.lords-done-"));
+        if let Some(n) = found {
+            return (p.to_path_buf(), p.join(n));
+        }
+    }
+    panic!("no done backup left: {:?} {:?}", leftovers(places[0]), leftovers(places[1]))
+}
+
+// Spec (sol-loop r1 S1: "an in-place write between the two is deleted, and for a directory `delete_tree_at` discards
+// whatever it now holds"; note §14.7, S1a): an owner's write to a recorded file, and into a recorded dir, made after
+// its hash was compared and before its removal, is kept, and its place is held.
+#[test]
+fn an_edit_between_the_comparison_and_the_removal_is_kept() {
+    let f = Fixture::new();
+    stopped_after_last_swap(&f);
+    let (mut file, mut dir) = (None, None);
+    let opts = Options::whole(&f.home());
+    let r = deliver::run_between(&f.pub_root(), Some(&f.priv_root()), &opts, &mut |s, p| {
+        if s != Step::Compared {
+            return;
+        }
+        let is_dir = p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("..lords."));
+        if is_dir && dir.is_none() {
+            fs::create_dir_all(p).unwrap();
+            fs::write(p.join("owner.txt"), "Owner's file in the dir.\n").unwrap();
+            dir = Some(p.to_path_buf());
+        } else if !is_dir && file.is_none() {
+            fs::write(p, "Owner's edit.\n").unwrap();
+            file = Some(p.to_path_buf());
+        }
+    })
+    .unwrap();
+    let file = file.unwrap_or_else(|| panic!("a recorded file was compared: {r:?}"));
+    let dir = dir.unwrap_or_else(|| panic!("a recorded dir was compared: {r:?}"));
+    assert_eq!(read(&file), "Owner's edit.\n", "{r:?}");
+    assert_eq!(read(&dir.join("owner.txt")), "Owner's file in the dir.\n", "{r:?}");
+    assert!(r.holds(), "{:?}", r.state);
+}
+
+// Spec (sol-loop r1 S1: "On Windows that means a handle that shares no write access, then hash, then delete"; note
+// §14.7, S1b): a recorded backup that a writer already holds open is kept with its bytes, and its place is held.
+#[cfg(windows)]
+#[test]
+fn a_recorded_backup_a_writer_holds_is_kept() {
+    let f = Fixture::new();
+    let (a, b) = stopped_after_last_swap(&f);
+    let (place, done) = a_done_backup([&a, &b]);
+    let bytes = read(&done);
+    let writer = fs::OpenOptions::new().write(true).open(&done).unwrap();
+    let r = run(&f).unwrap();
+    assert_eq!(read(&done), bytes, "kept as it was: {r:?}");
+    assert!(reasons(&r.state, &place).contains(&"left-beside".to_string()), "{:?}", r.state);
+    drop(writer);
+}
+
+// Spec (sol-loop r1 S2: "Recovery must not claim a failed creation"; note §14.7, S2): a dir planted at the name a
+// staged dir is about to take, with other content, is kept with its content, and its place is held.
+#[test]
+fn a_dir_planted_at_a_staged_name_is_kept() {
+    let f = Fixture::new();
+    let (a, _) = rule_two(&f);
+    let mut planted = None;
+    let opts = Options::whole(&f.home());
+    let r = deliver::run_between(&f.pub_root(), Some(&f.priv_root()), &opts, &mut |s, p| {
+        let staged_dir =
+            p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("..lords.lords-new-"));
+        if s == Step::Creating && planted.is_none() && staged_dir && key(p).starts_with(&key(&a)) {
+            fs::create_dir_all(p).unwrap();
+            fs::write(p.join("planted.txt"), "Planted, not Lords'.\n").unwrap();
+            planted = Some(p.to_path_buf());
+        }
+    })
+    .unwrap();
+    let planted =
+        planted.unwrap_or_else(|| panic!("a staged dir was about to be made in a: {r:?}"));
+    assert_eq!(read(&planted.join("planted.txt")), "Planted, not Lords'.\n", "{r:?}");
+    assert!(held_at(&r.state, &a).is_some(), "{:?}", r.state);
+    let r = run(&f).unwrap();
+    assert_eq!(
+        read(&planted.join("planted.txt")),
+        "Planted, not Lords'.\n",
+        "never claimed: {r:?}"
+    );
+}
+
+// Spec (sol-loop r1 S3: "An unchanged backup that a reader held temporarily becomes unrecorded forever after the
+// reader closes"; note §14.7): a recorded backup a reader holds open without delete sharing is kept while it does,
+// and the next delivery after the reader lets go removes it and holds nothing.
+#[cfg(windows)]
+#[test]
+fn a_backup_a_reader_held_is_removed_once_the_reader_lets_go() {
+    let f = Fixture::new();
+    let (a, b) = stopped_after_last_swap(&f);
+    let (place, done) = a_done_backup([&a, &b]);
+    let reader = read_sharing_only(&done).unwrap();
+    let r = run(&f).unwrap();
+    assert!(done.exists(), "kept while read: {r:?}");
+    assert!(held_at(&r.state, &place).is_some(), "{:?}", r.state);
+    drop(reader);
+    let r = run(&f).unwrap();
+    for p in [&a, &b] {
+        assert!(leftovers(p).is_empty(), "{:?}", leftovers(p));
+    }
+    assert!(!r.holds(), "{:?}", r.state);
 }
 
 // Spec (F8 §15, M4; review F8-R1-03; note A5): once a store's hooks are installed, delivery is configured, so a state
