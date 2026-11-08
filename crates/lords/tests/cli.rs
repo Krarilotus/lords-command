@@ -1316,6 +1316,36 @@ fn the_install_never_writes_a_file_past_its_harness_limit() {
     assert!(!fresh.status.success(), "{}", text(&fresh));
 }
 
+// Spec (the master thread, 8 Nov: `lords sync --repo Harness` answered only "no repo or workspace `Harness`", so the
+// caller couldn't tell the name to use): a `--repo` name the private stack doesn't declare is refused, and the answer
+// names the declared repos and workspaces, so the next command can use one.
+#[test]
+fn an_unknown_repo_name_is_refused_with_the_declared_names() {
+    let env = Env::new();
+    let d = env.dir.path();
+    let (public, private, work) = (d.join("pub"), d.join("priv"), d.join("Work"));
+    for p in [&public, &private, &work] {
+        fs::create_dir_all(p).unwrap();
+    }
+    fs::write(public.join("stack.toml"), "name = \"pub\"\nvisibility = \"public\"\n").unwrap();
+    let manifest = format!(
+        "name = \"priv\"\nvisibility = \"private\"\n[workspaces.work]\npath = '{}'\nadapters = [\"codex\"]\n",
+        work.display()
+    );
+    fs::write(private.join("stack.toml"), manifest).unwrap();
+    assert!(env.git(&private, &["init", "-q"]).status.success());
+    env.git(&private, &["add", "-A"]);
+    env.git(&private, &["commit", "-q", "-m", "start"]);
+    let stacks =
+        ["--public-stack", public.to_str().unwrap(), "--private-stack", private.to_str().unwrap()];
+    for safe_only in [&[][..], &["--safe-only"][..]] {
+        let o = env.lords(d, &[&["sync", "--repo", "Work"][..], safe_only, &stacks].concat());
+        let out = text(&o);
+        assert!(!o.status.success(), "{out}");
+        assert!(out.contains("`Work`") && out.contains("names: work"), "{out}");
+    }
+}
+
 // Spec (Codex's source, openai/codex 0d68383: `project_doc_max_bytes` bounds only the project's AGENTS files,
 // codex-rs/core/src/agents_md.rs:68-92 and 142-178, while `~/.codex/AGENTS.md` is read whole outside it,
 // codex-rs/codex-home/src/instructions/mod.rs:41-78): a user-level Codex file past 32 KiB is no conflict; it is

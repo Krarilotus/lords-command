@@ -29,6 +29,8 @@ usage:
     (a write of Codex's hooks: trusts Lords' own through Codex's app-server, names each hook that isn't trusted, exit 1)
   lords sync --safe-only [--user | --repo NAME [--place DIR]] [--json] [--apply]   only what needs no one: a place
     with anything else is held whole and named with why; no import or retirement (listed); exit 1 while a place is held
+  (sync scope: none, every declared place, the one command after a store commit; --user, the user-level files only;
+    --repo NAME, one repo or workspace by its stack.toml name)
   lords sync --restore BACKUP_DIR   undo one apply's owner-file edits, each only while it holds what sync wrote
   lords deliver [--on-commit DIR | --repo NAME --place DIR --new-worktree] [--home DIR]   the stores' committed
     entries into every place (or one new worktree), safe-only, under the apply lock, place by place; what it held, or
