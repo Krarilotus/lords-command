@@ -13,6 +13,7 @@ basis:
 - quote: "Everything has its place and needs to make semantic sense."
   date: 2026-10-25
   by: owner
+  source: "recorded only in this entry; not found in his intent files (corpus audit 8 Nov, U1)"
 - quote: "not just tooling to get it running but sorting of the meta information is crucial and actually making sure it's reviewable"
   date: 2026-10-25
   by: owner

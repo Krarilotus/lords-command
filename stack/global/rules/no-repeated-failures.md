@@ -13,6 +13,7 @@ basis:
 - quote: 'not running the same tasks and gates in loops that failed previously'
   date: 2026-10-20
   by: owner
+  source: "recorded only in this entry; not found in his intent files (corpus audit 8 Nov, U1)"
 evidence:
 - summary: Most failed scheduler jobs over a week showed no recorded cause and many were resubmitted unchanged; 22 % of host-hours went to failed or cancelled jobs.
   date: 2026-10-25

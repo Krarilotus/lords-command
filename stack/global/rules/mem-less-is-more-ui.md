@@ -13,6 +13,7 @@ basis:
 - quote: "the UI must speak for itself — a slick version"
   date: 2026-10-21
   by: owner
+  source: "recorded only in this entry; not found in his intent files (corpus audit 8 Nov, U1)"
 evidence:
 - summary: Three design rounds failed partly because agents produced large amounts of explanatory UI text; the owner had said it many times
   date: 2026-10-05

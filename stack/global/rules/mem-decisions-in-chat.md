@@ -15,12 +15,15 @@ basis:
 - quote: "I want to only decide line by line offered to me through you in chat … I can't be bothered to check different documents all over the place, that's for your organization with the subagents."
   date: 2026-10-03
   by: owner
+  source: "recorded only in this entry; not found in his intent files (corpus audit 8 Nov, U1)"
 - quote: "please not too many forward references its hard to follow then"
   date: 2026-10-21
   by: owner
+  source: "recorded only in this entry; not found in his intent files (corpus audit 8 Nov, U1)"
 - quote: "I think you should fold al lthe thigns into a bigger proposal i can sign off with taking your recommendations as defaults and ask only questions for the overall proposal so it is easier for me to grasp everything how it works together"
   date: 2026-10-30
   by: owner
+  source: "recorded only in this entry; not found in his intent files (corpus audit 8 Nov, U1)"
 evidence:
 - summary: "Example item: '1. Delete the build cache (frees 268 GB; risk: other apps rebuild slower) → yes/no'"
   date: 2026-10-03

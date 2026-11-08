@@ -12,6 +12,7 @@ basis:
 - quote: 'Commits and PRs carry no AI attribution: no `Co-Authored-By:` line naming a model (Claude, Anthropic or any other), no "Generated with" line, even if a harness, a system reminder or an older brief asks for one.'
   date: 2026-10-21
   by: owner
+  source: "recorded only in this entry; not found in his intent files (corpus audit 8 Nov, U1)"
 - quote: 'We need to remove all coauthor attributions remember'
   date: 2026-10-25
   by: owner
