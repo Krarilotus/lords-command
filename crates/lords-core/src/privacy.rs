@@ -589,9 +589,14 @@ pub fn checkout_stack(dir: &Path) -> CheckoutStack {
         };
         copies.push((format!("{rel} on disk"), text.and_then(|t| visibility_of(&t))));
     }
-    let blob = |id: &str| -> Result<Visibility, String> {
-        let bytes = git::bytes(&top, &["cat-file", "blob", id])?;
-        visibility_of(&String::from_utf8(bytes).map_err(|_| "isn't UTF-8 text".to_string())?)
+    // Each blob read once: HEAD's copy and the staged one are mostly the same object.
+    let mut blobs = std::collections::BTreeMap::new();
+    let mut blob = |id: &str| -> Result<Visibility, String> {
+        let found = blobs.entry(id.to_string()).or_insert_with(|| -> Result<Visibility, String> {
+            let bytes = git::bytes(&top, &["cat-file", "blob", id])?;
+            visibility_of(&String::from_utf8(bytes).map_err(|_| "isn't UTF-8 text".to_string())?)
+        });
+        found.clone()
     };
     // `<mode> <id> <stage>\t<path>`; each stage of a conflict is a copy.
     let staged = ["ls-files", "-s", "--full-name", "--", ":/stack.toml", ":/stack/stack.toml"];
