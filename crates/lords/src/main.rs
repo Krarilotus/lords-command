@@ -30,8 +30,8 @@ usage:
   lords sync --safe-only [--user | --repo NAME [--place DIR]] [--json] [--apply]   only what needs no one: a place
     with anything else is held whole and named with why; no import or retirement (listed); exit 1 while a place is held
   (sync scope: none, every declared place, the one command after a store commit; --user, the user-level files only;
-    --repo NAME, one repo or workspace by its stack.toml key in any case; a path in a checkout or worktree, or a
-    checkout's dir name, names that one only, as --place does; a scoped plan ends naming the places it leaves out.
+    --repo NAME, one repo or workspace by its stack.toml key in any case; a path in a checkout or worktree names
+    that one only, as --place does; a scoped plan ends naming the places it leaves out.
     uninstall --repo takes the key only)
   lords sync --restore BACKUP_DIR   undo one apply's owner-file edits, each only while it holds what sync wrote
   lords uninstall [--user | --repo NAME] [--apply]   remove the tool's paths that still match its ledger
@@ -675,9 +675,11 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         (Some(s), place) if s.place.is_none() => (Some(s.key), place),
         (Some(s), None) => (Some(s.key), s.place),
         (Some(_), Some(_)) => {
-            return Err("--repo names one checkout by its path or dir name: drop --place, or give --repo its key \
+            return Err(
+                "--repo names one checkout by its path: drop --place, or give --repo its key \
                  (nothing was planned)"
-                .into())
+                    .into(),
+            )
         }
     };
     let codex = lords_core::codex_trust::Codex::found(deadline);

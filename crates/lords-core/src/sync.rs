@@ -2119,9 +2119,9 @@ pub enum Reach {
     Place,
 }
 
-/// What a `--repo` selector names: a declared key, and, when it named one checkout or worktree of a repo by a path or
-/// a dir name, that dir, which scopes the command as `--place` does (review 4b r1, F1: a path never widens to the
-/// whole repo). A key names the whole repo; a workspace is one dir, so it has no `place`.
+/// What a `--repo` selector names: a declared key, and, when it named one checkout or worktree of a repo by a path,
+/// that dir, which scopes the command as `--place` does (review 4b r1, F1: a path never widens to the whole repo). A
+/// key names the whole repo; a workspace is one dir, so it has no `place`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Selected {
     pub key: String,
@@ -2130,8 +2130,8 @@ pub struct Selected {
 
 /// What a `--repo` selector names (gap 4b, S1–S3; `Selected`). The first rule that matches decides: the exact key;
 /// the key in any case; with `Reach::Place`, a path (relative to `cwd`) that is a declared place's dir or lies in one,
-/// the deepest; a declared checkout's or workspace's dir name in any case. A rule matching two keys is refused
-/// naming each, and no match is refused naming every key: never a guess.
+/// the deepest. A dir's name is no selector (fix check r1: one name can be a checkout's and a worktree's). A path
+/// matching two places is refused naming each, and no match is refused naming every key: never a guess.
 pub fn select(
     stacks: &Stacks,
     selector: &str,
@@ -2162,18 +2162,12 @@ pub fn select(
         for (key, repo) in &manifest.repos {
             let declared: Vec<PathBuf> = repo.checkouts.iter().map(|c| expand_home(c)).collect();
             let worktrees = checkouts(repo).map(|(roots, _, _)| roots).unwrap_or_default();
-            let place = |dir: PathBuf, declared: bool| Found {
-                key: key.clone(),
-                dir,
-                declared,
-                repo: true,
-            };
-            dirs.extend(declared.into_iter().map(|d| place(d, true)));
-            dirs.extend(worktrees.iter().map(|r| place(r.path().to_path_buf(), false)));
+            let place = |dir: PathBuf| Found { key: key.clone(), dir, repo: true };
+            dirs.extend(declared.into_iter().map(place));
+            dirs.extend(worktrees.iter().map(|r| place(r.path().to_path_buf())));
         }
         for (key, w) in &manifest.workspaces {
-            let dir = expand_home(&w.path);
-            dirs.push(Found { key: key.clone(), dir, declared: true, repo: false });
+            dirs.push(Found { key: key.clone(), dir: expand_home(&w.path), repo: false });
         }
         // Compared resolved (a junction or link, A4), in the ledger's form (any case on Windows); a declared dir that
         // isn't there never matches.
@@ -2196,18 +2190,6 @@ pub fn select(
                 }
             }
         }
-        let by_name = dirs
-            .iter()
-            .filter(|f| {
-                f.declared
-                    && f.dir
-                        .file_name()
-                        .is_some_and(|n| n.to_string_lossy().to_lowercase() == lower)
-            })
-            .collect();
-        if let Some(answer) = pick(selector, by_name, "its dir name") {
-            return answer;
-        }
     }
     let names: Vec<&str> = keys.iter().map(|k| k.as_str()).collect();
     let hint = match reach {
@@ -2222,11 +2204,10 @@ pub fn select(
     ))
 }
 
-/// One dir of a declared place, as `select` matches it: a repo's checkout (`declared`) or worktree, or a workspace.
+/// One dir of a declared place, as `select` matches it: a repo's checkout or worktree, or a workspace.
 struct Found {
     key: String,
     dir: PathBuf,
-    declared: bool,
     repo: bool,
 }
 
