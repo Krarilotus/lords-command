@@ -1326,10 +1326,12 @@ fn an_unknown_repo_name_is_refused_with_the_declared_names() {
     let stacks =
         ["--public-stack", public.to_str().unwrap(), "--private-stack", private.to_str().unwrap()];
     for safe_only in [&[][..], &["--safe-only"][..]] {
-        let o = env.lords(d, &[&["sync", "--repo", "Work"][..], safe_only, &stacks].concat());
+        // Not `Work`: since gap 4b a key in another case, or the place's dir name, selects it (tests/selectors.rs).
+        let o = env.lords(d, &[&["sync", "--repo", "elsewhere"][..], safe_only, &stacks].concat());
         let out = text(&o);
         assert!(!o.status.success(), "{out}");
-        assert!(out.contains("`Work`") && out.contains("names: work"), "{out}");
+        assert!(out.contains("`elsewhere`") && out.contains("names: work"), "{out}");
+        assert!(out.contains("no --repo: every place"), "{out}");
     }
 }
 

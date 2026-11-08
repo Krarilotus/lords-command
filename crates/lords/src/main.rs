@@ -30,7 +30,8 @@ usage:
   lords sync --safe-only [--user | --repo NAME [--place DIR]] [--json] [--apply]   only what needs no one: a place
     with anything else is held whole and named with why; no import or retirement (listed); exit 1 while a place is held
   (sync scope: none, every declared place, the one command after a store commit; --user, the user-level files only;
-    --repo NAME, one repo or workspace by its stack.toml name)
+    --repo NAME, one repo or workspace: its stack.toml key in any case, a path in it, or its dir name; a scoped plan
+    ends naming the places it leaves out. uninstall --repo takes the key only)
   lords sync --restore BACKUP_DIR   undo one apply's owner-file edits, each only while it holds what sync wrote
   lords uninstall [--user | --repo NAME] [--apply]   remove the tool's paths that still match its ledger
   lords uninstall --repo NAME --place DIR [--apply] [--json]   one checkout or worktree's recorded copies
@@ -666,6 +667,7 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         ));
     }
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    let repo = selected(&stacks, repo, sync::Reach::Place)?;
     let codex = lords_core::codex_trust::Codex::found(deadline);
     let opts = sync::Options {
         repo,
@@ -685,6 +687,12 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         print_plan(&plan);
         if let Some(held) = &plan.held {
             print_held(&plan, held);
+        }
+        if !plan.out_of_scope.is_empty() {
+            println!(
+                "not in this scope: {}; no --user or --repo covers every place",
+                plan.out_of_scope.join(", ")
+            );
         }
     }
     // A place skipped because its file would be cut never reads as success, planned or applied; nor does a place a
@@ -714,6 +722,22 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     print_applied(&applied);
     // A Codex hook that doesn't run never reads as success either (design note 2026-11-02-lords-codex-trust, §2.3).
     Ok(whole && applied.codex.is_empty())
+}
+
+/// A `--repo` selector as its declared key (gap 4b, `sync::select`), said on stderr when it isn't what was typed, so
+/// stdout and JSON stay the command's own.
+fn selected(
+    stacks: &Stacks,
+    typed: Option<String>,
+    reach: sync::Reach,
+) -> Result<Option<String>, String> {
+    let Some(typed) = typed else { return Ok(None) };
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let key = sync::select(stacks, &typed, &cwd, reach)?;
+    if key != typed {
+        eprintln!("--repo {typed}: `{key}`");
+    }
+    Ok(Some(key))
 }
 
 /// One record of a place, as `uninstall --place` lists it.
@@ -813,6 +837,7 @@ fn uninstall_place(a: &mut Args, dir: &Path, run: &mut PlaceRun) -> Result<bool,
         return Err("--place needs --repo (a checkout or worktree of that repo)".into());
     }
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    run.repo = selected(&stacks, run.repo.take(), sync::Reach::Key)?;
     let opts = sync::Options {
         repo: run.repo.clone(),
         user_only,
@@ -922,6 +947,7 @@ fn cmd_uninstall(mut a: Args) -> Result<bool, String> {
     let p = paths(&mut a)?;
     a.done()?;
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    let repo = selected(&stacks, repo, sync::Reach::Key)?;
     let opts = sync::Options {
         repo: repo.clone(),
         user_only,
@@ -1326,6 +1352,7 @@ fn cmd_compose(mut a: Args) -> Result<bool, String> {
     let p = paths(&mut a)?;
     a.done()?;
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    let place = selected(&stacks, place, sync::Reach::Place)?;
     let adapter = lords_core::adapters::get(&adapter_id).ok_or_else(|| {
         format!(
             "unknown adapter `{adapter_id}` (known: {})",

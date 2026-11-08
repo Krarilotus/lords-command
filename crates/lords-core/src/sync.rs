@@ -348,6 +348,10 @@ pub struct Plan {
     /// What `Stage::SafeOnly` left out; `None` for any other stage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub held: Option<Held>,
+    /// The declared repos and workspaces this plan's scope doesn't cover (`repo app`, `workspace notes`): what
+    /// `--user` or `--repo` leaves out, so "in sync" is never read as every place (gap 4b, S6).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub out_of_scope: Vec<String>,
 }
 
 /// What applying a plan releases besides its installs and updates: paths it removes, and ledger records it forgets
@@ -2106,6 +2110,133 @@ pub(crate) fn checkouts(repo: &stack::Repo) -> Result<Checkouts, String> {
     }
     Ok((out, skipped, stale))
 }
+
+/// How far a `--repo` selector reaches (gap 4b, design note 2026-11-08-lords-gap4b-selectors S5): `uninstall` takes
+/// a key only, in any case, since a path there could name one worktree yet remove the whole repo's copies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reach {
+    Key,
+    Place,
+}
+
+/// The declared key a `--repo` selector names (gap 4b, S1–S3). The first rule that matches decides: the exact key;
+/// the key in any case; with `Reach::Place`, a path (relative to `cwd`) that is a declared place's dir or lies in one,
+/// the deepest; a declared checkout's or workspace's dir name in any case. A rule matching two keys is refused
+/// naming each, and no match is refused naming every key: never a guess.
+pub fn select(stacks: &Stacks, selector: &str, cwd: &Path, reach: Reach) -> Result<String, String> {
+    let manifest = &stacks
+        .private
+        .as_ref()
+        .ok_or(
+            "repos and workspaces are declared in the private stack.toml; no private stack loaded",
+        )?
+        .manifest;
+    let keys: Vec<&String> = manifest.repos.keys().chain(manifest.workspaces.keys()).collect();
+    if keys.iter().any(|k| *k == selector) {
+        return Ok(selector.to_string());
+    }
+    // One key, or a refusal naming each candidate; `None` when the rule matched nothing.
+    let pick = |found: Vec<(String, String)>, how: &str| -> Option<Result<String, String>> {
+        let mut found = found;
+        found.sort();
+        found.dedup_by(|a, b| a.0 == b.0);
+        match &found[..] {
+            [] => None,
+            [(key, _)] => Some(Ok(key.clone())),
+            many => Some(Err(format!(
+                "--repo `{selector}` names more than one place by {how}: {}; give the key",
+                many.iter().map(|(k, d)| format!("`{k}` ({d})")).collect::<Vec<_>>().join(", ")
+            ))),
+        }
+    };
+    let lower = selector.to_lowercase();
+    let in_any_case = keys
+        .iter()
+        .filter(|k| k.to_lowercase() == lower)
+        .map(|k| (k.to_string(), "its key in another case".to_string()))
+        .collect();
+    if let Some(answer) = pick(in_any_case, "its key in another case") {
+        return answer;
+    }
+    if reach == Reach::Place {
+        // Each declared place's dirs: a repo's checkouts and the worktrees git lists (a repo whose worktrees can't be
+        // listed keeps its checkouts, A8), a workspace's path.
+        let mut dirs: Vec<(String, PathBuf, bool)> = Vec::new();
+        for (key, repo) in &manifest.repos {
+            let declared: Vec<PathBuf> = repo.checkouts.iter().map(|c| expand_home(c)).collect();
+            let worktrees = checkouts(repo).map(|(roots, _, _)| roots).unwrap_or_default();
+            dirs.extend(declared.into_iter().map(|d| (key.clone(), d, true)));
+            dirs.extend(worktrees.iter().map(|r| (key.clone(), r.path().to_path_buf(), false)));
+        }
+        for (key, w) in &manifest.workspaces {
+            dirs.push((key.clone(), expand_home(&w.path), true));
+        }
+        // Compared resolved (a junction or link, A4), in the ledger's form (any case on Windows); a declared dir that
+        // isn't there never matches.
+        let resolved = |p: &Path| fsguard::canonical(p).ok().map(|c| ledger::key(&c));
+        let typed = Path::new(selector);
+        let typed = if typed.is_absolute() { typed.to_path_buf() } else { cwd.join(typed) };
+        if let Some(at) = resolved(&typed) {
+            let within: Vec<(String, String, usize)> = dirs
+                .iter()
+                .filter_map(|(key, dir, _)| {
+                    let d = resolved(dir)?;
+                    (at == d || at.starts_with(&format!("{}/", d.trim_end_matches('/'))))
+                        .then(|| (key.clone(), d.clone(), d.len()))
+                })
+                .collect();
+            if let Some(deepest) = within.iter().map(|w| w.2).max() {
+                let found =
+                    within.into_iter().filter(|w| w.2 == deepest).map(|(k, d, _)| (k, d)).collect();
+                if let Some(answer) = pick(found, "a path") {
+                    return answer;
+                }
+            }
+        }
+        let by_name = dirs
+            .iter()
+            .filter(|(_, dir, declared)| {
+                *declared
+                    && dir.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase() == lower)
+            })
+            .map(|(k, d, _)| (k.clone(), adapters::slashes(d)))
+            .collect();
+        if let Some(answer) = pick(by_name, "its dir name") {
+            return answer;
+        }
+    }
+    let names: Vec<&str> = keys.iter().map(|k| k.as_str()).collect();
+    let hint = match reach {
+        Reach::Place => " or a path inside one",
+        Reach::Key => {
+            "; uninstall takes a key (one checkout or worktree: `--repo KEY --place DIR`)"
+        }
+    };
+    Err(format!(
+        "no repo or workspace `{selector}` in the private stack.toml; its names: {}{hint} (no --repo: every place)",
+        names.join(", ")
+    ))
+}
+
+/// The declared repos and workspaces a plan's scope leaves out (gap 4b, S6): every one with `--user`, every other
+/// one with `--repo`, none without a scope.
+fn left_out(manifest: &stack::Manifest, opts: &Options) -> Vec<String> {
+    if opts.uninstall {
+        return Vec::new();
+    }
+    let all = manifest
+        .repos
+        .keys()
+        .map(|k| (k, "repo"))
+        .chain(manifest.workspaces.keys().map(|k| (k, "workspace")));
+    match (&opts.repo, opts.user_only) {
+        (None, false) => Vec::new(),
+        (repo, _) => all
+            .filter(|(k, _)| repo.as_deref() != Some(k.as_str()))
+            .map(|(k, kind)| format!("{kind} {k}"))
+            .collect(),
+    }
+}
 /// Where sync writes a place's files: a repo (its checkouts and worktrees) or a workspace (one dir, no git).
 struct Place<'a> {
     label: String,
@@ -2706,6 +2837,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
             home: opts.home.clone(),
             ledger_revision: ledger.revision(),
             codex: opts.codex.clone(),
+            out_of_scope: left_out(&private.manifest, opts),
             ..Plan::default()
         },
         ledger,
