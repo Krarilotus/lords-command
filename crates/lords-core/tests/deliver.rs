@@ -395,25 +395,52 @@ fn an_edit_to_an_in_sync_file_before_its_place_is_written_holds_the_place() {
     assert!(held_at(&r.state, &b).is_some(), "{:?}", r.state);
 }
 
-// Spec (sol-loop r2 S4; K4: only committed text reaches agents): a store file written while the delivery planned, even
-// put back as it was (a stack edit whose commit was refused), may have been read uncommitted: the delivery plans again,
-// from what the store holds then, and delivers that.
+// Spec (K4, only committed text reaches agents, held by construction since gap 11: design note §0e, R6-N2; it replaces
+// sol-loop r2 S4's spec, under which a store file written while the delivery planned made it plan again, two attempts):
+// a store file changed once the delivery has the stores' committed trees, and left changed, is never delivered. The
+// delivery delivers the committed text, in one attempt.
 #[test]
-fn a_store_file_written_while_the_delivery_planned_is_planned_again() {
+fn a_store_file_changed_after_the_capture_is_not_delivered() {
     let f = Fixture::new();
     let (a, b) = delivered_once(&f, "");
     rule(&f, "Rule two.\n");
     commit(&f, "pub", "rule two");
-    let file = f.path("pub/global/rules/r.md");
-    let committed_text = read(&file);
-    let r = run_at(&f, Step::Planned, 1, None, || {
-        fs::write(&file, "a draft").unwrap();
-        fs::write(&file, &committed_text).unwrap();
-    })
-    .unwrap();
-    assert_eq!(r.attempts, 2, "{r:?}");
+    let r = run_at(&f, Step::Captured, 1, None, || rule(&f, "A draft.\n")).unwrap();
+    assert_eq!(r.attempts, 1, "{r:?}");
     for p in [&a, &b] {
-        assert!(files(p).iter().all(|t| t.contains("Rule two.")), "{r:?}");
+        assert!(
+            files(p).iter().all(|t| t.contains("Rule two.") && !t.contains("A draft.")),
+            "{r:?}"
+        );
+    }
+}
+
+// Spec (gap 11 §0d, I3; §0d.6 T8a: "the files whole delivery installs equal … the composition from the committed
+// trees"; the orchestrator, 8 Nov 16:45: "agents get what was committed"): a store's checkout can hold other text than
+// its commit while git calls it clean, by a skip-worktree file edited in place and by the `ident` attribute expanding
+// `$Id$`. Whole delivery delivers the committed text of both.
+#[test]
+fn a_clean_checkout_that_differs_from_its_commit_delivers_the_commit() {
+    let f = Fixture::new();
+    let (a, b) = delivered_once(&f, "");
+    let roles = "roles: [coder, reviewer]\n";
+    f.write("pub/.gitattributes", "global/rules/i.md ident\n");
+    f.write("pub/global/rules/i.md", &entry("rule.i", "global", "public", roles, "Id $Id$ end.\n"));
+    rule(&f, "Rule two.\n");
+    commit(&f, "pub", "rule two, and an ident entry");
+    let pub_root = f.pub_root();
+    git(&pub_root, &["update-index", "--skip-worktree", "global/rules/r.md"]);
+    rule(&f, "Checkout text.\n");
+    fs::remove_file(f.path("pub/global/rules/i.md")).unwrap();
+    git(&pub_root, &["checkout", "--", "global/rules/i.md"]);
+    assert!(read(&f.path("pub/global/rules/i.md")).contains("$Id: "), "git expanded it");
+    assert_eq!(git(&pub_root, &["status", "--porcelain"]), "", "git calls the checkout clean");
+    let r = run(&f).unwrap();
+    for p in [&a, &b] {
+        for t in files(p) {
+            assert!(t.contains("Rule two.") && !t.contains("Checkout text."), "{r:?}\n{t}");
+            assert!(t.contains("Id $Id$ end.") && !t.contains("$Id: "), "{t}");
+        }
     }
 }
 

@@ -3246,6 +3246,9 @@ impl ApplyLock {
 /// an owner's edit, a reader or a kill would.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
+    /// A delivery has the stores' committed trees it delivers, under the lock it applies with; it hasn't loaded them
+    /// yet (gap 11, §0e: what is written to a store's checkout from here on can't reach this delivery).
+    Captured,
     /// A delivery's plan is made, under the lock it applies with; nothing is written yet.
     Planned,
     /// Every item of one place is checked and its new version staged beside it; nothing at its paths has changed.

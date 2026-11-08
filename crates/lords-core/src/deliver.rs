@@ -636,6 +636,7 @@ fn attempt(
     if Instant::now() > deadline {
         return Err(past("the store work ended"));
     }
+    between(Step::Captured, home);
     // Every store file written from here on was perhaps read half way (sol-loop r2 S4).
     let loading = std::time::SystemTime::now();
     let stacks = Stacks::load(public, private)?;
