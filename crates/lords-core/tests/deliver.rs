@@ -695,7 +695,9 @@ fn stopped_after_last_swap(f: &Fixture) -> (PathBuf, PathBuf) {
     ab
 }
 
-/// The first of `places` with a `done` backup of its `CLAUDE.local.md` beside it, and that backup.
+/// The first of `places` with a `done` backup of its `CLAUDE.local.md` beside it, and that backup. Only the Windows
+/// reader and writer cases ask (an unused function fails clippy elsewhere).
+#[cfg(windows)]
 fn a_done_backup(places: [&Path; 2]) -> (PathBuf, PathBuf) {
     for p in places {
         let found =
