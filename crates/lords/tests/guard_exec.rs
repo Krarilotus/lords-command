@@ -66,3 +66,58 @@ fn a_guard_copy_held_open_for_writing_longer_is_refused_with_why() {
     assert!(e.contains("busy"), "{e}");
     assert!(took < Duration::from_millis(2500), "bounded: {took:?}");
 }
+
+/// A stand-in guard copy that never answers: it hangs until it is killed.
+fn hanging(d: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = d.join("hanging-guard");
+    fs::write(&p, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+/// `guard_self_test_within(copy, budget)`, started while the copy is held open for writing, which ends `hold` later;
+/// and how long it took.
+fn within_while_held(
+    copy: &Path,
+    hold: Duration,
+    budget: Duration,
+) -> (Result<(), String>, Duration) {
+    let held = fs::OpenOptions::new().write(true).open(copy).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        drop(held);
+    });
+    let started = Instant::now();
+    let r = lords_core::process::guard_self_test_within(copy, budget);
+    let took = started.elapsed();
+    release.join().unwrap();
+    (r, took)
+}
+
+// Spec (package review r1, R1-01: "establish the overall deadline before the first spawn and retain it through
+// child/output waiting"; the master: a spawn that succeeds near the window's end does not get a fresh budget): a copy
+// held busy for 800 ms that then hangs is stopped at its budget (1.5 s) counted from the call, not from its start
+// (about 2.3 s).
+#[test]
+fn a_copy_that_starts_late_gets_only_what_is_left_of_its_budget() {
+    let d = tempfile::TempDir::new().unwrap();
+    let copy = hanging(d.path());
+    let (r, took) =
+        within_while_held(&copy, Duration::from_millis(800), Duration::from_millis(1500));
+    let e = r.expect_err("past its budget");
+    assert!(e.contains("took over"), "the budget stops it: {e}");
+    assert!(took < Duration::from_millis(2000), "one budget from the call: {took:?}");
+}
+
+// Spec (package review r1, R1-01: the busy wait inside the overall budget): a copy held busy for longer than a short
+// budget (300 ms) is refused as busy when the budget ends, not after the whole busy window (1 s).
+#[test]
+fn the_busy_wait_ends_with_the_budget() {
+    let d = tempfile::TempDir::new().unwrap();
+    let copy = hanging(d.path());
+    let (r, took) = within_while_held(&copy, Duration::from_secs(3), Duration::from_millis(300));
+    let e = r.expect_err("refused");
+    assert!(e.contains("busy"), "the last busy refusal: {e}");
+    assert!(took < Duration::from_millis(700), "within the budget: {took:?}");
+}

@@ -91,12 +91,22 @@ pub(crate) fn git_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result
     c.output().map_err(|e| format!("git {}: {e}", args.join(" ")))
 }
 
+/// How long one run of the guard copy may take, its start included.
+const GUARD_TIME: Duration = Duration::from_secs(20);
+
 /// Runs `<exe> guard --self-test` and requires it to print `ok` and exit 0 within 20 s: the copy a harness hook will
 /// run answers before sync names it (orchestrator, 30 Oct). A child past the deadline is killed. Public for tests only
 /// (tests/guard_exec.rs runs it at the moment a copy is held open, which `install_guard`'s reads before it can't fix).
 #[doc(hidden)]
 pub fn guard_self_test(guard_copy: &Path) -> Result<(), String> {
-    let (status, out) = run_guard(guard_copy, &["guard", "--self-test"], b"", "guard self-test")?;
+    guard_self_test_within(guard_copy, GUARD_TIME)
+}
+
+/// `guard_self_test` within `budget` instead of 20 s: public for tests only, which can't wait 20 s for a hung copy.
+#[doc(hidden)]
+pub fn guard_self_test_within(guard_copy: &Path, budget: Duration) -> Result<(), String> {
+    let args = ["guard", "--self-test"];
+    let (status, out) = run_guard_within(guard_copy, &args, b"", "guard self-test", budget)?;
     if status.success() && out.trim() == "ok" {
         Ok(())
     } else {
@@ -236,6 +246,17 @@ fn run_guard(
     stdin: &[u8],
     what: &str,
 ) -> Result<(std::process::ExitStatus, String), String> {
+    run_guard_within(guard_copy, args, stdin, what, GUARD_TIME)
+}
+
+/// `run_guard` within `budget`.
+fn run_guard_within(
+    guard_copy: &Path,
+    args: &[&str],
+    stdin: &[u8],
+    what: &str,
+    budget: Duration,
+) -> Result<(std::process::ExitStatus, String), String> {
     use std::io::{Read, Write};
     // Off Windows a file any process holds open for writing doesn't run (ETXTBSY). A copy written and closed a moment
     // ago can still be held: a child another thread of this process started meanwhile holds every file open then until
@@ -266,7 +287,8 @@ fn run_guard(
     if let Some(mut i) = child.stdin.take() {
         let _ = i.write_all(stdin);
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + budget;
+    let secs = budget.as_secs_f32();
     // Its output is read beside it, so a child that keeps the pipe open can't hold the sync past the deadline
     // (sol-loop r2, S14).
     let (tx, rx) = std::sync::mpsc::channel();
@@ -284,15 +306,15 @@ fn run_guard(
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("{}: {what} took over 20 s", guard_copy.display()));
+                return Err(format!("{}: {what} took over {secs} s", guard_copy.display()));
             }
             None => std::thread::sleep(std::time::Duration::from_millis(20)),
         }
     };
     let left = deadline.saturating_duration_since(std::time::Instant::now());
-    let out = rx
-        .recv_timeout(left)
-        .map_err(|_| format!("{}: {what}'s output not closed within 20 s", guard_copy.display()))?;
+    let out = rx.recv_timeout(left).map_err(|_| {
+        format!("{}: {what}'s output not closed within {secs} s", guard_copy.display())
+    })?;
     Ok((status, out))
 }
 
