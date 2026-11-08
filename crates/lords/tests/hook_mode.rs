@@ -3,14 +3,16 @@
 //! checks in the mode of the checkout it runs in, whichever checkout installed it. Every copy of that checkout's
 //! manifests (`stack.toml`, `stack/stack.toml`; in HEAD, staged, on disk, tracked or not) saying `private` is secrets
 //! only; all saying `public` is the whole policy; anything else is the whole policy with a line saying why. Design note
-//! 2026-11-08-lords-d28-r2, attack list 1-9.
+//! 2026-11-08-lords-d28-r2, attack list 1-9. Fix check r3 (R2-01, filesystem aliases): design note
+//! 2026-11-08-lords-d28-alias, attack list 1-12.
 
 // Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use tempfile::TempDir;
 
 struct Env {
@@ -388,5 +390,242 @@ fn a_repo_without_a_stack_keeps_its_flag() {
         env.ok_git(&repo, &["add", "notes.md"]);
         let o = env.git(&repo, &["commit", "-q", "-m", "notes"]);
         assert_eq!(o.status.success(), commits, "{flag:?}: {}", text(&o));
+    }
+}
+
+// ---------------------------------------------------------------- fix check r3: aliases (design note d28-alias)
+
+/// A fresh repo at `repo`, with nothing committed.
+fn bare_repo(env: &Env) -> PathBuf {
+    let repo = env.path("repo");
+    fs::create_dir_all(&repo).unwrap();
+    env.ok_git(&repo, &["init", "-q"]);
+    repo
+}
+
+/// Stages `body` at the git path `at` with `mode`, as git takes it, without a file on disk and without Windows' path
+/// protection (`core.protectNTFS`), which refuses names such as `stack.toml.` at `git add`. A submodule's commit is a
+/// made-up id. Checks the index then holds `at` byte for byte, so no row silently tests another name.
+fn stage_raw(env: &Env, repo: &Path, mode: &str, at: &str, body: &str) {
+    let id = if mode == "160000" {
+        "1".repeat(40)
+    } else {
+        let mut c = env.cmd("git", repo);
+        c.args(["hash-object", "-w", "--stdin"]).stdin(Stdio::piped()).stdout(Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(body.as_bytes()).unwrap();
+        let o = child.wait_with_output().unwrap();
+        assert!(o.status.success(), "setup: hash-object: {}", text(&o));
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let mut c = env.cmd("git", repo);
+    c.args(["-c", "core.protectNTFS=false", "update-index", "--add", "--index-info"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(format!("{mode} {id}\t{at}\n").as_bytes()).unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert!(o.status.success(), "setup: stage {at:?}: {}", text(&o));
+    let listed = env.git(repo, &["ls-files", "-s", "-z"]);
+    let want = format!("{mode} {id} 0\t{at}");
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).split('\0').any(|r| r == want),
+        "setup: the index holds {at:?} as written: {}",
+        text(&listed)
+    );
+}
+
+/// Commits the index as HEAD without a hook and without path protection, then empties the index, so HEAD alone
+/// holds what was staged.
+fn commit_raw_then_unstage(env: &Env, repo: &Path) {
+    let raw = |args: &[&str]| {
+        let o = env.git(repo, &[&["-c", "core.protectNTFS=false"][..], args].concat());
+        assert!(o.status.success(), "setup: git {args:?}: {}", text(&o));
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let tree = raw(&["write-tree"]);
+    let commit = raw(&["commit-tree", &tree, "-m", "start"]);
+    raw(&["update-ref", "HEAD", &commit]);
+    raw(&["read-tree", "--empty"]);
+}
+
+/// A commit message holding a user path is refused in `repo` under both `--by-stack` and `--secrets-only`, and the
+/// output names `names` (why the whole policy runs).
+fn refused_by_both(env: &Env, repo: &Path, case: &str, names: &str) {
+    let msg = env.path("msg");
+    write(&msg, &detail());
+    for flag in ["--by-stack", "--secrets-only"] {
+        let o = env.lords(repo, &["privacy", "--message", &msg.to_string_lossy(), flag]);
+        let out = text(&o);
+        assert!(!o.status.success() && out.contains("path"), "{case}, {flag}: refused: {out}");
+        assert!(out.contains(names), "{case}, {flag}: names {names:?}: {out}");
+    }
+}
+
+/// The same message passes in `repo` under both flags: secrets-only mode.
+fn accepted_by_both(env: &Env, repo: &Path, case: &str) {
+    let msg = env.path("msg");
+    write(&msg, &detail());
+    for flag in ["--by-stack", "--secrets-only"] {
+        let o = env.lords(repo, &["privacy", "--message", &msg.to_string_lossy(), flag]);
+        assert!(o.status.success(), "{case}, {flag}: secrets only: {}", text(&o));
+    }
+}
+
+/// A check this host can't make, said on the real stderr (the test harness captures only `eprintln!`), so the job's
+/// log shows it.
+fn not_run(why: &str) {
+    let _ = writeln!(std::io::stderr().lock(), "hook_mode: NOT RUN: {why}");
+}
+
+// Spec (fix check r3, R2-01: "filesystem aliases still hide public manifest copies"; the master: "If any entry anywhere
+// in the tree has a basename that, after case folding and trailing-dot/space stripping, equals `stack.toml`, and it
+// isn't one of the two canonical paths, the result is Unknown"): a public manifest staged or committed under a name a
+// filesystem may take for a manifest, with a private one at the canonical path on disk, leaves a commit message holding
+// a user path refused under both flags, naming that name. The rows: trailing dot and space on the dir and the file (r3's
+// second witness), an NTFS stream, `\` as a separator, an HFS+-ignorable code point, and r3's short-name witness's git
+// half (a long dir holding `stack.toml`), on either OS.
+#[test]
+fn a_git_name_a_filesystem_may_take_for_a_manifest_is_never_left_out() {
+    let rows = [
+        ("stack./stack.toml", "stack/stack.toml"),
+        ("stack /stack.toml", "stack/stack.toml"),
+        ("stack.toml.", "stack.toml"),
+        ("stack.toml ", "stack.toml"),
+        ("stack.toml::$DATA", "stack.toml"),
+        ("stack\\stack.toml", "stack/stack.toml"),
+        ("stack\u{200d}.toml", "stack.toml"),
+        ("long-stack-directory/stack.toml", "stack/stack.toml"),
+    ];
+    for (alias, disk) in rows {
+        for copies in ["index", "head"] {
+            let env = Env::new();
+            let repo = bare_repo(&env);
+            stage_raw(&env, &repo, "100644", alias, PUBLIC);
+            if copies == "head" {
+                commit_raw_then_unstage(&env, &repo);
+            }
+            write(&repo.join(disk), PRIVATE);
+            refused_by_both(&env, &repo, &format!("{alias:?} in the {copies}"), alias);
+        }
+    }
+}
+
+// Spec (design note d28-alias, attack 8: "a symlink or a submodule whose path folds to `stack` or `stack.toml` is
+// Unknown"): a submodule or a symlink staged at `stack`, or a symlink at `stack.toml` whose target text reads as a
+// private manifest, with a private manifest on disk, checks the whole policy under both flags.
+#[test]
+fn a_symlink_or_submodule_where_a_manifest_goes_checks_the_whole_policy() {
+    let rows = [
+        ("160000", "stack", "elsewhere", "stack/stack.toml", "submodule"),
+        ("120000", "stack", "elsewhere", "stack/stack.toml", "symlink"),
+        ("120000", "stack.toml", PRIVATE, "stack.toml", "symlink"),
+    ];
+    for (mode, at, body, disk, names) in rows {
+        let env = Env::new();
+        let repo = bare_repo(&env);
+        stage_raw(&env, &repo, mode, at, body);
+        write(&repo.join(disk), PRIVATE);
+        refused_by_both(&env, &repo, &format!("{mode} at {at}"), names);
+    }
+}
+
+// Spec (the master: "a repo with a fixture `stack.toml` deeper in the tree that gets the full policy", deliberately
+// over-restrictive and fixed by renaming): a private store that also commits `tests/fixtures/stack.toml` checks the
+// whole policy under both flags, naming the fixture; so does a repo without a stack that holds only the fixture, under
+// `--secrets-only`.
+#[test]
+fn a_stack_toml_deeper_in_the_tree_checks_the_whole_policy() {
+    let fixture = "tests/fixtures/stack.toml";
+    let env = Env::new();
+    let repo = env.repo("repo", &[("stack.toml", PRIVATE), (fixture, PRIVATE)]);
+    refused_by_both(&env, &repo, "a private store with a fixture", fixture);
+    let plain = env.repo("plain", &[("README.md", "a repo\n"), (fixture, PRIVATE)]);
+    let msg = env.path("msg");
+    write(&msg, &detail());
+    let o = env.lords(&plain, &["privacy", "--message", &msg.to_string_lossy(), "--secrets-only"]);
+    let out = text(&o);
+    assert!(!o.status.success() && out.contains("path"), "no stack, a fixture: refused: {out}");
+    assert!(out.contains(fixture), "no stack, a fixture: names it: {out}");
+}
+
+// Spec (design note d28-alias, disk: "If a canonical path opens but its exact entry isn't listed, the answer is
+// Unknown"): an untracked private manifest under another case (`STACK.toml`, `STACK/stack.toml`) is, where the
+// filesystem opens the canonical path to it (Windows, macOS), a copy reached by another name: both flags refuse the
+// message, naming the exact-name rule. Where it doesn't (Linux), it is no manifest, and `--secrets-only` holds.
+#[test]
+fn a_manifest_on_disk_counts_only_under_its_exact_name() {
+    for (spelling, canonical) in
+        [("STACK.toml", "stack.toml"), ("STACK/stack.toml", "stack/stack.toml")]
+    {
+        let env = Env::new();
+        let repo = bare_repo(&env);
+        write(&repo.join(spelling), PRIVATE);
+        if fs::symlink_metadata(repo.join(canonical)).is_ok() {
+            refused_by_both(&env, &repo, &format!("untracked {spelling}"), "exactly");
+        } else {
+            let msg = env.path("msg");
+            write(&msg, &detail());
+            let args = ["privacy", "--message", &msg.to_string_lossy(), "--secrets-only"];
+            let o = env.lords(&repo, &args);
+            assert!(o.status.success(), "case-sensitive, {spelling} is no manifest: {}", text(&o));
+        }
+    }
+}
+
+/// Gives `dir` the NTFS short name `stack`, or says why this host can't (not NTFS, short names off on the volume, or
+/// no right to set them).
+fn short_name_stack(dir: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        match Command::new("fsutil").args(["file", "setshortname"]).arg(dir).arg("stack").output() {
+            Ok(o) if o.status.success() => return true,
+            Ok(o) => not_run(&format!("fsutil can't set a short name here: {}", text(&o).trim())),
+            Err(e) => not_run(&format!("fsutil didn't start: {e}")),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        not_run("short names are NTFS's");
+    }
+    false
+}
+
+// Spec (fix check r3, R2-01's primary witness: "the indexed `long-stack-directory/stack.toml` is public, while the disk
+// path `stack/stack.toml` reaches the same file through its short name, which is private"; the master: "Add a
+// behavioural fails-without message check for the short-name witness, with both flags"): with the dir given the short
+// name `stack`, both flags refuse the message, staged (the git rule) or untracked (the disk rule alone).
+#[test]
+fn a_short_name_never_reaches_a_manifest() {
+    for staged in [true, false] {
+        let env = Env::new();
+        let repo = bare_repo(&env);
+        let long = repo.join("long-stack-directory");
+        write(&long.join("stack.toml"), PUBLIC);
+        if staged {
+            env.ok_git(&repo, &["add", "-A"]);
+        }
+        write(&long.join("stack.toml"), PRIVATE);
+        if !short_name_stack(&long) {
+            return;
+        }
+        let through = fs::read_to_string(repo.join("stack/stack.toml")).unwrap();
+        assert_eq!(through, PRIVATE, "setup: the short name reaches the private copy");
+        let names = if staged { "long-stack-directory/stack.toml" } else { "exactly" };
+        refused_by_both(&env, &repo, &format!("short name, staged {staged}"), names);
+    }
+}
+
+// Spec (the master: "Add canonical-private controls"; design note C1: every copy `private` is secrets only): a
+// manifest committed at either canonical path, saying private, still checks secrets only under both flags; the exact
+// listing rule leaves the real store shapes alone.
+#[test]
+fn a_canonical_private_manifest_still_checks_secrets_only() {
+    for at in ["stack.toml", "stack/stack.toml"] {
+        let env = Env::new();
+        let repo = env.repo("repo", &[(at, PRIVATE), ("README.md", "a repo\n")]);
+        accepted_by_both(&env, &repo, at);
     }
 }
