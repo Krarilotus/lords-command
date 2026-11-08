@@ -5,7 +5,7 @@
 //! their pause, and the deadline no attempt or plan starts past. Nothing kills a delivery from inside, and its hooks
 //! start it without a deadline of their own (design note D-2).
 
-use crate::capture::{self, committed, git, tree};
+use crate::capture::{self, committed, tree};
 use crate::fsguard::{self, Contained, Kind, Part, Root};
 use crate::ledger::{self, Ledger};
 use crate::stack::{Delivery, Stacks, Store};
@@ -252,25 +252,6 @@ pub fn status(stacks: &Stacks, home: &Path) -> Status {
         }
     };
     Status::Read(state, why)
-}
-
-/// Whether a file git tracks in a store's stack dir was written at or after `since` (sol-loop r2 S4): a write put back
-/// before the next status leaves no other trace.
-fn written_since(
-    dirs: &[&Path],
-    since: std::time::SystemTime,
-    limit: Duration,
-) -> Result<bool, String> {
-    for d in dirs {
-        for f in git(d, &["ls-files", "-z"], limit)?.split('\0').filter(|f| !f.is_empty()) {
-            match fsguard::modified(d.join(f)) {
-                Ok(t) if t >= since => return Ok(true),
-                Ok(_) => {}
-                Err(e) => return Err(format!("{}: {e}", d.join(f).display())),
-            }
-        }
-    }
-    Ok(false)
 }
 
 /// Whether a commit in `dir` starts a delivery: `dir` is the checkout of a store `[delivery] on_commit` lists.
@@ -615,8 +596,6 @@ fn attempt(
         return Err(past("the stores' capture ended"));
     }
     between(Step::Captured, home);
-    // Every store file written from here on was perhaps read half way (sol-loop r2 S4).
-    let loading = std::time::SystemTime::now();
     let stacks = match kept {
         Some(mut k) => {
             let public = k.remove(0);
@@ -644,18 +623,9 @@ fn attempt(
         return Err(past("planning ended"));
     }
     between(Step::Planned, home);
-    // What was planned is what the stores committed: a store edited or committed while it loaded, or a file written
-    // since the load began, even put back (a stack edit whose commit was refused), is planned again, so no uncommitted
-    // text is delivered under a committed tree (K4; sol-loop r1 S4, r2 S4).
-    if opts.worktree.is_none()
-        && (committed(&dirs, git_limit)? != trees || written_since(&dirs, loading, git_limit)?)
-    {
-        let why = "a store's stack changed while the delivery planned";
-        return Ok(Next::Again { pause: false, why: why.into() });
-    }
-    if Instant::now() > deadline {
-        return Err(past("the stores' check after planning ended"));
-    }
+    // What was planned is what the stores committed as `trees`: it was loaded from those trees, so no store edit or
+    // commit since can reach it, and the apply lock keeps an older tree from replacing a newer one's delivery (gap 11,
+    // §0e; it replaces sol-loop r1 S4's and r2 S4's re-check after planning).
     let not_ready = plan.held.iter().flat_map(|h| &h.places).flat_map(|p| &p.items);
     if let Some(i) = not_ready.clone().find(|i| i.reason == Hold::NotReady) {
         return Ok(Next::Again { pause: true, why: i.note.clone() });
