@@ -8,6 +8,9 @@
 //! Renderer-agnostic by rule (owner, 25 Oct: one native app keeps the egui UI code; its renderer is chosen by
 //! measurement, not assumption): draw only through egui's painter and widgets. No glow, wgpu or GPU calls, no paint
 //! callbacks, no custom shaders or textures; the renderer is picked in Cargo.toml alone.
+//!
+//! A Windows app (D27): the library, its tests among it, compiles on Windows only; elsewhere `main` is a stub.
+#![cfg(windows)]
 
 #[cfg(test)]
 mod tests;
