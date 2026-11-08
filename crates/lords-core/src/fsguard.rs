@@ -912,6 +912,17 @@ pub enum Renamed {
     Failed(String),
 }
 
+#[cfg(target_os = "linux")]
+impl Renamed {
+    /// The cause, as it can be said (sol-loop r4, S7: an error's own words are kept).
+    fn cause(&self) -> String {
+        match self {
+            Renamed::Occupied => "something is at the target".into(),
+            Renamed::Failed(e) => e.clone(),
+        }
+    }
+}
+
 impl From<std::io::Error> for Renamed {
     fn from(e: std::io::Error) -> Renamed {
         match e.kind() {
@@ -1222,14 +1233,14 @@ pub fn replace_if(
     }
     #[cfg(target_os = "linux")]
     {
-        match exchange(&with.path, path) {
-            Ok(()) => {}
-            Err(Renamed::Occupied | Renamed::Failed(_)) => {
-                return Err(format!(
-                    "{}: this filesystem can't swap two names in one step (renameat2 RENAME_EXCHANGE), so the old version isn't put back; it keeps what was published",
-                    path.display()
-                ))
-            }
+        // The swap's own error, kept (sol-loop r4, S7): EINVAL is a filesystem without RENAME_EXCHANGE, anything else
+        // is said as it is.
+        if let Err(e) = exchange(&with.path, path) {
+            return Err(format!(
+                "{}: the old version isn't put back, it keeps what was published: renameat2 RENAME_EXCHANGE refused ({})",
+                path.display(),
+                e.cause()
+            ));
         }
         // `with` now names what was at `p`.
         match holds(&with.path) {
@@ -1246,9 +1257,10 @@ pub fn replace_if(
                     "{}: it held something else, so it stays",
                     path.display()
                 ))),
-                Err(_) => Err(format!(
-                    "{}: it held something else, and it couldn't go back: it is at {}, and {} holds the old version",
+                Err(e) => Err(format!(
+                    "{}: it held something else, and it couldn't go back ({}): it is at {}, and {} holds the old version",
                     path.display(),
+                    e.cause(),
                     with.path.display(),
                     path.display()
                 )),
