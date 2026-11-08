@@ -476,7 +476,7 @@ fn transact(
         let deadline = Instant::now() + wait;
         let swapped = swap(&mut changes[k], ledger, home, deadline);
         if let Err(why) = swapped.and_then(|()| record_made(home, changes, wait)) {
-            let undone = undo(changes, ledger, home, wait);
+            let undone = undo(changes, ledger, home, wait, between);
             drop(holding);
             return Err(match undone {
                 Ok(()) => Stop::Held(why),
@@ -730,6 +730,7 @@ fn undo(
     ledger: &mut Ledger,
     home: &Path,
     wait: Duration,
+    between: &mut dyn FnMut(Step, &Path),
 ) -> Result<(), String> {
     let mut left = Vec::new();
     let deadline = Instant::now() + wait;
@@ -763,6 +764,7 @@ fn undo(
                     true
                 }
                 (Op::ReplaceFile, Some(b)) if ours => {
+                    between(Step::Compared, at.path());
                     fsguard::rename_over(&b, &at, deadline)?;
                     true
                 }

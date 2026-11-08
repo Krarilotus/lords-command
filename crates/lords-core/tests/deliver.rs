@@ -805,6 +805,84 @@ fn a_backup_a_reader_held_is_removed_once_the_reader_lets_go() {
     assert!(!r.holds(), "{:?}", r.state);
 }
 
+// Spec (sol-loop r2 S1: "The final recursive cleanup of `gone` deletes files that an owner's process added inside it
+// after the hash"; note §14.8): a file an owner's process adds inside a recorded dir after its comparison, while the
+// dir is moved aside, is kept with its bytes, and the place is held.
+#[test]
+fn a_file_added_inside_a_compared_dir_is_kept() {
+    let f = Fixture::new();
+    stopped_after_last_swap(&f);
+    let mut late = None;
+    let opts = Options::whole(&f.home());
+    let r = deliver::run_between(&f.pub_root(), Some(&f.priv_root()), &opts, &mut |s, p| {
+        let is_dir = p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("..lords."));
+        if s != Step::Compared || !is_dir || late.is_some() {
+            return;
+        }
+        // The dir as it is between its comparison and its removal: at `p`, or moved aside beside it.
+        let parent = p.parent().unwrap();
+        let aside = fs::read_dir(parent)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|q| {
+                q.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("..lords.lords-gone-"))
+            })
+            .unwrap_or_else(|| p.to_path_buf());
+        fs::write(aside.join("late.txt"), "Late owner file.\n").unwrap();
+        late = Some(p.to_path_buf());
+    });
+    let p = late.unwrap_or_else(|| panic!("a recorded dir was compared: {r:?}"));
+    let kept: Vec<PathBuf> = fs::read_dir(p.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().path().join("late.txt"))
+        .filter(|q| q.is_file())
+        .collect();
+    assert_eq!(kept.len(), 1, "the late file is kept once: {kept:?} {r:?}");
+    assert_eq!(read(&kept[0]), "Late owner file.\n");
+    if let Ok(r) = &r {
+        assert!(r.holds(), "{r:?}");
+    }
+}
+
+// Spec (sol-loop r2 S4: "the undo's `rename_over` overwrites an owner edit that lands between its hash and the
+// rename"; note §14.8): while a place is put back, an owner's write to its published file, landing after the undo
+// compared it and before the old version goes back, is kept.
+#[test]
+fn an_owner_edit_between_the_undo_comparison_and_its_put_back_is_kept() {
+    let f = Fixture::new();
+    let (a, _) = rule_two(&f);
+    let (mut published, mut edited) = (None::<PathBuf>, false);
+    let opts = Options::whole(&f.home());
+    let r = deliver::run_between(&f.pub_root(), Some(&f.priv_root()), &opts, &mut |s, p| {
+        let names = ["CLAUDE.local.md", "AGENTS.override.md"].map(|n| a.join(n));
+        if s == Step::Swapped && published.is_none() && key(p) == key(&a) {
+            let new: Vec<&PathBuf> =
+                names.iter().filter(|n| read(n).contains("Rule two.")).collect();
+            if let [one] = new[..] {
+                // The other file, still old, gets its owner's line: its swap is refused and the place is put back.
+                let old = names.iter().find(|n| *n != one).unwrap();
+                fs::write(old, format!("{}My own line.\n", read(old))).unwrap();
+                published = Some(one.clone());
+            }
+        } else if s == Step::Compared && !edited {
+            if let Some(pubd) = &published {
+                if key(p) == key(pubd) {
+                    fs::write(p, "Owner's edit after the comparison.\n").unwrap();
+                    edited = true;
+                }
+            }
+        }
+    });
+    let published = published.unwrap_or_else(|| panic!("a place was half published: {r:?}"));
+    assert!(edited, "the undo compared the published file: {r:?}");
+    let kept = fs::read_dir(a.as_path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .any(|q| read(&q) == "Owner's edit after the comparison.\n");
+    assert!(kept, "the owner's edit is kept: {:?} {r:?}", read(&published));
+}
+
 // Spec (F8 §15, M4; review F8-R1-03; note A5): once a store's hooks are installed, delivery is configured, so a state
 // file that is missing reads stale in `lords paths`, never as "not set up".
 #[test]
