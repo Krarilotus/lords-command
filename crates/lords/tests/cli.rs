@@ -581,11 +581,10 @@ fn a_new_worktree_gets_its_place_files_from_the_post_checkout_hook() {
     // A hook that was there first: it is chained, not replaced.
     let hooks = env.dir.path().join("repo/.git/hooks");
     fs::create_dir_all(&hooks).unwrap();
-    fs::write(
-        hooks.join("post-checkout"),
+    write_script(
+        &hooks.join("post-checkout"),
         "#!/bin/sh\necho ran >> \"$(git rev-parse --git-common-dir)/before.log\"\n",
-    )
-    .unwrap();
+    );
     let (repo, wts, log) = repo_with_post_checkout(&env);
     assert!(hooks.join("post-checkout.before-lords").is_file(), "the old hook is kept");
 
@@ -671,6 +670,16 @@ fn real_dispatcher(dir: &Path) -> PathBuf {
     dir.join("hooks")
 }
 
+/// Writes a hook script at `p`, executable off Windows, as an owner's hook is for git to run it (D27).
+fn write_script(p: &Path, text: &str) {
+    fs::write(p, text).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 /// An owner's post-checkout hook: it logs that it ran, in the git common dir's `before.log`.
 const OWNERS_HOOK: &str =
     "#!/bin/sh\necho ran >> \"$(git rev-parse --git-common-dir)/before.log\"\n";
@@ -720,7 +729,7 @@ fn the_post_checkout_install_goes_through_a_local_dispatcher_that_forwards() {
     env.git(&repo, &["config", "core.hooksPath", guard_path]);
     fs::write(repo.join(".git/user.inc"), "[user]\n\tname = Linked\n").unwrap();
     env.git(&repo, &["config", "includeIf.gitdir:**/worktrees/.path", "user.inc"]);
-    fs::write(repo.join(".git/hooks/post-checkout"), OWNERS_HOOK).unwrap();
+    write_script(&repo.join(".git/hooks/post-checkout"), OWNERS_HOOK);
     let dispatcher = fs::read(env.dir.path().join("guard/dispatch.sh")).unwrap();
 
     let o = install_post_checkout(&env, &repo, &stacks);
@@ -795,7 +804,7 @@ fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
     let inc = format!("[core]\n\thooksPath = {}\n", empty.display()).replace('\\', "/");
     fs::write(repo.join(".git/linked-hooks.inc"), inc).unwrap();
     let hooks = repo.join(".git/hooks");
-    fs::write(hooks.join("post-checkout"), OWNERS_HOOK).unwrap();
+    write_script(&hooks.join("post-checkout"), OWNERS_HOOK);
     let before = listing(&hooks);
     let ledger = d.join("home/.lords-command/state/ledger.toml");
     let recorded = fs::read(&ledger).unwrap();
@@ -954,7 +963,7 @@ fn a_reinstall_whose_ledger_cant_be_saved_changes_nothing() {
     let env = Env::new();
     let (repo, _wts, stacks) = post_checkout_repo(&env);
     let hooks = repo.join(".git/hooks");
-    fs::write(hooks.join("post-checkout"), OWNERS_HOOK).unwrap();
+    write_script(&hooks.join("post-checkout"), OWNERS_HOOK);
     let o = install_post_checkout(&env, &repo, &stacks);
     assert!(o.status.success(), "{}", text(&o));
     let ledger = env.dir.path().join("home/.lords-command/state/ledger.toml");
@@ -1462,6 +1471,57 @@ fn the_guard_fails_open_when_it_cant_write() {
         drop(child.stdout.take());
         assert_eq!(child.wait().unwrap().code(), Some(0), "{args:?} with a closed stdout");
     }
+}
+
+// Spec (D27, the master thread 8 Nov 12:11: "On Linux, `lords guard install` should succeed"; witness: Linux fleet
+// `lords-test-linux-594a5551-1794135478-267523`, "Permission denied (os error 13)" on the staged copy): off Windows,
+// `guard install` succeeds and leaves a guard copy that is executable and answers.
+#[cfg(unix)]
+#[test]
+fn guard_install_leaves_a_copy_that_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let home = env.dir.path().join("tool-home");
+    let o = env.lords(env.dir.path(), &["guard", "install", "--home", home.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", text(&o));
+    let copy = fs::read_dir(home.join("bin"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("lords-guard")))
+        .unwrap_or_else(|| panic!("no guard copy in {}", home.join("bin").display()));
+    let mode = fs::metadata(&copy).unwrap().permissions().mode();
+    assert!(mode & 0o111 != 0, "{} is {mode:o}", copy.display());
+    let o = env
+        .cmd(copy.to_str().unwrap(), env.dir.path())
+        .args(["guard", "--guards"])
+        .output()
+        .unwrap();
+    assert!(o.status.success() && text(&o).contains("rm"), "{}", text(&o));
+}
+
+// Spec (D27, the master thread 8 Nov 12:11: "a non-executable chained hook should be skipped", as git skips a hook
+// that isn't executable; witness: "post-checkout: 12: …/post-checkout.before-lords: Permission denied"): a repo's
+// earlier post-checkout hook without its executable bit is chained but not run, the checkout says nothing of it, and
+// the new worktree still gets its place file.
+#[cfg(unix)]
+#[test]
+fn a_chained_hook_that_isnt_executable_is_skipped_as_git_skips_it() {
+    let env = Env::new();
+    let hooks = env.dir.path().join("repo/.git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    // Mode 0644, as `fs::write` leaves it: git itself wouldn't run this hook.
+    fs::write(hooks.join("post-checkout"), OWNERS_HOOK).unwrap();
+    let (repo, wts, log) = repo_with_post_checkout(&env);
+    assert!(hooks.join("post-checkout.before-lords").is_file(), "the old hook is kept");
+    let wt = wts.join("one");
+    let o = env.git(&repo, &["worktree", "add", "-q", "-b", "one", wt.to_str().unwrap()]);
+    assert!(o.status.success() && !text(&o).contains("Permission denied"), "{}", text(&o));
+    assert!(
+        appears(&wt.join("CLAUDE.local.md")),
+        "log: {}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert!(!repo.join(".git/before.log").exists(), "a hook git wouldn't run isn't run");
 }
 
 // Spec: rm-guard fix check r5, R10 (witness: `lords guard install --r5-invalid-option` with its stderr reader closed

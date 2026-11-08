@@ -13,6 +13,8 @@ use lords_core::sync::Action;
 use shim::*;
 use std::fs;
 use std::path::Path;
+// Only the Windows junction case makes a process (`cmd /c mklink /J`; D27: an unused import fails clippy elsewhere).
+#[cfg(windows)]
 use std::process::Command;
 
 const BEGIN: &str = "<!-- lords-command:begin -->";
