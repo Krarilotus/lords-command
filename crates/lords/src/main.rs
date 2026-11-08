@@ -16,7 +16,8 @@ lords: one home for how you work with agents
 
 usage:
   lords check [--public | --stack] [--strict] [--json]   --stack: the entries only (a stack repo's pre-commit)
-    (--public --by-stack, a stack repo's pre-push: nothing to check where this checkout's stack is private)
+    (--by-stack, a stack repo's hooks: --public checks nothing where this checkout's stack is private, --stack nothing
+    where it has no stack)
   lords import [--store NAME] [--no-commit]
   lords retire ID --reason TEXT [--superseded-by ID] [--date YYYY-MM-DD] [--no-commit]
   lords promote ID [--strip | --split] [--no-commit]
@@ -510,19 +511,25 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     let stack_only = a.flag("--stack");
     let strict = a.flag("--strict");
     let json = a.flag("--json");
-    // A stack repo's pre-push: no public tree to check where the pushing checkout's stack is private (D28 r2, C5).
+    // A stack repo's hooks: no public tree to check at a push where the pushing checkout's stack is private (D28 r2,
+    // C5), and no entries at a commit where the committing checkout has no stack (fix check r2, F01).
     let by_stack = a.flag("--by-stack");
     let explicit = a.words.iter().any(|w| w == "--public-stack");
     let explicit_private = a.words.iter().any(|w| w == "--private-stack");
     let p = paths(&mut a);
     a.done()?;
     let cwd = std::env::current_dir().ok();
-    if public_only && by_stack {
+    if by_stack && (public_only || stack_only) {
+        use lords_core::privacy::CheckoutStack;
         let here = cwd.as_deref().map(lords_core::privacy::checkout_stack);
-        if here == Some(lords_core::privacy::CheckoutStack::Is(Visibility::Private)) {
+        if public_only && here == Some(CheckoutStack::Is(Visibility::Private)) {
             println!(
                 "lords check: this checkout's stack is private, so it has no public tree to check"
             );
+            return Ok(true);
+        }
+        if stack_only && here == Some(CheckoutStack::None) {
+            println!("lords check: this checkout has no stack, so it has no entries to check");
             return Ok(true);
         }
     }

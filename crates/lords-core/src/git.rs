@@ -107,6 +107,30 @@ pub fn toplevel(dir: &Path) -> Option<PathBuf> {
     run(dir, &["rev-parse", "--show-toplevel"]).ok().map(|s| PathBuf::from(s.trim()))
 }
 
+/// `toplevel`, keeping why not: `None` only where git says `dir` is in no repository, an error for every other
+/// failure, so a failed lookup is never taken for no checkout (D28 fix check r2, R2-02). Git speaks C here, so its
+/// answer reads the same in every locale.
+pub fn top_level(dir: &Path) -> Result<Option<PathBuf>, String> {
+    let args = ["rev-parse", "--show-toplevel"];
+    let env = [("LC_ALL", "C"), ("LANGUAGE", "C")];
+    let out = started(
+        &args,
+        || crate::process::git_env(dir, &args, &env),
+        |out| out.status.code(),
+        std::thread::sleep,
+    )?;
+    if out.status.success() {
+        return Ok(Some(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())));
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    if out.status.code() == Some(128)
+        && said.trim_start().starts_with("fatal: not a git repository")
+    {
+        return Ok(None);
+    }
+    Err(failed(&args, out.status, &out.stderr, &out.stdout))
+}
+
 /// Stages `paths` (relative to `dir`, or `.`) and commits if anything changed. Returns the new commit, if any.
 pub fn commit(dir: &Path, paths: &[&Path], message: &str) -> Result<Option<String>, String> {
     let mut add = vec!["add", "-A", "--"];

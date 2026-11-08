@@ -118,9 +118,23 @@ fn staged_script(
     let exe = lords_exe.to_string_lossy().replace('\\', "/");
     let flag = mode_flag(secrets_only, stack);
     let stack = if stack {
-        format!("# A stack repo: its entries, as `lords check` sees them.\n\"{exe}\" check --stack || exit $?\n")
+        format!(
+            "# A stack repo: this checkout's entries, as `lords check` sees them (none where it has no stack).\n\
+             \"{exe}\" check --stack --by-stack || exit $?\n"
+        )
     } else {
-        String::new()
+        // A checkout that has a stack only since these hooks were installed pushes unchecked until they are installed
+        // again (fix check r2, F01): said at each commit.
+        format!(
+            "for m in {} {}; do\n\
+             \x20 if [ -f \"$top/$m\" ]; then\n\
+             \x20   echo \"lords: this checkout has $m, but its repo's hooks were installed for a repo without a stack, so no pre-push checks its pushes: run \\`lords hooks install\\` again\" >&2\n\
+             \x20   break\n\
+             \x20 fi\n\
+             done\n",
+            crate::privacy::MANIFESTS[0],
+            crate::privacy::MANIFESTS[1]
+        )
     };
     format!(
         "#!/bin/sh\n{MARKER} of the staged files (installed by `lords hooks install`).\n\
@@ -147,6 +161,21 @@ fn pre_push_script(lords_exe: &Path, home: &Path) -> String {
          \"{exe}\" privacy --history --by-stack || exit $?\nexec \"{exe}\" check --public --by-stack\n",
         probe_lines(home, "pre-push")
     )
+}
+
+/// Whether a checkout that runs `repo`'s hooks has a stack (`privacy::checkout_stack`, a manifest found or one it
+/// can't read): `repo`'s own, else any worktree `git worktree list` names that is there (fix check r2, F01: a
+/// public sibling's push is checked whichever checkout installs). Where the list can't be read, `true`: the stack
+/// hooks check each checkout by its own stack, so they are the safe ones.
+fn shares_a_stack(repo: &Path) -> bool {
+    if crate::privacy::checkout_stack(repo).found() {
+        return true;
+    }
+    let Ok(list) = git::run(repo, &["worktree", "list", "--porcelain", "-z"]) else { return true };
+    list.split('\0').filter_map(|l| l.strip_prefix("worktree ")).map(Path::new).any(|w| {
+        // A worktree whose dir is gone (prunable) runs no hook.
+        fsguard::kind(w) != Ok(fsguard::Kind::Missing) && crate::privacy::checkout_stack(w).found()
+    })
 }
 
 /// The commit-msg hook: git passes the message file as `$1`.
@@ -331,9 +360,9 @@ pub fn install_with(
     stacks: &SyncArgs,
 ) -> Result<Vec<Installed>, String> {
     let dir = hooks_dir(repo)?;
-    // A stack repo where this checkout has a manifest, tracked or not (D28 r2, C4). Which mode each hook checks in is
-    // decided by the checkout that runs it, so nothing here depends on the worktree that installs (C1).
-    let stack = crate::privacy::checkout_stack(repo).found();
+    // A stack repo where any checkout that runs these hooks has a manifest, tracked or not (D28 r2, C4; fix check r2,
+    // F01). Which mode each hook checks in is decided by the checkout that runs it (C1).
+    let stack = shares_a_stack(repo);
     let _lock = ApplyLock::take(home, 60)?;
     let mut ledger = Ledger::load(home)?;
     let mut hooks = vec![

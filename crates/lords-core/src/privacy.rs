@@ -576,9 +576,18 @@ impl CheckoutStack {
 /// Every copy of the manifests (`MANIFESTS`) of the checkout `dir` is in: in HEAD, in the index a hook checks (the
 /// commit's own, as `scan_staged` reads it), and on disk, tracked or not (review r1, R1-02). All naming one
 /// visibility is that visibility. Anything else is `Unknown`, never a guess: a copy that can't be read or names no
-/// visibility, and copies that disagree, two manifests or a change that is only partly staged.
+/// visibility, and copies that disagree, two manifests or a change that is only partly staged. A committed or staged
+/// path under another spelling of a manifest, which a case-insensitive filesystem reads as the manifest (`STACK.toml`,
+/// `Stack/stack.toml`), is never left out: it is `Unknown`, named (fix check r2, R2-01). Only a dir git says is in no
+/// repository has no stack; a checkout git can't tell is `Unknown`, with git's answer (R2-02).
 pub fn checkout_stack(dir: &Path) -> CheckoutStack {
-    let Some(top) = git::toplevel(dir) else { return CheckoutStack::None };
+    let top = match git::top_level(dir) {
+        Ok(Some(top)) => top,
+        Ok(None) => return CheckoutStack::None,
+        Err(e) => {
+            return CheckoutStack::Unknown(format!("git can't tell which checkout this is ({e})"))
+        }
+    };
     let mut copies: Vec<(String, Result<Visibility, String>)> = Vec::new();
     for rel in MANIFESTS {
         let path = top.join(rel);
@@ -598,43 +607,95 @@ pub fn checkout_stack(dir: &Path) -> CheckoutStack {
         });
         found.clone()
     };
-    // `<mode> <id> <stage>\t<path>`; each stage of a conflict is a copy.
-    let staged = ["ls-files", "-s", "--full-name", "--", ":/stack.toml", ":/stack/stack.toml"];
+    // A copy at a manifest's own path counts by what it names; one under another spelling of it is named (R2-01).
+    let spelled = |path: &str, read: Result<Visibility, String>| {
+        match manifest_named(path) {
+        Some(m) if m == path => Some(read),
+        Some(m) => Some(Err(format!(
+            "is another spelling of {m}, which a case-insensitive filesystem reads as the manifest: rename it to {m}"
+        ))),
+        None => None,
+    }
+    };
+    // Every staged path at the top or one dir down, where a manifest's spellings are: `<mode> <id> <stage>\t<path>`,
+    // each stage of a conflict a copy. Git's own case folding is ASCII only, so the spellings are matched here.
+    let staged = ["ls-files", "-s", "-z", "--", ":(top,glob)*", ":(top,glob)*/*"];
     match git::run_index(&top, &staged) {
         Ok(out) => {
-            for line in out.lines().filter(|l| !l.is_empty()) {
-                let (head, rel) = line.split_once('\t').unwrap_or((line, "?"));
+            for rec in out.split('\0').filter(|r| !r.is_empty()) {
+                let (head, path) = rec.split_once('\t').unwrap_or((rec, ""));
+                if manifest_named(path).is_none() {
+                    continue;
+                }
                 let read = match head.split(' ').collect::<Vec<_>>().as_slice() {
                     [_, id, _] => blob(id),
-                    _ => Err(format!("`git ls-files -s` said {line:?}")),
+                    _ => Err(format!("`git ls-files -s` said {rec:?}")),
                 };
-                copies.push((format!("{rel} staged"), read));
+                copies.extend(spelled(path, read).map(|r| (format!("{path} staged"), r)));
             }
         }
         Err(e) => copies.push(("the index".to_string(), Err(e))),
     }
     match git::status(&top, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]) {
         Ok(false) => {}
-        Ok(true) => {
-            // `<mode> <type> <id>\t<path>`.
-            let committed = ["ls-tree", "--full-tree", "HEAD", "--", MANIFESTS[0], MANIFESTS[1]];
-            match git::run(&top, &committed) {
-                Ok(out) => {
-                    for line in out.lines().filter(|l| !l.is_empty()) {
-                        let (head, rel) = line.split_once('\t').unwrap_or((line, "?"));
-                        let read = match head.split(' ').collect::<Vec<_>>().as_slice() {
-                            [_, "blob", id] => blob(id),
-                            _ => Err(format!("isn't a file ({head})")),
-                        };
-                        copies.push((format!("{rel} in HEAD"), read));
-                    }
+        Ok(true) => match committed_spellings(&top) {
+            Ok(found) => {
+                for (path, kind, id) in found {
+                    let read = if kind == "blob" { blob(&id) } else { Err(format!("is a {kind}")) };
+                    copies.extend(spelled(&path, read).map(|r| (format!("{path} in HEAD"), r)));
                 }
-                Err(e) => copies.push(("HEAD".to_string(), Err(e))),
             }
-        }
+            Err(e) => copies.push(("HEAD".to_string(), Err(e))),
+        },
         Err(e) => copies.push(("HEAD".to_string(), Err(e))),
     }
     agreed(copies)
+}
+
+/// The manifest (`MANIFESTS`) a checkout path may name: its own path, or another spelling a case-insensitive filesystem
+/// takes for it, any letter in another case, Unicode's folds included (R2-01).
+fn manifest_named(path: &str) -> Option<&'static str> {
+    MANIFESTS.into_iter().find(|m| same_but_case(path, m))
+}
+
+fn same_but_case(a: &str, b: &str) -> bool {
+    a.chars().count() == b.chars().count()
+        && a.chars().zip(b.chars()).all(|(x, y)| {
+            x == y || x.to_lowercase().eq(y.to_lowercase()) || x.to_uppercase().eq(y.to_uppercase())
+        })
+}
+
+/// HEAD's entries at a manifest's spellings, as `(path, type, id)`: its top level, and each dir spelled like `stack`
+/// one level down (`git ls-tree` takes no case-folding pathspec).
+fn committed_spellings(top: &Path) -> Result<Vec<(String, String, String)>, String> {
+    // `<mode> <type> <id>\t<name>`, NUL-terminated.
+    let entries = |tree: &str| -> Result<Vec<(String, String, String)>, String> {
+        let out = git::run(top, &["ls-tree", "-z", "--full-tree", tree])?;
+        out.split('\0')
+            .filter(|r| !r.is_empty())
+            .map(|rec| {
+                let (head, name) = rec.split_once('\t').unwrap_or((rec, ""));
+                match head.split(' ').collect::<Vec<_>>().as_slice() {
+                    [_, kind, id] => Ok((name.to_string(), kind.to_string(), id.to_string())),
+                    _ => Err(format!("`git ls-tree` said {rec:?}")),
+                }
+            })
+            .collect()
+    };
+    let mut found = Vec::new();
+    for (name, kind, id) in entries("HEAD")? {
+        if same_but_case(&name, MANIFESTS[0]) {
+            found.push((name, kind, id));
+        } else if kind == "tree" && same_but_case(&name, "stack") {
+            for (inner, k, i) in entries(&id)? {
+                let path = format!("{name}/{inner}");
+                if manifest_named(&path).is_some() {
+                    found.push((path, k, i));
+                }
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// The visibility a manifest's text names, as the manifest's schema reads it.
