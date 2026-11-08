@@ -841,3 +841,79 @@ fn check_by_stack_allowances_are_this_checkouts_own() {
         assert!(o.status.success(), "its own allow-list accepts it ({variant}): {}", text(&o));
     }
 }
+
+// ---------------------------------------------------------------- fix check r6: an unreadable HEAD (D28-R6-01)
+
+/// A repo whose canonical `stack.toml` says private on disk and in the index, and whose HEAD, as `head` sets it, names
+/// a commit that isn't in the object store: `"branch"`, the branch HEAD names points at it; `"detached"`, HEAD itself.
+/// `"unborn"` leaves HEAD as `init` made it.
+fn private_with_head(env: &Env, head: &str) -> PathBuf {
+    let repo = bare_repo(env);
+    write(&repo.join("stack.toml"), PRIVATE);
+    env.ok_git(&repo, &["add", "stack.toml"]);
+    let missing = format!("{}\n", "5".repeat(40));
+    match head {
+        "branch" => {
+            let o = env.git(&repo, &["symbolic-ref", "HEAD"]);
+            let branch = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            assert!(o.status.success() && branch.starts_with("refs/heads/"), "setup: {}", text(&o));
+            write(&repo.join(".git").join(&branch), &missing);
+        }
+        "detached" => write(&repo.join(".git/HEAD"), &missing),
+        _ => {}
+    }
+    let o = env.git(&repo, &["cat-file", "-e", "HEAD^{commit}"]);
+    assert!(!o.status.success(), "setup: HEAD names no readable commit ({head})");
+    repo
+}
+
+// Spec (fix check r6, D28-R6-01: "an existing HEAD whose commit can't be read is treated as an unborn checkout ...
+// both `privacy --message` mode flags must refuse a non-secret user path under full policy (or error), and `check
+// --public --by-stack` must refuse rather than skip"; design note d28-alias, r6 invariant, attack items 1, 3 and 12):
+// with a private manifest on disk and staged, and HEAD's branch or HEAD itself naming a commit that isn't there, HEAD's
+// copy can't be read, so the stack can't be told. A message holding a user path is refused under both flags, naming
+// HEAD, and `check --public --by-stack` refuses, naming HEAD. Every row runs before the refusals are asserted.
+#[test]
+fn a_head_whose_commit_cant_be_read_is_no_unborn_head() {
+    let msg_flags = ["--by-stack", "--secrets-only"];
+    let outputs: Vec<_> = ["branch", "detached"]
+        .iter()
+        .flat_map(|head| {
+            let env = Env::new();
+            let repo = private_with_head(&env, head);
+            let msg = env.path("msg");
+            write(&msg, &detail());
+            let mut runs: Vec<(String, Output)> = msg_flags
+                .iter()
+                .map(|flag| {
+                    let args = ["privacy", "--message", &msg.to_string_lossy(), *flag];
+                    (format!("{head}, privacy {flag}"), env.lords(&repo, &args))
+                })
+                .collect();
+            let o = env.lords(&repo, &["check", "--public", "--by-stack"]);
+            runs.push((format!("{head}, check --public --by-stack"), o));
+            runs
+        })
+        .collect();
+    let let_through: Vec<_> = outputs
+        .iter()
+        .filter(|(_, o)| o.status.success())
+        .map(|(row, o)| format!("{row}: {}", text(o)))
+        .collect();
+    assert!(let_through.is_empty(), "refused in every row, but let through: {let_through:#?}");
+    for (row, o) in &outputs {
+        assert!(text(o).contains("HEAD"), "{row}: names HEAD: {}", text(o));
+    }
+}
+
+// Spec (the same: "Retain a genuine unborn-private control"; design note d28-alias, r6 attack item 6; design note C1):
+// with the same private manifest and a HEAD that is truly unborn, the message is still checked secrets only under both
+// flags, and `check --public --by-stack` still skips, saying the stack is private.
+#[test]
+fn an_unborn_private_checkout_is_still_private() {
+    let env = Env::new();
+    let repo = private_with_head(&env, "unborn");
+    accepted_by_both(&env, &repo, "unborn");
+    let o = env.lords(&repo, &["check", "--public", "--by-stack"]);
+    assert!(o.status.success() && text(&o).contains("private"), "{}", text(&o));
+}
