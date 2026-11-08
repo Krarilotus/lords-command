@@ -467,7 +467,8 @@ pub fn post_checkout_script(
     chain: bool,
 ) -> String {
     let chain = if chain {
-        format!("before=\"$(dirname \"$0\")/{CHAINED}\"\nif [ -f \"$before\" ]; then\n  \"$before\" \"$@\"\n  status=$?\nfi\n")
+        // Run as git runs a hook: only when it is executable (D27).
+        format!("before=\"$(dirname \"$0\")/{CHAINED}\"\nif [ -f \"$before\" ] && [ -x \"$before\" ]; then\n  \"$before\" \"$@\"\n  status=$?\nfi\n")
     } else {
         String::new()
     };

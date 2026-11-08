@@ -424,7 +424,8 @@ fn a_place_to_uninstall_needs_its_repo_and_nothing_else() {
     assert!(copies(&a).iter().all(|c| c.exists()));
 }
 
-/// What a move aside left in `dir` (`.<name>.lords-old-…`, fsguard's name for it).
+/// What a move aside left in `dir` (`.<name>.lords-old-…`, fsguard's name for it). Only the Windows cases ask (D27).
+#[cfg(windows)]
 fn asides(dir: &Path) -> Vec<String> {
     fs::read_dir(dir)
         .unwrap()

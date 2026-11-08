@@ -9,6 +9,8 @@ mod common;
 use common::*;
 use lords_core::fsguard;
 use std::path::Path;
+// Only the Windows junction case makes a process (D27: an unused import fails clippy elsewhere).
+#[cfg(windows)]
 use std::process::Command;
 
 fn dir_link(link: &Path, to: &Path) {

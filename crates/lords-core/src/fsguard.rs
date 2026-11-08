@@ -1872,7 +1872,8 @@ pub fn install_exe(
     check(path)?;
     // `.exe` appended, keeping the staged name unique (sol-loop r2, S11).
     let staged = PathBuf::from(format!("{}.exe", beside(path, "new")?.display()));
-    if let Err(e) = create_file_at(&staged, bytes) {
+    // Executable before it is run, so `verify` can run it off Windows too (D27; a no-op on Windows).
+    if let Err(e) = create_file_at(&staged, bytes).and_then(|()| make_executable_at(&staged)) {
         let _ = delete_file_at(&staged);
         return Err(e);
     }
