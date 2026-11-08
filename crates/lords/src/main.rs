@@ -26,7 +26,10 @@ usage:
   lords privacy --history [--private-stack DIR] [--secrets-only | --by-stack]   every commit's message and patch (the pre-push check)
   lords privacy FILE...
     (--by-stack: the mode of this checkout's stack, secrets only where every copy of its manifest says private, else the
-    whole policy; --secrets-only holds only where this checkout has no stack or a private one)
+    whole policy; --secrets-only holds only where this checkout has no stack or a private one; with --by-stack the
+    allow-list is this checkout's own stack/privacy/allow.txt, and a configured private stack adds its deny and fleet terms)
+  lords privacy --explain [--secrets-only | --by-stack]   what privacy checks here with those flags (mode, lists, counts) and
+    whether a commit and a push reach the privacy hooks; scans nothing, prints no term
   lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit, pre-merge-commit and commit-msg hooks; in a stack repo also `check --stack`, a pre-push and a post-commit that runs `deliver`
     (a stack repo's hooks check with --by-stack, so each checkout by its own stack; --secrets-only is for a repo without one)
   lords hash PATH
@@ -566,7 +569,9 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
             let top = top.ok_or_else(|| format!("git names no checkout here, {not_checked}"))?;
             let private = p.private.as_deref().map(Stack::load).transpose()?;
             let rules = Rules::public().with_private_terms(private.as_ref())?;
-            let (scan, findings) = check::public_tree(&top, &rules)?;
+            let (scan, mut findings) = check::public_tree(&top, &rules)?;
+            // What wasn't checked is said, as `check` says it (D28 r6, R6-F02).
+            findings.extend(rules.notes.iter().map(|n| Finding::info("privacy-scope", n.clone())));
             print_findings(&findings, json);
             if !json {
                 println!(
@@ -1479,6 +1484,131 @@ fn cmd_promote(mut a: Args) -> Result<bool, String> {
     Ok(true)
 }
 
+/// What `privacy` checks in `cwd` with these flags: its rules, its mode, this checkout's stack where the mode needs it,
+/// and where each list came from (a path and a count, never a term). The scan and `--explain` both take it from here,
+/// so `--explain` says what a hook checks (design note 2026-11-08-lords-privacy-own-allow).
+struct PrivacyRules {
+    rules: Rules,
+    secrets_only: bool,
+    /// The line to say when the mode isn't the one asked for.
+    why: Option<String>,
+    stack: Option<privacy::CheckoutStack>,
+    sources: Vec<String>,
+}
+
+fn privacy_rules(
+    cwd: &Path,
+    by_stack: bool,
+    secrets_only: bool,
+    public_stack: Option<PathBuf>,
+    private_stack: Option<PathBuf>,
+) -> Result<PrivacyRules, String> {
+    // Secrets only only where this checkout's stack allows it, so no caller gives a public checkout that mode (C2).
+    let stack = (by_stack || secrets_only).then(|| privacy::checkout_stack(cwd));
+    let (secrets_only, why) = match &stack {
+        Some(s) => privacy::checkout_mode(s, by_stack, secrets_only),
+        None => (false, None),
+    };
+    let mut sources = Vec::new();
+    if secrets_only {
+        let rules = Rules::secrets_only();
+        return Ok(PrivacyRules { rules, secrets_only, why, stack, sources });
+    }
+    fn count(n: usize, one: &str, many: &str) -> String {
+        format!("{n} {}", if n == 1 { one } else { many })
+    }
+    fn allow_from(rules: Rules, root: &Path, sources: &mut Vec<String>) -> Rules {
+        let before = rules.allow.len();
+        let rules = rules.with_allow_from(root);
+        let n = rules.allow.len() - before;
+        if n > 0 {
+            let at = root.join("privacy").join("allow.txt");
+            sources.push(format!(
+                "allow-list: {} ({})",
+                at.display(),
+                count(n, "entry", "entries")
+            ));
+        }
+        rules
+    }
+    // A config.txt that is there but can't be read fails the check: its private stack would be skipped.
+    let mut cfg = Config::load()?;
+    if private_stack.is_some() {
+        cfg.private = private_stack;
+    }
+    if public_stack.is_some() {
+        cfg.public = public_stack;
+    }
+    // A configured private stack that doesn't load fails the check: its deny and fleet lists would be skipped.
+    let private = cfg.private.as_deref().map(Stack::load).transpose()?;
+    let mut rules = Rules::public();
+    // `--by-stack`, a stack repo's hooks: a configured stack only adds restrictions, so the allowances are this
+    // checkout's own (D28 r6, R6-F01). Without it, as before: the configured lists too.
+    if let (false, Some(p)) = (by_stack, &private) {
+        rules = allow_from(rules, &p.root, &mut sources);
+    }
+    let (deny, hosts) = (rules.deny.len(), rules.hosts.len());
+    rules = rules.with_private_terms(private.as_ref())?;
+    if let Some(p) = &private {
+        let n = rules.deny.len() - deny;
+        if n > 0 {
+            let at = p.root.join("privacy").join("deny.txt");
+            sources.push(format!("deny-list: {} ({})", at.display(), count(n, "term", "terms")));
+        }
+        if let Some(f) = &p.manifest.privacy.fleet_config {
+            let n = rules.hosts.len() - hosts;
+            let at = lords_core::config::expand_home(f);
+            sources.push(format!("fleet: {} ({})", at.display(), count(n, "host", "hosts")));
+        }
+    }
+    if let Some(top) = git::toplevel(cwd) {
+        rules = allow_from(rules, &top.join("stack"), &mut sources);
+    }
+    if let (false, Some(p)) = (by_stack, &cfg.public) {
+        rules = allow_from(rules, p, &mut sources);
+    }
+    Ok(PrivacyRules { rules, secrets_only, why, stack, sources })
+}
+
+/// `privacy --explain`: what `privacy` with the same flags checks here, and whether a commit and a push here reach the
+/// privacy hooks (the probe `lords check` runs). It scans nothing, changes nothing in the repo and prints no term
+/// (self-service audit, journey 7).
+fn explain_privacy(cwd: &Path, c: &PrivacyRules) -> Result<bool, String> {
+    use privacy::CheckoutStack;
+    let stack = match &c.stack {
+        None => "not looked for (no --by-stack or --secrets-only)".to_string(),
+        Some(CheckoutStack::None) => "none".to_string(),
+        Some(CheckoutStack::Is(v)) => v.to_string(),
+        Some(CheckoutStack::Unknown(why)) => format!("can't be told ({why})"),
+    };
+    println!("this checkout's stack: {stack}");
+    println!("mode: {}", if c.secrets_only { "secrets only" } else { "the whole policy" });
+    if let Some(why) = &c.why {
+        println!("  ({why})");
+    }
+    let classes: Vec<&str> = c.rules.classes.iter().map(|k| k.name()).collect();
+    println!("classes: {}", classes.join(", "));
+    for s in &c.sources {
+        println!("{s}");
+    }
+    for n in &c.rules.notes {
+        println!("note: {n}");
+    }
+    let top = git::toplevel(cwd).ok_or("not in a git repo")?;
+    let home = sync::default_home()?;
+    let commit = hooks::privacy_dispatch(&top, &home);
+    if commit.is_empty() {
+        println!("commit: reaches the privacy hooks ({})", hooks::PRIVACY.join(", "));
+    } else {
+        println!("commit: not verified: {}", commit.join("; "));
+    }
+    match hooks::push_dispatch(&top, &home) {
+        Ok(()) => println!("push: reaches the privacy pre-push"),
+        Err(e) => println!("push: not verified: {e}"),
+    }
+    Ok(true)
+}
+
 fn cmd_privacy(mut a: Args) -> Result<bool, String> {
     let staged = a.flag("--staged");
     let history = a.flag("--history");
@@ -1488,38 +1618,17 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
     let message = a.value("--message")?;
     let public_stack = a.value("--public-stack")?.map(PathBuf::from);
     let private_stack = a.value("--private-stack")?.map(PathBuf::from);
+    let explain = a.flag("--explain");
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    // Secrets only only where this checkout's stack allows it, so no caller gives a public checkout that mode (C2).
-    let (secrets_only, why) = if by_stack || secrets_only {
-        privacy::checkout_mode(&privacy::checkout_stack(&cwd), by_stack, secrets_only)
-    } else {
-        (false, None)
-    };
-    if let Some(why) = why {
+    let composed = privacy_rules(&cwd, by_stack, secrets_only, public_stack, private_stack)?;
+    if explain {
+        a.done()?;
+        return explain_privacy(&cwd, &composed);
+    }
+    if let Some(why) = &composed.why {
         eprintln!("lords privacy: {why}");
     }
-    let rules = if secrets_only {
-        Rules::secrets_only()
-    } else {
-        // A config.txt that is there but can't be read fails the check: its private stack would be skipped.
-        let mut cfg = Config::load()?;
-        if private_stack.is_some() {
-            cfg.private = private_stack;
-        }
-        if public_stack.is_some() {
-            cfg.public = public_stack;
-        }
-        // A configured private stack that doesn't load fails the check: its deny and fleet lists would be skipped.
-        let private = cfg.private.as_deref().map(Stack::load).transpose()?;
-        let mut rules = Rules::public().with_private(private.as_ref())?;
-        if let Some(top) = git::toplevel(&cwd) {
-            rules = rules.with_allow_from(&top.join("stack"));
-        }
-        if let Some(p) = &cfg.public {
-            rules = rules.with_allow_from(p);
-        }
-        rules
-    };
+    let rules = composed.rules;
     for n in &rules.notes {
         eprintln!("lords privacy: {n}");
     }
