@@ -2566,7 +2566,12 @@ fn helper_guard(env: &Env, args: &[&str], vars: &[(&str, String)], event: &str) 
     }
     let mut c =
         c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    c.stdin.take().unwrap().write_all(event.as_bytes()).unwrap();
+    // A guard that answers without reading its event (a usage error) may have ended before this write: off Windows that
+    // is a broken pipe, which says nothing about the answer (Linux fleet `lords-test-linux-d3f8b7c6-…`, the race).
+    match c.stdin.take().unwrap().write_all(event.as_bytes()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        r => r.unwrap(),
+    }
     c.wait_with_output().unwrap()
 }
 
