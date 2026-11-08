@@ -39,11 +39,14 @@ pub struct Count {
     pub place: String,
     /// `child.md` or `start-<role>.md`.
     pub file: String,
+    /// The role it starts: with its place and file, what makes it the same start on both sides (sol-loop r1, S2: a
+    /// `child.md` of another child role is another start).
+    pub role: String,
     /// Characters as the hook gives it, with the commit.
     pub new: usize,
-    /// Without it, as its store's `HEAD` has it with the same other store: 0 for a start that isn't there yet, or one
-    /// a `HEAD` that doesn't load can't tell. `None` where the baseline wasn't read: every start fits, or the store
-    /// has no `HEAD` yet; either way it counts as 0.
+    /// Without it, as its store's `HEAD` has it with the same other store: 0 for a start that isn't there yet.
+    /// `None` where the baseline wasn't read: every start fits, or the store has no `HEAD` yet; either way it counts
+    /// as 0.
     pub old: Option<usize>,
 }
 
@@ -137,16 +140,19 @@ pub fn admit_between(i: &Inputs, between: &mut dyn FnMut(AdmitStep)) -> Result<O
             };
             let h =
                 capture::capture_tree(Env::Inherited, i.checkout, own, &at, i.limit, &mut |_| {})?;
-            Some(pair.stacks(h).map(|s| counts(&s, i)).unwrap_or_default())
+            // A HEAD that doesn't load says nothing of its starts: the check fails, naming why (sol-loop r1, S3).
+            let baseline =
+                pair.stacks(h).map_err(|e| format!("its store's HEAD doesn't load: {e}"))?;
+            Some(counts(&baseline, i))
         }
         _ => None,
     };
     let counted: Vec<Count> = new
         .into_iter()
-        .map(|((place, file), n)| {
-            let was =
-                old.as_ref().map(|o| o.get(&(place.clone(), file.clone())).copied().unwrap_or(0));
-            Count { place, file, new: n, old: was }
+        .map(|(start, n)| {
+            let was = old.as_ref().map(|o| o.get(&start).copied().unwrap_or(0));
+            let (place, file, role) = start;
+            Count { place, file, role, new: n, old: was }
         })
         .collect();
     between(AdmitStep::Decided);
@@ -174,21 +180,31 @@ impl Pair {
     }
 }
 
-/// Each declared place's hook starts, in characters, keyed by (place, file).
-fn counts(stacks: &Stacks, i: &Inputs) -> BTreeMap<(String, String), usize> {
+/// A start's identity on both sides: its place, its file and the role it starts.
+type Start = (String, String, String);
+
+/// Each declared place's hook starts, in characters.
+fn counts(stacks: &Stacks, i: &Inputs) -> BTreeMap<Start, usize> {
     let mut out = BTreeMap::new();
     for (place, layers) in sync::declared_places(stacks) {
         for s in sync::hook_starts(stacks, layers, i.home, i.today) {
-            out.insert((place.clone(), s.file.clone()), s.chars());
+            out.insert((place.clone(), s.file.clone(), s.role.clone()), s.chars());
         }
     }
     out
 }
 
+/// A git read of the commit's checkout, as its hook got it; a failure to run it at all names the checkout (sol-loop
+/// r1, S4).
+fn inherited(i: &Inputs, args: &[&str]) -> Result<crate::process::Ran, String> {
+    crate::process::git_inherited_bounded(i.checkout, args, None, i.limit)
+        .map_err(|e| format!("{}: {e}", i.checkout.display()))
+}
+
 /// The commit's store's `HEAD`, or none before its first commit.
 fn head(i: &Inputs) -> Result<Option<String>, String> {
     let args = ["rev-parse", "--verify", "-q", "HEAD"];
-    let out = crate::process::git_inherited_bounded(i.checkout, &args, None, i.limit)?;
+    let out = inherited(i, &args)?;
     match out.status.code() {
         Some(0) => Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_string())),
         Some(1) => Ok(None),
@@ -205,7 +221,7 @@ fn head(i: &Inputs) -> Result<Option<String>, String> {
 /// it was (§0b.1). Any other answer than yes or no is an error.
 fn unchanged(i: &Inputs) -> Result<bool, String> {
     let args = ["diff-index", "--cached", "--quiet", "HEAD", "--", i.stack];
-    let out = crate::process::git_inherited_bounded(i.checkout, &args, None, i.limit)?;
+    let out = inherited(i, &args)?;
     match out.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),

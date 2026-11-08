@@ -618,11 +618,16 @@ fn start_check(
                     Some(0) | None => "not there before".to_string(),
                     Some(n) => format!("{n} before"),
                 };
+                // A child's start is its child role's: say whose (sol-loop r1, S2).
+                let file = match c.file == sync::CHILD_FILE {
+                    true => format!("{} ({})", c.file, c.role),
+                    false => c.file.clone(),
+                };
                 Finding::error(
                     "start-limit",
                     format!(
                         "{}: {} would be {} characters ({was}), past the {max} one hook gives a session at its start; a commit may not make a start past that grow: shorten what this commit adds to it, or other entries it holds",
-                        c.place, c.file, c.new
+                        c.place, file, c.new
                     ),
                 )
             })

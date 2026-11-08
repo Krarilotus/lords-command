@@ -718,6 +718,8 @@ struct Planner<'a> {
     /// A place whose child start its hooks can't deliver whole: the plan fails whatever else its role files' item
     /// has against it (repair sol-loop r2, R2).
     undeliverable: bool,
+    /// The date the plan composes the starts a hook gives on, read once (`plan_on`).
+    today: String,
 }
 
 /// Every place sync puts a tool-owned path (design: Ownership boundary), as one grammar: a scope names roots (a
@@ -2721,8 +2723,7 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
     // A start per role for a session whose launch names it (F10; the `role` guard gives it). One past what one hook
     // gives is written all the same: the guard then points the session at its role file, and the plan says so.
     let (mut undeliverable, mut long_starts) = (Vec::new(), Vec::new());
-    let today = crate::ops::today();
-    for s in hook_starts(pl.stacks, place.layers(true), &pl.plan.home, &today) {
+    for s in hook_starts(pl.stacks, place.layers(true), &pl.plan.home, &pl.today) {
         let (file, n) = (&s.file, s.chars());
         if n > CHILD_START_CHARS && s.kind == compose::ChildStart::Beyond {
             undeliverable.push(format!(
@@ -2940,15 +2941,14 @@ fn workspace_items(pl: &mut Planner, name: &str, w: &stack::Workspace, only: Opt
     place_items(pl, &place, only, None);
 }
 
-/// `plan` on the date `today` (`YYYY-MM-DD`): the starts a hook gives are composed on it (gap 11, §0d.5). Not yet
-/// read: the test of sol-loop r1's S5, before its fix.
-#[doc(hidden)]
-pub fn plan_on(stacks: &Stacks, opts: &Options, today: &str) -> Result<Plan, String> {
-    let _ = today;
-    plan(stacks, opts)
+pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
+    plan_on(stacks, opts, &crate::ops::today())
 }
 
-pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
+/// `plan` on the date `today` (`YYYY-MM-DD`), read once for the whole plan: every place's starts a hook gives are
+/// composed on it, and the ended entries it names are those ended by then (gap 11, §0d.5; sol-loop r1, S5).
+#[doc(hidden)]
+pub fn plan_on(stacks: &Stacks, opts: &Options, today: &str) -> Result<Plan, String> {
     let private: &Stack = stacks
         .private
         .as_ref()
@@ -2996,6 +2996,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         trees: BTreeMap::new(),
         places: BTreeMap::new(),
         checkouts: BTreeMap::new(),
+        today: today.to_string(),
     };
     pl.check_ledger()?;
     // The memory index points at the stack's copies: say what an import would bring first.
@@ -3018,7 +3019,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         }
     }
     // Ended temporary entries: never composed; listed here, retired by import_and_apply.
-    for (e, why) in crate::temporary::expired(stacks, &crate::ops::today()) {
+    for (e, why) in crate::temporary::expired(stacks, today) {
         let mut item = Item::new(
             &format!("{} (temporary entry)", e.id()),
             e.meta_file.clone(),

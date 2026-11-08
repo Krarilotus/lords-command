@@ -53,10 +53,12 @@ fn run(
     limit: Duration,
 ) -> Result<Vec<u8>, String> {
     let out = match (env, stdin) {
-        (Env::Isolated, None) => crate::process::git_bounded(dir, args, limit)?,
-        (Env::Isolated, Some(i)) => crate::process::git_input_bounded(dir, args, i, limit)?,
-        (Env::Inherited, i) => crate::process::git_inherited_bounded(dir, args, i, limit)?,
+        (Env::Isolated, None) => crate::process::git_bounded(dir, args, limit),
+        (Env::Isolated, Some(i)) => crate::process::git_input_bounded(dir, args, i, limit),
+        (Env::Inherited, i) => crate::process::git_inherited_bounded(dir, args, i, limit),
     };
+    // A git that couldn't run, or ran past its limit, names the store too, as one that failed does (sol-loop r1, S4).
+    let out = out.map_err(|e| format!("{}: {e}", dir.display()))?;
     succeeded(dir, args, &out)
 }
 
