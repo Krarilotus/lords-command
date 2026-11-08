@@ -33,6 +33,11 @@ fn global() -> Context {
 /// The composed text of a fixture holding `files` (path, text), each written with CRLF line endings if `crlf`.
 fn composed(files: &[(&str, String)], crlf: bool) -> String {
     let f = Fixture::new();
+    // Roles declared, so an entry's core lines have readers (with none, a `start: core` entry composes nothing).
+    f.write(
+        "pub/stack.toml",
+        "name = \"pub\"\nvisibility = \"public\"\nroles = [\"coder\", \"reviewer\"]\n",
+    );
     for (rel, text) in files {
         let text = if crlf { text.replace('\n', "\r\n") } else { text.clone() };
         f.write(rel, &text);
