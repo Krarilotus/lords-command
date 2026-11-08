@@ -845,18 +845,19 @@ fn a_file_added_inside_a_compared_dir_is_kept() {
     }
 }
 
-// Spec (sol-loop r2 S4: "the undo's `rename_over` overwrites an owner edit that lands between its hash and the
-// rename"; note §14.8): while a place is put back, an owner's write to its published file, landing after the undo
-// compared it and before the old version goes back, is kept.
-#[test]
-fn an_owner_edit_between_the_undo_comparison_and_its_put_back_is_kept() {
-    let f = Fixture::new();
-    let (a, _) = rule_two(&f);
-    let (mut published, mut edited) = (None::<PathBuf>, false);
+/// A whole delivery that publishes one of `a`'s two place files, then finds an owner's line in the other, so the place
+/// is put back; `at` runs once, at the undo's comparison of the published file (`Step::Compared` with its path). The
+/// published file's path, and the delivery's answer.
+fn undo_compared(
+    f: &Fixture,
+    a: &Path,
+    mut at: impl FnMut(&Path),
+) -> (PathBuf, Result<Report, String>) {
+    let (mut published, mut done) = (None::<PathBuf>, false);
     let opts = Options::whole(&f.home());
     let r = deliver::run_between(&f.pub_root(), Some(&f.priv_root()), &opts, &mut |s, p| {
         let names = ["CLAUDE.local.md", "AGENTS.override.md"].map(|n| a.join(n));
-        if s == Step::Swapped && published.is_none() && key(p) == key(&a) {
+        if s == Step::Swapped && published.is_none() && key(p) == key(a) {
             let new: Vec<&PathBuf> =
                 names.iter().filter(|n| read(n).contains("Rule two.")).collect();
             if let [one] = new[..] {
@@ -865,22 +866,65 @@ fn an_owner_edit_between_the_undo_comparison_and_its_put_back_is_kept() {
                 fs::write(old, format!("{}My own line.\n", read(old))).unwrap();
                 published = Some(one.clone());
             }
-        } else if s == Step::Compared && !edited {
-            if let Some(pubd) = &published {
-                if key(p) == key(pubd) {
-                    fs::write(p, "Owner's edit after the comparison.\n").unwrap();
-                    edited = true;
-                }
-            }
+        } else if s == Step::Compared
+            && !done
+            && published.as_ref().is_some_and(|q| key(p) == key(q))
+        {
+            at(p);
+            done = true;
         }
     });
-    let published = published.unwrap_or_else(|| panic!("a place was half published: {r:?}"));
-    assert!(edited, "the undo compared the published file: {r:?}");
+    assert!(done, "the undo compared the published file: {r:?}");
+    (published.expect("a place was half published"), r)
+}
+
+// Spec (sol-loop r2 S4, r3 S4 and S5: "an owner write that creates `p` between the two is lost"; "file rollback leaves
+// `p` missing for a moment"; note §14.9): while a place is put back, its published file's path always names a file,
+// and an owner's write to it after the undo compared it is refused or kept, never lost.
+#[test]
+fn an_owner_edit_between_the_undo_comparison_and_its_put_back_is_kept() {
+    let f = Fixture::new();
+    let (a, _) = rule_two(&f);
+    let (mut there, mut refused) = (false, false);
+    let (published, r) = undo_compared(&f, &a, |p| {
+        there = p.is_file();
+        refused = fs::write(p, "Owner's edit after the comparison.\n").is_err();
+    });
+    assert!(there, "the published file's path names a file throughout the put-back: {r:?}");
     let kept = fs::read_dir(a.as_path())
         .unwrap()
         .map(|e| e.unwrap().path())
         .any(|q| read(&q) == "Owner's edit after the comparison.\n");
-    assert!(kept, "the owner's edit is kept: {:?} {r:?}", read(&published));
+    assert!(refused || kept, "the owner's edit is refused or kept: {:?} {r:?}", read(&published));
+}
+
+// Spec (sol-loop r3 S6: "every restore-rename error is treated as occupied. Other errors can leave `p` absent while the
+// compared copy gets deleted"; note §14.9): if the backup named for the old version goes at the undo's comparison, the
+// published file's path still names a file afterwards, and the place is either put back (its old text) or the delivery
+// reports that it couldn't be.
+#[test]
+fn a_put_back_that_fails_leaves_the_path_named() {
+    let f = Fixture::new();
+    let (a, _) = rule_two(&f);
+    let (published, r) = undo_compared(&f, &a, |p| {
+        // The old version's backup, which the undo would put back, goes.
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        for e in fs::read_dir(p.parent().unwrap()).unwrap() {
+            let q = e.unwrap().path();
+            if q.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(&format!(".{name}.lords-done-")))
+            {
+                fs::remove_file(&q).unwrap();
+            }
+        }
+    });
+    assert!(published.is_file(), "the path still names a file: {r:?}");
+    let reported = match &r {
+        Ok(rep) => rep.state.failed.is_some(),
+        Err(_) => true,
+    };
+    let put_back = read(&published).contains("Rule one.");
+    assert!(put_back || reported, "put back, or reported as not: {:?} {r:?}", read(&published));
 }
 
 // Spec (F8 §15, M4; review F8-R1-03; note A5): once a store's hooks are installed, delivery is configured, so a state
