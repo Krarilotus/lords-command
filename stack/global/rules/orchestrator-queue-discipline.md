@@ -10,7 +10,7 @@ start: role
 core:
 - line: "Owner messages first next turn; at turn start/end drain own queue: read full text, cancel read text-only/completions, promote attachments only, singly with no parallel call; also read finished children's full latest runs against last acted runs, never poll running children. Resolve requests in one batch/message per agent; read busy state then one steer holding current work; read-then-cancel means taken, judge delivery by answer."
   roles: [orchestrator]
-- line: "Delegate work that would take more than a few minutes of your own tool calls."
+- line: "Delegate work that separates cleanly, needs an independent review or would fill your context; stay free for the owner."
   roles: [orchestrator]
 visibility: public
 basis:
@@ -47,5 +47,6 @@ task's automatic completion notice is read whole, then cancelled. A cancel after
 that finished since the last one, comparing its latest run with the last one you acted on, since a result can sit
 there with no notification (a lead's later turns don't wake its parent); don't poll children that are still running. Handle what arrived together as one batch: one message per agent,
 and close each request with its disposition, not merely because it was read. To a busy agent, read its state first and
-send one steer that holds whatever it is doing, never several corrections. Delegate work that would take more than a
-few minutes of your own tool calls.
+send one steer that holds whatever it is doing, never several corrections. Delegate work that separates cleanly from
+yours, needs a review not anchored on your own reading, or would fill your context; keep enough attention free to answer
+the owner promptly.
