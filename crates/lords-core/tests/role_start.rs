@@ -49,6 +49,25 @@ fn place() -> (Fixture, PathBuf) {
     (f, checkout)
 }
 
+// Spec (gap 11 design note §0d.5: "the date is read once per H3 run and once per whole delivery"; sol-loop r1, S5: one
+// date per plan): a plan made on a given date composes the starts on that date. A temporary coder rule that has ended by
+// then is in no start, though it hasn't ended today.
+#[test]
+fn a_plan_composes_the_starts_on_its_own_date() {
+    let (f, checkout) = place();
+    let trial = "roles: [coder]\ntemporary:\n  until: 2999-01-01\n  review_by: 2999-12-31\n  reason: a trial\n";
+    f.write(
+        "priv/project/beta/rules/trial.md",
+        &entry("rule.trial", "project:beta", "private", trial, "TRIAL-BODY\n"),
+    );
+    let dir = checkout.join(".lords");
+    let now = plan(&f.stacks(), &f.opts()).unwrap();
+    assert!(planned_in(&now, &dir, "start-coder.md").contains("TRIAL-BODY"), "the fixture's rule");
+    let later = lords_core::sync::plan_on(&f.stacks(), &f.opts(), "2999-06-01").unwrap();
+    let start = planned_in(&later, &dir, "start-coder.md");
+    assert!(start.contains("The coder's line.") && !start.contains("TRIAL-BODY"), "{start}");
+}
+
 // Spec (F10, the Lords owner's spec: "a top-level session starts with its role's lines, not only the place's default
 // role"; design note D2): each declared role but `product` (product runs read no place file) gets `.lords/start-<role>.md`,
 // which names the role as given at launch and the role file, and carries the role's lines for only some roles and its

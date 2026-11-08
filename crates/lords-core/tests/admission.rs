@@ -67,6 +67,11 @@ impl Stores {
 
     /// Writes the coder-only rule `id` in `store`, scoped to `scope`, whose body is `body`.
     fn rule(&self, store: Store, id: &str, scope: &str, body: &str) {
+        self.rule_for(store, id, "coder", scope, body);
+    }
+
+    /// Writes the rule `id` for `role` alone in `store`, scoped to `scope`, whose body is `body`.
+    fn rule_for(&self, store: Store, id: &str, role: &str, scope: &str, body: &str) {
         let (vis, dir) = match store {
             Store::Public => ("public", "public/stack"),
             Store::Private => ("private", "private"),
@@ -78,7 +83,7 @@ impl Stores {
         let name = id.trim_start_matches("rule.");
         self.f.write(
             &format!("{dir}/{layer}/rules/{name}.md"),
-            &entry(id, scope, vis, "roles: [coder]\n", body),
+            &entry(id, scope, vis, &format!("roles: [{role}]\n"), body),
         );
     }
 
@@ -114,11 +119,33 @@ impl Stores {
     /// Writes rule `id`'s one-line body so that `start-coder.md` of `place` is exactly `n` characters long, in the
     /// checkout (staged or not is the caller's).
     fn sized(&self, store: Store, id: &str, scope: &str, place: &str, n: usize) {
-        self.rule(store, id, scope, "a\n");
-        let base = self.chars(place, "start-coder.md");
+        self.sized_as(store, id, ("coder", scope), place, "start-coder.md", n);
+    }
+
+    /// Writes rule `id` for `role` alone, in `scope`, so that `file` of `place` is exactly `n` characters long.
+    fn sized_as(
+        &self,
+        store: Store,
+        id: &str,
+        (role, scope): (&str, &str),
+        place: &str,
+        file: &str,
+        n: usize,
+    ) {
+        self.rule_for(store, id, role, scope, "a\n");
+        let base = self.chars(place, file);
         assert!(n >= base, "{n} < {base}");
-        self.rule(store, id, scope, &format!("{}\n", "a".repeat(n - base + 1)));
-        assert_eq!(self.chars(place, "start-coder.md"), n);
+        self.rule_for(store, id, role, scope, &format!("{}\n", "a".repeat(n - base + 1)));
+        assert_eq!(self.chars(place, file), n);
+    }
+
+    /// The private manifest, with `child_role` if any.
+    fn manifest(&self, child_role: Option<&str>) {
+        let child = child_role.map(|r| format!("child_role = \"{r}\"\n")).unwrap_or_default();
+        self.f.write(
+            "private/stack.toml",
+            &format!("name = \"priv\"\nvisibility = \"private\"\nroles = [\"coder\", \"reviewer\"]\n{child}[repos.demo]\n[repos.other]\n"),
+        );
     }
 
     fn inputs(&self, store: Store) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
@@ -139,6 +166,15 @@ impl Stores {
         store: Store,
         between: &mut dyn FnMut(AdmitStep),
     ) -> Result<Outcome, String> {
+        self.admit_within(store, Duration::from_secs(60), between)
+    }
+
+    fn admit_within(
+        &self,
+        store: Store,
+        limit: Duration,
+        between: &mut dyn FnMut(AdmitStep),
+    ) -> Result<Outcome, String> {
         isolate_git();
         let (checkout, public, private, home) = self.inputs(store);
         let i = Inputs {
@@ -149,7 +185,7 @@ impl Stores {
             private: &private,
             home: &home,
             today: TODAY,
-            limit: Duration::from_secs(60),
+            limit,
         };
         admission::admit_between(&i, between)
     }
@@ -391,6 +427,59 @@ fn a_first_commit_counts_from_nothing() {
     let o = s.admit(Store::Public).unwrap();
     assert!(refused(&o), "{o:?}");
     assert_eq!(coder(&o, "repo demo").old, None);
+}
+
+// Spec (§0c.5 T4: "a changed `child_role`: its new child.md is admitted against old = 0 if it's under the limit, and
+// refused if it's over"; sol-loop r1, S2: a start is its place, its file and its role): with the coder's child.md at
+// 9,700 in HEAD, a commit that makes the reviewer the child role, whose child.md is 9,600, is refused: the reviewer's
+// child start wasn't there before. It would be admitted against the coder's 9,700 if the role weren't part of it.
+#[test]
+fn a_child_role_switch_counts_the_new_role_from_nothing() {
+    let s = Stores::new();
+    s.manifest(Some("reviewer"));
+    s.sized_as(Store::Private, "rule.r", ("reviewer", "global"), "repo demo", "child.md", 9_600);
+    s.manifest(Some("coder"));
+    s.sized_as(Store::Private, "rule.c", ("coder", "global"), "repo demo", "child.md", 9_700);
+    s.commit(Store::Private, "the coder's child start past the limit");
+    s.manifest(Some("reviewer"));
+    assert_eq!(s.chars("repo demo", "child.md"), 9_600);
+    s.stage(Store::Private);
+    let o = s.admit(Store::Private).unwrap();
+    let child =
+        counted(&o).iter().find(|c| c.place == "repo demo" && c.file == "child.md").unwrap();
+    assert_eq!((child.new, child.old), (9_600, Some(0)), "{o:?}");
+    assert!(refused(&o), "{o:?}");
+}
+
+// Spec (sol-loop r1, S3: "old = 0 is only for a start that's genuinely absent"; §0b.3 step 6): when a start is past
+// the limit and the store's HEAD doesn't load (a manifest this commit repairs), the check fails, naming why, rather
+// than counting every start of HEAD as absent.
+#[test]
+fn a_baseline_that_does_not_load_is_an_error() {
+    let s = Stores::new();
+    s.f.write(
+        "private/stack.toml",
+        "name = \"priv\"\nvisibility = \"private\"\nroles = [\"coder\", \"reviewer\"\n",
+    );
+    s.commit(Store::Private, "a broken manifest");
+    s.manifest(None);
+    s.sized(Store::Private, "rule.p", "global", "repo demo", LIMIT + 1);
+    s.stage(Store::Private);
+    let err = s.admit(Store::Private).unwrap_err();
+    assert!(err.contains("stack.toml"), "{err}");
+}
+
+// Spec (sol-loop r1, S4: a failure names the store it happened in, as `succeeded` names it for a git that failed): a
+// git read stopped at its limit fails the check, naming the checkout it was reading.
+#[test]
+fn a_git_read_past_its_limit_names_the_store() {
+    let s = Stores::new();
+    s.rule(Store::Private, "rule.p", "global", "a rule\n");
+    s.stage(Store::Private);
+    let err = s.admit_within(Store::Private, Duration::ZERO, &mut |_| {}).unwrap_err();
+    let shown = err.replace('\\', "/");
+    let repo = s.repo(Store::Private).display().to_string().replace('\\', "/");
+    assert!(shown.contains(&repo) && shown.contains("deadline"), "{err}");
 }
 
 // Spec (r3's F3 counterexample; design check r4, R4-F2: synchronize at the real status read, so a mutant that reads

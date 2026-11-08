@@ -2940,6 +2940,14 @@ fn workspace_items(pl: &mut Planner, name: &str, w: &stack::Workspace, only: Opt
     place_items(pl, &place, only, None);
 }
 
+/// `plan` on the date `today` (`YYYY-MM-DD`): the starts a hook gives are composed on it (gap 11, §0d.5). Not yet
+/// read: the test of sol-loop r1's S5, before its fix.
+#[doc(hidden)]
+pub fn plan_on(stacks: &Stacks, opts: &Options, today: &str) -> Result<Plan, String> {
+    let _ = today;
+    plan(stacks, opts)
+}
+
 pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
     let private: &Stack = stacks
         .private
