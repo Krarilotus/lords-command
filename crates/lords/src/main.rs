@@ -16,14 +16,19 @@ lords: one home for how you work with agents
 
 usage:
   lords check [--public | --stack] [--strict] [--json]   --stack: the entries only (a stack repo's pre-commit)
+    (--by-stack, a stack repo's hooks: --public checks nothing where this checkout's stack is private, --stack nothing
+    where it has no stack)
   lords import [--store NAME] [--no-commit]
   lords retire ID --reason TEXT [--superseded-by ID] [--date YYYY-MM-DD] [--no-commit]
   lords promote ID [--strip | --split] [--no-commit]
-  lords privacy --staged [--secrets-only]   staged files and their paths; a binary needs `lords-binary` in .gitattributes
-  lords privacy --message FILE [--staged] [--secrets-only]   a commit message (the commit-msg hook)
-  lords privacy --history [--private-stack DIR]   every commit's message and patch (the pre-push check)
+  lords privacy --staged [--secrets-only | --by-stack]   staged files and their paths; a binary needs `lords-binary` in .gitattributes
+  lords privacy --message FILE [--staged] [--secrets-only | --by-stack]   a commit message (the commit-msg hook)
+  lords privacy --history [--private-stack DIR] [--secrets-only | --by-stack]   every commit's message and patch (the pre-push check)
   lords privacy FILE...
+    (--by-stack: the mode of this checkout's stack, secrets only where every copy of its manifest says private, else the
+    whole policy; --secrets-only holds only where this checkout has no stack or a private one)
   lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit, pre-merge-commit and commit-msg hooks; in a stack repo also `check --stack`, a pre-push and a post-commit that runs `deliver`
+    (a stack repo's hooks check with --by-stack, so each checkout by its own stack; --secrets-only is for a repo without one)
   lords hash PATH
   lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--stage install] [--json] [--apply] [--deadline-ms N]
     (a write of Codex's hooks: trusts Lords' own through Codex's app-server, names each hook that isn't trusted, exit 1)
@@ -506,29 +511,111 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     let stack_only = a.flag("--stack");
     let strict = a.flag("--strict");
     let json = a.flag("--json");
+    // A stack repo's hooks: no public tree to check at a push where the pushing checkout's stack is private (D28 r2,
+    // C5), and no entries at a commit where the committing checkout has no stack (fix check r2, F01).
+    let by_stack = a.flag("--by-stack");
     let explicit = a.words.iter().any(|w| w == "--public-stack");
     let explicit_private = a.words.iter().any(|w| w == "--private-stack");
-    let mut p = paths(&mut a)?;
+    let p = paths(&mut a);
     a.done()?;
+    let cwd = std::env::current_dir().ok();
+    // A stack repo's hooks check the checkout they run in, as `checkout_stack` finds it, or refuse: a configured stack
+    // never stands in for it, since its entries aren't this checkout's and its allow-list isn't this checkout's
+    // (fix check r4, D28-R4-01; design note 2026-11-08-lords-d28-alias, "Fix check r4").
+    // Found once, for the selection and for the start check (gap 11) alike (the master, 8 Nov).
+    use lords_core::privacy::CheckoutStack;
+    let found = (stack_only || (by_stack && public_only)).then(|| match cwd.as_deref() {
+        Some(d) => lords_core::privacy::checkout_stack(d),
+        None => CheckoutStack::Unknown("the current dir can't be read".to_string()),
+    });
+    let here = found.as_ref().filter(|_| by_stack);
+    let not_checked = "so it isn't checked: no configured stack stands in for this checkout's";
+    match here {
+        Some(CheckoutStack::Unknown(why)) => {
+            return Err(format!("this checkout's stack can't be told ({why}), {not_checked}"))
+        }
+        Some(CheckoutStack::Is(Visibility::Private)) if public_only => {
+            println!(
+                "lords check: this checkout's stack is private, so it has no public tree to check"
+            );
+            return Ok(true);
+        }
+        Some(CheckoutStack::None) if stack_only => {
+            println!("lords check: this checkout has no stack, so it has no entries to check");
+            return Ok(true);
+        }
+        _ => {}
+    }
+    let mut p = p?;
     // The stores as configured: where installs read them, so what the start check composes and compares (gap 11).
     let configured = (p.public.clone(), p.private.clone());
     // `--public` and `--stack` check the repo they run in (its hooks), not whatever config.txt points at.
-    let top = std::env::current_dir().ok().and_then(|d| git::toplevel(&d));
+    let top = cwd.and_then(|d| git::toplevel(&d));
     let committing = top.clone();
-    if (public_only || stack_only) && !explicit {
-        if let Some(stack) =
-            top.as_ref().map(|t| t.join("stack")).filter(|s| s.join("stack.toml").is_file())
-        {
-            p.public = stack;
+    let own_public =
+        top.as_ref().map(|t| t.join("stack")).filter(|s| s.join("stack.toml").is_file());
+    let own_private = top.clone().filter(|t| t.join("stack.toml").is_file());
+    // A `--by-stack` check's allowances are this checkout's own: a configured stack adds restrictions only, so a
+    // configured private stack gives its deny and fleet terms, never its allow-list (fix check r5, D28-R5-01; design
+    // note d28-alias, "Fix check r5").
+    let mut own_private_stack = false;
+    match here {
+        // Proven to have no stack (the `--stack` case returned above): its own tree, under the public rules and the
+        // configured private stack's deny and fleet terms, never a configured stack's allow-list or repo.
+        Some(CheckoutStack::None) => {
+            let top = top.ok_or_else(|| format!("git names no checkout here, {not_checked}"))?;
+            let private = p.private.as_deref().map(Stack::load).transpose()?;
+            let rules = Rules::public().with_private_terms(private.as_ref())?;
+            let (scan, findings) = check::public_tree(&top, &rules)?;
+            print_findings(&findings, json);
+            if !json {
+                println!(
+                    "public: this checkout has no stack, so its own tree is checked: {} files scanned, {} not text",
+                    scan.files_scanned,
+                    scan.binary.len()
+                );
+            }
+            return Ok(!check::has_errors(&findings, strict));
         }
-    }
-    if stack_only && !explicit_private {
-        if let Some(t) = top.filter(|t| t.join("stack.toml").is_file()) {
-            p.private = Some(t);
+        Some(CheckoutStack::Is(v)) => {
+            let missing = |at: &str| {
+                format!("this checkout's stack is {v}, but {at} isn't on disk, {not_checked}")
+            };
+            if *v == Visibility::Public {
+                p.public = own_public.ok_or_else(|| missing("stack/stack.toml"))?;
+                if let Some(t) = own_private.filter(|_| stack_only) {
+                    p.private = Some(t);
+                    own_private_stack = true;
+                }
+            } else {
+                p.private = Some(own_private.ok_or_else(|| missing("stack.toml"))?);
+                own_private_stack = true;
+                if let Some(s) = own_public {
+                    p.public = s;
+                }
+            }
+        }
+        _ => {
+            if (public_only || stack_only) && !explicit {
+                if let Some(stack) = own_public {
+                    p.public = stack;
+                }
+            }
+            if stack_only && !explicit_private {
+                if let Some(t) = own_private {
+                    p.private = Some(t);
+                }
+            }
         }
     }
     let private = p.private.as_deref().map(Stack::load).transpose()?;
-    let rules = public_rules(&p.public, private.as_ref())?;
+    // Here `p.public` is this checkout's own `stack/` (Is(Public)) or, for Is(Private), the configured complementary
+    // stack, whose allow-list reaches only its own public entries, never this checkout's private ones.
+    let rules = if here.is_some() && !own_private_stack {
+        Rules::public().with_allow_from(&p.public).with_private_terms(private.as_ref())?
+    } else {
+        public_rules(&p.public, private.as_ref())?
+    };
     if public_only {
         let stacks = Stacks::load(&p.public, None)?;
         let mut findings = check::check(&stacks, &rules);
@@ -556,7 +643,7 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     let findings = if stack_only {
         let mut f = check::check_stack(&stacks, &rules);
         let limit = std::time::Duration::from_secs(stacks.delivery().store_git_secs);
-        f.extend(start_check(committing.as_deref(), &configured, limit, json));
+        f.extend(start_check(committing.as_deref(), found.as_ref(), &configured, limit, json));
         f
     } else {
         let mut f = check::check(&stacks, &rules);
@@ -574,24 +661,36 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
 /// The stores' commit check of the starts one hook gives (gap 11, `admission`): in a store's checkout `top`, what the
 /// commit makes of each place's `child.md` and `start-<role>.md`, against the other store as committed. A refusal, an
 /// other store that can't be read as committed, and any failure to check are errors, so the commit stops. Admitted,
-/// it says how long each start is at most, unless `json`. Outside a store's checkout, or with no private store
-/// configured (no place is declared), there is nothing to check.
+/// it says how long each start is at most, unless `json`. Which store `top` is, is D28's discovery `found`, as
+/// `cmd_check` holds it: a checkout whose stack can't be told is refused, and its stack's manifest not on disk too.
+/// Outside a store's checkout, or with no private store configured (no place is declared), there is nothing to check.
 fn start_check(
     top: Option<&Path>,
+    found: Option<&lords_core::privacy::CheckoutStack>,
     configured: &(PathBuf, Option<PathBuf>),
     limit: std::time::Duration,
     json: bool,
 ) -> Vec<Finding> {
     use lords_core::admission::{self, Inputs, Outcome};
+    use lords_core::privacy::CheckoutStack;
     use lords_core::stack::Store;
-    let (Some(top), (public, Some(private))) = (top, configured) else { return Vec::new() };
-    let (store, stack) = if top.join("stack").join("stack.toml").is_file() {
-        (Store::Public, "stack")
-    } else if top.join("stack.toml").is_file() {
-        (Store::Private, ".")
-    } else {
-        return Vec::new();
+    let unchecked = |why: String| {
+        vec![Finding::error("start-check", format!("{why}, so its starts can't be checked"))]
     };
+    let (v, store, stack, manifest) = match found {
+        None | Some(CheckoutStack::None) => return Vec::new(),
+        Some(CheckoutStack::Unknown(why)) => {
+            return unchecked(format!("this checkout's stack can't be told ({why})"))
+        }
+        Some(CheckoutStack::Is(v @ Visibility::Public)) => {
+            (v, Store::Public, "stack", "stack/stack.toml")
+        }
+        Some(CheckoutStack::Is(v @ Visibility::Private)) => (v, Store::Private, ".", "stack.toml"),
+    };
+    let (Some(top), (public, Some(private))) = (top, configured) else { return Vec::new() };
+    if !top.join(manifest).is_file() {
+        return unchecked(format!("this checkout's stack is {v}, but {manifest} isn't on disk"));
+    }
     let home = match sync::default_home() {
         Ok(h) => h,
         Err(e) => {
@@ -1384,10 +1483,21 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
     let staged = a.flag("--staged");
     let history = a.flag("--history");
     let secrets_only = a.flag("--secrets-only");
+    // A stack repo's hooks: the mode of the checkout this runs in, whichever installed them (D28 r2, C1).
+    let by_stack = a.flag("--by-stack");
     let message = a.value("--message")?;
     let public_stack = a.value("--public-stack")?.map(PathBuf::from);
     let private_stack = a.value("--private-stack")?.map(PathBuf::from);
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    // Secrets only only where this checkout's stack allows it, so no caller gives a public checkout that mode (C2).
+    let (secrets_only, why) = if by_stack || secrets_only {
+        privacy::checkout_mode(&privacy::checkout_stack(&cwd), by_stack, secrets_only)
+    } else {
+        (false, None)
+    };
+    if let Some(why) = why {
+        eprintln!("lords privacy: {why}");
+    }
     let rules = if secrets_only {
         Rules::secrets_only()
     } else {
@@ -1553,6 +1663,12 @@ fn cmd_hooks(mut a: Args) -> Result<bool, String> {
         println!(
             "note: global core.hooksPath = {g}; its dispatcher must run .git/hooks/{} for this to take effect",
             hooks::PRIVACY.join(", ")
+        );
+    }
+    // A stack repo's hooks (its pre-push among them) check by each checkout's own stack (D28 r2, C3).
+    if secrets_only && installed.iter().any(|r| r.hook.file_name() == Some("pre-push".as_ref())) {
+        println!(
+            "note: a stack repo's hooks check each checkout by its own stack's visibility, so --secrets-only isn't written"
         );
     }
     Ok(true)

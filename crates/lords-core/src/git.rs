@@ -103,8 +103,57 @@ pub fn status(dir: &Path, args: &[&str]) -> Result<bool, String> {
     }
 }
 
+/// Whether `dir`'s HEAD is proven unborn: it names a branch (`symbolic-ref`), it names no object id (`rev-parse
+/// --verify HEAD`), and that branch doesn't exist (`show-ref --verify`). Each "no" must be exit 1 with nothing said.
+/// A HEAD that names an id is `false`, the object read or not, and every other answer is an error: an exit 1 of
+/// `rev-parse --verify HEAD^{commit}` is no proof of absence (D28 fix check r6, R6-01; design note d28-alias). Only
+/// exit codes and empty output are read, never git's wording.
+pub fn head_unborn(dir: &Path) -> Result<bool, String> {
+    let quiet_no = |args: &[&str]| -> Result<bool, String> {
+        let out = git(dir, args)?;
+        match out.status.code() {
+            Some(0) => Ok(false),
+            Some(1) if out.stderr.is_empty() && out.stdout.is_empty() => Ok(true),
+            _ => Err(failed(args, out.status, &out.stderr, &out.stdout)),
+        }
+    };
+    if !quiet_no(&["rev-parse", "-q", "--verify", "HEAD"])? {
+        return Ok(false);
+    }
+    let branch = run(dir, &["symbolic-ref", "-q", "HEAD"])?;
+    let branch = branch.trim();
+    if quiet_no(&["show-ref", "--verify", "--quiet", branch])? {
+        return Ok(true);
+    }
+    Err(format!("HEAD names {branch}, which exists, but HEAD names no object"))
+}
+
 pub fn toplevel(dir: &Path) -> Option<PathBuf> {
     run(dir, &["rev-parse", "--show-toplevel"]).ok().map(|s| PathBuf::from(s.trim()))
+}
+
+/// `toplevel`, keeping why not: `None` only where git says `dir` is in no repository, an error for every other
+/// failure, so a failed lookup is never taken for no checkout (D28 fix check r2, R2-02). Git speaks C here, so its
+/// answer reads the same in every locale.
+pub fn top_level(dir: &Path) -> Result<Option<PathBuf>, String> {
+    let args = ["rev-parse", "--show-toplevel"];
+    let env = [("LC_ALL", "C"), ("LANGUAGE", "C")];
+    let out = started(
+        &args,
+        || crate::process::git_env(dir, &args, &env),
+        |out| out.status.code(),
+        std::thread::sleep,
+    )?;
+    if out.status.success() {
+        return Ok(Some(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())));
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    if out.status.code() == Some(128)
+        && said.trim_start().starts_with("fatal: not a git repository")
+    {
+        return Ok(None);
+    }
+    Err(failed(&args, out.status, &out.stderr, &out.stdout))
 }
 
 /// Stages `paths` (relative to `dir`, or `.`) and commits if anything changed. Returns the new commit, if any.

@@ -96,6 +96,17 @@ pub fn merge_script(lords_exe: &Path, secrets_only: bool, home: &Path) -> String
     staged_script("pre-merge-commit", lords_exe, secrets_only, false, home)
 }
 
+/// The mode a privacy hook's command names (D28 r2, design note 2026-11-08-lords-d28-r2, C1-C3): a stack repo's none,
+/// `--by-stack`, since every worktree runs the same hooks and the checkout that runs one decides its mode; another
+/// repo's the flag it was installed with, which the check still holds only where that checkout's stack allows it.
+fn mode_flag(secrets_only: bool, stack: bool) -> &'static str {
+    match (stack, secrets_only) {
+        (true, _) => " --by-stack",
+        (false, true) => " --secrets-only",
+        (false, false) => "",
+    }
+}
+
 /// `stack`: the repo is a stack repo, whose entries `lords check --stack` checks before the privacy check.
 fn staged_script(
     hook: &str,
@@ -105,11 +116,25 @@ fn staged_script(
     home: &Path,
 ) -> String {
     let exe = lords_exe.to_string_lossy().replace('\\', "/");
-    let flag = if secrets_only { " --secrets-only" } else { "" };
+    let flag = mode_flag(secrets_only, stack);
     let stack = if stack {
-        format!("# A stack repo: its entries, as `lords check` sees them.\n\"{exe}\" check --stack || exit $?\n")
+        format!(
+            "# A stack repo: this checkout's entries, as `lords check` sees them (none where it has no stack).\n\
+             \"{exe}\" check --stack --by-stack || exit $?\n"
+        )
     } else {
-        String::new()
+        // A checkout that has a stack only since these hooks were installed pushes unchecked until they are installed
+        // again (fix check r2, F01): said at each commit.
+        format!(
+            "for m in {} {}; do\n\
+             \x20 if [ -f \"$top/$m\" ]; then\n\
+             \x20   echo \"lords: this checkout has $m, but its repo's hooks were installed for a repo without a stack, so no pre-push checks its pushes: run \\`lords hooks install\\` again\" >&2\n\
+             \x20   break\n\
+             \x20 fi\n\
+             done\n",
+            crate::privacy::MANIFESTS[0],
+            crate::privacy::MANIFESTS[1]
+        )
     };
     format!(
         "#!/bin/sh\n{MARKER} of the staged files (installed by `lords hooks install`).\n\
@@ -126,32 +151,37 @@ fn staged_script(
 }
 
 /// A stack repo's pre-push hook (orchestrator, 27 Oct): every commit's message and patch, secrets only where the
-/// stack is private; a public stack's whole tree too, as `lords check --public` checks it.
-/// It answers a probe like the commit hooks, so a push can tell that it is there and dispatches (review r1 R4).
-fn pre_push_script(lords_exe: &Path, secrets_only: bool, home: &Path) -> String {
+/// pushing checkout's stack is private; a public stack's whole tree too, as `lords check --public` checks it, which
+/// `--by-stack` skips in a private checkout (D28 r2, C5). It answers a probe like the commit hooks, so a push can tell
+/// that it is there and dispatches (review r1 R4).
+fn pre_push_script(lords_exe: &Path, home: &Path) -> String {
     let exe = lords_exe.to_string_lossy().replace('\\', "/");
-    let tail = if secrets_only {
-        format!("exec \"{exe}\" privacy --history --secrets-only\n")
-    } else {
-        format!("\"{exe}\" privacy --history || exit $?\nexec \"{exe}\" check --public\n")
-    };
     format!(
-        "#!/bin/sh\n{MARKER} of the history to push (installed by `lords hooks install`).\n{}{tail}",
+        "#!/bin/sh\n{MARKER} of the history to push (installed by `lords hooks install`).\n{}\
+         \"{exe}\" privacy --history --by-stack || exit $?\nexec \"{exe}\" check --public --by-stack\n",
         probe_lines(home, "pre-push")
     )
 }
 
-/// Whether the repo tracks a stack: `stack.toml` at its top (the private stack) or `stack/stack.toml` (the public).
-fn is_stack_repo(repo: &Path) -> Result<bool, String> {
-    Ok(!git::run(repo, &["ls-files", "--", ":/stack.toml", ":/stack/stack.toml"])?
-        .trim()
-        .is_empty())
+/// Whether a checkout that runs `repo`'s hooks has a stack (`privacy::checkout_stack`, a manifest found or one it
+/// can't read): `repo`'s own, else any worktree `git worktree list` names that is there (fix check r2, F01: a
+/// public sibling's push is checked whichever checkout installs). Where the list can't be read, `true`: the stack
+/// hooks check each checkout by its own stack, so they are the safe ones.
+fn shares_a_stack(repo: &Path) -> bool {
+    if crate::privacy::checkout_stack(repo).found() {
+        return true;
+    }
+    let Ok(list) = git::run(repo, &["worktree", "list", "--porcelain", "-z"]) else { return true };
+    list.split('\0').filter_map(|l| l.strip_prefix("worktree ")).map(Path::new).any(|w| {
+        // A worktree whose dir is gone (prunable) runs no hook.
+        fsguard::kind(w) != Ok(fsguard::Kind::Missing) && crate::privacy::checkout_stack(w).found()
+    })
 }
 
 /// The commit-msg hook: git passes the message file as `$1`.
-pub fn commit_msg_script(lords_exe: &Path, secrets_only: bool, home: &Path) -> String {
+pub fn commit_msg_script(lords_exe: &Path, secrets_only: bool, stack: bool, home: &Path) -> String {
     let exe = lords_exe.to_string_lossy().replace('\\', "/");
-    let flag = if secrets_only { " --secrets-only" } else { "" };
+    let flag = mode_flag(secrets_only, stack);
     format!(
         "#!/bin/sh\n{MARKER} of the commit message (installed by `lords hooks install`).\n{probe}exec \"{exe}\" privacy --message \"$1\"{flag}\n",
         probe = probe_lines(home, "commit-msg"),
@@ -279,7 +309,7 @@ fn backup_name(dir: &Root, name: &str) -> Result<Contained, String> {
     unreachable!()
 }
 
-/// The repo's hooks dir for the privacy hooks: `own_hooks_dir`, refused where a local `core.hooksPath` bypasses it.
+/// The repo's hooks dir for the privacy hooks: `own_hooks_root`, refused where a local `core.hooksPath` bypasses it.
 fn hooks_dir(repo: &Path) -> Result<Root, String> {
     if git::status(repo, &["config", "--local", "--get", "core.hooksPath"])? {
         let local = git::run(repo, &["config", "--local", "--get", "core.hooksPath"])?;
@@ -288,16 +318,21 @@ fn hooks_dir(repo: &Path) -> Result<Root, String> {
             local.trim()
         ));
     }
-    own_hooks_dir(repo)
+    own_hooks_root(repo)
 }
 
 /// The repo's own hooks dir as a verified root: the repo's checkout root (git's top level, exactly), then git's common
 /// hooks dir, made where it isn't yet.
 fn own_hooks_dir(repo: &Path) -> Result<Root, String> {
-    let top = git::run(repo, &["rev-parse", "--show-toplevel"])?;
-    let dir = Root::hooks(&Root::checkout(Path::new(top.trim()))?)?;
+    let dir = own_hooks_root(repo)?;
     dir.create()?;
     Ok(dir)
+}
+
+/// `own_hooks_dir`, not made yet: an install makes it only after every refusal (review r1, R1-03).
+fn own_hooks_root(repo: &Path) -> Result<Root, String> {
+    let top = git::run(repo, &["rev-parse", "--show-toplevel"])?;
+    Root::hooks(&Root::checkout(Path::new(top.trim()))?)
 }
 
 /// Installs the privacy hooks (`PRIVACY`), and in a stack repo its pre-push and post-commit (`post_commit_script`, with
@@ -325,19 +360,21 @@ pub fn install_with(
     stacks: &SyncArgs,
 ) -> Result<Vec<Installed>, String> {
     let dir = hooks_dir(repo)?;
+    // A stack repo where any checkout that runs these hooks has a manifest, tracked or not (D28 r2, C4; fix check r2,
+    // F01). Which mode each hook checks in is decided by the checkout that runs it (C1).
+    let stack = shares_a_stack(repo);
     let _lock = ApplyLock::take(home, 60)?;
     let mut ledger = Ledger::load(home)?;
-    let stack = is_stack_repo(repo)?;
     let mut hooks = vec![
         ("pre-commit", staged_script("pre-commit", lords_exe, secrets_only, stack, home)),
         (
             "pre-merge-commit",
             staged_script("pre-merge-commit", lords_exe, secrets_only, stack, home),
         ),
-        ("commit-msg", commit_msg_script(lords_exe, secrets_only, home)),
+        ("commit-msg", commit_msg_script(lords_exe, secrets_only, stack, home)),
     ];
     if stack {
-        hooks.push(("pre-push", pre_push_script(lords_exe, secrets_only, home)));
+        hooks.push(("pre-push", pre_push_script(lords_exe, home)));
         hooks.push(("post-commit", post_commit_script(lords_exe, home, stacks)));
     }
     let mut foreign = Vec::new();
@@ -359,6 +396,8 @@ pub fn install_with(
         .ok()
         .map(|s| s.trim().to_string());
     let scope = format!("hooks:{}", crate::ledger::key(dir.path()));
+    // Made only now, after every refusal (review r1, R1-03).
+    dir.create()?;
     let mut installed = Vec::new();
     for (name, text) in hooks {
         let hook = dir.join(&[Part::new(name)?]);

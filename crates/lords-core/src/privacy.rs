@@ -3,6 +3,7 @@
 use crate::config::expand_home;
 use crate::fsguard;
 use crate::git;
+use crate::model::Visibility;
 use crate::stack::Stack;
 use regex::Regex;
 use serde::Serialize;
@@ -81,14 +82,23 @@ impl Rules {
         self
     }
 
-    /// Adds the private stack's deny-list and fleet hosts. Without a private stack, or a deny-list, that is noted;
-    /// a deny-list or fleet config that is there but can't be read is an error, so the check fails closed.
-    pub fn with_private(mut self, private: Option<&Stack>) -> Result<Rules, String> {
+    /// Adds the private stack's allow-list (`with_allow_from`), deny-list and fleet hosts (`with_private_terms`).
+    pub fn with_private(self, private: Option<&Stack>) -> Result<Rules, String> {
+        match private {
+            Some(p) => self.with_allow_from(&p.root).with_private_terms(Some(p)),
+            None => self.with_private_terms(None),
+        }
+    }
+
+    /// Adds the private stack's deny-list and fleet hosts, and never its allow-list: the rules a stack that isn't the
+    /// checked checkout's adds, so they only find more (design note d28-alias, fix check r5, D28-R5-01). Without a
+    /// private stack, or a deny-list, that is noted; a deny-list or fleet config that is there but can't be read is an
+    /// error, so the check fails closed.
+    pub fn with_private_terms(mut self, private: Option<&Stack>) -> Result<Rules, String> {
         let Some(private) = private else {
             self.notes.push("no private stack: the deny and fleet classes were not checked".into());
             return Ok(self);
         };
-        self = self.with_allow_from(&private.root);
         let deny = private.root.join("privacy").join("deny.txt");
         match fsguard::read_string(&deny) {
             Ok(text) => self.deny.extend(list_lines(&text).map(fold_term)),
@@ -545,4 +555,269 @@ pub fn scan_history(repo: &Path, rules: &Rules) -> Result<HistoryScan, String> {
         }
     }
     Ok(scan)
+}
+
+// ---------------------------------------------------------------- the checkout's own mode (D28 r2)
+
+/// Where a stack's manifest is at a checkout's top: the private stack's, and the public one's (`stack/`).
+pub const MANIFESTS: [&str; 2] = ["stack.toml", "stack/stack.toml"];
+
+/// What a checkout's own stack says about the mode of a privacy check that runs in it (D28 r2, design note
+/// 2026-11-08-lords-d28-r2, C1 and C4): the mode belongs to the checkout that runs the check, never to the one that
+/// installed its hooks, since every worktree of a repo runs the same hooks (review r1, R1-01).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckoutStack {
+    /// No copy of a manifest anywhere in the checkout, or no git checkout.
+    None,
+    /// Every copy names this visibility.
+    Is(Visibility),
+    /// A copy is there, but the mode can't be told from the copies: why, in one line.
+    Unknown(String),
+}
+
+impl CheckoutStack {
+    /// Whether the checkout has a stack's manifest, readable or not: install's choice of a stack repo's hooks.
+    pub fn found(&self) -> bool {
+        !matches!(self, CheckoutStack::None)
+    }
+}
+
+/// Every copy of the manifests (`MANIFESTS`) of the checkout `dir` is in: in HEAD, in the index a hook checks (the
+/// commit's own, as `scan_staged` reads it), and on disk, tracked or not (review r1, R1-02). All naming one
+/// visibility is that visibility. Anything else is `Unknown`, never a guess: a copy that can't be read or names no
+/// visibility, and copies that disagree, two manifests or a change that is only partly staged. Only a dir git says is
+/// in no repository has no stack; a checkout git can't tell is `Unknown`, with git's answer (R2-02).
+///
+/// A copy counts by structure, never by matching the names that alias it (fix check r3, R2-01; design note
+/// 2026-11-08-lords-d28-alias): on disk only through entries listed under their exact canonical names
+/// (`exactly_listed`), and in git only at a canonical path as a regular file. Any other git entry a filesystem may take
+/// for a manifest (`git_entry`) is `Unknown`, named, so no alias of a public copy is left out.
+pub fn checkout_stack(dir: &Path) -> CheckoutStack {
+    let top = match git::top_level(dir) {
+        Ok(Some(top)) => top,
+        Ok(None) => return CheckoutStack::None,
+        Err(e) => {
+            return CheckoutStack::Unknown(format!("git can't tell which checkout this is ({e})"))
+        }
+    };
+    let mut copies: Vec<(String, Result<Visibility, String>)> = Vec::new();
+    for rel in MANIFESTS {
+        let path = top.join(rel);
+        let text = match fsguard::kind(&path) {
+            Ok(fsguard::Kind::Missing) => continue,
+            Ok(_) => exactly_listed(&top, rel).and_then(|()| {
+                fsguard::read_text(&path).and_then(|t| t.ok_or_else(|| "gone".to_string()))
+            }),
+            Err(e) => Err(e),
+        };
+        copies.push((format!("{rel} on disk"), text.and_then(|t| visibility_of(&t))));
+    }
+    // Each blob read once: HEAD's copy and the staged one are mostly the same object.
+    let mut blobs = std::collections::BTreeMap::new();
+    let mut blob = |id: &str| -> Result<Visibility, String> {
+        let found = blobs.entry(id.to_string()).or_insert_with(|| -> Result<Visibility, String> {
+            let bytes = git::bytes(&top, &["cat-file", "blob", id])?;
+            visibility_of(&String::from_utf8(bytes).map_err(|_| "isn't UTF-8 text".to_string())?)
+        });
+        found.clone()
+    };
+    // Every git entry, at any depth, is put to `git_entry`: `<mode> <id> <stage>\t<path>` from the index (each stage of
+    // a conflict a copy), `<mode> <type> <id>\t<path>` from HEAD's whole tree. Two listings, not a pathspec: git's
+    // case folding is ASCII only and knows no other filesystem rule.
+    let mut entry = |path: &str, mode: &str, id: &str, at: String| -> Option<_> {
+        match git_entry(path, mode) {
+            GitEntry::Other => None,
+            GitEntry::Manifest => Some((at, blob(id))),
+            GitEntry::Alias(why) => Some((at, Err(why))),
+        }
+    };
+    let staged = ["ls-files", "-s", "-z", "--full-name"];
+    match git::run_index(&top, &staged) {
+        Ok(out) => {
+            for rec in out.split('\0').filter(|r| !r.is_empty()) {
+                let (head, path) = rec.split_once('\t').unwrap_or((rec, ""));
+                copies.extend(match head.split(' ').collect::<Vec<_>>().as_slice() {
+                    [mode, id, _] => entry(path, mode, id, format!("{path} staged")),
+                    _ => Some((
+                        format!("{path} staged"),
+                        Err(format!("`git ls-files -s` said {rec:?}")),
+                    )),
+                });
+            }
+        }
+        Err(e) => copies.push(("the index".to_string(), Err(e))),
+    }
+    // No HEAD copy only where git proves HEAD unborn; a HEAD naming a commit that can't be read is `Unknown` (fix check
+    // r6, R6-01).
+    match git::status(&top, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]) {
+        Ok(false) => match git::head_unborn(&top) {
+            Ok(true) => {}
+            Ok(false) => copies.push((
+                "HEAD".to_string(),
+                Err("names an object that isn't a commit git can read".to_string()),
+            )),
+            Err(e) => copies.push(("HEAD".to_string(), Err(e))),
+        },
+        Ok(true) => match git::run(&top, &["ls-tree", "-r", "-z", "--full-tree", "HEAD"]) {
+            Ok(out) => {
+                for rec in out.split('\0').filter(|r| !r.is_empty()) {
+                    let (head, path) = rec.split_once('\t').unwrap_or((rec, ""));
+                    copies.extend(match head.split(' ').collect::<Vec<_>>().as_slice() {
+                        [mode, _, id] => entry(path, mode, id, format!("{path} in HEAD")),
+                        _ => Some((
+                            format!("{path} in HEAD"),
+                            Err(format!("`git ls-tree` said {rec:?}")),
+                        )),
+                    });
+                }
+            }
+            Err(e) => copies.push(("HEAD".to_string(), Err(e))),
+        },
+        Err(e) => copies.push(("HEAD".to_string(), Err(e))),
+    }
+    agreed(copies)
+}
+
+/// Whether each step of the manifest path `rel` below `top` is an entry its dir lists under exactly that name, so the
+/// file read at `top/rel` is the canonical one, not one a short name, another case, a trailing dot or space or an
+/// ignorable code point reaches (design note d28-alias, the disk rule). No filesystem's aliasing is modelled: a name
+/// that opens but isn't listed is an error, so discovery is `Unknown`.
+fn exactly_listed(top: &Path, rel: &str) -> Result<(), String> {
+    let mut dir = top.to_path_buf();
+    let mut shown = "the checkout's top".to_string();
+    for name in rel.split('/') {
+        let names = fsguard::list_dir(&dir)?;
+        if !names.iter().any(|p| p.file_name() == Some(std::ffi::OsStr::new(name))) {
+            return Err(format!(
+                "opens, but {shown} lists no entry named exactly {name:?}, so another name reaches it (a short name, \
+                 another case, a trailing dot or space): name it exactly {rel}"
+            ));
+        }
+        dir.push(name);
+        shown = format!("{name}/");
+    }
+    Ok(())
+}
+
+/// What a git entry is to discovery (design note d28-alias, the git rule).
+enum GitEntry {
+    /// A regular file at a manifest's own path: it counts by what it names.
+    Manifest,
+    /// Something a filesystem may take for a manifest, or a link or submodule where one goes: why, in a line.
+    Alias(String),
+    Other,
+}
+
+/// The git rule: an entry whose basename (after the last `/` or `\`, which Windows takes for a separator) a filesystem
+/// may take for `stack.toml` (`folds_to`) is a manifest only at a canonical path and as a regular file (`100644`,
+/// `100755`). Elsewhere, at any depth, it is an alias, a fixture's included: renaming it settles that. So is a symlink
+/// or submodule at the top whose name folds to `stack`: what it reaches isn't this checkout's content.
+fn git_entry(path: &str, mode: &str) -> GitEntry {
+    let parts: Vec<&str> = path.split(['/', '\\']).collect();
+    let base = parts.last().copied().unwrap_or(path);
+    let what = |mode: &str| match mode {
+        "120000" => "a symlink".to_string(),
+        "160000" => "a submodule".to_string(),
+        m => format!("mode {m}"),
+    };
+    if folds_to(base, MANIFESTS[0]) {
+        if !MANIFESTS.contains(&path) {
+            return GitEntry::Alias(format!(
+                "is named like a stack manifest but isn't {} or {}, so a filesystem may read it as one: rename or \
+                 remove it (a copy in HEAD counts until a commit removes it)",
+                MANIFESTS[0], MANIFESTS[1]
+            ));
+        }
+        return match mode {
+            "100644" | "100755" => GitEntry::Manifest,
+            m => GitEntry::Alias(format!("is {} where the manifest goes", what(m))),
+        };
+    }
+    if parts.len() == 1 && folds_to(base, "stack") && matches!(mode, "120000" | "160000") {
+        return GitEntry::Alias(format!("is {} where the stack's dir goes", what(mode)));
+    }
+    GitEntry::Other
+}
+
+/// Whether some filesystem may take the name `name` for `canonical` (an ASCII name). The rules, all applied, so the
+/// answer is a superset of every one: HFS+ ignores some code points (git's own `is_hfs_dotgit` list); NTFS reads a name
+/// up to a `:` as the file (`stack.toml::$DATA` is its data) and drops trailing dots and spaces; case-insensitive
+/// filesystems fold case, Unicode's folds included.
+fn folds_to(name: &str, canonical: &str) -> bool {
+    let kept: String = name
+        .chars()
+        .filter(|c| {
+            !matches!(c, '\u{200C}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{206A}'..='\u{206F}' | '\u{FEFF}')
+        })
+        .collect();
+    let file = kept.split(':').next().unwrap_or_default();
+    same_but_case(file.trim_end_matches(['.', ' ']), canonical)
+}
+
+fn same_but_case(a: &str, b: &str) -> bool {
+    a.chars().count() == b.chars().count()
+        && a.chars().zip(b.chars()).all(|(x, y)| {
+            x == y || x.to_lowercase().eq(y.to_lowercase()) || x.to_uppercase().eq(y.to_uppercase())
+        })
+}
+
+/// The visibility a manifest's text names, as the manifest's schema reads it.
+fn visibility_of(text: &str) -> Result<Visibility, String> {
+    #[derive(serde::Deserialize)]
+    struct Head {
+        visibility: Option<Visibility>,
+    }
+    let head: Head = toml::from_str(text)
+        .map_err(|e| format!("can't be read as a manifest ({})", e.message()))?;
+    head.visibility.ok_or_else(|| "names no visibility".to_string())
+}
+
+/// The one visibility every copy names, or why there isn't one.
+fn agreed(copies: Vec<(String, Result<Visibility, String>)>) -> CheckoutStack {
+    let mut named = Vec::new();
+    for (at, v) in copies {
+        match v {
+            Ok(v) => named.push((at, v)),
+            Err(e) => return CheckoutStack::Unknown(format!("{at}: {e}")),
+        }
+    }
+    match named.first() {
+        None => CheckoutStack::None,
+        Some((_, v)) if named.iter().all(|(_, w)| w == v) => CheckoutStack::Is(*v),
+        Some(_) => CheckoutStack::Unknown(format!(
+            "this checkout's stack manifests disagree ({})",
+            named.iter().map(|(at, v)| format!("{at}: {v}")).collect::<Vec<_>>().join("; ")
+        )),
+    }
+}
+
+/// Whether a privacy check in a checkout whose stack is `stack` runs secrets only, and the line to say when its mode
+/// isn't the one asked for (D28 r2, C1 and C2). `by_stack` (a stack repo's hooks): the stack's mode, the whole policy
+/// where it can't be told. `secrets_only`: only where the checkout has no stack or a private one, so no caller gives
+/// a public checkout secrets-only mode. Neither: the whole policy.
+pub fn checkout_mode(
+    stack: &CheckoutStack,
+    by_stack: bool,
+    secrets_only: bool,
+) -> (bool, Option<String>) {
+    let whole = "so the whole privacy policy is checked";
+    match stack {
+        CheckoutStack::Is(Visibility::Private) => (by_stack || secrets_only, None),
+        CheckoutStack::None if by_stack => (
+            false,
+            Some(format!(
+                "this checkout has no stack manifest ({} or {}), {whole}",
+                MANIFESTS[0], MANIFESTS[1]
+            )),
+        ),
+        CheckoutStack::None => (secrets_only, None),
+        CheckoutStack::Is(Visibility::Public) if secrets_only => {
+            (false, Some(format!("this checkout's stack is public, {whole}, not --secrets-only")))
+        }
+        CheckoutStack::Is(Visibility::Public) => (false, None),
+        CheckoutStack::Unknown(why) if by_stack || secrets_only => {
+            (false, Some(format!("{why}, {whole}")))
+        }
+        CheckoutStack::Unknown(_) => (false, None),
+    }
 }
