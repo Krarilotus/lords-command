@@ -922,20 +922,57 @@ impl From<std::io::Error> for Renamed {
 }
 
 /// Renames `from` to `to` in one step that refuses, never replaces, whatever is at `to`, even if it appeared just
-/// before (no check-then-rename, F8 sol-loop r3, S4): `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows,
-/// `renameat2(RENAME_NOREPLACE)` on Linux. Elsewhere, and on a filesystem without it, refused.
+/// before (no check-then-rename, F8 sol-loop r3, S4). On Windows as `std::fs::rename` does it, handle and all, but
+/// without its replace flag: a file a running process maps renames as there (`MoveFileExW` refused one: round-4
+/// green, `lords-test-db4fcdb2-1794138156-290875`). On Linux `renameat2(RENAME_NOREPLACE)`. Elsewhere, and on a
+/// filesystem without it, refused.
 fn rename_noreplace(from: &Path, to: &Path) -> Result<(), Renamed> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
-        let wide = |p: &Path| p.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>();
-        let (f, t) = (wide(from), wide(to));
-        // SAFETY: two NUL-terminated wide paths that live across the call; flags 0: never replace, same volume only.
-        let ok = unsafe { MoveFileExW(f.as_ptr(), t.as_ptr(), 0) };
-        match ok {
-            0 => Err(std::io::Error::last_os_error().into()),
-            _ => Ok(()),
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileRenameInfo, FileRenameInfoEx, SetFileInformationByHandle, FILE_RENAME_INFO,
+        };
+        // DELETE | SYNCHRONIZE; every sharing; FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT (std's own).
+        let file = fs::OpenOptions::new()
+            .access_mode(0x0001_0000 | 0x0010_0000)
+            .share_mode(0x7)
+            .custom_flags(0x0200_0000 | 0x0020_0000)
+            .open(from)?;
+        let name: Vec<u16> = to.as_os_str().encode_wide().collect();
+        let name_bytes = name.len() * 2;
+        let size = std::mem::size_of::<FILE_RENAME_INFO>() + name_bytes;
+        // Aligned for the struct; the name runs past its one-element array, as the API expects.
+        let mut buf = vec![0u64; size.div_ceil(8)];
+        let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let set = |class, flags: u32| -> std::io::Result<()> {
+            // SAFETY: `info` points into `buf`, which is zeroed, aligned for FILE_RENAME_INFO and `size` bytes long, so
+            // the name fits after the header; the handle is `file`'s, open across the call.
+            let ok = unsafe {
+                (*info).Anonymous.Flags = flags;
+                (*info).RootDirectory = std::ptr::null_mut();
+                (*info).FileNameLength = name_bytes as u32;
+                std::ptr::copy_nonoverlapping(
+                    name.as_ptr(),
+                    std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+                    name.len(),
+                );
+                SetFileInformationByHandle(file.as_raw_handle(), class, info.cast(), size as u32)
+            };
+            match ok {
+                0 => Err(std::io::Error::last_os_error()),
+                _ => Ok(()),
+            }
+        };
+        // FILE_RENAME_FLAG_POSIX_SEMANTICS, without FILE_RENAME_FLAG_REPLACE_IF_EXISTS; where a volume doesn't take
+        // the Ex class (ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED), the plain one with ReplaceIfExists false.
+        match set(FileRenameInfoEx, 0x2) {
+            Err(e) if matches!(e.raw_os_error(), Some(87 | 50)) => {
+                set(FileRenameInfo, 0).map_err(Renamed::from)
+            }
+            r => r.map_err(Renamed::from),
         }
     }
     #[cfg(target_os = "linux")]
