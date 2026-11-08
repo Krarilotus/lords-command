@@ -28,7 +28,11 @@ fn run(home: &Path, cwd: &Path, args: &[&str], stdin: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    c.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    // A guard that answers without reading its input may have ended first: a broken pipe off Windows (the race).
+    match c.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        r => r.unwrap(),
+    }
     c.wait_with_output().unwrap()
 }
 
