@@ -14,15 +14,15 @@ use std::path::Path;
 
 const EXE: &str = "C:/lords/lords.exe";
 
-/// The privacy command of each of the repo's hooks that has one (its `exec … privacy` line, not the comment naming the
-/// check): whether it checks secrets only.
+/// The privacy command of each of the repo's hooks that has one (the line running `… privacy --…`, with or without
+/// `exec`; not the comment naming the check): whether it checks secrets only.
 fn secrets_only(repo: &Path) -> Vec<(String, bool)> {
     ["pre-commit", "commit-msg", "pre-push"]
         .iter()
         .filter_map(|h| {
             let text = fs::read_to_string(repo.join(".git/hooks").join(h)).ok()?;
-            let exec = |l: &&str| l.starts_with("exec ") && l.contains(" privacy ");
-            let line = text.lines().find(exec)?.to_string();
+            let runs = |l: &&str| !l.starts_with('#') && l.contains(" privacy --");
+            let line = text.lines().find(runs)?.to_string();
             Some((h.to_string(), line.contains("--secrets-only")))
         })
         .collect()
