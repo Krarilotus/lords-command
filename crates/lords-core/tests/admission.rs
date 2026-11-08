@@ -189,8 +189,8 @@ fn the_predicate_refuses_growth_past_the_limit_and_nothing_else() {
     }
 }
 
-// Spec (§0b.3 step 6, I1): a staged rule that takes a fitting start past the limit is refused; one that reaches it
-// exactly is admitted.
+// Spec (§0b.3 step 6, I1; design check r3: "9,499 → 9,500: allowed; 9,500 → 9,501: refused"): a staged rule that takes
+// a start to the limit exactly is admitted; committed there, one more character is refused, against HEAD's 9,500.
 #[test]
 fn a_commit_that_takes_a_start_over_the_limit_is_refused() {
     let s = Stores::new();
@@ -199,6 +199,7 @@ fn a_commit_that_takes_a_start_over_the_limit_is_refused() {
     let o = s.admit(Store::Private).unwrap();
     assert!(!refused(&o), "{o:?}");
     assert_eq!(coder(&o, "repo demo").new, LIMIT);
+    s.commit(Store::Private, "at the limit");
     s.sized(Store::Private, "rule.p", "global", "repo demo", LIMIT + 1);
     s.stage(Store::Private);
     let o = s.admit(Store::Private).unwrap();
@@ -207,19 +208,35 @@ fn a_commit_that_takes_a_start_over_the_limit_is_refused() {
 }
 
 // Spec (I1, the master's 14:42 direction: "a commit that shrinks an over-limit start … passes"): with HEAD's start past
-// the limit, growing it is refused, keeping its size or shrinking it is admitted.
+// the limit, growing it is refused and shrinking it is admitted. Keeping it as HEAD has it leaves the stack unchanged,
+// which is admitted unread; the same size by another text is counted, and admitted.
 #[test]
 fn a_start_past_the_limit_may_shrink_or_stay_but_not_grow() {
     let s = Stores::new();
     s.sized(Store::Public, "rule.q", "global", "repo demo", LIMIT + 200);
     s.commit(Store::Public, "over the limit already");
-    for (n, refuses) in [(LIMIT + 201, true), (LIMIT + 200, false), (LIMIT + 100, false)] {
+    for (n, refuses) in [(LIMIT + 201, true), (LIMIT + 100, false)] {
         s.sized(Store::Public, "rule.q", "global", "repo demo", n);
         s.stage(Store::Public);
         let o = s.admit(Store::Public).unwrap();
         assert_eq!(refused(&o), refuses, "{n}: {o:?}");
         assert_eq!(coder(&o, "repo demo").old, Some(LIMIT + 200));
     }
+    s.sized(Store::Public, "rule.q", "global", "repo demo", LIMIT + 200);
+    s.stage(Store::Public);
+    assert_eq!(s.admit(Store::Public).unwrap(), Outcome::Unchanged);
+    let file = s.f.path("public/stack/global/rules/q.md");
+    let text = fs::read_to_string(&file).unwrap();
+    let (head, body) = text.rsplit_once("---\n").unwrap();
+    fs::write(&file, format!("{head}---\n{}", body.replace('a', "b"))).unwrap();
+    assert_eq!(s.chars("repo demo", "start-coder.md"), LIMIT + 200);
+    s.stage(Store::Public);
+    let o = s.admit(Store::Public).unwrap();
+    assert!(!refused(&o), "{o:?}");
+    assert_eq!(
+        (coder(&o, "repo demo").new, coder(&o, "repo demo").old),
+        (LIMIT + 200, Some(LIMIT + 200))
+    );
 }
 
 // Spec (I1: "Growth in one (p, s) is never paid for by shrinking another"; r3 test matrix): two places, one start
@@ -493,11 +510,14 @@ fn the_check_counts_what_install_writes() {
     assert_eq!(counted_child.new, lords_core::guard::child_context(&child).chars().count());
 }
 
-/// A pre-commit hook that waits until `signal` exists, at most a minute: a commit held while its index lock is taken.
-fn holding_hook(repo: &Path, signal: &Path) {
+/// A pre-commit hook that writes `started`, then waits until `signal` exists, at most a minute: a commit held while its
+/// index lock is taken. It runs only once git has prepared the commit's index, so `started` says that index is made.
+fn holding_hook(repo: &Path, started: &Path, signal: &Path) {
+    let sh = |p: &Path| p.display().to_string().replace('\\', "/");
     let hook = format!(
-        "#!/bin/sh\ni=0\nwhile [ ! -f '{}' ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done\n",
-        signal.display().to_string().replace('\\', "/")
+        "#!/bin/sh\n: > '{}'\ni=0\nwhile [ ! -f '{}' ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done\n",
+        sh(started),
+        sh(signal)
     );
     let at = repo.join(".git/hooks/pre-commit");
     fs::create_dir_all(at.parent().unwrap()).unwrap();
@@ -520,8 +540,8 @@ fn a_commit_under_way_in_the_other_store_is_seen_by_its_lock() {
         let private = s.repo(Store::Private);
         s.rule(Store::Private, "rule.p", "global", "committed first\n");
         s.commit(Store::Private, "a rule to edit");
-        let signal = s.f.path("release");
-        holding_hook(&private, &signal);
+        let (started, signal) = (s.f.path("started"), s.f.path("release"));
+        holding_hook(&private, &started, &signal);
         s.rule(Store::Private, "rule.p", "global", "under way\n");
         let mut args = vec!["commit", "-q", "-m", "held"];
         args.extend(match mode {
@@ -531,12 +551,14 @@ fn a_commit_under_way_in_the_other_store_is_seen_by_its_lock() {
         isolate_git();
         let mut held =
             std::process::Command::new("git").arg("-C").arg(&private).args(&args).spawn().unwrap();
-        let lock = private.join(".git/index.lock");
+        // The hook has started: git has read the working tree into the commit's index, so putting it back from here
+        // on can't change what the commit holds (waiting for the lock alone raced that read on Windows).
         let until = std::time::Instant::now() + Duration::from_secs(30);
-        while !lock.exists() && std::time::Instant::now() < until {
+        while !started.exists() && std::time::Instant::now() < until {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(lock.exists(), "{mode}: the commit holds its lock");
+        assert!(started.exists(), "{mode}: the commit reached its pre-commit hook");
+        assert!(private.join(".git/index.lock").exists(), "{mode}: the commit holds its lock");
         s.rule(Store::Private, "rule.p", "global", "committed first\n");
         assert_eq!(git(&private, &["status", "--porcelain"]), "", "{mode}: the status reads clean");
         s.rule(Store::Public, "rule.q", "global", "public change\n");
