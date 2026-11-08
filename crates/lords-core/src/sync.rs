@@ -4038,8 +4038,16 @@ pub fn restore_between(
             }
             Undo::Created { owner, written } if holds(&written)? => {
                 between(&path);
-                fsguard::move_aside(&owner)?.delete()?;
-                format!("removed {}", path.display())
+                // Checked again once it is aside, like an edit's undo: a write since the check comes back (the Lords
+                // whole-project review, 9 Nov).
+                let aside = fsguard::move_aside(&owner)?;
+                if fsguard::read(aside.path())?.is_some_and(|b| fsguard::sha(&b) == written) {
+                    aside.delete()?;
+                    format!("removed {}", path.display())
+                } else {
+                    aside.back()?;
+                    format!("kept {} (changed while restoring)", path.display())
+                }
             }
             Undo::Aside { to, from } => match fsguard::kind(to.path())? {
                 fsguard::Kind::Missing => {
