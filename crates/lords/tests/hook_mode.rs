@@ -630,3 +630,86 @@ fn a_canonical_private_manifest_still_checks_secrets_only() {
         accepted_by_both(&env, &repo, at);
     }
 }
+
+// ---------------------------------------------------------------- fix check r4: `check --by-stack` (D28-R4-01)
+
+/// config.txt naming a clean public stack in a repo of its own, `elsewhere`: what a `check --by-stack` must never
+/// check in place of the checkout it runs in. Checked clean first, so a pass elsewhere can't come from it failing.
+fn config_elsewhere(env: &Env) {
+    let other = env.repo("elsewhere", &[("stack/stack.toml", PUBLIC), ("README.md", "clean\n")]);
+    let cfg = env.path("home/.lords-command");
+    write(&cfg.join("config.txt"), &format!("public = {}\n", other.join("stack").display()));
+    for variant in ["--stack", "--public"] {
+        let o = env.lords(&other, &["check", variant, "--by-stack"]);
+        assert!(
+            o.status.success(),
+            "setup: the configured stack is clean ({variant}): {}",
+            text(&o)
+        );
+    }
+}
+
+// Spec (fix check r4, D28-R4-01: "bind automatic `--by-stack` checks to this checkout. When its stack cannot be safely
+// loaded, return its cause instead of falling back to configured stacks"; witness: a public HEAD, a private index and
+// neither manifest on disk): with a clean, unrelated stack configured, `check --stack --by-stack` and `check --public
+// --by-stack` refuse in a checkout whose copies disagree, naming the disagreement, and in one whose public stack isn't
+// on disk, saying so.
+#[test]
+fn check_by_stack_never_lets_a_configured_stack_stand_in() {
+    for (row, cause) in
+        [("public HEAD, private index", "disagree"), ("public, not on disk", "on disk")]
+    {
+        for variant in ["--stack", "--public"] {
+            let env = Env::new();
+            config_elsewhere(&env);
+            let repo = env.repo("repo", &[("stack/stack.toml", PUBLIC), ("README.md", "a repo\n")]);
+            let manifest = repo.join("stack/stack.toml");
+            if row == "public HEAD, private index" {
+                write(&manifest, PRIVATE);
+                env.ok_git(&repo, &["add", "stack/stack.toml"]);
+            }
+            fs::remove_file(&manifest).unwrap();
+            let o = env.lords(&repo, &["check", variant, "--by-stack"]);
+            let out = text(&o);
+            assert!(!o.status.success(), "{row}, {variant}: refused: {out}");
+            assert!(out.contains(cause), "{row}, {variant}: names {cause:?}: {out}");
+        }
+    }
+}
+
+// Spec (D28-R4-01: "A known current stack may still be checked conservatively ... Keep proven no-stack/private
+// controls"; design note d28-alias, r4 table): in a checkout proven to have no stack, `check --public --by-stack`
+// scans its own tree, so a user path in its own file is refused while the configured stack is clean, and its clean twin
+// passes; `check --stack --by-stack` skips, as before.
+#[test]
+fn check_by_stack_without_a_stack_checks_this_checkouts_own_tree() {
+    let env = Env::new();
+    config_elsewhere(&env);
+    let dirty =
+        env.repo("dirty", &[("README.md", "a repo\n"), ("notes.md", &format!("{}\n", detail()))]);
+    let o = env.lords(&dirty, &["check", "--public", "--by-stack"]);
+    assert!(!o.status.success() && text(&o).contains("notes.md"), "its own file: {}", text(&o));
+    let clean = env.repo("clean", &[("README.md", "a repo\n")]);
+    let o = env.lords(&clean, &["check", "--public", "--by-stack"]);
+    assert!(o.status.success(), "a clean tree passes: {}", text(&o));
+    let o = env.lords(&dirty, &["check", "--stack", "--by-stack"]);
+    assert!(
+        o.status.success() && text(&o).contains("no entries"),
+        "no stack, no entries: {}",
+        text(&o)
+    );
+}
+
+// Spec (D28-R4-01: "Keep proven ... private controls"; design note C5): in a checkout proven private, with a clean
+// unrelated stack configured, `check --public --by-stack` skips, saying its stack is private, and `check --stack
+// --by-stack` checks its own manifest and passes.
+#[test]
+fn check_by_stack_in_a_private_checkout_checks_its_own_stack() {
+    let env = Env::new();
+    config_elsewhere(&env);
+    let repo = env.repo("priv", &[("stack.toml", PRIVATE), ("README.md", "a repo\n")]);
+    let o = env.lords(&repo, &["check", "--public", "--by-stack"]);
+    assert!(o.status.success() && text(&o).contains("private"), "{}", text(&o));
+    let o = env.lords(&repo, &["check", "--stack", "--by-stack"]);
+    assert!(o.status.success(), "{}", text(&o));
+}
