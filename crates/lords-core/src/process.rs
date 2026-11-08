@@ -225,6 +225,9 @@ pub fn codex_ask(
     answer
 }
 
+/// How long a guard copy that the OS won't run yet, because something holds it open for writing, is tried again.
+const BUSY_FOR: Duration = Duration::from_secs(1);
+
 /// Runs the guard copy with `args` and `stdin`, within 20 s: its exit status and stdout. A child past the deadline is
 /// killed.
 fn run_guard(
@@ -234,14 +237,31 @@ fn run_guard(
     what: &str,
 ) -> Result<(std::process::ExitStatus, String), String> {
     use std::io::{Read, Write};
-    let mut child = Command::new(guard_copy)
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        // Never read, so never a full pipe that holds the child (an older copy's usage note goes there).
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("{}: {e}", guard_copy.display()))?;
+    // Off Windows a file any process holds open for writing doesn't run (ETXTBSY). A copy written and closed a moment
+    // ago can still be held: a child another thread of this process started meanwhile holds every file open then until
+    // its own exec (job lords-test-linux-84c9449e-1794157526-435833; golang/go#22315). That refusal alone is tried
+    // again, for `BUSY_FOR`; past it, it fails with why.
+    let busy_since = Instant::now();
+    let mut child = loop {
+        let started = Command::new(guard_copy)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            // Never read, so never a full pipe that holds the child (an older copy's usage note goes there).
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match started {
+            Ok(c) => break c,
+            Err(e)
+                if cfg!(unix)
+                    && e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && busy_since.elapsed() < BUSY_FOR =>
+            {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Err(e) => return Err(format!("{}: {e}", guard_copy.display())),
+        }
+    };
     // Written whole and closed before the wait: the guard reads its event to the end first.
     if let Some(mut i) = child.stdin.take() {
         let _ = i.write_all(stdin);
