@@ -82,14 +82,23 @@ impl Rules {
         self
     }
 
-    /// Adds the private stack's deny-list and fleet hosts. Without a private stack, or a deny-list, that is noted;
-    /// a deny-list or fleet config that is there but can't be read is an error, so the check fails closed.
-    pub fn with_private(mut self, private: Option<&Stack>) -> Result<Rules, String> {
+    /// Adds the private stack's allow-list (`with_allow_from`), deny-list and fleet hosts (`with_private_terms`).
+    pub fn with_private(self, private: Option<&Stack>) -> Result<Rules, String> {
+        match private {
+            Some(p) => self.with_allow_from(&p.root).with_private_terms(Some(p)),
+            None => self.with_private_terms(None),
+        }
+    }
+
+    /// Adds the private stack's deny-list and fleet hosts, and never its allow-list: the rules a stack that isn't the
+    /// checked checkout's adds, so they only find more (design note d28-alias, fix check r5, D28-R5-01). Without a
+    /// private stack, or a deny-list, that is noted; a deny-list or fleet config that is there but can't be read is an
+    /// error, so the check fails closed.
+    pub fn with_private_terms(mut self, private: Option<&Stack>) -> Result<Rules, String> {
         let Some(private) = private else {
             self.notes.push("no private stack: the deny and fleet classes were not checked".into());
             return Ok(self);
         };
-        self = self.with_allow_from(&private.root);
         let deny = private.root.join("privacy").join("deny.txt");
         match fsguard::read_string(&deny) {
             Ok(text) => self.deny.extend(list_lines(&text).map(fold_term)),

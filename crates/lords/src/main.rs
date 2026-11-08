@@ -550,13 +550,17 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     let own_public =
         top.as_ref().map(|t| t.join("stack")).filter(|s| s.join("stack.toml").is_file());
     let own_private = top.clone().filter(|t| t.join("stack.toml").is_file());
+    // A `--by-stack` check's allowances are this checkout's own: a configured stack adds restrictions only, so a
+    // configured private stack gives its deny and fleet terms, never its allow-list (fix check r5, D28-R5-01; design
+    // note d28-alias, "Fix check r5").
+    let mut own_private_stack = false;
     match &here {
         // Proven to have no stack (the `--stack` case returned above): its own tree, under the public rules and the
-        // configured private stack's deny terms, never the configured public stack's allow-list or repo.
+        // configured private stack's deny and fleet terms, never a configured stack's allow-list or repo.
         Some(CheckoutStack::None) => {
             let top = top.ok_or_else(|| format!("git names no checkout here, {not_checked}"))?;
             let private = p.private.as_deref().map(Stack::load).transpose()?;
-            let rules = Rules::public().with_private(private.as_ref())?;
+            let rules = Rules::public().with_private_terms(private.as_ref())?;
             let (scan, findings) = check::public_tree(&top, &rules)?;
             print_findings(&findings, json);
             if !json {
@@ -576,9 +580,11 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
                 p.public = own_public.ok_or_else(|| missing("stack/stack.toml"))?;
                 if let Some(t) = own_private.filter(|_| stack_only) {
                     p.private = Some(t);
+                    own_private_stack = true;
                 }
             } else {
                 p.private = Some(own_private.ok_or_else(|| missing("stack.toml"))?);
+                own_private_stack = true;
                 if let Some(s) = own_public {
                     p.public = s;
                 }
@@ -598,7 +604,13 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
         }
     }
     let private = p.private.as_deref().map(Stack::load).transpose()?;
-    let rules = public_rules(&p.public, private.as_ref())?;
+    // Here `p.public` is this checkout's own `stack/` (Is(Public)) or, for Is(Private), the configured complementary
+    // stack, whose allow-list reaches only its own public entries, never this checkout's private ones.
+    let rules = if here.is_some() && !own_private_stack {
+        Rules::public().with_allow_from(&p.public).with_private_terms(private.as_ref())?
+    } else {
+        public_rules(&p.public, private.as_ref())?
+    };
     if public_only {
         let stacks = Stacks::load(&p.public, None)?;
         let mut findings = check::check(&stacks, &rules);
