@@ -9,7 +9,10 @@
 
 mod common;
 use common::*;
-use lords_core::sync::{self, Action};
+use lords_core::sync;
+// Only the Windows ACL case uses it (D27: an unused import fails clippy elsewhere).
+#[cfg(windows)]
+use lords_core::sync::Action;
 use std::{fs, path::Path};
 
 fn declare(f: &Fixture, body: &str) {
