@@ -237,3 +237,49 @@ fn the_other_store_is_read_as_itself_whatever_git_exports() {
         .unwrap();
     assert!(!o.status.success() && text(&o).contains("draft.md"), "{}", text(&o));
 }
+
+// Spec (the master, 20:48: "pass D28's held `here` identity and checkout to admission; `Unknown` refuses and `None`
+// skips; never call `checkout_stack` twice"; review gap11a r1, "Merge and interface risks"; design note d28-alias,
+// attack item 11: "H3 refuses on `Unknown`"): the start check knows a store's checkout by D28's discovery, not by which
+// manifest is on disk. A `check --stack` without `--by-stack` in either store, with a stray `docs/stack.toml` staged
+// (a copy discovery can't count), is refused, naming it. Every row runs before the refusals are asserted.
+#[test]
+fn the_start_check_refuses_a_store_whose_stack_cant_be_told() {
+    let env = Env::new();
+    let outputs: Vec<_> = ["priv", "pub"]
+        .iter()
+        .map(|store| {
+            let dir = env.path(store);
+            env.write(
+                &format!("{store}/docs/stack.toml"),
+                "name = \"x\"\nvisibility = \"private\"\n",
+            );
+            env.git(&dir, &["add", "-A"]);
+            (store, env.lords(&dir, &["check", "--stack"]))
+        })
+        .collect();
+    let let_through: Vec<_> = outputs
+        .iter()
+        .filter(|(_, o)| o.status.success())
+        .map(|(store, o)| format!("{store}: {}", text(o)))
+        .collect();
+    assert!(let_through.is_empty(), "refused in both stores, but let through: {let_through:#?}");
+    for (store, o) in &outputs {
+        assert!(text(o).contains("docs/stack.toml"), "{store}: names it: {}", text(o));
+    }
+}
+
+// Spec (the same: "`None` skips"): outside any store, a `check --stack` with both stores configured checks no starts,
+// and passes.
+#[test]
+fn the_start_check_skips_a_checkout_without_a_stack() {
+    let env = Env::new();
+    let other = env.path("other");
+    env.write("other/README.md", "a repo\n");
+    assert!(env.git(&other, &["init", "-q"]).status.success());
+    env.git(&other, &["add", "-A"]);
+    assert!(env.git(&other, &["commit", "-q", "-m", "start"]).status.success());
+    let o = env.lords(&other, &["check", "--stack"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(!text(&o).contains("starts, the longest"), "no starts checked: {}", text(&o));
+}
