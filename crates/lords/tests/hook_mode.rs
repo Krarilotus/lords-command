@@ -596,7 +596,9 @@ fn short_name_stack(dir: &Path) -> bool {
 // Spec (fix check r3, R2-01's primary witness: "the indexed `long-stack-directory/stack.toml` is public, while the disk
 // path `stack/stack.toml` reaches the same file through its short name, which is private"; the master: "Add a
 // behavioural fails-without message check for the short-name witness, with both flags"): with the dir given the short
-// name `stack`, both flags refuse the message, staged (the git rule) or untracked (the disk rule alone).
+// name `stack`, both flags refuse the message, staged or untracked. Both name the disk rule: discovery names the first
+// copy it can't count, and the disk copies come first. That the git rule names the staged entry too is the git-name
+// test's `long-stack-directory/stack.toml` row.
 #[test]
 fn a_short_name_never_reaches_a_manifest() {
     for staged in [true, false] {
@@ -613,8 +615,7 @@ fn a_short_name_never_reaches_a_manifest() {
         }
         let through = fs::read_to_string(repo.join("stack/stack.toml")).unwrap();
         assert_eq!(through, PRIVATE, "setup: the short name reaches the private copy");
-        let names = if staged { "long-stack-directory/stack.toml" } else { "exactly" };
-        refused_by_both(&env, &repo, &format!("short name, staged {staged}"), names);
+        refused_by_both(&env, &repo, &format!("short name, staged {staged}"), "exactly");
     }
 }
 
