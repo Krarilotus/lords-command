@@ -7,7 +7,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "Every screen word must help the user: no explanatory paragraphs, system labels, eyebrow labels, slogans, rhetorical questions or repeated text; when in doubt, cut it. Extend existing views rather than redesigning for decoration, and check outputs against this before showing them."
+core: "So the interface speaks for itself: every screen word must help the user; no explanatory paragraphs, system or eyebrow labels, slogans, rhetorical questions or repeats, and when in doubt cut it. Extend existing views rather than redesign for decoration; check outputs before showing them. Error and accessibility text the user needs stays."
 visibility: public
 basis:
 - quote: "the UI must speak for itself — a slick version"
@@ -22,6 +22,12 @@ origin:
   type: own
 topics: [design]
 ---
-Every word on screen must help the user do what they came for: no explanatory paragraphs, no labels describing the
-system, no eyebrow labels, slogans or rhetorical questions, no repeated text. When in doubt, cut it. Extend existing
-views rather than redesigning for decoration, and check outputs against this before showing them.
+**Purpose:** the UI must speak for itself (owner, 21 Oct); explanatory text sank three design rounds.
+
+**Default:** every word on screen must help the user do what they came for: no explanatory paragraphs, no labels
+describing the system, no eyebrow labels, slogans or rhetorical questions, no repeated text. When in doubt, cut it;
+detail can live in a tooltip. Extend existing views rather than redesigning for decoration, and check outputs against
+this before showing them.
+
+**When to depart:** an error message, a label a screen reader needs, or text without which the user can't do the task
+stays; say in review why it is needed.

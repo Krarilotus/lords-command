@@ -7,9 +7,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core:
-- line: "Report a result, blocker or decision request, not progress, in plain words, leading with outcome, decisions/owners/recommendations, change ids, checks and open risks; never cut blockers, uncertainty or material findings for brevity, repeat automatic completion notices or narrate routine activity. Link full indexed evidence with stable ids in Harness/notes; code/design reports give owner/level and whether you would build it again."
-- line: "Use machine-readable fields only where a consumer checks them and reuse the harness's result/check data; collect declared batches and consolidate top-down by requirement and owner before assigning anything. A justified project exception names this rule, its difference and reason, approving owner and review time, and refers here instead of copying it."
+core: "To give the reader their next step: report a result, blocker or decision request, not progress, in plain words, outcome first, then decisions with owner and recommendation, change ids, checks and open risks; blockers and uncertainty are never cut for brevity. Full evidence goes in one indexed record in Harness/notes, linked; no repeated completion notices or narrated routine."
 visibility: public
 basis:
 - quote: "I don'T see why we put an arbitrary number on it, that came out of nowhere an should be raised as an issue, there must be a better design there out there that already covers that"
@@ -27,9 +25,11 @@ evidence:
 origin:
   type: own
 topics: [reporting, delegation]
-links: [rule.briefs-point-not-restate]
+links: [rule.bounded-scope]
 ---
-Report a result, a blocker or a decision request, not progress, in plain words. Lead with the outcome and what it
+**Purpose:** a report is read to decide the next step; activity volume is not delivered work.
+
+**Default:** report a result, a blocker or a decision request, not progress, in plain words. Lead with the outcome and what it
 means, then what the recipient needs for the next step: the decisions needed (or "none"), each with a recommendation
 and its owner; the result or change, with commits or finding ids; the verification, with what passed, failed or
 wasn't run; and the open risks and unknowns. Blockers, uncertainty and material findings stay in the report; they are
@@ -40,13 +40,16 @@ place each project sets, with stable ids and an index at the top, linked from th
 evidence home is `Harness/notes`, a private repository that syncs itself. Don't repeat an automatic completion notice
 or narrate routine activity.
 
-Every report on code or design also gives its owner and level verdict, and one line on whether you would build it
-this way again (the level-and-cost skill).
+A hand-over of code or design you built says in a line whether it sits at the right owner and level, and whether you
+would build it this way again (the level-and-cost skill); leave it out where it tells the reader nothing new.
 
 Machine-readable fields only where a consumer checks them; reuse the harness's own result and check data before adding
 any. A declared batch of results is collected and then consolidated top-down, by requirement and owner, before
 anything is assigned. A project may make a justified exception: it names this rule, the difference, its reason, the
 approving owner and when it is reviewed, and refers to this rule instead of copying it.
+
+**When to depart:** shape the report to what the reader needs; the outline below is an example, not a form. Say what
+evidence is missing rather than leaving it out silently.
 
 ```text
 Outcome:  status, verdict, what it means; the revision it applies to

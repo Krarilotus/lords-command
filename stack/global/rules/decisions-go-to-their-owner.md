@@ -7,7 +7,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "Send decisions, questions and findings straight to their owner in its thread and take answers directly; never relay or ask a third agent to relay; consult the owner table, then ask your lead only if it names no owner. Choices within your lead's task go to it; other owners decide theirs; report results to whoever tasked you; reading threads and speaking up with evidence never transfer authority."
+core: "To lose nothing in relay: send decisions, questions and findings straight to their owner's thread (the owner table names it; else ask your lead who) and take the answer directly, never through a third agent. Choices inside your lead's task go to your lead; your result goes to whoever tasked you. Reading other threads and speaking up with evidence move no authority."
 visibility: public
 basis:
 - quote: "They shoudl target the correct owners of correct decisions, if they have to say sth about thigns they can and interfere or even check up on thigns and other threads themselves."
@@ -27,7 +27,9 @@ origin:
 topics: [delegation, owner-decisions, process]
 links: [rule.ask-owner-only-real-choices]
 ---
-Send a decision, question or finding straight to the one who owns it, in its own thread, and take the answer from it
+**Purpose:** every relay costs turns and drops detail; a correction once arrived before the message it corrected.
+
+**Default:** send a decision, question or finding straight to the one who owns it, in its own thread, and take the answer from it
 directly. Never relay between two owners, and don't ask a third agent to pass something on. If you don't know the
 owner, the owner table names it; if nothing does, ask your lead who the owner is, not what the answer is. A choice
 inside your lead's task goes to your lead. One that belongs to another owner (a shared tool, a host, another project)
@@ -35,3 +37,6 @@ goes to that owner. Your result still goes to whoever gave you the task, with th
 
 You may read other threads and records to check on work that touches yours, and speak up to their owner, with
 evidence, where it does. Reading and speaking up don't move the decision: its owner makes it.
+
+**When to depart:** when the owner can't be reached in time, or several owners' choices only make sense together,
+coordinate through your lead or the orchestrator, and say why the route differs.
