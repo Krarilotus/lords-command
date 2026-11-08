@@ -522,13 +522,15 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     // A stack repo's hooks check the checkout they run in, as `checkout_stack` finds it, or refuse: a configured stack
     // never stands in for it, since its entries aren't this checkout's and its allow-list isn't this checkout's
     // (fix check r4, D28-R4-01; design note 2026-11-08-lords-d28-alias, "Fix check r4").
+    // Found once, for the selection and for the start check (gap 11) alike (the master, 8 Nov).
     use lords_core::privacy::CheckoutStack;
-    let here = (by_stack && (public_only || stack_only)).then(|| match cwd.as_deref() {
+    let found = (stack_only || (by_stack && public_only)).then(|| match cwd.as_deref() {
         Some(d) => lords_core::privacy::checkout_stack(d),
         None => CheckoutStack::Unknown("the current dir can't be read".to_string()),
     });
+    let here = found.as_ref().filter(|_| by_stack);
     let not_checked = "so it isn't checked: no configured stack stands in for this checkout's";
-    match &here {
+    match here {
         Some(CheckoutStack::Unknown(why)) => {
             return Err(format!("this checkout's stack can't be told ({why}), {not_checked}"))
         }
@@ -557,7 +559,7 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     // configured private stack gives its deny and fleet terms, never its allow-list (fix check r5, D28-R5-01; design
     // note d28-alias, "Fix check r5").
     let mut own_private_stack = false;
-    match &here {
+    match here {
         // Proven to have no stack (the `--stack` case returned above): its own tree, under the public rules and the
         // configured private stack's deny and fleet terms, never a configured stack's allow-list or repo.
         Some(CheckoutStack::None) => {
@@ -641,7 +643,7 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     let findings = if stack_only {
         let mut f = check::check_stack(&stacks, &rules);
         let limit = std::time::Duration::from_secs(stacks.delivery().store_git_secs);
-        f.extend(start_check(committing.as_deref(), &configured, limit, json));
+        f.extend(start_check(committing.as_deref(), found.as_ref(), &configured, limit, json));
         f
     } else {
         let mut f = check::check(&stacks, &rules);
@@ -659,24 +661,36 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
 /// The stores' commit check of the starts one hook gives (gap 11, `admission`): in a store's checkout `top`, what the
 /// commit makes of each place's `child.md` and `start-<role>.md`, against the other store as committed. A refusal, an
 /// other store that can't be read as committed, and any failure to check are errors, so the commit stops. Admitted,
-/// it says how long each start is at most, unless `json`. Outside a store's checkout, or with no private store
-/// configured (no place is declared), there is nothing to check.
+/// it says how long each start is at most, unless `json`. Which store `top` is, is D28's discovery `found`, as
+/// `cmd_check` holds it: a checkout whose stack can't be told is refused, and its stack's manifest not on disk too.
+/// Outside a store's checkout, or with no private store configured (no place is declared), there is nothing to check.
 fn start_check(
     top: Option<&Path>,
+    found: Option<&lords_core::privacy::CheckoutStack>,
     configured: &(PathBuf, Option<PathBuf>),
     limit: std::time::Duration,
     json: bool,
 ) -> Vec<Finding> {
     use lords_core::admission::{self, Inputs, Outcome};
+    use lords_core::privacy::CheckoutStack;
     use lords_core::stack::Store;
-    let (Some(top), (public, Some(private))) = (top, configured) else { return Vec::new() };
-    let (store, stack) = if top.join("stack").join("stack.toml").is_file() {
-        (Store::Public, "stack")
-    } else if top.join("stack.toml").is_file() {
-        (Store::Private, ".")
-    } else {
-        return Vec::new();
+    let unchecked = |why: String| {
+        vec![Finding::error("start-check", format!("{why}, so its starts can't be checked"))]
     };
+    let (v, store, stack, manifest) = match found {
+        None | Some(CheckoutStack::None) => return Vec::new(),
+        Some(CheckoutStack::Unknown(why)) => {
+            return unchecked(format!("this checkout's stack can't be told ({why})"))
+        }
+        Some(CheckoutStack::Is(v @ Visibility::Public)) => {
+            (v, Store::Public, "stack", "stack/stack.toml")
+        }
+        Some(CheckoutStack::Is(v @ Visibility::Private)) => (v, Store::Private, ".", "stack.toml"),
+    };
+    let (Some(top), (public, Some(private))) = (top, configured) else { return Vec::new() };
+    if !top.join(manifest).is_file() {
+        return unchecked(format!("this checkout's stack is {v}, but {manifest} isn't on disk"));
+    }
     let home = match sync::default_home() {
         Ok(h) => h,
         Err(e) => {
