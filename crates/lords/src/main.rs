@@ -16,15 +16,18 @@ lords: one home for how you work with agents
 
 usage:
   lords check [--public | --stack] [--strict] [--json]   --stack: the entries only (a stack repo's pre-commit)
+    (--public --by-stack, a stack repo's pre-push: nothing to check where this checkout's stack is private)
   lords import [--store NAME] [--no-commit]
   lords retire ID --reason TEXT [--superseded-by ID] [--date YYYY-MM-DD] [--no-commit]
   lords promote ID [--strip | --split] [--no-commit]
-  lords privacy --staged [--secrets-only]   staged files and their paths; a binary needs `lords-binary` in .gitattributes
-  lords privacy --message FILE [--staged] [--secrets-only]   a commit message (the commit-msg hook)
-  lords privacy --history [--private-stack DIR]   every commit's message and patch (the pre-push check)
+  lords privacy --staged [--secrets-only | --by-stack]   staged files and their paths; a binary needs `lords-binary` in .gitattributes
+  lords privacy --message FILE [--staged] [--secrets-only | --by-stack]   a commit message (the commit-msg hook)
+  lords privacy --history [--private-stack DIR] [--secrets-only | --by-stack]   every commit's message and patch (the pre-push check)
   lords privacy FILE...
+    (--by-stack: the mode of this checkout's stack, secrets only where every copy of its manifest says private, else the
+    whole policy; --secrets-only holds only where this checkout has no stack or a private one)
   lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit, pre-merge-commit and commit-msg hooks; in a stack repo also `check --stack`, a pre-push and a post-commit that runs `deliver`
-    (a stack repo checks by its stack's visibility: private, secrets only; public, the whole policy, and --secrets-only there is refused)
+    (a stack repo's hooks check with --by-stack, so each checkout by its own stack; --secrets-only is for a repo without one)
   lords hash PATH
   lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--stage install] [--json] [--apply] [--deadline-ms N]
     (a write of Codex's hooks: trusts Lords' own through Codex's app-server, names each hook that isn't trusted, exit 1)
@@ -507,12 +510,25 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     let stack_only = a.flag("--stack");
     let strict = a.flag("--strict");
     let json = a.flag("--json");
+    // A stack repo's pre-push: no public tree to check where the pushing checkout's stack is private (D28 r2, C5).
+    let by_stack = a.flag("--by-stack");
     let explicit = a.words.iter().any(|w| w == "--public-stack");
     let explicit_private = a.words.iter().any(|w| w == "--private-stack");
-    let mut p = paths(&mut a)?;
+    let p = paths(&mut a);
     a.done()?;
+    let cwd = std::env::current_dir().ok();
+    if public_only && by_stack {
+        let here = cwd.as_deref().map(lords_core::privacy::checkout_stack);
+        if here == Some(lords_core::privacy::CheckoutStack::Is(Visibility::Private)) {
+            println!(
+                "lords check: this checkout's stack is private, so it has no public tree to check"
+            );
+            return Ok(true);
+        }
+    }
+    let mut p = p?;
     // `--public` and `--stack` check the repo they run in (its hooks), not whatever config.txt points at.
-    let top = std::env::current_dir().ok().and_then(|d| git::toplevel(&d));
+    let top = cwd.and_then(|d| git::toplevel(&d));
     if (public_only || stack_only) && !explicit {
         if let Some(stack) =
             top.as_ref().map(|t| t.join("stack")).filter(|s| s.join("stack.toml").is_file())
@@ -1299,10 +1315,21 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
     let staged = a.flag("--staged");
     let history = a.flag("--history");
     let secrets_only = a.flag("--secrets-only");
+    // A stack repo's hooks: the mode of the checkout this runs in, whichever installed them (D28 r2, C1).
+    let by_stack = a.flag("--by-stack");
     let message = a.value("--message")?;
     let public_stack = a.value("--public-stack")?.map(PathBuf::from);
     let private_stack = a.value("--private-stack")?.map(PathBuf::from);
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    // Secrets only only where this checkout's stack allows it, so no caller gives a public checkout that mode (C2).
+    let (secrets_only, why) = if by_stack || secrets_only {
+        privacy::checkout_mode(&privacy::checkout_stack(&cwd), by_stack, secrets_only)
+    } else {
+        (false, None)
+    };
+    if let Some(why) = why {
+        eprintln!("lords privacy: {why}");
+    }
     let rules = if secrets_only {
         Rules::secrets_only()
     } else {
@@ -1468,6 +1495,12 @@ fn cmd_hooks(mut a: Args) -> Result<bool, String> {
         println!(
             "note: global core.hooksPath = {g}; its dispatcher must run .git/hooks/{} for this to take effect",
             hooks::PRIVACY.join(", ")
+        );
+    }
+    // A stack repo's hooks (its pre-push among them) check by each checkout's own stack (D28 r2, C3).
+    if secrets_only && installed.iter().any(|r| r.hook.file_name() == Some("pre-push".as_ref())) {
+        println!(
+            "note: a stack repo's hooks check each checkout by its own stack's visibility, so --secrets-only isn't written"
         );
     }
     Ok(true)

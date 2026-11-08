@@ -3,6 +3,7 @@
 use crate::config::expand_home;
 use crate::fsguard;
 use crate::git;
+use crate::model::Visibility;
 use crate::stack::Stack;
 use regex::Regex;
 use serde::Serialize;
@@ -545,4 +546,149 @@ pub fn scan_history(repo: &Path, rules: &Rules) -> Result<HistoryScan, String> {
         }
     }
     Ok(scan)
+}
+
+// ---------------------------------------------------------------- the checkout's own mode (D28 r2)
+
+/// Where a stack's manifest is at a checkout's top: the private stack's, and the public one's (`stack/`).
+pub const MANIFESTS: [&str; 2] = ["stack.toml", "stack/stack.toml"];
+
+/// What a checkout's own stack says about the mode of a privacy check that runs in it (D28 r2, design note
+/// 2026-11-08-lords-d28-r2, C1 and C4): the mode belongs to the checkout that runs the check, never to the one that
+/// installed its hooks, since every worktree of a repo runs the same hooks (review r1, R1-01).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckoutStack {
+    /// No copy of a manifest anywhere in the checkout, or no git checkout.
+    None,
+    /// Every copy names this visibility.
+    Is(Visibility),
+    /// A copy is there, but the mode can't be told from the copies: why, in one line.
+    Unknown(String),
+}
+
+impl CheckoutStack {
+    /// Whether the checkout has a stack's manifest, readable or not: install's choice of a stack repo's hooks.
+    pub fn found(&self) -> bool {
+        !matches!(self, CheckoutStack::None)
+    }
+}
+
+/// Every copy of the manifests (`MANIFESTS`) of the checkout `dir` is in: in HEAD, in the index a hook checks (the
+/// commit's own, as `scan_staged` reads it), and on disk, tracked or not (review r1, R1-02). All naming one
+/// visibility is that visibility. Anything else is `Unknown`, never a guess: a copy that can't be read or names no
+/// visibility, and copies that disagree, two manifests or a change that is only partly staged.
+pub fn checkout_stack(dir: &Path) -> CheckoutStack {
+    let Some(top) = git::toplevel(dir) else { return CheckoutStack::None };
+    let mut copies: Vec<(String, Result<Visibility, String>)> = Vec::new();
+    for rel in MANIFESTS {
+        let path = top.join(rel);
+        let text = match fsguard::kind(&path) {
+            Ok(fsguard::Kind::Missing) => continue,
+            Ok(_) => fsguard::read_text(&path).and_then(|t| t.ok_or_else(|| "gone".to_string())),
+            Err(e) => Err(e),
+        };
+        copies.push((format!("{rel} on disk"), text.and_then(|t| visibility_of(&t))));
+    }
+    let blob = |id: &str| -> Result<Visibility, String> {
+        let bytes = git::bytes(&top, &["cat-file", "blob", id])?;
+        visibility_of(&String::from_utf8(bytes).map_err(|_| "isn't UTF-8 text".to_string())?)
+    };
+    // `<mode> <id> <stage>\t<path>`; each stage of a conflict is a copy.
+    let staged = ["ls-files", "-s", "--full-name", "--", ":/stack.toml", ":/stack/stack.toml"];
+    match git::run_index(&top, &staged) {
+        Ok(out) => {
+            for line in out.lines().filter(|l| !l.is_empty()) {
+                let (head, rel) = line.split_once('\t').unwrap_or((line, "?"));
+                let read = match head.split(' ').collect::<Vec<_>>().as_slice() {
+                    [_, id, _] => blob(id),
+                    _ => Err(format!("`git ls-files -s` said {line:?}")),
+                };
+                copies.push((format!("{rel} staged"), read));
+            }
+        }
+        Err(e) => copies.push(("the index".to_string(), Err(e))),
+    }
+    match git::status(&top, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]) {
+        Ok(false) => {}
+        Ok(true) => {
+            // `<mode> <type> <id>\t<path>`.
+            let committed = ["ls-tree", "--full-tree", "HEAD", "--", MANIFESTS[0], MANIFESTS[1]];
+            match git::run(&top, &committed) {
+                Ok(out) => {
+                    for line in out.lines().filter(|l| !l.is_empty()) {
+                        let (head, rel) = line.split_once('\t').unwrap_or((line, "?"));
+                        let read = match head.split(' ').collect::<Vec<_>>().as_slice() {
+                            [_, "blob", id] => blob(id),
+                            _ => Err(format!("isn't a file ({head})")),
+                        };
+                        copies.push((format!("{rel} in HEAD"), read));
+                    }
+                }
+                Err(e) => copies.push(("HEAD".to_string(), Err(e))),
+            }
+        }
+        Err(e) => copies.push(("HEAD".to_string(), Err(e))),
+    }
+    agreed(copies)
+}
+
+/// The visibility a manifest's text names, as the manifest's schema reads it.
+fn visibility_of(text: &str) -> Result<Visibility, String> {
+    #[derive(serde::Deserialize)]
+    struct Head {
+        visibility: Option<Visibility>,
+    }
+    let head: Head = toml::from_str(text)
+        .map_err(|e| format!("can't be read as a manifest ({})", e.message()))?;
+    head.visibility.ok_or_else(|| "names no visibility".to_string())
+}
+
+/// The one visibility every copy names, or why there isn't one.
+fn agreed(copies: Vec<(String, Result<Visibility, String>)>) -> CheckoutStack {
+    let mut named = Vec::new();
+    for (at, v) in copies {
+        match v {
+            Ok(v) => named.push((at, v)),
+            Err(e) => return CheckoutStack::Unknown(format!("{at}: {e}")),
+        }
+    }
+    match named.first() {
+        None => CheckoutStack::None,
+        Some((_, v)) if named.iter().all(|(_, w)| w == v) => CheckoutStack::Is(*v),
+        Some(_) => CheckoutStack::Unknown(format!(
+            "this checkout's stack manifests disagree ({})",
+            named.iter().map(|(at, v)| format!("{at}: {v}")).collect::<Vec<_>>().join("; ")
+        )),
+    }
+}
+
+/// Whether a privacy check in a checkout whose stack is `stack` runs secrets only, and the line to say when its mode
+/// isn't the one asked for (D28 r2, C1 and C2). `by_stack` (a stack repo's hooks): the stack's mode, the whole policy
+/// where it can't be told. `secrets_only`: only where the checkout has no stack or a private one, so no caller gives
+/// a public checkout secrets-only mode. Neither: the whole policy.
+pub fn checkout_mode(
+    stack: &CheckoutStack,
+    by_stack: bool,
+    secrets_only: bool,
+) -> (bool, Option<String>) {
+    let whole = "so the whole privacy policy is checked";
+    match stack {
+        CheckoutStack::Is(Visibility::Private) => (by_stack || secrets_only, None),
+        CheckoutStack::None if by_stack => (
+            false,
+            Some(format!(
+                "this checkout has no stack manifest ({} or {}), {whole}",
+                MANIFESTS[0], MANIFESTS[1]
+            )),
+        ),
+        CheckoutStack::None => (secrets_only, None),
+        CheckoutStack::Is(Visibility::Public) if secrets_only => {
+            (false, Some(format!("this checkout's stack is public, {whole}, not --secrets-only")))
+        }
+        CheckoutStack::Is(Visibility::Public) => (false, None),
+        CheckoutStack::Unknown(why) if by_stack || secrets_only => {
+            (false, Some(format!("{why}, {whole}")))
+        }
+        CheckoutStack::Unknown(_) => (false, None),
+    }
 }
