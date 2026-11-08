@@ -417,36 +417,120 @@ fn a_store_file_written_while_the_delivery_planned_is_planned_again() {
     }
 }
 
-// Spec (F8 §15.2 A3, A4; note A3, A4): when a reader holds a place's second file open so it can't be replaced, the swap
-// is tried again until `lock_wait_secs`, then the place's first file is put back, so the place stays whole at its old
-// text and the state holds it (`write-refused`); once the reader lets go, the next delivery brings it current, with
-// nothing left beside its files.
+/// A whole delivery that runs `act` once, at the first swap at `place` after which exactly `n` of its two place files
+/// hold "Rule two.": with 1, one is published and the other still to be replaced (a place's dirs go first, note
+/// §14.2); with 2, both are in and the place's backups not yet removed.
+fn run_when_new(
+    f: &Fixture,
+    place: &Path,
+    n: usize,
+    mut act: impl FnMut(),
+) -> Result<Report, String> {
+    let mut done = false;
+    let opts = Options::whole(&f.home());
+    deliver::run_between(&f.pub_root(), Some(&f.priv_root()), &opts, &mut |s, p| {
+        let new = || files(place).iter().filter(|t| t.contains("Rule two.")).count();
+        if !done && s == Step::Swapped && key(p) == key(place) && new() == n {
+            done = true;
+            act();
+        }
+    })
+}
+
+/// Opens `p` for reading with read sharing only (`FileShare.Read`): Windows then refuses to rename over it or delete it.
+#[cfg(windows)]
+fn read_sharing_only(p: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    fs::OpenOptions::new().read(true).share_mode(1).open(p)
+}
+
+// Spec (review r1 F8-R1-02, witness P3; note §14.2, T2a, A16): once a place's transaction has published its first file,
+// a reader without delete sharing can open neither the published file nor the one still to be replaced, so it can't
+// stop the swaps or their undo; the place ends fully current and isn't held.
 #[cfg(windows)]
 #[test]
-fn a_file_a_reader_holds_open_leaves_its_place_whole() {
-    use std::os::windows::fs::OpenOptionsExt;
+fn a_reader_without_delete_sharing_cant_open_a_place_file_during_its_transaction() {
+    let f = Fixture::new();
+    let (a, b) = delivered_once(&f, "[delivery]\nlock_wait_secs = 0\n");
+    rule(&f, "Rule two.\n");
+    commit(&f, "pub", "rule two");
+    let mut opened = Vec::new();
+    let r = run_when_new(&f, &a, 1, || {
+        for n in ["CLAUDE.local.md", "AGENTS.override.md"] {
+            opened.push((n, read_sharing_only(&a.join(n))));
+        }
+    })
+    .unwrap();
+    assert_eq!(opened.len(), 2, "the delivery reached a half-published place");
+    for (n, o) in &opened {
+        assert!(o.is_err(), "{n}: a reader without delete sharing got in during the transaction");
+    }
+    drop(opened);
+    for p in [&a, &b] {
+        assert!(files(p).iter().all(|t| t.contains("Rule two.")), "fully current: {r:?}");
+        assert!(leftovers(p).is_empty(), "{:?}", leftovers(p));
+    }
+    assert!(held_at(&r.state, &a).is_none(), "{:?}", r.state);
+}
+
+// Spec (note §14.2, T2b, A16; C4): a reader without delete sharing that holds a place file before the transaction is
+// found before anything is written: the place stays untouched at its old text, with nothing beside its files, and is
+// held (`write-refused`); once the reader lets go, the next delivery brings it current.
+#[cfg(windows)]
+#[test]
+fn a_reader_there_before_the_transaction_leaves_its_place_untouched() {
     let f = Fixture::new();
     let (a, b) = delivered_once(&f, "[delivery]\nlock_wait_secs = 1\n");
     rule(&f, "Rule two.\n");
     commit(&f, "pub", "rule two");
-    let codex = a.join("AGENTS.override.md");
-    let mut open = None;
+    let reader = read_sharing_only(&a.join("AGENTS.override.md")).unwrap();
     let start = Instant::now();
-    let r = run_at(&f, Step::Swapped, 1, Some(&a), || {
-        // Read sharing only: the file can't be replaced or deleted while this is open.
-        open = Some(fs::OpenOptions::new().read(true).share_mode(1).open(&codex).unwrap());
-    });
-    assert!(files(&b).iter().all(|t| t.contains("Rule two.")), "{r:?}");
-    assert!(files(&a).iter().all(|t| t.contains("Rule one.")), "whole at its old text: {r:?}");
+    let r = run(&f).unwrap();
     assert!(start.elapsed() < Duration::from_secs(60), "{:?}", start.elapsed());
-    let s = state(&f);
-    let held = held_at(&s, &a).unwrap_or_else(|| panic!("held: {s:?}"));
+    assert!(files(&b).iter().all(|t| t.contains("Rule two.")), "{r:?}");
+    assert!(files(&a).iter().all(|t| t.contains("Rule one.")), "untouched: {r:?}");
+    assert!(leftovers(&a).is_empty(), "{:?}", leftovers(&a));
+    let held = held_at(&r.state, &a).unwrap_or_else(|| panic!("held: {:?}", r.state));
     assert!(held.items.iter().any(|i| i.reason == "write-refused"), "{held:?}");
-    drop(open);
+    drop(reader);
     run(&f).unwrap();
     assert!(files(&a).iter().all(|t| t.contains("Rule two.")));
     assert!(leftovers(&a).is_empty(), "{:?}", leftovers(&a));
     assert!(held_at(&state(&f), &a).is_none());
+}
+
+// Spec (note §14.2, T2c; C4): a place whose second file's owner edit is found after its first file is published is put
+// back whole even while a reader with delete sharing (as the harnesses read) holds the published file open.
+#[cfg(windows)]
+#[test]
+fn a_place_is_put_back_whole_under_a_reader_that_shares_delete() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = Fixture::new();
+    let (a, _) = delivered_once(&f, "[delivery]\nlock_wait_secs = 0\n");
+    rule(&f, "Rule two.\n");
+    commit(&f, "pub", "rule two");
+    let before = files(&a);
+    let mut reader = Vec::new();
+    let mut edited = None;
+    let r = run_when_new(&f, &a, 1, || {
+        for n in ["CLAUDE.local.md", "AGENTS.override.md"] {
+            let p = a.join(n);
+            if read(&p).contains("Rule two.") {
+                reader.push(fs::OpenOptions::new().read(true).share_mode(7).open(&p).unwrap());
+            } else {
+                let mine = format!("{}My own line.\n", read(&p));
+                fs::write(&p, &mine).unwrap();
+                edited = Some((p, mine));
+            }
+        }
+    })
+    .unwrap();
+    let (p, mine) = edited.expect("one file was still old");
+    assert_eq!(read(&p), mine, "the owner's edit stays");
+    let other = files(&a).into_iter().find(|t| !t.contains("My own line.")).unwrap();
+    assert!(before.contains(&other), "the published file is put back: {other:?}");
+    assert!(held_at(&r.state, &a).is_some(), "{:?}", r.state);
+    drop(reader);
 }
 
 // Spec (F8 §15.2 A1; note A1, D-2: a stop from outside at each step): a delivery stopped after a place is staged, or
@@ -474,6 +558,134 @@ fn a_delivery_stopped_at_any_step_is_finished_by_the_next() {
         }
         assert!(killed.is_err(), "{step:?} {nth}: never reached");
     }
+}
+
+/// Every swap a whole delivery makes in a fresh fixture set up by `setup`, counted: the same setup makes the same plan.
+fn swaps(setup: impl Fn(&Fixture)) -> usize {
+    let f = Fixture::new();
+    setup(&f);
+    let mut n = 0;
+    let opts = Options::whole(&f.home());
+    deliver::run_between(&f.pub_root(), Some(&f.priv_root()), &opts, &mut |s, _| {
+        n += usize::from(s == Step::Swapped);
+    })
+    .unwrap();
+    n
+}
+
+/// Delivered once, then the public rule two committed: a whole delivery has every place to change.
+fn rule_two(f: &Fixture) -> (PathBuf, PathBuf) {
+    let ab = delivered_once(f, "");
+    rule(f, "Rule two.\n");
+    commit(f, "pub", "rule two");
+    ab
+}
+
+/// The held reason of `p`'s place in the state, if it is held.
+fn reasons(s: &State, p: &Path) -> Vec<String> {
+    held_at(s, p).map(|h| h.items.iter().map(|i| i.reason.clone()).collect()).unwrap_or_default()
+}
+
+// Spec (review r1 F8-R1-01, witness P1; note §14.1, T1a, T1b, A14; rule.delete-only-what-you-created): a file and a dir
+// beside a place file with Lords' names that no transaction recorded are kept byte for byte by a whole delivery, and
+// hold their place (`left-beside`), named in the state and in `lords paths`; the other place is delivered.
+#[test]
+fn an_unrecorded_sibling_with_lords_name_is_kept_and_holds_its_place() {
+    let f = Fixture::new();
+    let (a, b) = rule_two(&f);
+    let file = a.join(".CLAUDE.local.md.lords-done-123-456-1");
+    fs::write(&file, "Owner's unique saved text.\n").unwrap();
+    let dir = a.join(".AGENTS.override.md.lords-new-123-456-2");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("keep.txt"), "Owner's dir text.\n").unwrap();
+
+    let r = run(&f).unwrap();
+    assert_eq!(read(&file), "Owner's unique saved text.\n", "{r:?}");
+    assert_eq!(read(&dir.join("keep.txt")), "Owner's dir text.\n", "{r:?}");
+    assert!(files(&b).iter().all(|t| t.contains("Rule two.")), "{r:?}");
+    assert!(reasons(&state(&f), &a).contains(&"left-beside".to_string()), "{:?}", state(&f));
+    let rows = rows(&f);
+    assert!(
+        rows.iter().any(|r| r.state == "stale" && r.why.contains("lords-")),
+        "{:?}",
+        shown(&rows)
+    );
+}
+
+// Spec (note §14.1, T1c, A15): a sibling a stopped transaction recorded, changed after the stop, is kept byte for byte
+// by the next delivery, and holds its place (`left-beside`).
+#[test]
+fn a_recorded_sibling_changed_after_a_stop_is_kept_and_holds_its_place() {
+    let f = Fixture::new();
+    let (a, _) = rule_two(&f);
+    let stop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_when_new(&f, &a, 2, || panic!("stopped"))
+    }));
+    assert!(stop.is_err(), "the stop was reached");
+    let done = leftovers(&a).into_iter().find(|n| n.starts_with(".CLAUDE.local.md.lords-done-"));
+    let done =
+        a.join(done.unwrap_or_else(|| panic!("a checked backup is left: {:?}", leftovers(&a))));
+    fs::write(&done, "Owner's text, written over the backup.\n").unwrap();
+
+    let r = run(&f).unwrap();
+    assert_eq!(read(&done), "Owner's text, written over the backup.\n", "{r:?}");
+    assert!(reasons(&state(&f), &a).contains(&"left-beside".to_string()), "{:?}", state(&f));
+}
+
+// Spec (review r1 F8-R1-03, witness P2; note §14.3, T3a): with every place in sync, an unchecked backup beside a place
+// file holding other text is kept, and holds its place, named in the state and in `lords paths`.
+#[test]
+fn an_unchecked_backup_holds_its_place_when_nothing_else_changes() {
+    let f = Fixture::new();
+    let (a, _) = delivered_once(&f, "");
+    let old = a.join(".CLAUDE.local.md.lords-old-123-456-1");
+    fs::write(&old, "The owner's other text.\n").unwrap();
+    let r = run(&f).unwrap();
+    assert_eq!(read(&old), "The owner's other text.\n", "{r:?}");
+    assert!(reasons(&state(&f), &a).contains(&"left-beside".to_string()), "{:?}", state(&f));
+    let rows = rows(&f);
+    assert!(rows.iter().any(|r| r.state == "stale"), "{:?}", shown(&rows));
+}
+
+// Spec (review r1 F8-R1-03, "a stop after the final successful swap/ledger save leaves checked `done` backups"; note
+// §14.3, T3b, A17): a delivery stopped after its last swap leaves its places current with recorded siblings beside; the
+// next delivery, with nothing to change, removes exactly those and holds nothing.
+#[test]
+fn a_stop_after_the_last_swap_is_cleared_by_a_delivery_with_nothing_to_change() {
+    let last = swaps(|f| {
+        rule_two(f);
+    });
+    let f = Fixture::new();
+    let (a, b) = rule_two(&f);
+    let stop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_at(&f, Step::Swapped, last, None, || panic!("stopped"))
+    }));
+    assert!(stop.is_err(), "the last swap ({last}) was reached");
+    for p in [&a, &b] {
+        assert!(files(p).iter().all(|t| t.contains("Rule two.")), "current after its last swap");
+    }
+    assert!(!(leftovers(&a).is_empty() && leftovers(&b).is_empty()), "siblings are left");
+
+    let r = run(&f).unwrap();
+    for p in [&a, &b] {
+        assert!(leftovers(p).is_empty(), "{:?}", leftovers(p));
+    }
+    assert!(!r.holds() && state(&f).places.is_empty(), "{:?}", state(&f));
+}
+
+// Spec (note §14.5, A18): a transaction record that can't be read removes nothing: the whole delivery fails, named in
+// the state with the record's path, and the siblings beside the place files stay.
+#[test]
+fn a_transaction_record_that_cant_be_read_removes_nothing() {
+    let f = Fixture::new();
+    let (a, _) = rule_two(&f);
+    let sibling = a.join(".CLAUDE.local.md.lords-new-123-456-1");
+    fs::write(&sibling, "Some bytes.\n").unwrap();
+    fs::write(f.home().join("place-transaction.json"), "not a record").unwrap();
+    let r = run(&f);
+    assert_eq!(read(&sibling), "Some bytes.\n", "{r:?}");
+    let failed = state(&f).failed.unwrap_or_else(|| panic!("recorded: {r:?}"));
+    assert!(failed.why.contains("place-transaction.json"), "{failed:?}");
 }
 
 // Spec (F8 §15, M4; review F8-R1-03; note A5): once a store's hooks are installed, delivery is configured, so a state
