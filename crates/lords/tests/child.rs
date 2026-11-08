@@ -28,8 +28,19 @@ fn run(home: &Path, cwd: &Path, args: &[&str], stdin: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    c.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
-    c.wait_with_output().unwrap()
+    // A guard that answers without reading its input may have ended first: a broken pipe off Windows (the race).
+    let unread = match c.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => true,
+        r => {
+            r.unwrap();
+            false
+        }
+    };
+    let out = c.wait_with_output().unwrap();
+    // Only a guard that ended well may have left its input unread: the guard child never fails an event (review r1,
+    // R1-04: a broken pipe alone says nothing about how the child ended).
+    assert!(!unread || out.status.success(), "the guard ended without reading its input: {out:?}");
+    out
 }
 
 fn event(cwd: &Path) -> String {

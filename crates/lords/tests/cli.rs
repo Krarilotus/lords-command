@@ -1444,7 +1444,11 @@ fn guard(env: &Env, exe: &Path, args: &[&str], stdin: &str) -> Output {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    c.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    // A guard that answers without reading its input may have ended first: a broken pipe off Windows (the race).
+    match c.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        r => r.unwrap(),
+    }
     c.wait_with_output().unwrap()
 }
 
@@ -2142,7 +2146,11 @@ fn queue_guard(env: &Env, args: &[&str], cli: &Path, event: &str) -> Output {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    c.stdin.take().unwrap().write_all(event.as_bytes()).unwrap();
+    // A guard that answers without reading its event may have ended first: a broken pipe off Windows (the race).
+    match c.stdin.take().unwrap().write_all(event.as_bytes()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        r => r.unwrap(),
+    }
     c.wait_with_output().unwrap()
 }
 
@@ -2298,7 +2306,11 @@ fn rules_guard(env: &Env, args: &[&str], event: &str) -> Output {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    c.stdin.take().unwrap().write_all(event.as_bytes()).unwrap();
+    // A guard that answers without reading its event may have ended first: a broken pipe off Windows (the race).
+    match c.stdin.take().unwrap().write_all(event.as_bytes()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        r => r.unwrap(),
+    }
     c.wait_with_output().unwrap()
 }
 
