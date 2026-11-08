@@ -576,10 +576,13 @@ impl CheckoutStack {
 /// Every copy of the manifests (`MANIFESTS`) of the checkout `dir` is in: in HEAD, in the index a hook checks (the
 /// commit's own, as `scan_staged` reads it), and on disk, tracked or not (review r1, R1-02). All naming one
 /// visibility is that visibility. Anything else is `Unknown`, never a guess: a copy that can't be read or names no
-/// visibility, and copies that disagree, two manifests or a change that is only partly staged. A committed or staged
-/// path under another spelling of a manifest, which a case-insensitive filesystem reads as the manifest (`STACK.toml`,
-/// `Stack/stack.toml`), is never left out: it is `Unknown`, named (fix check r2, R2-01). Only a dir git says is in no
-/// repository has no stack; a checkout git can't tell is `Unknown`, with git's answer (R2-02).
+/// visibility, and copies that disagree, two manifests or a change that is only partly staged. Only a dir git says is
+/// in no repository has no stack; a checkout git can't tell is `Unknown`, with git's answer (R2-02).
+///
+/// A copy counts by structure, never by matching the names that alias it (fix check r3, R2-01; design note
+/// 2026-11-08-lords-d28-alias): on disk only through entries listed under their exact canonical names
+/// (`exactly_listed`), and in git only at a canonical path as a regular file. Any other git entry a filesystem may take
+/// for a manifest (`git_entry`) is `Unknown`, named, so no alias of a public copy is left out.
 pub fn checkout_stack(dir: &Path) -> CheckoutStack {
     let top = match git::top_level(dir) {
         Ok(Some(top)) => top,
@@ -593,7 +596,9 @@ pub fn checkout_stack(dir: &Path) -> CheckoutStack {
         let path = top.join(rel);
         let text = match fsguard::kind(&path) {
             Ok(fsguard::Kind::Missing) => continue,
-            Ok(_) => fsguard::read_text(&path).and_then(|t| t.ok_or_else(|| "gone".to_string())),
+            Ok(_) => exactly_listed(&top, rel).and_then(|()| {
+                fsguard::read_text(&path).and_then(|t| t.ok_or_else(|| "gone".to_string()))
+            }),
             Err(e) => Err(e),
         };
         copies.push((format!("{rel} on disk"), text.and_then(|t| visibility_of(&t))));
@@ -607,42 +612,45 @@ pub fn checkout_stack(dir: &Path) -> CheckoutStack {
         });
         found.clone()
     };
-    // A copy at a manifest's own path counts by what it names; one under another spelling of it is named (R2-01).
-    let spelled = |path: &str, read: Result<Visibility, String>| {
-        match manifest_named(path) {
-        Some(m) if m == path => Some(read),
-        Some(m) => Some(Err(format!(
-            "is another spelling of {m}, which a case-insensitive filesystem reads as the manifest: rename it to {m}"
-        ))),
-        None => None,
-    }
+    // Every git entry, at any depth, is put to `git_entry`: `<mode> <id> <stage>\t<path>` from the index (each stage of
+    // a conflict a copy), `<mode> <type> <id>\t<path>` from HEAD's whole tree. Two listings, not a pathspec: git's
+    // case folding is ASCII only and knows no other filesystem rule.
+    let mut entry = |path: &str, mode: &str, id: &str, at: String| -> Option<_> {
+        match git_entry(path, mode) {
+            GitEntry::Other => None,
+            GitEntry::Manifest => Some((at, blob(id))),
+            GitEntry::Alias(why) => Some((at, Err(why))),
+        }
     };
-    // Every staged path at the top or one dir down, where a manifest's spellings are: `<mode> <id> <stage>\t<path>`,
-    // each stage of a conflict a copy. Git's own case folding is ASCII only, so the spellings are matched here.
-    let staged = ["ls-files", "-s", "-z", "--", ":(top,glob)*", ":(top,glob)*/*"];
+    let staged = ["ls-files", "-s", "-z", "--full-name"];
     match git::run_index(&top, &staged) {
         Ok(out) => {
             for rec in out.split('\0').filter(|r| !r.is_empty()) {
                 let (head, path) = rec.split_once('\t').unwrap_or((rec, ""));
-                if manifest_named(path).is_none() {
-                    continue;
-                }
-                let read = match head.split(' ').collect::<Vec<_>>().as_slice() {
-                    [_, id, _] => blob(id),
-                    _ => Err(format!("`git ls-files -s` said {rec:?}")),
-                };
-                copies.extend(spelled(path, read).map(|r| (format!("{path} staged"), r)));
+                copies.extend(match head.split(' ').collect::<Vec<_>>().as_slice() {
+                    [mode, id, _] => entry(path, mode, id, format!("{path} staged")),
+                    _ => Some((
+                        format!("{path} staged"),
+                        Err(format!("`git ls-files -s` said {rec:?}")),
+                    )),
+                });
             }
         }
         Err(e) => copies.push(("the index".to_string(), Err(e))),
     }
     match git::status(&top, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]) {
         Ok(false) => {}
-        Ok(true) => match committed_spellings(&top) {
-            Ok(found) => {
-                for (path, kind, id) in found {
-                    let read = if kind == "blob" { blob(&id) } else { Err(format!("is a {kind}")) };
-                    copies.extend(spelled(&path, read).map(|r| (format!("{path} in HEAD"), r)));
+        Ok(true) => match git::run(&top, &["ls-tree", "-r", "-z", "--full-tree", "HEAD"]) {
+            Ok(out) => {
+                for rec in out.split('\0').filter(|r| !r.is_empty()) {
+                    let (head, path) = rec.split_once('\t').unwrap_or((rec, ""));
+                    copies.extend(match head.split(' ').collect::<Vec<_>>().as_slice() {
+                        [mode, _, id] => entry(path, mode, id, format!("{path} in HEAD")),
+                        _ => Some((
+                            format!("{path} in HEAD"),
+                            Err(format!("`git ls-tree` said {rec:?}")),
+                        )),
+                    });
                 }
             }
             Err(e) => copies.push(("HEAD".to_string(), Err(e))),
@@ -652,10 +660,80 @@ pub fn checkout_stack(dir: &Path) -> CheckoutStack {
     agreed(copies)
 }
 
-/// The manifest (`MANIFESTS`) a checkout path may name: its own path, or another spelling a case-insensitive filesystem
-/// takes for it, any letter in another case, Unicode's folds included (R2-01).
-fn manifest_named(path: &str) -> Option<&'static str> {
-    MANIFESTS.into_iter().find(|m| same_but_case(path, m))
+/// Whether each step of the manifest path `rel` below `top` is an entry its dir lists under exactly that name, so the
+/// file read at `top/rel` is the canonical one, not one a short name, another case, a trailing dot or space or an
+/// ignorable code point reaches (design note d28-alias, the disk rule). No filesystem's aliasing is modelled: a name
+/// that opens but isn't listed is an error, so discovery is `Unknown`.
+fn exactly_listed(top: &Path, rel: &str) -> Result<(), String> {
+    let mut dir = top.to_path_buf();
+    let mut shown = "the checkout's top".to_string();
+    for name in rel.split('/') {
+        let names = fsguard::list_dir(&dir)?;
+        if !names.iter().any(|p| p.file_name() == Some(std::ffi::OsStr::new(name))) {
+            return Err(format!(
+                "opens, but {shown} lists no entry named exactly {name:?}, so another name reaches it (a short name, \
+                 another case, a trailing dot or space): name it exactly {rel}"
+            ));
+        }
+        dir.push(name);
+        shown = format!("{name}/");
+    }
+    Ok(())
+}
+
+/// What a git entry is to discovery (design note d28-alias, the git rule).
+enum GitEntry {
+    /// A regular file at a manifest's own path: it counts by what it names.
+    Manifest,
+    /// Something a filesystem may take for a manifest, or a link or submodule where one goes: why, in a line.
+    Alias(String),
+    Other,
+}
+
+/// The git rule: an entry whose basename (after the last `/` or `\`, which Windows takes for a separator) a filesystem
+/// may take for `stack.toml` (`folds_to`) is a manifest only at a canonical path and as a regular file (`100644`,
+/// `100755`). Elsewhere, at any depth, it is an alias, a fixture's included: renaming it settles that. So is a symlink
+/// or submodule at the top whose name folds to `stack`: what it reaches isn't this checkout's content.
+fn git_entry(path: &str, mode: &str) -> GitEntry {
+    let parts: Vec<&str> = path.split(['/', '\\']).collect();
+    let base = parts.last().copied().unwrap_or(path);
+    let what = |mode: &str| match mode {
+        "120000" => "a symlink".to_string(),
+        "160000" => "a submodule".to_string(),
+        m => format!("mode {m}"),
+    };
+    if folds_to(base, MANIFESTS[0]) {
+        if !MANIFESTS.contains(&path) {
+            return GitEntry::Alias(format!(
+                "is named like a stack manifest but isn't {} or {}, so a filesystem may read it as one: rename or \
+                 remove it (a copy in HEAD counts until a commit removes it)",
+                MANIFESTS[0], MANIFESTS[1]
+            ));
+        }
+        return match mode {
+            "100644" | "100755" => GitEntry::Manifest,
+            m => GitEntry::Alias(format!("is {} where the manifest goes", what(m))),
+        };
+    }
+    if parts.len() == 1 && folds_to(base, "stack") && matches!(mode, "120000" | "160000") {
+        return GitEntry::Alias(format!("is {} where the stack's dir goes", what(mode)));
+    }
+    GitEntry::Other
+}
+
+/// Whether some filesystem may take the name `name` for `canonical` (an ASCII name). The rules, all applied, so the
+/// answer is a superset of every one: HFS+ ignores some code points (git's own `is_hfs_dotgit` list); NTFS reads a name
+/// up to a `:` as the file (`stack.toml::$DATA` is its data) and drops trailing dots and spaces; case-insensitive
+/// filesystems fold case, Unicode's folds included.
+fn folds_to(name: &str, canonical: &str) -> bool {
+    let kept: String = name
+        .chars()
+        .filter(|c| {
+            !matches!(c, '\u{200C}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{206A}'..='\u{206F}' | '\u{FEFF}')
+        })
+        .collect();
+    let file = kept.split(':').next().unwrap_or_default();
+    same_but_case(file.trim_end_matches(['.', ' ']), canonical)
 }
 
 fn same_but_case(a: &str, b: &str) -> bool {
@@ -663,39 +741,6 @@ fn same_but_case(a: &str, b: &str) -> bool {
         && a.chars().zip(b.chars()).all(|(x, y)| {
             x == y || x.to_lowercase().eq(y.to_lowercase()) || x.to_uppercase().eq(y.to_uppercase())
         })
-}
-
-/// HEAD's entries at a manifest's spellings, as `(path, type, id)`: its top level, and each dir spelled like `stack`
-/// one level down (`git ls-tree` takes no case-folding pathspec).
-fn committed_spellings(top: &Path) -> Result<Vec<(String, String, String)>, String> {
-    // `<mode> <type> <id>\t<name>`, NUL-terminated.
-    let entries = |tree: &str| -> Result<Vec<(String, String, String)>, String> {
-        let out = git::run(top, &["ls-tree", "-z", "--full-tree", tree])?;
-        out.split('\0')
-            .filter(|r| !r.is_empty())
-            .map(|rec| {
-                let (head, name) = rec.split_once('\t').unwrap_or((rec, ""));
-                match head.split(' ').collect::<Vec<_>>().as_slice() {
-                    [_, kind, id] => Ok((name.to_string(), kind.to_string(), id.to_string())),
-                    _ => Err(format!("`git ls-tree` said {rec:?}")),
-                }
-            })
-            .collect()
-    };
-    let mut found = Vec::new();
-    for (name, kind, id) in entries("HEAD")? {
-        if same_but_case(&name, MANIFESTS[0]) {
-            found.push((name, kind, id));
-        } else if kind == "tree" && same_but_case(&name, "stack") {
-            for (inner, k, i) in entries(&id)? {
-                let path = format!("{name}/{inner}");
-                if manifest_named(&path).is_some() {
-                    found.push((path, k, i));
-                }
-            }
-        }
-    }
-    Ok(found)
 }
 
 /// The visibility a manifest's text names, as the manifest's schema reads it.
