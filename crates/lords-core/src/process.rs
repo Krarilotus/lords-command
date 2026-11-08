@@ -82,6 +82,22 @@ pub(crate) fn git_inherited(dir: &Path, args: &[&str]) -> Result<Output, String>
     c.output().map_err(|e| format!("git {}: {e}", args.join(" ")))
 }
 
+/// `git_inherited`, with `stdin` if any, waiting at most `deadline`: the stores' commit check reads the index and
+/// objects of the commit its hook checks (gap 11, §0d.3), within `[delivery] store_git_secs`. See `bounded`.
+pub(crate) fn git_inherited_bounded(
+    dir: &Path,
+    args: &[&str],
+    stdin: Option<Vec<u8>>,
+    deadline: Duration,
+) -> Result<Output, String> {
+    let mut c = Command::new("git");
+    c.arg("-C").arg(dir).args(args);
+    for v in PATHSPEC_VARS {
+        c.env_remove(v);
+    }
+    bounded(c, stdin, deadline).map_err(|e| format!("git {}: {e}", args.join(" ")))
+}
+
 /// Runs `git -C <dir> <args>` with these environment variables set, and waits for it (the hook probe).
 pub(crate) fn git_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<Output, String> {
     let mut c = command(dir, args);

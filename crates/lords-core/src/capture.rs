@@ -14,8 +14,50 @@ use std::time::Duration;
 
 /// One git read of a store, stopped past `limit` (`[delivery] store_git_secs`).
 pub(crate) fn git(dir: &Path, args: &[&str], limit: Duration) -> Result<String, String> {
-    let out = crate::process::git_bounded(dir, args, limit)?;
-    succeeded(dir, args, &out).map(|b| String::from_utf8_lossy(&b).trim().to_string())
+    let out = run(Env::Isolated, dir, args, None, limit)?;
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+/// The git environment a store's reads run in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Env {
+    /// The store's own, with none of the variables that tie git to the repo this process runs for: every store a
+    /// delivery reads, and the store a commit hook doesn't commit to.
+    Isolated,
+    /// The commit's, as its hook got it: the index `commit -a` and `commit <paths>` name in `GIT_INDEX_FILE`.
+    Inherited,
+}
+
+/// A store's git read, in the order the stores' commit check makes them: for a test to act just before one, wherever
+/// the code makes it (gap 11, design note §0c.2, §0d.5: the seam is at the read, not at a place in the code).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Read {
+    /// `index.lock`'s path, before it is looked at.
+    Lock,
+    /// The status `committed` requires empty.
+    Status,
+    /// The committed tree's id (`HEAD:./`).
+    Head,
+    /// A tree's or an index's listing.
+    List,
+    /// The listed blobs' bytes.
+    Blobs,
+}
+
+/// What git printed for `args` in `dir`, run in `env` with `stdin`, within `limit`; or why it failed.
+fn run(
+    env: Env,
+    dir: &Path,
+    args: &[&str],
+    stdin: Option<Vec<u8>>,
+    limit: Duration,
+) -> Result<Vec<u8>, String> {
+    let out = match (env, stdin) {
+        (Env::Isolated, None) => crate::process::git_bounded(dir, args, limit)?,
+        (Env::Isolated, Some(i)) => crate::process::git_input_bounded(dir, args, i, limit)?,
+        (Env::Inherited, i) => crate::process::git_inherited_bounded(dir, args, i, limit)?,
+    };
+    succeeded(dir, args, &out)
 }
 
 /// What a git read of a store printed, or why it failed.
@@ -40,27 +82,58 @@ pub(crate) fn tree(dir: &Path, limit: Duration) -> Result<StoreTree, String> {
 /// ignored (F8 K4; sol-loop r1 S1). Only committed entries, which passed the stores' commit hooks, reach agents: since
 /// gap 11 by construction too, as a delivery loads what `capture` reads of these trees, never the checkout.
 pub(crate) fn committed(dirs: &[&Path], limit: Duration) -> Result<Vec<StoreTree>, String> {
+    committed_between(dirs, limit, &mut |_| {})
+}
+
+/// `committed`, calling `between` just before each status and tree read: the status first, then the tree, so a clean
+/// status is never paired with a tree read before it (gap 11, I2).
+pub(crate) fn committed_between(
+    dirs: &[&Path],
+    limit: Duration,
+    between: &mut dyn FnMut(Read),
+) -> Result<Vec<StoreTree>, String> {
     let mut trees = Vec::new();
     for d in dirs {
-        let status = "--no-optional-locks status --porcelain --untracked-files=all --ignored -- .";
-        if !git(d, &status.split(' ').collect::<Vec<_>>(), limit)?.is_empty() {
+        between(Read::Status);
+        if !status(d, limit)?.is_empty() {
             return Err(format!(
                 "{} has uncommitted (edited, untracked or ignored) files in its stack, and a delivery takes committed entries only; nothing was written: the next commit delivers",
                 d.display()
             ));
         }
+        between(Read::Head);
         trees.push(tree(d, limit)?);
     }
     Ok(trees)
+}
+
+/// What a store's stack dir `d` holds besides its commit, as `git status --porcelain` lists it: edited, untracked and
+/// ignored files alike; empty when there is nothing.
+pub(crate) fn status(d: &Path, limit: Duration) -> Result<String, String> {
+    let status = "--no-optional-locks status --porcelain --untracked-files=all --ignored -- .";
+    git(d, &status.split(' ').collect::<Vec<_>>(), limit)
 }
 
 /// The stack the store at `dir` committed as `tree` (a stack dir's tree, as `tree` resolves it), read from git's
 /// objects alone, each git read within `limit`: every blob's bytes as committed, with no checkout filter, and each
 /// symlink or submodule as a link, at its logical path under `dir`.
 pub(crate) fn capture(dir: &Path, tree: &str, limit: Duration) -> Result<Captured, String> {
-    let ls = ["ls-tree", "-r", "-z", "--full-tree", tree];
-    let listed = succeeded(dir, &ls, &crate::process::git_bounded(dir, &ls, limit)?)?;
-    let mut kept = Captured::new(dir);
+    capture_tree(Env::Isolated, dir, dir, tree, limit, &mut |_| {})
+}
+
+/// `capture` of `tree` (a tree id, or a `<rev>:<path>` that names one) in the repo at `dir`, in `env`, with its paths
+/// under `logical`, calling `between` before each read.
+pub(crate) fn capture_tree(
+    env: Env,
+    dir: &Path,
+    logical: &Path,
+    tree: &str,
+    limit: Duration,
+    between: &mut dyn FnMut(Read),
+) -> Result<Captured, String> {
+    between(Read::List);
+    let listed = run(env, dir, &["ls-tree", "-r", "-z", "--full-tree", tree], None, limit)?;
+    let mut kept = Captured::new(logical);
     let mut blobs: Vec<(String, String)> = Vec::new();
     for item in listed.split(|b| *b == 0).filter(|i| !i.is_empty()) {
         let item =
@@ -72,13 +145,62 @@ pub(crate) fn capture(dir: &Path, tree: &str, limit: Duration) -> Result<Capture
             _ => return Err(malformed(dir, item)),
         }
     }
+    read_blobs(env, dir, &mut kept, blobs, limit, between)?;
+    Ok(kept)
+}
+
+/// The stack dir `stack` (repo-relative, `.` for the repo's root) as the index the commit in the repo at `dir` checks
+/// holds it: `ls-files -s` of the hook's own index (`Env::Inherited`), with its paths under `logical`. An entry not at
+/// stage 0 (a merge conflict left in the index) refuses it, as no commit holds one.
+pub(crate) fn capture_index(
+    dir: &Path,
+    stack: &str,
+    logical: &Path,
+    limit: Duration,
+) -> Result<Captured, String> {
+    let env = Env::Inherited;
+    let listed = run(env, dir, &["ls-files", "-s", "-z", "--", stack], None, limit)?;
+    let prefix =
+        if stack == "." { String::new() } else { format!("{}/", stack.trim_end_matches('/')) };
+    let mut kept = Captured::new(logical);
+    let mut blobs: Vec<(String, String)> = Vec::new();
+    for item in listed.split(|b| *b == 0).filter(|i| !i.is_empty()) {
+        let item =
+            std::str::from_utf8(item).map_err(|_| malformed(dir, "a path that isn't UTF-8"))?;
+        let (head, path) = item.split_once('\t').ok_or_else(|| malformed(dir, item))?;
+        let path = path.strip_prefix(&prefix).ok_or_else(|| malformed(dir, item))?;
+        match head.split(' ').collect::<Vec<_>>()[..] {
+            [_, _, stage] if stage != "0" => {
+                return Err(format!(
+                    "{}: `{path}` is unmerged in the index (stage {stage}); a commit holds no such entry",
+                    dir.display()
+                ))
+            }
+            ["120000", _, _] | ["160000", _, _] => kept.add_link(path)?,
+            [_, oid, _] => blobs.push((oid.to_string(), path.to_string())),
+            _ => return Err(malformed(dir, item)),
+        }
+    }
+    read_blobs(env, dir, &mut kept, blobs, limit, &mut |_| {})?;
+    Ok(kept)
+}
+
+/// Adds `blobs` (object id, path) to `kept` with their bytes, read by one `cat-file --batch` in `dir`.
+fn read_blobs(
+    env: Env,
+    dir: &Path,
+    kept: &mut Captured,
+    blobs: Vec<(String, String)>,
+    limit: Duration,
+    between: &mut dyn FnMut(Read),
+) -> Result<(), String> {
     if blobs.is_empty() {
-        return Ok(kept);
+        return Ok(());
     }
     let input: String = blobs.iter().map(|(oid, _)| format!("{oid}\n")).collect();
-    let cat = ["cat-file", "--batch"];
-    let out = crate::process::git_input_bounded(dir, &cat, input.into_bytes(), limit)?;
-    let mut rest = &succeeded(dir, &cat, &out)?[..];
+    between(Read::Blobs);
+    let out = run(env, dir, &["cat-file", "--batch"], Some(input.into_bytes()), limit)?;
+    let mut rest = &out[..];
     for (oid, path) in blobs {
         let end = rest.iter().position(|b| *b == b'\n').ok_or_else(|| malformed(dir, &oid))?;
         let header = std::str::from_utf8(&rest[..end]).map_err(|_| malformed(dir, &oid))?;
@@ -90,7 +212,7 @@ pub(crate) fn capture(dir: &Path, tree: &str, limit: Duration) -> Result<Capture
         kept.add_file(&path, body.to_vec())?;
         rest = rest.get(end + 2 + size..).ok_or_else(|| malformed(dir, header))?;
     }
-    Ok(kept)
+    Ok(())
 }
 
 fn malformed(dir: &Path, what: &str) -> String {

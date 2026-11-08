@@ -2,6 +2,7 @@
 //! The CLI and the GUI both call this; neither shells out to the other.
 
 pub mod adapters;
+pub mod admission;
 pub mod capture;
 pub mod check;
 pub mod codex_trust;
