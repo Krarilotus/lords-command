@@ -1,0 +1,336 @@
+//! A privacy hook takes allowances only from its own checkout, and `privacy --explain` says what it checks (design
+//! note 2026-11-08-lords-privacy-own-allow; D28 review r6, R6-F01 and R6-F02; the self-service audit, journey 7).
+
+// Tests are outside the filesystem boundary (fsguard.rs): their fixtures write their own temp dirs.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use tempfile::TempDir;
+
+struct Env {
+    dir: TempDir,
+}
+
+impl Env {
+    /// An empty home and global git config, so no real home dir, hook or setting is read or touched.
+    fn new() -> Env {
+        let dir = TempDir::new().unwrap();
+        let email = ["test", "example.invalid"].join("@");
+        fs::write(
+            dir.path().join("gitconfig"),
+            format!("[user]\n\tname = Test\n\temail = {email}\n"),
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("home")).unwrap();
+        Env { dir }
+    }
+
+    fn cmd(&self, program: &str, cwd: &Path) -> Command {
+        let mut c = Command::new(program);
+        c.current_dir(cwd)
+            .env("GIT_CONFIG_GLOBAL", self.dir.path().join("gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", self.dir.path().join("home"))
+            .env("USERPROFILE", self.dir.path().join("home"))
+            .env("LORDS_CODEX", env!("CARGO_BIN_EXE_lords-codex-stub"));
+        c
+    }
+
+    fn lords(&self, cwd: &Path, args: &[&str]) -> Output {
+        self.cmd(env!("CARGO_BIN_EXE_lords"), cwd).args(args).output().unwrap()
+    }
+
+    fn git(&self, cwd: &Path, args: &[&str]) -> Output {
+        self.cmd("git", cwd).args(args).output().unwrap()
+    }
+
+    fn ok_git(&self, cwd: &Path, args: &[&str]) {
+        let o = self.git(cwd, args);
+        assert!(o.status.success(), "git {args:?}: {}", text(&o));
+    }
+
+    fn path(&self, rel: &str) -> PathBuf {
+        self.dir.path().join(rel)
+    }
+
+    /// A repo at `rel` with these files, committed (no hooks are installed in it).
+    fn repo(&self, rel: &str, files: &[(&str, &str)]) -> PathBuf {
+        let r = self.path(rel);
+        fs::create_dir_all(&r).unwrap();
+        self.ok_git(&r, &["init", "-q"]);
+        for (f, body) in files {
+            write(&r.join(f), body);
+        }
+        self.ok_git(&r, &["add", "-A"]);
+        self.ok_git(&r, &["commit", "-q", "-m", "start"]);
+        r
+    }
+
+    /// config.txt naming a public stack `elsewhere/stack` in a repo of its own, whose allow-list holds
+    /// `public_allow`, and a private stack outside any repo with these lists, each left out where empty; its manifest
+    /// names a fleet config holding `fleet`, or one that isn't there for `None`. Neither is the checkout under test.
+    fn configure(&self, public_allow: &str, allow: &str, deny: &str, fleet: Option<&str>) {
+        let mut public = vec![("stack/stack.toml", PUBLIC), ("README.md", "clean\n")];
+        if !public_allow.is_empty() {
+            public.push(("stack/privacy/allow.txt", public_allow));
+        }
+        let elsewhere = self.repo("elsewhere", &public);
+        let private = self.path("privstack");
+        let fleet_path = self.path("fleet.toml");
+        write(
+            &private.join("stack.toml"),
+            &format!("{PRIVATE}[privacy]\nfleet_config = '{}'\n", fleet_path.display()),
+        );
+        for (file, body) in [("allow.txt", allow), ("deny.txt", deny)] {
+            if !body.is_empty() {
+                write(&private.join("privacy").join(file), body);
+            }
+        }
+        if let Some(body) = fleet {
+            write(&fleet_path, body);
+        }
+        write(
+            &self.path("home/.lords-command/config.txt"),
+            &format!(
+                "public = {}\nprivate = {}\n",
+                elsewhere.join("stack").display(),
+                private.display()
+            ),
+        );
+    }
+}
+
+const PUBLIC: &str = "name = \"pub\"\nvisibility = \"public\"\n";
+const PRIVATE: &str = "name = \"priv\"\nvisibility = \"private\"\n";
+
+fn write(path: &Path, body: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, body).unwrap();
+}
+
+fn text(o: &Output) -> String {
+    format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))
+}
+
+/// A private detail that is no secret: a user path, whose private part is `alice`. Built from parts, so this file
+/// holds none.
+fn detail() -> String {
+    format!("logs in C:\\{}\\alice\\logs", "Users")
+}
+
+/// A committed checkout at `rel` with a public stack (`public`) or none, and, unless `own_allow` is empty, its own
+/// `stack/privacy/allow.txt`.
+fn checkout(env: &Env, rel: &str, public: bool, own_allow: &str) -> PathBuf {
+    let mut files = vec![("README.md", "a repo\n")];
+    if public {
+        files.push(("stack/stack.toml", PUBLIC));
+    }
+    if !own_allow.is_empty() {
+        files.push(("stack/privacy/allow.txt", own_allow));
+    }
+    env.repo(rel, &files)
+}
+
+/// `privacy` with `flags`, as the hook named by `how` runs it in `repo`, over content saying `body`: `staged`, a
+/// staged `notes.md`; `message`, a commit message; `history`, a commit holding `notes.md`.
+fn run_privacy(env: &Env, repo: &Path, how: &str, body: &str, flags: &[&str]) -> Output {
+    let notes = repo.join("notes.md");
+    match how {
+        "staged" => {
+            write(&notes, &format!("{body}\n"));
+            env.ok_git(repo, &["add", "notes.md"]);
+            env.lords(repo, &[&["privacy", "--staged"][..], flags].concat())
+        }
+        "message" => {
+            let msg = env.path("msg");
+            write(&msg, &format!("{body}\n"));
+            env.lords(
+                repo,
+                &[&["privacy", "--message", &msg.to_string_lossy()][..], flags].concat(),
+            )
+        }
+        _ => {
+            write(&notes, &format!("{body}\n"));
+            env.ok_git(repo, &["add", "notes.md"]);
+            env.ok_git(repo, &["commit", "-q", "-m", "notes"]);
+            env.lords(repo, &[&["privacy", "--history"][..], flags].concat())
+        }
+    }
+}
+
+// Spec (D28 r6, R6-F01: "A public checkout's own message containing a user-path match accepted only by a foreign
+// `alice` allowance remains a source witness ... foreign stacks supply terms only"; the master, 23:43; design note
+// privacy-own-allow, invariant and attack items 1-4): under `--by-stack`, neither configured stack's allow-list
+// accepts a hit in this checkout's staged files, message or history. Rows: the configured private allow-list in a
+// public checkout, each way a hook scans; the configured public allow-list in a public checkout; both in a checkout
+// with no stack. Every row runs before the refusals are asserted.
+#[test]
+fn a_privacy_hook_takes_no_configured_allowance() {
+    let rows = [
+        ("private allow-list, staged", "", "alice\n", true, "staged"),
+        ("private allow-list, message", "", "alice\n", true, "message"),
+        ("private allow-list, history", "", "alice\n", true, "history"),
+        ("public allow-list, staged", "alice\n", "", true, "staged"),
+        ("both, no stack, staged", "alice\n", "alice\n", false, "staged"),
+    ];
+    let outputs: Vec<_> = rows
+        .iter()
+        .map(|&(row, public_allow, private_allow, public, how)| {
+            let env = Env::new();
+            env.configure(public_allow, private_allow, "", Some("[host.alpha]\n"));
+            let repo = checkout(&env, "repo", public, "");
+            (row, run_privacy(&env, &repo, how, &detail(), &["--by-stack"]))
+        })
+        .collect();
+    let let_through: Vec<_> = outputs
+        .iter()
+        .filter(|(_, o)| o.status.success())
+        .map(|(row, o)| format!("{row}: {}", text(o)))
+        .collect();
+    assert!(let_through.is_empty(), "refused in every row, but let through: {let_through:#?}");
+    for (row, o) in &outputs {
+        assert!(text(o).contains("path: `alice`"), "{row}: names the hit: {}", text(o));
+    }
+}
+
+// Spec (design note privacy-own-allow, attack items 5-7): under `--by-stack` a public checkout's own allow-list still
+// accepts its false positive; the configured private stack's deny term and fleet host are still refused, naming both;
+// and a fleet config its manifest names that isn't there fails the check, naming it.
+#[test]
+fn a_privacy_hook_keeps_its_own_allowance_and_the_configured_terms() {
+    let env = Env::new();
+    env.configure("", "", "zephyr plan\n", Some("[host.alpha]\n"));
+    let own = checkout(&env, "own", true, "alice\n");
+    let o = run_privacy(&env, &own, "staged", &detail(), &["--by-stack"]);
+    assert!(o.status.success(), "its own allow-list accepts it: {}", text(&o));
+    let repo = checkout(&env, "terms", true, "");
+    let o = run_privacy(&env, &repo, "staged", "the zephyr plan runs on alpha", &["--by-stack"]);
+    assert!(!o.status.success(), "the terms: refused: {}", text(&o));
+    assert!(text(&o).contains("deny: `") && text(&o).contains("fleet: `"), "{}", text(&o));
+
+    let env = Env::new();
+    env.configure("", "", "", None);
+    let repo = checkout(&env, "repo", true, "");
+    let o = run_privacy(&env, &repo, "staged", "clean", &["--by-stack"]);
+    assert!(!o.status.success(), "a missing fleet config: refused: {}", text(&o));
+    assert!(text(&o).contains("fleet.toml"), "names it: {}", text(&o));
+}
+
+// Spec (design note privacy-own-allow, attack item 10): without `--by-stack` the composition is as before, so a plain
+// repo's hook still takes the configured allow-lists (outside the invariant, listed in the note, not changed).
+#[test]
+fn a_plain_privacy_check_keeps_the_configured_allow_lists() {
+    let env = Env::new();
+    env.configure("", "alice\n", "", Some("[host.alpha]\n"));
+    let repo = checkout(&env, "plain", false, "");
+    let o = run_privacy(&env, &repo, "staged", &detail(), &[]);
+    assert!(o.status.success(), "{}", text(&o));
+}
+
+// Spec (D28 r6, R6-F02: "With no private stack it can pass without saying deny/fleet were not checked ... render the
+// standard privacy-scope findings/notes on this branch and add one output check"; design note privacy-own-allow,
+// attack item 16): `check --public --by-stack` in a checkout with no stack, and no private stack configured, says that
+// no private stack was there.
+#[test]
+fn a_public_check_without_a_stack_says_what_it_didnt_check() {
+    let env = Env::new();
+    let elsewhere = env.repo("elsewhere", &[("stack/stack.toml", PUBLIC)]);
+    let cfg = format!("public = {}\n", elsewhere.join("stack").display());
+    write(&env.path("home/.lords-command/config.txt"), &cfg);
+    let repo = checkout(&env, "repo", false, "");
+    let o = env.lords(&repo, &["check", "--public", "--by-stack"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("no private stack"), "says it: {}", text(&o));
+}
+
+// Spec (the self-service audit, journey 7: "provide a read-only command that reports effective policy/hook chain";
+// design note privacy-own-allow, attack items 12 and 15): `privacy --explain --by-stack` reports what a hook here
+// checks, from the same composition. In a public checkout with a configured private stack: the whole policy, the
+// private deny-list with its count, its own allow-list, and neither configured allow-list; in a private checkout,
+// secrets only; in one whose stack can't be told, why. It prints no deny term and no allowed text.
+#[test]
+fn explain_says_what_a_privacy_hook_here_checks() {
+    let env = Env::new();
+    let terms = ["allowedpublicq", "allowedprivateq", "deniedtermq", "fleethostq", "allowedownq"];
+    env.configure(
+        &format!("{}\n", terms[0]),
+        &format!("{}\n", terms[1]),
+        &format!("{}\n", terms[2]),
+        Some(&format!("[host.{}]\n", terms[3])),
+    );
+    let repo = checkout(&env, "repo", true, &format!("{}\n", terms[4]));
+    let o = env.lords(&repo, &["privacy", "--explain", "--by-stack"]);
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    let lines = |p: &str| out.lines().filter(|l| l.starts_with(p)).collect::<Vec<_>>();
+    assert!(out.contains("this checkout's stack: public"), "{out}");
+    assert!(out.contains("mode: the whole policy"), "{out}");
+    let allow = lines("allow-list: ");
+    let own = |l: &&str| l.contains("repo") && l.contains("allow.txt") && l.contains("(1 ");
+    assert!(allow.len() == 1 && allow.iter().all(own), "only its own allow-list: {out}");
+    let deny = lines("deny-list: ");
+    assert!(
+        deny.len() == 1 && deny[0].contains("privstack") && deny[0].contains("(1 "),
+        "the private deny-list: {out}"
+    );
+    let fleet = lines("fleet: ");
+    assert!(
+        fleet.len() == 1 && fleet[0].contains("fleet.toml") && fleet[0].contains("(1 "),
+        "the fleet hosts: {out}"
+    );
+    assert!(!out.contains("elsewhere"), "the configured public stack adds nothing: {out}");
+    for term in terms {
+        assert!(!out.contains(term), "prints no term ({term}): {out}");
+    }
+
+    let private = env.repo("private", &[("stack.toml", PRIVATE)]);
+    let o = env.lords(&private, &["privacy", "--explain", "--by-stack"]);
+    assert!(o.status.success() && text(&o).contains("mode: secrets only"), "{}", text(&o));
+
+    let unknown = env.repo("unknown", &[("stack.toml", PRIVATE), ("docs/stack.toml", PUBLIC)]);
+    let o = env.lords(&unknown, &["privacy", "--explain", "--by-stack"]);
+    let out = text(&o);
+    assert!(
+        o.status.success() && out.contains("can't be told") && out.contains("docs/stack.toml"),
+        "{out}"
+    );
+}
+
+// Spec (journey 7's hook chain; design note privacy-own-allow, attack items 13 and 14): `privacy --explain` says
+// whether a commit and a push here reach the privacy hooks. After `lords hooks install` both are reached; in a repo
+// without them neither is verified. It changes nothing: the checkout's status and HEAD are as before, and the probe
+// leaves no file in the tool's home.
+#[test]
+fn explain_reports_the_hook_chain_and_changes_nothing() {
+    let env = Env::new();
+    let bare = checkout(&env, "bare", true, "");
+    let o = env.lords(&bare, &["privacy", "--explain", "--by-stack"]);
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(out.contains("commit: not verified") && out.contains("push: not verified"), "{out}");
+
+    let repo = checkout(&env, "hooked", true, "");
+    let o = env.lords(&repo, &["hooks", "install"]);
+    assert!(o.status.success(), "setup: {}", text(&o));
+    let state = |r: &Path| {
+        let s = env.git(r, &["status", "--porcelain", "--ignored"]);
+        let h = env.git(r, &["rev-parse", "HEAD"]);
+        (text(&s), text(&h))
+    };
+    let before = state(&repo);
+    let o = env.lords(&repo, &["privacy", "--explain", "--by-stack"]);
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(out.contains("commit: reaches the privacy hooks"), "{out}");
+    assert!(out.contains("push: reaches the privacy pre-push"), "{out}");
+    assert_eq!(state(&repo), before, "the checkout is as it was");
+    let probes: Vec<_> = fs::read_dir(env.path("home/.lords-command/state"))
+        .map(|d| {
+            d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("probe-")).count()
+        })
+        .into_iter()
+        .collect();
+    assert!(probes.iter().all(|&n| n == 0), "no probe file stays: {probes:?}");
+}
