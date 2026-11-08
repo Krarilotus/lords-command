@@ -1024,6 +1024,30 @@ fn a_new_worktree_is_delivered_by_its_own_safe_only_run() {
     assert!(held.command.starts_with("lords sync --repo beta-core --place "), "{held:?}");
 }
 
+// Spec (the orchestrator, 8 Nov 17:05: "an uncommitted stack entry must not appear in the new worktree's place"; K4;
+// gap 11 §0e, 3c): a new worktree's own delivery delivers what the stores committed, as a whole delivery does: an
+// uncommitted edit of a committed entry and an entry not yet committed, both in the store's checkout, stay out of the
+// new place, which gets the committed text.
+#[test]
+fn a_new_worktree_gets_only_committed_entries() {
+    let f = Fixture::new();
+    let a = with_worktrees(&f, "");
+    rule(&f, "A draft of rule one.\n");
+    let roles = "roles: [coder, reviewer]\n";
+    f.write(
+        "pub/global/rules/new.md",
+        &entry("rule.new", "global", "public", roles, "Not committed.\n"),
+    );
+    let one = f.path("wts/one");
+    add_worktree(&a, &one, "one");
+    let o = Options::worktree(&f.home(), "beta-core", &one);
+    let r = deliver::run(&f.pub_root(), Some(&f.priv_root()), &o).unwrap();
+    for t in files(&one) {
+        assert!(t.contains("Rule one.") && !t.contains("A draft"), "{r:?}\n{t}");
+        assert!(!t.contains("Not committed.") && !t.contains("rule.new"), "{t}");
+    }
+}
+
 // Spec (D22, the post-checkout log of 7 Nov: a worktree git didn't list yet, or listed before it was a checkout; note
 // C5, A7; settings `attempts`, `retry_pause_secs`): a new worktree's delivery that finds its place not yet a worktree of
 // its repo tries again after the pause; once it is one, its files come. One that never becomes one is held after the
