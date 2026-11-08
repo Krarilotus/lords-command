@@ -690,10 +690,14 @@ fn owner_block_item(
 /// the copy keeps itself out of git. A link anywhere in the skill's dir is an error: a copy would silently lack what
 /// it points at (Sol review r2, R2-23).
 pub fn skill_tree(src: &Path) -> Result<Tree, String> {
-    let mut tree = fsguard::read_tree(src)?;
+    fsguard::read_tree(src).map(skill_files)
+}
+
+/// What a skill's dir holds as its copy has it: without Lords' sidecar, and ignoring itself.
+fn skill_files(mut tree: Tree) -> Tree {
     tree.remove(stack::SIDECAR);
     tree.insert(".gitignore".into(), b"*\n".to_vec());
-    Ok(tree)
+    tree
 }
 
 /// What planning carries besides the stacks: the ledger, which tool-owned paths the plan wants, and which ledger
@@ -714,6 +718,8 @@ struct Planner<'a> {
     /// A place whose child start its hooks can't deliver whole: the plan fails whatever else its role files' item
     /// has against it (repair sol-loop r2, R2).
     undeliverable: bool,
+    /// The date the plan composes the starts a hook gives on, read once (`plan_on`).
+    today: String,
 }
 
 /// Every place sync puts a tool-owned path (design: Ownership boundary), as one grammar: a scope names roots (a
@@ -962,9 +968,17 @@ impl Planner<'_> {
     /// A skill's copy, read once per plan.
     fn tree_of(&mut self, e: &Entry) -> Result<std::sync::Arc<Tree>, String> {
         let src = e.meta_file.parent().expect("a sidecar has a dir").to_path_buf();
+        // A stack loaded from its committed tree gives its skills' files from that tree too (gap 11, §0e condition 2).
+        let kept = self.stacks.captured_for(e);
         self.trees
             .entry(e.id().to_string())
-            .or_insert_with(|| skill_tree(&src).map(std::sync::Arc::new))
+            .or_insert_with(|| {
+                let tree = match kept {
+                    Some(c) => c.tree(&src),
+                    None => fsguard::read_tree(&src),
+                };
+                tree.map(skill_files).map(std::sync::Arc::new)
+            })
             .clone()
     }
 
@@ -2392,9 +2406,77 @@ pub fn child_composed(
     home: &Path,
     start: compose::ChildStart,
 ) -> Composed {
+    child_composed_on(stacks, layers, role, home, start, &crate::ops::today())
+}
+
+fn child_composed_on(
+    stacks: &Stacks,
+    layers: Layers,
+    role: &str,
+    home: &Path,
+    start: compose::ChildStart,
+    today: &str,
+) -> Composed {
     let mut ctx = role_context(layers, role, home);
     ctx.child = Some(start);
-    compose::compose(stacks, &ctx)
+    compose::compose_on(stacks, &ctx, today)
+}
+
+/// A start one hook gives a session in a place, as install writes it in the place's role dir and the stores' commit
+/// check counts it (gap 11, design note §0b.3 step 6: one calculation for both).
+pub struct HookStart {
+    /// Its file in the role dir: `child.md`, or `start-<role>.md`.
+    pub file: String,
+    pub role: String,
+    /// `Beyond` for `child.md`, `Launched` for a role's start.
+    pub kind: compose::ChildStart,
+    pub text: String,
+}
+
+impl HookStart {
+    /// Its size as the hook gives it: characters, without Lords' marker lines (`guard::child_context`).
+    pub fn chars(&self) -> usize {
+        crate::guard::child_context(&self.text).chars().count()
+    }
+}
+
+/// The starts a place in `layers` gives through a hook, on `today`: `child.md` for the child role (plan L6), then a
+/// `start-<role>.md` for every declared role but the product's (F10). `child-whole.md` isn't one of them: past what a
+/// hook gives, it is given nowhere (the Lords owner's option 1, 1 Nov).
+pub fn hook_starts(stacks: &Stacks, layers: Layers, home: &Path, today: &str) -> Vec<HookStart> {
+    let child = child_role(stacks)
+        .map(|r| (CHILD_FILE.to_string(), r.to_string(), compose::ChildStart::Beyond));
+    let roles = declared_roles(stacks).into_iter().filter(|r| r != compose::PRODUCT_ROLE);
+    let launched = roles.map(|r| (start_file(&r), r, compose::ChildStart::Launched));
+    child
+        .into_iter()
+        .chain(launched)
+        .map(|(file, role, kind)| {
+            let text = child_composed_on(stacks, layers.clone(), &role, home, kind, today).text;
+            HookStart { file, role, kind, text }
+        })
+        .collect()
+}
+
+/// Every place the private stack declares, as `(label, layers)`: each repo, then each workspace, as `plan` takes them,
+/// whether or not it has a checkout here (a place's starts don't depend on one: `role_context`).
+pub fn declared_places(stacks: &Stacks) -> Vec<(String, Layers)> {
+    let Some(private) = stacks.private.as_ref() else { return Vec::new() };
+    let repos = private.manifest.repos.keys().map(|name| {
+        let layers = Layers::Repo {
+            repo: name.clone(),
+            project: stacks.repo_project(name),
+            sub: None,
+            global: true,
+        };
+        (format!("repo {name}"), layers)
+    });
+    let workspaces = private.manifest.workspaces.iter().map(|(name, w)| {
+        let layers =
+            Layers::Workspace { name: name.clone(), project: w.project.clone(), global: true };
+        (format!("workspace {name}"), layers)
+    });
+    repos.chain(workspaces).collect()
 }
 
 /// The most a `SubagentStart` hook's context may hold in characters before Claude Code saves it to a file and gives
@@ -2638,37 +2720,29 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
     // `child.md` one hook can't give in one read is refused like a file past its harness's limit (repair sol-loop r1,
     // R2; fix check r2, FC1). A `child-whole.md` past it is written and given nowhere, with the guard's note, until the
     // corpus fits (the Lords owner's option 1, 1 Nov): today every place's is.
-    let mut undeliverable = Vec::new();
-    if let Some(role) = child_role(pl.stacks) {
-        for (file, start) in [
-            (CHILD_FILE, compose::ChildStart::Beyond),
-            (CHILD_WHOLE_FILE, compose::ChildStart::Whole),
-        ] {
-            let text =
-                child_composed(pl.stacks, place.layers(true), role, &pl.plan.home, start).text;
-            let n = crate::guard::child_context(&text).chars().count();
-            if n > CHILD_START_CHARS && start == compose::ChildStart::Beyond {
-                undeliverable.push(format!(
-                    "{file} is {n} characters, past the {CHILD_START_CHARS} one hook gives a child in one read, one part: not written, the old files stay"
-                ));
-            }
-            tree.insert(file.into(), text.into_bytes());
-        }
-    }
     // A start per role for a session whose launch names it (F10; the `role` guard gives it). One past what one hook
     // gives is written all the same: the guard then points the session at its role file, and the plan says so.
-    let mut long_starts = Vec::new();
-    for role in declared_roles(pl.stacks).iter().filter(|r| *r != compose::PRODUCT_ROLE) {
-        let start = compose::ChildStart::Launched;
-        let text = child_composed(pl.stacks, place.layers(true), role, &pl.plan.home, start).text;
-        let file = start_file(role);
-        let n = crate::guard::child_context(&text).chars().count();
-        if n > CHILD_START_CHARS {
+    let (mut undeliverable, mut long_starts) = (Vec::new(), Vec::new());
+    for s in hook_starts(pl.stacks, place.layers(true), &pl.plan.home, &pl.today) {
+        let (file, n) = (&s.file, s.chars());
+        if n > CHILD_START_CHARS && s.kind == compose::ChildStart::Beyond {
+            undeliverable.push(format!(
+                "{file} is {n} characters, past the {CHILD_START_CHARS} one hook gives a child in one read, one part: not written, the old files stay"
+            ));
+        } else if n > CHILD_START_CHARS {
             long_starts.push(format!(
-                "{file} is {n} characters, past the {CHILD_START_CHARS} one hook gives: a session named {role} at launch is told to read role-{role}.md instead"
+                "{file} is {n} characters, past the {CHILD_START_CHARS} one hook gives: a session named {} at launch is told to read role-{}.md instead",
+                s.role, s.role
             ));
         }
-        tree.insert(file, text.into_bytes());
+        tree.insert(s.file, s.text.into_bytes());
+    }
+    // A `child-whole.md` past what one hook gives is written and given nowhere, with the guard's note, until the
+    // corpus fits (the Lords owner's option 1, 1 Nov): today every place's is.
+    if let Some(role) = child_role(pl.stacks) {
+        let whole = compose::ChildStart::Whole;
+        let text = child_composed(pl.stacks, place.layers(true), role, &pl.plan.home, whole).text;
+        tree.insert(CHILD_WHOLE_FILE.into(), text.into_bytes());
     }
     // The Memory section of each adapter whose place files name it instead, whatever adapter this sync takes: those
     // files name it in every checkout (design note 2026-11-02-lords-memory-pointer, I2, A5). It is the same in each.
@@ -2868,6 +2942,13 @@ fn workspace_items(pl: &mut Planner, name: &str, w: &stack::Workspace, only: Opt
 }
 
 pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
+    plan_on(stacks, opts, &crate::ops::today())
+}
+
+/// `plan` on the date `today` (`YYYY-MM-DD`), read once for the whole plan: every place's starts a hook gives are
+/// composed on it, and the ended entries it names are those ended by then (gap 11, §0d.5; sol-loop r1, S5).
+#[doc(hidden)]
+pub fn plan_on(stacks: &Stacks, opts: &Options, today: &str) -> Result<Plan, String> {
     let private: &Stack = stacks
         .private
         .as_ref()
@@ -2915,6 +2996,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         trees: BTreeMap::new(),
         places: BTreeMap::new(),
         checkouts: BTreeMap::new(),
+        today: today.to_string(),
     };
     pl.check_ledger()?;
     // The memory index points at the stack's copies: say what an import would bring first.
@@ -2937,7 +3019,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         }
     }
     // Ended temporary entries: never composed; listed here, retired by import_and_apply.
-    for (e, why) in crate::temporary::expired(stacks, &crate::ops::today()) {
+    for (e, why) in crate::temporary::expired(stacks, today) {
         let mut item = Item::new(
             &format!("{} (temporary entry)", e.id()),
             e.meta_file.clone(),
@@ -3246,6 +3328,9 @@ impl ApplyLock {
 /// an owner's edit, a reader or a kill would.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
+    /// A delivery has the stores' committed trees it delivers, under the lock it applies with; it hasn't loaded them
+    /// yet (gap 11, §0e: what is written to a store's checkout from here on can't reach this delivery).
+    Captured,
     /// A delivery's plan is made, under the lock it applies with; nothing is written yet.
     Planned,
     /// Every item of one place is checked and its new version staged beside it; nothing at its paths has changed.
