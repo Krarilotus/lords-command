@@ -713,3 +713,131 @@ fn check_by_stack_in_a_private_checkout_checks_its_own_stack() {
     let o = env.lords(&repo, &["check", "--stack", "--by-stack"]);
     assert!(o.status.success(), "{}", text(&o));
 }
+
+// ---------------------------------------------------------------- fix check r5: allowances (D28-R5-01)
+
+/// Adds to config.txt, after `config_elsewhere`, a private stack outside any repo with these lists, each left out where
+/// empty. Its manifest names a fleet config, which holds `fleet`, or is not there for `None`.
+fn config_private(env: &Env, allow: &str, deny: &str, fleet: Option<&str>) {
+    let private = env.path("privstack");
+    let fleet_path = env.path("fleet.toml");
+    write(
+        &private.join("stack.toml"),
+        &format!("{PRIVATE}[privacy]\nfleet_config = '{}'\n", fleet_path.display()),
+    );
+    for (file, body) in [("allow.txt", allow), ("deny.txt", deny)] {
+        if !body.is_empty() {
+            write(&private.join("privacy").join(file), body);
+        }
+    }
+    if let Some(body) = fleet {
+        write(&fleet_path, body);
+    }
+    let cfg = env.path("home/.lords-command/config.txt");
+    let before = fs::read_to_string(&cfg).unwrap();
+    write(&cfg, &format!("{before}private = {}\n", private.display()));
+}
+
+/// The three `check --by-stack` branches that load a configured private stack and check this checkout's content: no
+/// stack (`--public`), and a public stack (`--public`, `--stack`).
+const LOADS_A_PRIVATE_STACK: [(&str, bool, &str); 3] = [
+    ("no stack", false, "--public"),
+    ("public stack", true, "--public"),
+    ("public stack", true, "--stack"),
+];
+
+/// A committed checkout at `rel` whose own content says `body`: with `public`, a public stack whose one entry says it
+/// (so `--stack` and `--public` both meet it) and, unless `own_allow` is empty, its own allow-list; else no stack, and
+/// `notes.md` says it.
+fn checkout_saying(env: &Env, rel: &str, public: bool, body: &str, own_allow: &str) -> PathBuf {
+    let rule = format!(
+        "---\nid: rule.a\nkind: rule\ntitle: A\naudience: [all]\nscope: global\nstatus: active\nvisibility: public\n\
+         origin:\n  type: own\n---\nRule A: {body}\n"
+    );
+    let mut files = vec![("README.md", "a repo\n".to_string())];
+    if public {
+        files.push(("stack/stack.toml", PUBLIC.to_string()));
+        files.push(("stack/global/rules/a.md", rule));
+        if !own_allow.is_empty() {
+            files.push(("stack/privacy/allow.txt", own_allow.to_string()));
+        }
+    } else {
+        files.push(("notes.md", format!("{body}\n")));
+    }
+    let files: Vec<(&str, &str)> = files.iter().map(|(f, b)| (*f, b.as_str())).collect();
+    env.repo(rel, &files)
+}
+
+// Spec (fix check r5, D28-R5-01: "use a manifest-free checkout with `notes.md` containing [a user path, `detail()`];
+// configure the existing clean unrelated public stack and a valid private stack with `privacy/allow.txt` containing
+// `alice` ... refusal must be asserted before diagnostics"; design note d28-alias, r5 invariant, attack items 2, 7 and
+// 9): a configured private stack's allow-list never lets a hit in this checkout's own content through. With no stack and
+// with a public one, `--public` refuses the user path in its own file, and with a public one `--stack` refuses it in its
+// own entry. Every row runs before the refusals are asserted, so each row's outcome is shown red on its own.
+#[test]
+fn a_configured_private_allow_list_never_lets_this_checkout_through() {
+    let outputs: Vec<_> = LOADS_A_PRIVATE_STACK
+        .iter()
+        .map(|&(row, public, variant)| {
+            let env = Env::new();
+            config_elsewhere(&env);
+            config_private(&env, "alice\n", "", Some("[host.alpha]\n"));
+            let repo = checkout_saying(&env, "repo", public, &detail(), "");
+            (format!("{row}, {variant}"), env.lords(&repo, &["check", variant, "--by-stack"]))
+        })
+        .collect();
+    let let_through: Vec<_> = outputs
+        .iter()
+        .filter(|(_, o)| o.status.success())
+        .map(|(row, o)| format!("{row}: {}", text(o)))
+        .collect();
+    assert!(let_through.is_empty(), "refused in every row, but let through: {let_through:#?}");
+    for (row, o) in &outputs {
+        assert!(text(o).contains("path: `alice`"), "{row}: names the hit: {}", text(o));
+    }
+}
+
+// Spec (D28-R5-01: "compose the no-stack public rules with configured private deny/fleet additions only, preserving
+// strict loading/read failures"; design note d28-alias, r5 attack items 4 and 5): in each branch that loads a configured
+// private stack, its deny term and fleet host in this checkout's content are refused, naming both; and a fleet config
+// its manifest names but that isn't there fails the check, naming it.
+#[test]
+fn check_by_stack_keeps_the_configured_private_deny_and_fleet_terms() {
+    for (row, public, variant) in LOADS_A_PRIVATE_STACK {
+        let env = Env::new();
+        config_elsewhere(&env);
+        config_private(&env, "", "zephyr plan\n", Some("[host.alpha]\n"));
+        let repo = checkout_saying(&env, "repo", public, "the zephyr plan runs on alpha", "");
+        let o = env.lords(&repo, &["check", variant, "--by-stack"]);
+        let out = text(&o);
+        assert!(!o.status.success(), "{row}, {variant}: refused: {out}");
+        assert!(out.contains("deny: `") && out.contains("fleet: `"), "{row}, {variant}: {out}");
+    }
+    let env = Env::new();
+    config_elsewhere(&env);
+    config_private(&env, "", "", None);
+    let repo = checkout_saying(&env, "repo", false, "clean", "");
+    let o = env.lords(&repo, &["check", "--public", "--by-stack"]);
+    assert!(!o.status.success(), "a missing fleet config: refused: {}", text(&o));
+    assert!(text(&o).contains("fleet.toml"), "names it: {}", text(&o));
+}
+
+// Spec (D28-R5-01: "include configured-public-allow isolation"; design note d28-alias, r5 attack items 1 and 3):
+// allowances are this checkout's own. With no stack, the configured public stack's allow-list doesn't accept the user
+// path in its file; with a public stack, its own `privacy/allow.txt` accepts it under both variants.
+#[test]
+fn check_by_stack_allowances_are_this_checkouts_own() {
+    let env = Env::new();
+    config_elsewhere(&env);
+    write(&env.path("elsewhere/stack/privacy/allow.txt"), "alice\n");
+    config_private(&env, "", "", Some("[host.alpha]\n"));
+    let repo = checkout_saying(&env, "nostack", false, &detail(), "");
+    let o = env.lords(&repo, &["check", "--public", "--by-stack"]);
+    assert!(!o.status.success(), "the configured public allow-list: refused: {}", text(&o));
+    assert!(text(&o).contains("path: `alice`"), "names the hit: {}", text(&o));
+    let repo = checkout_saying(&env, "own", true, &detail(), "alice\n");
+    for variant in ["--public", "--stack"] {
+        let o = env.lords(&repo, &["check", variant, "--by-stack"]);
+        assert!(o.status.success(), "its own allow-list accepts it ({variant}): {}", text(&o));
+    }
+}
