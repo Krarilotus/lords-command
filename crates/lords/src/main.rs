@@ -30,8 +30,9 @@ usage:
   lords sync --safe-only [--user | --repo NAME [--place DIR]] [--json] [--apply]   only what needs no one: a place
     with anything else is held whole and named with why; no import or retirement (listed); exit 1 while a place is held
   (sync scope: none, every declared place, the one command after a store commit; --user, the user-level files only;
-    --repo NAME, one repo or workspace: its stack.toml key in any case, a path in it, or its dir name; a scoped plan
-    ends naming the places it leaves out. uninstall --repo takes the key only)
+    --repo NAME, one repo or workspace by its stack.toml key in any case; a path in a checkout or worktree, or a
+    checkout's dir name, names that one only, as --place does; a scoped plan ends naming the places it leaves out.
+    uninstall --repo takes the key only)
   lords sync --restore BACKUP_DIR   undo one apply's owner-file edits, each only while it holds what sync wrote
   lords uninstall [--user | --repo NAME] [--apply]   remove the tool's paths that still match its ledger
   lords uninstall --repo NAME --place DIR [--apply] [--json]   one checkout or worktree's recorded copies
@@ -667,7 +668,18 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         ));
     }
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
-    let repo = selected(&stacks, repo, sync::Reach::Place)?;
+    // A path selector names one checkout or worktree: it scopes the run as `--place` does, never the whole repo
+    // (review 4b r1, F1), and a `--place` beside it is refused, so neither overrides the other.
+    let (repo, place) = match (selected(&stacks, repo, sync::Reach::Place)?, place) {
+        (None, place) => (None, place),
+        (Some(s), place) if s.place.is_none() => (Some(s.key), place),
+        (Some(s), None) => (Some(s.key), s.place),
+        (Some(_), Some(_)) => {
+            return Err("--repo names one checkout by its path or dir name: drop --place, or give --repo its key \
+                 (nothing was planned)"
+                .into())
+        }
+    };
     let codex = lords_core::codex_trust::Codex::found(deadline);
     let opts = sync::Options {
         repo,
@@ -724,20 +736,22 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     Ok(whole && applied.codex.is_empty())
 }
 
-/// A `--repo` selector as its declared key (gap 4b, `sync::select`), said on stderr when it isn't what was typed, so
+/// A `--repo` selector as what it names (gap 4b, `sync::select`), said on stderr when it isn't the key as typed, so
 /// stdout and JSON stay the command's own.
 fn selected(
     stacks: &Stacks,
     typed: Option<String>,
     reach: sync::Reach,
-) -> Result<Option<String>, String> {
+) -> Result<Option<sync::Selected>, String> {
     let Some(typed) = typed else { return Ok(None) };
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let key = sync::select(stacks, &typed, &cwd, reach)?;
-    if key != typed {
-        eprintln!("--repo {typed}: `{key}`");
+    let s = sync::select(stacks, &typed, &cwd, reach)?;
+    match &s.place {
+        Some(dir) => eprintln!("--repo {typed}: `{}` --place {}", s.key, dir.display()),
+        None if s.key != typed => eprintln!("--repo {typed}: `{}`", s.key),
+        None => {}
     }
-    Ok(Some(key))
+    Ok(Some(s))
 }
 
 /// One record of a place, as `uninstall --place` lists it.
@@ -837,7 +851,7 @@ fn uninstall_place(a: &mut Args, dir: &Path, run: &mut PlaceRun) -> Result<bool,
         return Err("--place needs --repo (a checkout or worktree of that repo)".into());
     }
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
-    run.repo = selected(&stacks, run.repo.take(), sync::Reach::Key)?;
+    run.repo = selected(&stacks, run.repo.take(), sync::Reach::Key)?.map(|s| s.key);
     let opts = sync::Options {
         repo: run.repo.clone(),
         user_only,
@@ -947,7 +961,7 @@ fn cmd_uninstall(mut a: Args) -> Result<bool, String> {
     let p = paths(&mut a)?;
     a.done()?;
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
-    let repo = selected(&stacks, repo, sync::Reach::Key)?;
+    let repo = selected(&stacks, repo, sync::Reach::Key)?.map(|s| s.key);
     let opts = sync::Options {
         repo: repo.clone(),
         user_only,
@@ -1352,7 +1366,8 @@ fn cmd_compose(mut a: Args) -> Result<bool, String> {
     let p = paths(&mut a)?;
     a.done()?;
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
-    let place = selected(&stacks, place, sync::Reach::Place)?;
+    // Composition is the same in every checkout of a repo: only the key counts here.
+    let place = selected(&stacks, place, sync::Reach::Place)?.map(|s| s.key);
     let adapter = lords_core::adapters::get(&adapter_id).ok_or_else(|| {
         format!(
             "unknown adapter `{adapter_id}` (known: {})",

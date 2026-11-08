@@ -2119,11 +2119,25 @@ pub enum Reach {
     Place,
 }
 
-/// The declared key a `--repo` selector names (gap 4b, S1–S3). The first rule that matches decides: the exact key;
+/// What a `--repo` selector names: a declared key, and, when it named one checkout or worktree of a repo by a path or
+/// a dir name, that dir, which scopes the command as `--place` does (review 4b r1, F1: a path never widens to the
+/// whole repo). A key names the whole repo; a workspace is one dir, so it has no `place`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Selected {
+    pub key: String,
+    pub place: Option<PathBuf>,
+}
+
+/// What a `--repo` selector names (gap 4b, S1–S3; `Selected`). The first rule that matches decides: the exact key;
 /// the key in any case; with `Reach::Place`, a path (relative to `cwd`) that is a declared place's dir or lies in one,
 /// the deepest; a declared checkout's or workspace's dir name in any case. A rule matching two keys is refused
 /// naming each, and no match is refused naming every key: never a guess.
-pub fn select(stacks: &Stacks, selector: &str, cwd: &Path, reach: Reach) -> Result<String, String> {
+pub fn select(
+    stacks: &Stacks,
+    selector: &str,
+    cwd: &Path,
+    reach: Reach,
+) -> Result<Selected, String> {
     let manifest = &stacks
         .private
         .as_ref()
@@ -2132,40 +2146,34 @@ pub fn select(stacks: &Stacks, selector: &str, cwd: &Path, reach: Reach) -> Resu
         )?
         .manifest;
     let keys: Vec<&String> = manifest.repos.keys().chain(manifest.workspaces.keys()).collect();
+    let whole = |key: &str| Selected { key: key.to_string(), place: None };
     if keys.iter().any(|k| *k == selector) {
-        return Ok(selector.to_string());
+        return Ok(whole(selector));
     }
-    // One key, or a refusal naming each candidate; `None` when the rule matched nothing.
-    let pick = |found: Vec<(String, String)>, how: &str| -> Option<Result<String, String>> {
-        let mut found = found;
-        found.sort();
-        found.dedup_by(|a, b| a.0 == b.0);
-        match &found[..] {
-            [] => None,
-            [(key, _)] => Some(Ok(key.clone())),
-            many => Some(Err(format!(
-                "--repo `{selector}` names more than one place by {how}: {}; give the key",
-                many.iter().map(|(k, d)| format!("`{k}` ({d})")).collect::<Vec<_>>().join(", ")
-            ))),
-        }
-    };
     // Keys are lowercase (the stack schema refuses others at load), so a key in another case names one at most.
     let lower = selector.to_lowercase();
     if keys.iter().any(|k| **k == lower) {
-        return Ok(lower);
+        return Ok(whole(&lower));
     }
     if reach == Reach::Place {
         // Each declared place's dirs: a repo's checkouts and the worktrees git lists (a repo whose worktrees can't be
-        // listed keeps its checkouts, A8), a workspace's path.
-        let mut dirs: Vec<(String, PathBuf, bool)> = Vec::new();
+        // listed keeps its checkouts, A8), each its own place; a workspace's path.
+        let mut dirs: Vec<Found> = Vec::new();
         for (key, repo) in &manifest.repos {
             let declared: Vec<PathBuf> = repo.checkouts.iter().map(|c| expand_home(c)).collect();
             let worktrees = checkouts(repo).map(|(roots, _, _)| roots).unwrap_or_default();
-            dirs.extend(declared.into_iter().map(|d| (key.clone(), d, true)));
-            dirs.extend(worktrees.iter().map(|r| (key.clone(), r.path().to_path_buf(), false)));
+            let place = |dir: PathBuf, declared: bool| Found {
+                key: key.clone(),
+                dir,
+                declared,
+                repo: true,
+            };
+            dirs.extend(declared.into_iter().map(|d| place(d, true)));
+            dirs.extend(worktrees.iter().map(|r| place(r.path().to_path_buf(), false)));
         }
         for (key, w) in &manifest.workspaces {
-            dirs.push((key.clone(), expand_home(&w.path), true));
+            let dir = expand_home(&w.path);
+            dirs.push(Found { key: key.clone(), dir, declared: true, repo: false });
         }
         // Compared resolved (a junction or link, A4), in the ledger's form (any case on Windows); a declared dir that
         // isn't there never matches.
@@ -2173,31 +2181,31 @@ pub fn select(stacks: &Stacks, selector: &str, cwd: &Path, reach: Reach) -> Resu
         let typed = Path::new(selector);
         let typed = if typed.is_absolute() { typed.to_path_buf() } else { cwd.join(typed) };
         if let Some(at) = resolved(&typed) {
-            let within: Vec<(String, String, usize)> = dirs
+            let within: Vec<(&Found, usize)> = dirs
                 .iter()
-                .filter_map(|(key, dir, _)| {
-                    let d = resolved(dir)?;
+                .filter_map(|f| {
+                    let d = resolved(&f.dir)?;
                     (at == d || at.starts_with(&format!("{}/", d.trim_end_matches('/'))))
-                        .then(|| (key.clone(), d.clone(), d.len()))
+                        .then_some((f, d.len()))
                 })
                 .collect();
-            if let Some(deepest) = within.iter().map(|w| w.2).max() {
-                let found =
-                    within.into_iter().filter(|w| w.2 == deepest).map(|(k, d, _)| (k, d)).collect();
-                if let Some(answer) = pick(found, "a path") {
+            if let Some(deepest) = within.iter().map(|w| w.1).max() {
+                let found = within.into_iter().filter(|w| w.1 == deepest).map(|w| w.0).collect();
+                if let Some(answer) = pick(selector, found, "a path") {
                     return answer;
                 }
             }
         }
         let by_name = dirs
             .iter()
-            .filter(|(_, dir, declared)| {
-                *declared
-                    && dir.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase() == lower)
+            .filter(|f| {
+                f.declared
+                    && f.dir
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy().to_lowercase() == lower)
             })
-            .map(|(k, d, _)| (k.clone(), adapters::slashes(d)))
             .collect();
-        if let Some(answer) = pick(by_name, "its dir name") {
+        if let Some(answer) = pick(selector, by_name, "its dir name") {
             return answer;
         }
     }
@@ -2212,6 +2220,37 @@ pub fn select(stacks: &Stacks, selector: &str, cwd: &Path, reach: Reach) -> Resu
         "no repo or workspace `{selector}` in the private stack.toml; its names: {}{hint} (no --repo: every place)",
         names.join(", ")
     ))
+}
+
+/// One dir of a declared place, as `select` matches it: a repo's checkout (`declared`) or worktree, or a workspace.
+struct Found {
+    key: String,
+    dir: PathBuf,
+    declared: bool,
+    repo: bool,
+}
+
+/// One place from a rule's matches, or a refusal naming each key matched; `None` when the rule matched nothing. Two
+/// matches of one key are one place only when they are one dir (a checkout git also lists as a worktree).
+fn pick(selector: &str, found: Vec<&Found>, how: &str) -> Option<Result<Selected, String>> {
+    let mut places: Vec<(String, String, Option<PathBuf>)> = found
+        .iter()
+        .map(|f| {
+            let place = f.repo.then(|| f.dir.clone());
+            let dir = fsguard::canonical(&f.dir).unwrap_or_else(|_| f.dir.clone());
+            (f.key.clone(), ledger::key(&dir), place)
+        })
+        .collect();
+    places.sort();
+    places.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    match &places[..] {
+        [] => None,
+        [(key, _, place)] => Some(Ok(Selected { key: key.clone(), place: place.clone() })),
+        many => Some(Err(format!(
+            "--repo `{selector}` names more than one place by {how}: {}; give the key, and --place DIR for one checkout",
+            many.iter().map(|(k, d, _)| format!("`{k}` ({d})")).collect::<Vec<_>>().join(", ")
+        ))),
+    }
 }
 
 /// The declared repos and workspaces a plan's scope leaves out (gap 4b, S6): every one with `--user`, every other
