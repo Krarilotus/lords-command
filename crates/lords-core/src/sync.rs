@@ -2149,14 +2149,10 @@ pub fn select(stacks: &Stacks, selector: &str, cwd: &Path, reach: Reach) -> Resu
             ))),
         }
     };
+    // Keys are lowercase (the stack schema refuses others at load), so a key in another case names one at most.
     let lower = selector.to_lowercase();
-    let in_any_case = keys
-        .iter()
-        .filter(|k| k.to_lowercase() == lower)
-        .map(|k| (k.to_string(), "its key in another case".to_string()))
-        .collect();
-    if let Some(answer) = pick(in_any_case, "its key in another case") {
-        return answer;
+    if keys.iter().any(|k| **k == lower) {
+        return Ok(lower);
     }
     if reach == Reach::Place {
         // Each declared place's dirs: a repo's checkouts and the worktrees git lists (a repo whose worktrees can't be

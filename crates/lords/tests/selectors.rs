@@ -133,26 +133,16 @@ fn a_place_is_selected_by_its_key_in_any_case_a_path_or_its_dir_name() {
     assert!(String::from_utf8_lossy(&o.stderr).contains("`work`"), "compose: {}", text(&o));
 }
 
-// Spec (design note S2, attacks A2, A3, A5: never a guess between two): two keys differing only in case, and two
-// places with the same dir name, are each refused naming both candidates, while the exact key still resolves; of two
-// nested places, a path resolves to the deepest that holds it.
+// Spec (design note S2, attacks A3, A5: never a guess between two): two places with the same dir name are refused
+// naming both candidates, while each key still resolves; of two nested places, a path resolves to the deepest that
+// holds it.
 #[test]
 fn a_selector_matching_two_places_is_refused_naming_each_and_the_deepest_path_wins() {
-    let env = Env::new(&[
-        ("Work", "x/one"),
-        ("work", "y/two"),
-        ("a", "x/same"),
-        ("b", "y/same"),
-        ("outer", "n"),
-        ("inner", "n/in"),
-    ]);
-    let o = env.sync(&["--repo", "WORK"]);
-    let out = text(&o);
-    assert!(!o.status.success() && out.contains("`Work`") && out.contains("`work`"), "{out}");
+    let env = Env::new(&[("a", "x/same"), ("b", "y/same"), ("outer", "n"), ("inner", "n/in")]);
     let o = env.sync(&["--repo", "same"]);
     let out = text(&o);
     assert!(!o.status.success() && out.contains("`a`") && out.contains("`b`"), "{out}");
-    assert!(plans_place(&env.sync(&["--repo", "Work"]), &env.path("x/one")));
+    assert!(plans_place(&env.sync(&["--repo", "A"]), &env.path("x/same")));
     fs::create_dir_all(env.path("n/in/deep")).unwrap();
     fs::create_dir_all(env.path("n/other")).unwrap();
     let o = env.sync(&["--repo", env.path("n/in/deep").to_str().unwrap()]);
