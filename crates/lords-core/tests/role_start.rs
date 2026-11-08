@@ -69,9 +69,12 @@ fn a_plan_composes_the_starts_on_its_own_date() {
 }
 
 // Spec (F10, the Lords owner's spec: "a top-level session starts with its role's lines, not only the place's default
-// role"; design note D2): each declared role but `product` (product runs read no place file) gets `.lords/start-<role>.md`,
-// which names the role as given at launch and the role file, and carries the role's lines for only some roles and its
-// whole entries with no class; never a line every role has, nor anything of a role it doesn't bind.
+// role"; design note D2; and design note 2026-11-08-lords-delivery-once D2a, which the owner approved on 9 Nov: the start
+// carries only what the place's files don't): each declared role but `product` (product runs read no place file) gets
+// `.lords/start-<role>.md`, which names the role as given at launch, and carries the role's lines for only some roles and
+// its whole entries with no class, leaving out what the place's files already show it: a line every role has, and a line
+// that names the place's default role (here the orchestrator), which those files show labelled; never anything of a role
+// it doesn't bind.
 #[test]
 fn each_role_gets_a_start_of_what_the_place_file_leaves_out() {
     let (f, checkout) = place();
@@ -81,21 +84,28 @@ fn each_role_gets_a_start_of_what_the_place_file_leaves_out() {
     for want in [
         "You start as a reviewer here",
         "at launch",
-        "- rule.verdicts: The verdicts line.",
         "- rule.tests: The tests line.",
         "The reviewer's half.",
         "REVIEWER-WHOLE-BODY",
     ] {
         assert!(reviewer.contains(want), "{want} in:\n{reviewer}");
     }
-    for never in ["Every role's line.", "The coder's line.", "The lead's half.", "ALL-BODY"] {
+    for never in [
+        "Every role's line.",
+        "The coder's line.",
+        "The lead's half.",
+        "ALL-BODY",
+        "The verdicts line.",
+    ] {
         assert!(!reviewer.contains(never), "{never} not in:\n{reviewer}");
     }
     let coder = planned_in(&p, &dir, "start-coder.md");
     assert!(coder.contains("The coder's line.") && coder.contains("The tests line."), "{coder}");
     assert!(!coder.contains("The verdicts line.") && !coder.contains("REVIEWER-WHOLE"), "{coder}");
     let orchestrator = planned_in(&p, &dir, "start-orchestrator.md");
-    assert!(orchestrator.contains("The lead's half."), "{orchestrator}");
+    for never in ["The lead's half.", "The verdicts line."] {
+        assert!(!orchestrator.contains(never), "{never} not in:\n{orchestrator}");
+    }
     assert_eq!(planned_in(&p, &dir, "start-product.md"), "", "no start for product");
 }
 
