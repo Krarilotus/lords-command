@@ -225,11 +225,7 @@ fn dispatch(repo: &Path, home: &Path, hooks: &[&str]) -> Vec<String> {
         let root = Root::home(home)?;
         let state = root.join(&[Part::new("state")?]);
         fsguard::create_dir_all(&state)?;
-        let probe = state.child(Part::new(&format!("probe-{n}"))?);
-        let message = state.child(Part::new(&format!("probe-{n}.msg"))?);
-        fsguard::create_file(&probe, b"")?;
-        fsguard::create_file(&message, b"a probe of the privacy hooks\n")?;
-        Ok((probe, message))
+        probe_files(&state, &n)
     })();
     let (probe, message) = match made {
         Ok(m) => m,
@@ -267,6 +263,16 @@ fn dispatch(repo: &Path, home: &Path, hooks: &[&str]) -> Vec<String> {
         }
     }
     problems
+}
+
+/// The probe's two files in `state` for the nonce `n`: the nonce's own, which a hook checks, and the message a
+/// commit-msg hook is given.
+fn probe_files(state: &Contained, n: &str) -> Result<(Contained, Contained), String> {
+    let probe = state.child(Part::new(&format!("probe-{n}"))?);
+    let message = state.child(Part::new(&format!("probe-{n}.msg"))?);
+    fsguard::create_file(&probe, b"")?;
+    fsguard::create_file(&message, b"a probe of the privacy hooks\n")?;
+    Ok((probe, message))
 }
 
 /// Whether the hook at `hook` is the tool's: its ledger record, and still exactly what sync wrote there.
@@ -890,4 +896,31 @@ fn refusal(repo: &Path, dir: &Root, why: &str) -> String {
         _ => format!("it doesn't run {} for a new worktree", hook.display()),
     };
     format!("core.hooksPath = {path} ({scope}): {case} ({why})")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Spec (package review privownallow r1, R1-01: "`dispatch` creates the nonce at `hooks.rs:230`, then creates the
+    // message at `:231`. If that second create/write/sync fails, `:236` returns without deleting the already-created
+    // nonce ... add a controlled second-create failure witness"): where the message file can't be made, `probe_files`
+    // fails and leaves no probe file behind.
+    #[test]
+    fn a_probe_whose_second_file_fails_leaves_neither() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = Root::home(dir.path()).unwrap();
+        let state = root.join(&[Part::new("state").unwrap()]);
+        fsguard::create_dir_all(&state).unwrap();
+        let n = "0123456789abcdef0123456789abcdef";
+        let msg = state.child(Part::new(&format!("probe-{n}.msg")).unwrap());
+        fsguard::create_dir_all(&msg).unwrap();
+        assert!(probe_files(&state, n).is_err(), "the message file can't be made");
+        let left = state.path().join(format!("probe-{n}"));
+        let kind = fsguard::kind(&left);
+        assert!(
+            matches!(kind, Ok(fsguard::Kind::Missing)),
+            "the probe file doesn't stay: {kind:?}"
+        );
+    }
 }

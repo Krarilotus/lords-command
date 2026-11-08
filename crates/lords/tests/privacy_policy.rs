@@ -218,15 +218,52 @@ fn a_privacy_hook_keeps_its_own_allowance_and_the_configured_terms() {
     assert!(text(&o).contains("fleet.toml"), "names it: {}", text(&o));
 }
 
-// Spec (design note privacy-own-allow, attack item 10): without `--by-stack` the composition is as before, so a plain
-// repo's hook still takes the configured allow-lists (outside the invariant, listed in the note, not changed).
+// Spec (package review privownallow r1, R1-F01: "a plain repo's full-policy check adds configured-private allowances
+// ... a private-store allowance can let a private term into an unrelated public plain repo"; the master, 00:23: "no
+// configured-private allowances, only the repo's own allow-list if it has one. Configured-public allowances stay. Invert
+// that test into a fails-without test"; design note privacy-own-allow, r1 attack items 24-26): without `--by-stack`,
+// the configured private stack's allow-list accepts no hit in a plain repo's staged files, message or history, nor at
+// a commit through the plain hooks `lords hooks install` writes, which leaves HEAD as it was; the configured public
+// stack's allow-list still accepts it. Every row runs before the refusals are asserted.
 #[test]
-fn a_plain_privacy_check_keeps_the_configured_allow_lists() {
+fn a_plain_privacy_check_takes_no_configured_private_allowance() {
+    let mut outputs: Vec<(String, Output)> = ["staged", "message", "history"]
+        .iter()
+        .map(|how| {
+            let env = Env::new();
+            env.configure("", "alice\n", "", Some("[host.alpha]\n"));
+            let repo = checkout(&env, "plain", false, "");
+            (format!("plain {how}"), run_privacy(&env, &repo, how, &detail(), &[]))
+        })
+        .collect();
     let env = Env::new();
     env.configure("", "alice\n", "", Some("[host.alpha]\n"));
+    let repo = checkout(&env, "hooked", false, "");
+    let o = env.lords(&repo, &["hooks", "install"]);
+    assert!(o.status.success(), "setup: {}", text(&o));
+    let before = env.git(&repo, &["rev-parse", "HEAD"]).stdout;
+    write(&repo.join("notes.md"), &format!("{}\n", detail()));
+    env.ok_git(&repo, &["add", "notes.md"]);
+    outputs.push((
+        "the installed plain hook".into(),
+        env.git(&repo, &["commit", "-q", "-m", "notes"]),
+    ));
+    let let_through: Vec<_> = outputs
+        .iter()
+        .filter(|(_, o)| o.status.success())
+        .map(|(row, o)| format!("{row}: {}", text(o)))
+        .collect();
+    assert!(let_through.is_empty(), "refused in every row, but let through: {let_through:#?}");
+    for (row, o) in &outputs {
+        assert!(text(o).contains("path: `alice`"), "{row}: names the hit: {}", text(o));
+    }
+    assert_eq!(env.git(&repo, &["rev-parse", "HEAD"]).stdout, before, "HEAD is as it was");
+
+    let env = Env::new();
+    env.configure("alice\n", "", "", Some("[host.alpha]\n"));
     let repo = checkout(&env, "plain", false, "");
     let o = run_privacy(&env, &repo, "staged", &detail(), &[]);
-    assert!(o.status.success(), "{}", text(&o));
+    assert!(o.status.success(), "the configured public allow-list still accepts it: {}", text(&o));
 }
 
 // Spec (D28 r6, R6-F02: "With no private stack it can pass without saying deny/fleet were not checked ... render the
@@ -298,39 +335,91 @@ fn explain_says_what_a_privacy_hook_here_checks() {
     );
 }
 
-// Spec (journey 7's hook chain; design note privacy-own-allow, attack items 13 and 14): `privacy --explain` says
-// whether a commit and a push here reach the privacy hooks. After `lords hooks install` both are reached; in a repo
-// without them neither is verified. It changes nothing: the checkout's status and HEAD are as before, and the probe
-// leaves no file in the tool's home.
+// Spec (package review privownallow r1, R1-01: "the ordinary pre-commit hook contains `touch explain-mutated.txt` ...
+// a read-only explanation must leave it unchanged"; the master, 00:23: "`--explain` doesn't probe live hooks. It
+// reports the hook chain as 'not verified here' and names `lords check` as the command that probes"; design note
+// privacy-own-allow, r1 attack item 17; this replaces r0's hook-chain test, whose probe the master took out): with an
+// ordinary pre-commit hook that makes a file, `privacy --explain` runs no hook, so the checkout's status and HEAD are as
+// before and the file isn't made, and it says the hooks are not verified here, naming `lords check`.
 #[test]
-fn explain_reports_the_hook_chain_and_changes_nothing() {
+fn explain_runs_no_hook_and_changes_nothing() {
     let env = Env::new();
-    let bare = checkout(&env, "bare", true, "");
-    let o = env.lords(&bare, &["privacy", "--explain", "--by-stack"]);
-    let out = text(&o);
-    assert!(o.status.success(), "{out}");
-    assert!(out.contains("commit: not verified") && out.contains("push: not verified"), "{out}");
-
-    let repo = checkout(&env, "hooked", true, "");
-    let o = env.lords(&repo, &["hooks", "install"]);
-    assert!(o.status.success(), "setup: {}", text(&o));
-    let state = |r: &Path| {
-        let s = env.git(r, &["status", "--porcelain", "--ignored"]);
-        let h = env.git(r, &["rev-parse", "HEAD"]);
+    let repo = checkout(&env, "repo", true, "");
+    let hook = repo.join(".git/hooks/pre-commit");
+    write(&hook, "#!/bin/sh\ntouch explain-mutated.txt\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let state = || {
+        let s = env.git(&repo, &["status", "--porcelain", "--ignored"]);
+        let h = env.git(&repo, &["rev-parse", "HEAD"]);
         (text(&s), text(&h))
     };
-    let before = state(&repo);
-    let o = env.lords(&repo, &["privacy", "--explain", "--by-stack"]);
+    let before = state();
+    let o = env.lords(&repo, &["privacy", "--explain"]);
     let out = text(&o);
     assert!(o.status.success(), "{out}");
-    assert!(out.contains("commit: reaches the privacy hooks"), "{out}");
-    assert!(out.contains("push: reaches the privacy pre-push"), "{out}");
-    assert_eq!(state(&repo), before, "the checkout is as it was");
-    let probes: Vec<_> = fs::read_dir(env.path("home/.lords-command/state"))
-        .map(|d| {
-            d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("probe-")).count()
-        })
-        .into_iter()
-        .collect();
-    assert!(probes.iter().all(|&n| n == 0), "no probe file stays: {probes:?}");
+    assert!(!repo.join("explain-mutated.txt").exists(), "no hook ran: {out}");
+    assert_eq!(state(), before, "the checkout is as it was");
+    assert!(out.contains("not verified here") && out.contains("lords check"), "{out}");
+}
+
+// Spec (R1-03: "Plain `privacy --explain` should model the stack hook policy (`--by-stack`) unless `--secrets-only` is
+// given ... Test it in a private and a public stack checkout, with foreign allowances"; design note privacy-own-allow,
+// r1 attack items 22 and 23): with stack hooks installed, plain `privacy --explain` says secrets only in a private stack
+// checkout, and in a public one lists only its own allow-list, with both configured ones there.
+#[test]
+fn plain_explain_models_the_stack_hooks() {
+    let env = Env::new();
+    env.configure("alice\n", "alice\n", "", Some("[host.alpha]\n"));
+    let private = env.repo("private", &[("stack.toml", PRIVATE)]);
+    let public = checkout(&env, "public", true, "carol\n");
+    for repo in [&private, &public] {
+        let o = env.lords(repo, &["hooks", "install"]);
+        assert!(o.status.success(), "setup: {}", text(&o));
+    }
+    let o = env.lords(&private, &["privacy", "--explain"]);
+    assert!(o.status.success() && text(&o).contains("mode: secrets only"), "{}", text(&o));
+    let o = env.lords(&public, &["privacy", "--explain"]);
+    let out = text(&o);
+    assert!(o.status.success() && out.contains("mode: the whole policy"), "{out}");
+    let allow: Vec<_> = out.lines().filter(|l| l.starts_with("allow-list: ")).collect();
+    assert!(allow.len() == 1 && allow[0].contains("public"), "only its own allow-list: {out}");
+    assert!(!out.contains("elsewhere") && !out.contains("privstack"), "{out}");
+}
+
+// Spec (R1-02: "a malformed fleet file, a malformed private manifest or an invalid visibility value prints the offending
+// text on `--explain`'s stderr ... Tests: those three inputs with a sentinel term, absent from both stdout and stderr";
+// "Keep refusal and Unknown as they are"; design note privacy-own-allow, r1 attack items 19-21): a fleet config that
+// isn't TOML and a private manifest that isn't either refuse `--explain`, naming the file; a checkout manifest whose
+// visibility is no visibility is a stack that can't be told; and the sentinel each holds appears in neither stream.
+#[test]
+fn explain_prints_no_content_from_a_broken_file() {
+    let sentinel = "sentinelvalueq";
+    let fleet = Env::new();
+    fleet.configure("", "", "", Some(&format!("[host.{sentinel}\n")));
+    let manifest = Env::new();
+    manifest.configure("", "", "", Some("[host.alpha]\n"));
+    let bad = format!("{PRIVATE}{sentinel} = [\n");
+    write(&manifest.path("privstack/stack.toml"), &bad);
+    let visibility = Env::new();
+    let rows = [("fleet", &fleet, "fleet.toml"), ("manifest", &manifest, "privstack")];
+    for (row, env, names) in rows {
+        let repo = checkout(env, "repo", true, "");
+        let o = env.lords(&repo, &["privacy", "--explain"]);
+        let out = text(&o);
+        assert!(!out.contains(sentinel), "{row}: no content: {out}");
+        assert!(
+            !o.status.success() && out.contains(names),
+            "{row}: refused, naming {names}: {out}"
+        );
+    }
+    let manifest = format!("name = \"x\"\nvisibility = \"{sentinel}\"\n");
+    let repo = visibility.repo("repo", &[("stack.toml", &manifest)]);
+    let o = visibility.lords(&repo, &["privacy", "--explain"]);
+    let out = text(&o);
+    assert!(!out.contains(sentinel), "visibility: no content: {out}");
+    assert!(o.status.success() && out.contains("can't be told"), "visibility: Unknown: {out}");
 }
