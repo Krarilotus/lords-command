@@ -103,6 +103,31 @@ pub fn status(dir: &Path, args: &[&str]) -> Result<bool, String> {
     }
 }
 
+/// Whether `dir`'s HEAD is proven unborn: it names a branch (`symbolic-ref`), it names no object id (`rev-parse
+/// --verify HEAD`), and that branch doesn't exist (`show-ref --verify`). Each "no" must be exit 1 with nothing said.
+/// A HEAD that names an id is `false`, the object read or not, and every other answer is an error: an exit 1 of
+/// `rev-parse --verify HEAD^{commit}` is no proof of absence (D28 fix check r6, R6-01; design note d28-alias). Only
+/// exit codes and empty output are read, never git's wording.
+pub fn head_unborn(dir: &Path) -> Result<bool, String> {
+    let quiet_no = |args: &[&str]| -> Result<bool, String> {
+        let out = git(dir, args)?;
+        match out.status.code() {
+            Some(0) => Ok(false),
+            Some(1) if out.stderr.is_empty() && out.stdout.is_empty() => Ok(true),
+            _ => Err(failed(args, out.status, &out.stderr, &out.stdout)),
+        }
+    };
+    if !quiet_no(&["rev-parse", "-q", "--verify", "HEAD"])? {
+        return Ok(false);
+    }
+    let branch = run(dir, &["symbolic-ref", "-q", "HEAD"])?;
+    let branch = branch.trim();
+    if quiet_no(&["show-ref", "--verify", "--quiet", branch])? {
+        return Ok(true);
+    }
+    Err(format!("HEAD names {branch}, which exists, but HEAD names no object"))
+}
+
 pub fn toplevel(dir: &Path) -> Option<PathBuf> {
     run(dir, &["rev-parse", "--show-toplevel"]).ok().map(|s| PathBuf::from(s.trim()))
 }

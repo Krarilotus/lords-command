@@ -647,8 +647,17 @@ pub fn checkout_stack(dir: &Path) -> CheckoutStack {
         }
         Err(e) => copies.push(("the index".to_string(), Err(e))),
     }
+    // No HEAD copy only where git proves HEAD unborn; a HEAD naming a commit that can't be read is `Unknown` (fix check
+    // r6, R6-01).
     match git::status(&top, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]) {
-        Ok(false) => {}
+        Ok(false) => match git::head_unborn(&top) {
+            Ok(true) => {}
+            Ok(false) => copies.push((
+                "HEAD".to_string(),
+                Err("names an object that isn't a commit git can read".to_string()),
+            )),
+            Err(e) => copies.push(("HEAD".to_string(), Err(e))),
+        },
         Ok(true) => match git::run(&top, &["ls-tree", "-r", "-z", "--full-tree", "HEAD"]) {
             Ok(out) => {
                 for rec in out.split('\0').filter(|r| !r.is_empty()) {
