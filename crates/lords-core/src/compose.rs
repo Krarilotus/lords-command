@@ -254,16 +254,21 @@ fn opener_line(ctx: &Context) -> String {
         Some(p) if !ctx.public_only => shown(p, ctx),
         _ => "lords".to_string(),
     };
+    // The owner's agreed reading of 8 Nov (intent.owner-decisions-2026-11-08 item 11): the boundaries stay absolute,
+    // everything else is guidance to follow by its purpose, and an agent that departs from it says so. With the shorter
+    // start intro, no longer than the two lines it replaces: it is in every start, and the orchestrator's has a few
+    // characters to spare.
     format!(
-        "Each line below is the hard line of the entry its id names; the entry's whole text binds. Open it by id before work its subject touches: `{exe} show <id>`."
+        "Each line below is an entry's short form. Boundaries (the owner's reserved decisions, credentials, history rewrites, machine safety) are absolute; the rest is guidance: follow its purpose, say where you depart. Full entry: `{exe} show <id>`."
     )
 }
 
-/// The first line of a native child's start file: its role, and how the place's file it also reads binds it.
+/// The first line of a native child's start file: its role, and how the place's file it also reads applies to it.
+/// The place's file and the start carry every line of the role, so no start sends the child to its whole role file.
 fn child_intro(role: &str, start: ChildStart) -> String {
     match start {
         ChildStart::Beyond => format!(
-            "You start as a {role} here, a native subagent. Besides the place's file you read, these bind you; its lines marked for other roles don't. Your role's whole start file is `role-{role}.md` in the place's `.lords` dir."
+            "You start as a {role} here, a native subagent: these lines and the place's file apply to you, except its lines marked for other roles."
         ),
         ChildStart::Whole => {
             format!("You start as a {role} here, a native subagent: this is your role's whole start.")
@@ -271,7 +276,7 @@ fn child_intro(role: &str, start: ChildStart) -> String {
         ChildStart::Launched => {
             let a = if role.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
             format!(
-                "You start as {a} {role} here, the role named at launch. Besides the place's file you read, these bind you; its lines marked for other roles don't. Your role's whole start file is `role-{role}.md` in the place's `.lords` dir."
+                "You start as {a} {role} here, the role named at launch: these lines and the place's file apply to you, except its lines marked for other roles."
             )
         }
     }
