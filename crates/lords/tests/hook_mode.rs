@@ -46,6 +46,15 @@ impl Env {
         self.cmd(env!("CARGO_BIN_EXE_lords"), cwd).args(args).output().unwrap()
     }
 
+    /// `lords` with these variables set besides the fixture's own.
+    fn lords_with(&self, cwd: &Path, args: &[&str], vars: &[(&str, &Path)]) -> Output {
+        let mut c = self.cmd(env!("CARGO_BIN_EXE_lords"), cwd);
+        for (k, v) in vars {
+            c.env(k, v);
+        }
+        c.args(args).output().unwrap()
+    }
+
     fn git(&self, cwd: &Path, args: &[&str]) -> Output {
         self.cmd("git", cwd).args(args).output().unwrap()
     }
@@ -262,6 +271,108 @@ fn secrets_only_in_a_public_checkout_checks_the_whole_policy_and_says_so() {
     let o = env.lords(&repo, &["privacy", "--staged", "--secrets-only"]);
     let out = text(&o);
     assert!(!o.status.success() && out.contains("path") && out.contains("public"), "{out}");
+}
+
+// Spec (fix check r2, D28-R2-01: "discovery must include every index/HEAD spelling which can designate a recognized
+// manifest on the running filesystem, or fail closed on such aliases"): a public manifest committed or staged under
+// another spelling (`STACK.toml`, `STACK/stack.toml`), whose disk copy says private, leaves a commit message holding a
+// user path refused, with the old `--secrets-only` text and with `--by-stack`: in HEAD and the index, the index alone
+// (no commit yet), and HEAD alone (no longer staged).
+#[test]
+fn another_spelling_of_a_manifest_is_never_left_out() {
+    for spelling in ["STACK.toml", "STACK/stack.toml"] {
+        for copies in ["head and index", "index", "head"] {
+            let env = Env::new();
+            let repo = env.path("repo");
+            fs::create_dir_all(&repo).unwrap();
+            env.ok_git(&repo, &["init", "-q"]);
+            write(&repo.join(spelling), PUBLIC);
+            env.ok_git(&repo, &["add", "-A"]);
+            if copies != "index" {
+                env.ok_git(&repo, &["commit", "-q", "-m", "start"]);
+            }
+            if copies == "head" {
+                env.ok_git(&repo, &["rm", "-q", "--cached", spelling]);
+            }
+            write(&repo.join(spelling), "name = \"pub\"\nvisibility = \"private\"\n");
+            let msg = env.path("msg");
+            write(&msg, &detail());
+            for flag in ["--secrets-only", "--by-stack"] {
+                let args = ["privacy", "--message", &msg.to_string_lossy(), flag];
+                let o = env.lords(&repo, &args);
+                let case = format!("{spelling}, {copies}, {flag}: {}", text(&o));
+                assert!(!o.status.success(), "{case}");
+                assert!(text(&o).contains("path"), "{case}");
+            }
+        }
+    }
+}
+
+// Spec (fix check r2, D28-R2-02: "preserve the checkout-discovery error as an unknown/error with its real cause"): where
+// git can't tell the checkout (a global config it can't read), `privacy --message --secrets-only` in a public stack
+// checkout checks the whole policy and names the cause; outside any repo, the flag holds (the control).
+#[test]
+fn a_failed_checkout_lookup_checks_the_whole_policy_and_says_why() {
+    let env = Env::new();
+    let repo = env.repo("repo", &[("stack/stack.toml", PUBLIC)]);
+    let broken = env.path("broken-gitconfig");
+    write(&broken, "[user\n\tname = Test\n");
+    let msg = env.path("msg");
+    write(&msg, &detail());
+    let args = ["privacy", "--message", &msg.to_string_lossy(), "--secrets-only"];
+    let o = env.lords_with(&repo, &args, &[("GIT_CONFIG_GLOBAL", &broken)]);
+    assert!(!o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("path") && text(&o).contains("config"), "{}", text(&o));
+
+    let plain = env.path("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let ceiling = [("GIT_CEILING_DIRECTORIES", env.dir.path())];
+    let o = env.lords_with(&plain, &args, &ceiling);
+    assert!(o.status.success(), "no repo, the flag holds: {}", text(&o));
+    let o = env.lords_with(&plain, &args[..3], &ceiling);
+    assert!(!o.status.success(), "no flag, the whole policy: {}", text(&o));
+}
+
+// Spec (fix check r2, D28-R2-F01: "install the runtime stack pre-push whenever any worktree that shares the hooks has a
+// stack"): hooks installed from a manifest-free sibling still give the public checkout its pre-push, which refuses a
+// history holding a user path (committed before any hook); the manifest-free sibling commits as before.
+#[test]
+fn a_manifest_free_installer_still_gives_the_public_sibling_its_push_check() {
+    let env = Env::new();
+    let main = env.repo("pub", &[("stack/stack.toml", PUBLIC)]);
+    write(&main.join("notes.md"), &format!("{}\n", detail()));
+    env.ok_git(&main, &["add", "notes.md"]);
+    env.ok_git(&main, &["commit", "-q", "-m", "notes"]);
+    let plain = env.path("plain");
+    env.ok_git(&main, &["worktree", "add", "-q", "-b", "plain", &plain.to_string_lossy()]);
+    env.ok_git(&plain, &["rm", "-q", "-r", "stack", "notes.md"]);
+    env.ok_git(&plain, &["commit", "-q", "-m", "no stack"]);
+    let o = env.lords(&plain, &["hooks", "install"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(main.join(".git/hooks/pre-push").is_file(), "the stack's pre-push");
+    let o = env.hook(&main, "pre-push", &["origin", "unused"]);
+    assert!(!o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("notes.md"), "{}", text(&o));
+    write(&plain.join("readme.md"), "a clean line\n");
+    env.ok_git(&plain, &["add", "readme.md"]);
+    let o = env.git(&plain, &["commit", "-q", "-m", "clean"]);
+    assert!(o.status.success(), "{}", text(&o));
+}
+
+// Spec (fix check r2, D28-R2-F01: "Say in the note what happens when a stack worktree is added later. One option: the
+// commit hooks warn"): a repo whose hooks were installed without a stack, where a checkout has one later, commits with a
+// line saying its pushes go unchecked until `lords hooks install` runs again.
+#[test]
+fn a_stack_that_came_later_is_named_at_the_next_commit() {
+    let env = Env::new();
+    let repo = env.repo("repo", &[("README.md", "a repo\n")]);
+    assert!(env.lords(&repo, &["hooks", "install"]).status.success());
+    write(&repo.join("stack/stack.toml"), PUBLIC);
+    write(&repo.join("notes.md"), "a clean line\n");
+    env.ok_git(&repo, &["add", "notes.md"]);
+    let o = env.git(&repo, &["commit", "-q", "-m", "clean"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("lords hooks install"), "{}", text(&o));
 }
 
 // Spec (attack 9; D28: the mode comes from a stack where there is one): a repo with no stack keeps what the flag says:
