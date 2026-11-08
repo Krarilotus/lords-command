@@ -2404,9 +2404,77 @@ pub fn child_composed(
     home: &Path,
     start: compose::ChildStart,
 ) -> Composed {
+    child_composed_on(stacks, layers, role, home, start, &crate::ops::today())
+}
+
+fn child_composed_on(
+    stacks: &Stacks,
+    layers: Layers,
+    role: &str,
+    home: &Path,
+    start: compose::ChildStart,
+    today: &str,
+) -> Composed {
     let mut ctx = role_context(layers, role, home);
     ctx.child = Some(start);
-    compose::compose(stacks, &ctx)
+    compose::compose_on(stacks, &ctx, today)
+}
+
+/// A start one hook gives a session in a place, as install writes it in the place's role dir and the stores' commit
+/// check counts it (gap 11, design note §0b.3 step 6: one calculation for both).
+pub struct HookStart {
+    /// Its file in the role dir: `child.md`, or `start-<role>.md`.
+    pub file: String,
+    pub role: String,
+    /// `Beyond` for `child.md`, `Launched` for a role's start.
+    pub kind: compose::ChildStart,
+    pub text: String,
+}
+
+impl HookStart {
+    /// Its size as the hook gives it: characters, without Lords' marker lines (`guard::child_context`).
+    pub fn chars(&self) -> usize {
+        crate::guard::child_context(&self.text).chars().count()
+    }
+}
+
+/// The starts a place in `layers` gives through a hook, on `today`: `child.md` for the child role (plan L6), then a
+/// `start-<role>.md` for every declared role but the product's (F10). `child-whole.md` isn't one of them: past what a
+/// hook gives, it is given nowhere (the Lords owner's option 1, 1 Nov).
+pub fn hook_starts(stacks: &Stacks, layers: Layers, home: &Path, today: &str) -> Vec<HookStart> {
+    let child = child_role(stacks)
+        .map(|r| (CHILD_FILE.to_string(), r.to_string(), compose::ChildStart::Beyond));
+    let roles = declared_roles(stacks).into_iter().filter(|r| r != compose::PRODUCT_ROLE);
+    let launched = roles.map(|r| (start_file(&r), r, compose::ChildStart::Launched));
+    child
+        .into_iter()
+        .chain(launched)
+        .map(|(file, role, kind)| {
+            let text = child_composed_on(stacks, layers.clone(), &role, home, kind, today).text;
+            HookStart { file, role, kind, text }
+        })
+        .collect()
+}
+
+/// Every place the private stack declares, as `(label, layers)`: each repo, then each workspace, as `plan` takes them,
+/// whether or not it has a checkout here (a place's starts don't depend on one: `role_context`).
+pub fn declared_places(stacks: &Stacks) -> Vec<(String, Layers)> {
+    let Some(private) = stacks.private.as_ref() else { return Vec::new() };
+    let repos = private.manifest.repos.keys().map(|name| {
+        let layers = Layers::Repo {
+            repo: name.clone(),
+            project: stacks.repo_project(name),
+            sub: None,
+            global: true,
+        };
+        (format!("repo {name}"), layers)
+    });
+    let workspaces = private.manifest.workspaces.iter().map(|(name, w)| {
+        let layers =
+            Layers::Workspace { name: name.clone(), project: w.project.clone(), global: true };
+        (format!("workspace {name}"), layers)
+    });
+    repos.chain(workspaces).collect()
 }
 
 /// The most a `SubagentStart` hook's context may hold in characters before Claude Code saves it to a file and gives
@@ -2650,37 +2718,30 @@ fn place_items(pl: &mut Planner, place: &Place, only: Option<&str>, under: Optio
     // `child.md` one hook can't give in one read is refused like a file past its harness's limit (repair sol-loop r1,
     // R2; fix check r2, FC1). A `child-whole.md` past it is written and given nowhere, with the guard's note, until the
     // corpus fits (the Lords owner's option 1, 1 Nov): today every place's is.
-    let mut undeliverable = Vec::new();
-    if let Some(role) = child_role(pl.stacks) {
-        for (file, start) in [
-            (CHILD_FILE, compose::ChildStart::Beyond),
-            (CHILD_WHOLE_FILE, compose::ChildStart::Whole),
-        ] {
-            let text =
-                child_composed(pl.stacks, place.layers(true), role, &pl.plan.home, start).text;
-            let n = crate::guard::child_context(&text).chars().count();
-            if n > CHILD_START_CHARS && start == compose::ChildStart::Beyond {
-                undeliverable.push(format!(
-                    "{file} is {n} characters, past the {CHILD_START_CHARS} one hook gives a child in one read, one part: not written, the old files stay"
-                ));
-            }
-            tree.insert(file.into(), text.into_bytes());
-        }
-    }
     // A start per role for a session whose launch names it (F10; the `role` guard gives it). One past what one hook
     // gives is written all the same: the guard then points the session at its role file, and the plan says so.
-    let mut long_starts = Vec::new();
-    for role in declared_roles(pl.stacks).iter().filter(|r| *r != compose::PRODUCT_ROLE) {
-        let start = compose::ChildStart::Launched;
-        let text = child_composed(pl.stacks, place.layers(true), role, &pl.plan.home, start).text;
-        let file = start_file(role);
-        let n = crate::guard::child_context(&text).chars().count();
-        if n > CHILD_START_CHARS {
+    let (mut undeliverable, mut long_starts) = (Vec::new(), Vec::new());
+    let today = crate::ops::today();
+    for s in hook_starts(pl.stacks, place.layers(true), &pl.plan.home, &today) {
+        let (file, n) = (&s.file, s.chars());
+        if n > CHILD_START_CHARS && s.kind == compose::ChildStart::Beyond {
+            undeliverable.push(format!(
+                "{file} is {n} characters, past the {CHILD_START_CHARS} one hook gives a child in one read, one part: not written, the old files stay"
+            ));
+        } else if n > CHILD_START_CHARS {
             long_starts.push(format!(
-                "{file} is {n} characters, past the {CHILD_START_CHARS} one hook gives: a session named {role} at launch is told to read role-{role}.md instead"
+                "{file} is {n} characters, past the {CHILD_START_CHARS} one hook gives: a session named {} at launch is told to read role-{}.md instead",
+                s.role, s.role
             ));
         }
-        tree.insert(file, text.into_bytes());
+        tree.insert(s.file, s.text.into_bytes());
+    }
+    // A `child-whole.md` past what one hook gives is written and given nowhere, with the guard's note, until the
+    // corpus fits (the Lords owner's option 1, 1 Nov): today every place's is.
+    if let Some(role) = child_role(pl.stacks) {
+        let whole = compose::ChildStart::Whole;
+        let text = child_composed(pl.stacks, place.layers(true), role, &pl.plan.home, whole).text;
+        tree.insert(CHILD_WHOLE_FILE.into(), text.into_bytes());
     }
     // The Memory section of each adapter whose place files name it instead, whatever adapter this sync takes: those
     // files name it in every checkout (design note 2026-11-02-lords-memory-pointer, I2, A5). It is the same in each.
