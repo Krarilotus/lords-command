@@ -400,7 +400,6 @@ fn a_forget_whose_path_came_back_changes_nothing() {
 // the next install finds the copy current and leaves the copy alone in its dir.
 #[test]
 fn guard_install_replaces_a_copy_a_hook_is_running() {
-    use std::process::Stdio;
     let h = Home::new(&[], "");
     let lords = fs::read(env!("CARGO_BIN_EXE_lords")).unwrap();
     // Another build: a trailing byte, past what Windows loads.
@@ -423,14 +422,7 @@ fn guard_install_replaces_a_copy_a_hook_is_running() {
         v
     };
     // A hook running the copy: the rm guard, waiting for its event on stdin.
-    let mut running = h
-        .cmd(&h.copy())
-        .args(["guard", "rm"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut running = running_hook(&h);
     let o = h.lords(&["guard", "install"]);
     let (now, beside) = (fs::read(h.copy()).unwrap(), names());
     let aside: Vec<Vec<u8>> = beside
@@ -450,12 +442,21 @@ fn guard_install_replaces_a_copy_a_hook_is_running() {
     assert_eq!(names(), ["lords-guard.exe"], "{}", text(&o));
 }
 
-/// The rm guard run from the copy, waiting for its event on stdin: a hook holding the copy until its stdin closes.
+/// The rm guard run from the copy, waiting for its event on stdin: a hook holding the copy until its stdin closes. A
+/// copy this test wrote a moment ago may still be held open for writing by a child another test thread started then
+/// (ETXTBSY off Windows; red run lords-test-linux-fafeb675-1794160088-460579 met it here): that refusal alone is tried
+/// again for up to 1 s, through the same `process::start_while_busy` as the guard copy's own start (review r1, R1-01:
+/// no start past the window, the last refusal kept).
 fn running_hook(h: &Home) -> std::process::Child {
     use std::process::Stdio;
-    let mut c = h.cmd(&h.copy());
-    c.args(["guard", "rm"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
-    c.spawn().unwrap()
+    use std::time::{Duration, Instant};
+    let spawn = || {
+        let mut c = h.cmd(&h.copy());
+        c.args(["guard", "rm"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+        c.spawn()
+    };
+    let until = Instant::now() + Duration::from_secs(1);
+    lords_core::process::start_while_busy(spawn, until, Instant::now, std::thread::sleep).unwrap()
 }
 
 // Spec (review r1, R1-01, witness 1: an owner's file `.lords-guard.exe.lords-busy-owner-notes.txt` was deleted by an

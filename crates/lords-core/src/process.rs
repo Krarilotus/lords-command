@@ -91,10 +91,22 @@ pub(crate) fn git_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result
     c.output().map_err(|e| format!("git {}: {e}", args.join(" ")))
 }
 
+/// How long one run of the guard copy may take, its start included.
+const GUARD_TIME: Duration = Duration::from_secs(20);
+
 /// Runs `<exe> guard --self-test` and requires it to print `ok` and exit 0 within 20 s: the copy a harness hook will
-/// run answers before sync names it (orchestrator, 30 Oct). A child past the deadline is killed.
-pub(crate) fn guard_self_test(guard_copy: &Path) -> Result<(), String> {
-    let (status, out) = run_guard(guard_copy, &["guard", "--self-test"], b"", "guard self-test")?;
+/// run answers before sync names it (orchestrator, 30 Oct). A child past the deadline is killed. Public for tests only
+/// (tests/guard_exec.rs runs it at the moment a copy is held open, which `install_guard`'s reads before it can't fix).
+#[doc(hidden)]
+pub fn guard_self_test(guard_copy: &Path) -> Result<(), String> {
+    guard_self_test_within(guard_copy, GUARD_TIME)
+}
+
+/// `guard_self_test` within `budget` instead of 20 s: public for tests only, which can't wait 20 s for a hung copy.
+#[doc(hidden)]
+pub fn guard_self_test_within(guard_copy: &Path, budget: Duration) -> Result<(), String> {
+    let args = ["guard", "--self-test"];
+    let (status, out) = run_guard_within(guard_copy, &args, b"", "guard self-test", budget)?;
     if status.success() && out.trim() == "ok" {
         Ok(())
     } else {
@@ -223,28 +235,82 @@ pub fn codex_ask(
     answer
 }
 
-/// Runs the guard copy with `args` and `stdin`, within 20 s: its exit status and stdout. A child past the deadline is
-/// killed.
+/// How long a guard copy that the OS won't run yet, because something holds it open for writing, is tried again.
+const BUSY_FOR: Duration = Duration::from_secs(1);
+
+/// The pause between two starts of a copy the OS refused as busy.
+const BUSY_PAUSE: Duration = Duration::from_millis(20);
+
+/// `spawn`, tried again only while it fails because the file it runs is held open for writing (ETXTBSY, off Windows).
+/// A copy written and closed a moment ago can still be held: a child another thread of this process started meanwhile
+/// holds every file open then until its own exec (job lords-test-linux-84c9449e-1794157526-435833; golang/go#22315).
+/// Every pause ends by `until`, and no start is tried at or past it, so the last busy refusal is the answer then (review
+/// r1, R1-01); any other result is the answer at once. `now` and `sleep` are the clock (a test's own, or
+/// `Instant::now` and `std::thread::sleep`). Public for tests only (tests/delivery.rs starts its copies through it).
+#[doc(hidden)]
+pub fn start_while_busy<T>(
+    mut spawn: impl FnMut() -> std::io::Result<T>,
+    until: Instant,
+    now: impl Fn() -> Instant,
+    sleep: impl Fn(Duration),
+) -> std::io::Result<T> {
+    loop {
+        match spawn() {
+            Err(e) if cfg!(unix) && e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                let left = until.saturating_duration_since(now());
+                if left.is_zero() {
+                    return Err(e);
+                }
+                sleep(left.min(BUSY_PAUSE));
+                if now() >= until {
+                    return Err(e);
+                }
+            }
+            r => return r,
+        }
+    }
+}
+
+/// Runs the guard copy with `args` and `stdin`, within 20 s of the call, its start included: its exit status and
+/// stdout. A child past the deadline is killed.
 fn run_guard(
     guard_copy: &Path,
     args: &[&str],
     stdin: &[u8],
     what: &str,
 ) -> Result<(std::process::ExitStatus, String), String> {
+    run_guard_within(guard_copy, args, stdin, what, GUARD_TIME)
+}
+
+/// `run_guard` within `budget`.
+fn run_guard_within(
+    guard_copy: &Path,
+    args: &[&str],
+    stdin: &[u8],
+    what: &str,
+    budget: Duration,
+) -> Result<(std::process::ExitStatus, String), String> {
     use std::io::{Read, Write};
-    let mut child = Command::new(guard_copy)
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        // Never read, so never a full pipe that holds the child (an older copy's usage note goes there).
-        .stderr(std::process::Stdio::null())
-        .spawn()
+    // One budget from here, the start included (review r1, R1-01): a copy that starts late gets only what is left.
+    let called = Instant::now();
+    let deadline = called + budget;
+    let secs = budget.as_secs_f32();
+    let spawn = || {
+        Command::new(guard_copy)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            // Never read, so never a full pipe that holds the child (an older copy's usage note goes there).
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+    let busy_until = (called + BUSY_FOR).min(deadline);
+    let mut child = start_while_busy(spawn, busy_until, Instant::now, std::thread::sleep)
         .map_err(|e| format!("{}: {e}", guard_copy.display()))?;
     // Written whole and closed before the wait: the guard reads its event to the end first.
     if let Some(mut i) = child.stdin.take() {
         let _ = i.write_all(stdin);
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     // Its output is read beside it, so a child that keeps the pipe open can't hold the sync past the deadline
     // (sol-loop r2, S14).
     let (tx, rx) = std::sync::mpsc::channel();
@@ -262,15 +328,15 @@ fn run_guard(
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("{}: {what} took over 20 s", guard_copy.display()));
+                return Err(format!("{}: {what} took over {secs} s", guard_copy.display()));
             }
             None => std::thread::sleep(std::time::Duration::from_millis(20)),
         }
     };
     let left = deadline.saturating_duration_since(std::time::Instant::now());
-    let out = rx
-        .recv_timeout(left)
-        .map_err(|_| format!("{}: {what}'s output not closed within 20 s", guard_copy.display()))?;
+    let out = rx.recv_timeout(left).map_err(|_| {
+        format!("{}: {what}'s output not closed within {secs} s", guard_copy.display())
+    })?;
     Ok((status, out))
 }
 
