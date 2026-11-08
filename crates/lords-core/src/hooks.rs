@@ -267,11 +267,30 @@ fn dispatch(repo: &Path, home: &Path, hooks: &[&str]) -> Vec<String> {
 
 /// The probe's two files in `state` for the nonce `n`: the nonce's own, which a hook checks, and the message a
 /// commit-msg hook is given.
+/// Nothing stays from the first successful create on (package review privownallow r1, R1-01): a file this call made
+/// is removed again on any failure after it, and a file that was there before is never touched.
 fn probe_files(state: &Contained, n: &str) -> Result<(Contained, Contained), String> {
     let probe = state.child(Part::new(&format!("probe-{n}"))?);
     let message = state.child(Part::new(&format!("probe-{n}.msg"))?);
-    fsguard::create_file(&probe, b"")?;
-    fsguard::create_file(&message, b"a probe of the privacy hooks\n")?;
+    let missing = |f: &Contained| fsguard::kind(f.path()) == Ok(fsguard::Kind::Missing);
+    // `create_file` can make the file and then fail to write it: what it made then is this call's.
+    let make = |f: &Contained, bytes: &[u8]| -> Result<(), String> {
+        let was_missing = missing(f);
+        fsguard::create_file(f, bytes).map_err(|e| match was_missing && !missing(f) {
+            true => match fsguard::delete_file(f) {
+                Ok(()) => e,
+                Err(d) => format!("{e}; and {} stays: {d}", f.path().display()),
+            },
+            false => e,
+        })
+    };
+    make(&probe, b"")?;
+    if let Err(e) = make(&message, b"a probe of the privacy hooks\n") {
+        return Err(match fsguard::delete_file(&probe) {
+            Ok(()) => e,
+            Err(d) => format!("{e}; and {} stays: {d}", probe.path().display()),
+        });
+    }
     Ok((probe, message))
 }
 

@@ -761,14 +761,20 @@ fn same_but_case(a: &str, b: &str) -> bool {
         })
 }
 
-/// The visibility a manifest's text names, as the manifest's schema reads it.
+/// The visibility a manifest's text names, as the manifest's schema reads it. Why it can't is said by line only: the
+/// parser's message can hold the text itself, a value in an unknown variant (package review privownallow r1, R1-02).
 fn visibility_of(text: &str) -> Result<Visibility, String> {
     #[derive(serde::Deserialize)]
     struct Head {
         visibility: Option<Visibility>,
     }
-    let head: Head = toml::from_str(text)
-        .map_err(|e| format!("can't be read as a manifest ({})", e.message()))?;
+    let head: Head = toml::from_str(text).map_err(|e| {
+        let line = e.span().and_then(|s| text.get(..s.start)).map(|t| t.matches('\n').count() + 1);
+        match line {
+            Some(n) => format!("can't be read as a manifest (line {n})"),
+            None => "can't be read as a manifest".to_string(),
+        }
+    })?;
     head.visibility.ok_or_else(|| "names no visibility".to_string())
 }
 

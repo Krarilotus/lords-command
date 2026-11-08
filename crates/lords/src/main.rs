@@ -26,10 +26,11 @@ usage:
   lords privacy --history [--private-stack DIR] [--secrets-only | --by-stack]   every commit's message and patch (the pre-push check)
   lords privacy FILE...
     (--by-stack: the mode of this checkout's stack, secrets only where every copy of its manifest says private, else the
-    whole policy; --secrets-only holds only where this checkout has no stack or a private one; with --by-stack the
-    allow-list is this checkout's own stack/privacy/allow.txt, and a configured private stack adds its deny and fleet terms)
-  lords privacy --explain [--secrets-only | --by-stack]   what privacy checks here with those flags (mode, lists, counts) and
-    whether a commit and a push reach the privacy hooks; scans nothing, prints no term
+    whole policy; --secrets-only holds only where this checkout has no stack or a private one. The allow-list is this
+    checkout's own stack/privacy/allow.txt, plus, without --by-stack, the configured public stack's; a configured
+    private stack adds only its deny and fleet terms)
+  lords privacy --explain [--secrets-only]   what a stack repo's privacy hooks (--by-stack) check here, or --secrets-only:
+    the mode and each list with its path and count; it only reads: no hook is run, no term or file text is printed
   lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit, pre-merge-commit and commit-msg hooks; in a stack repo also `check --stack`, a pre-push and a post-commit that runs `deliver`
     (a stack repo's hooks check with --by-stack, so each checkout by its own stack; --secrets-only is for a repo without one)
   lords hash PATH
@@ -1496,13 +1497,21 @@ struct PrivacyRules {
     sources: Vec<String>,
 }
 
+/// Why the rules couldn't be composed: `full`, what the scan says (the file's error as read); `brief`, the step and the
+/// path only, which `--explain` says, since a parser's message can hold the file's text (review r1, R1-02).
+struct RulesError {
+    brief: String,
+    full: String,
+}
+
 fn privacy_rules(
     cwd: &Path,
     by_stack: bool,
     secrets_only: bool,
     public_stack: Option<PathBuf>,
     private_stack: Option<PathBuf>,
-) -> Result<PrivacyRules, String> {
+) -> Result<PrivacyRules, RulesError> {
+    let failed = |brief: String| move |full: String| RulesError { brief, full };
     // Secrets only only where this checkout's stack allows it, so no caller gives a public checkout that mode (C2).
     let stack = (by_stack || secrets_only).then(|| privacy::checkout_stack(cwd));
     let (secrets_only, why) = match &stack {
@@ -1532,7 +1541,7 @@ fn privacy_rules(
         rules
     }
     // A config.txt that is there but can't be read fails the check: its private stack would be skipped.
-    let mut cfg = Config::load()?;
+    let mut cfg = Config::load().map_err(failed("config.txt can't be read".into()))?;
     if private_stack.is_some() {
         cfg.private = private_stack;
     }
@@ -1540,24 +1549,43 @@ fn privacy_rules(
         cfg.public = public_stack;
     }
     // A configured private stack that doesn't load fails the check: its deny and fleet lists would be skipped.
-    let private = cfg.private.as_deref().map(Stack::load).transpose()?;
+    let private = match &cfg.private {
+        Some(root) => Some(Stack::load(root).map_err(failed(format!(
+            "the private stack at {} doesn't load: its stack.toml can't be read, isn't TOML or doesn't fit the schema",
+            root.display()
+        )))?),
+        None => None,
+    };
+    // A configured private stack only adds restrictions, whatever the flags: its allow-list is no other repo's (D28 r6,
+    // R6-F01; review r1, R1-F01). The allowances are this checkout's own, and without `--by-stack` the configured
+    // public stack's too.
     let mut rules = Rules::public();
-    // `--by-stack`, a stack repo's hooks: a configured stack only adds restrictions, so the allowances are this
-    // checkout's own (D28 r6, R6-F01). Without it, as before: the configured lists too.
-    if let (false, Some(p)) = (by_stack, &private) {
-        rules = allow_from(rules, &p.root, &mut sources);
-    }
     let (deny, hosts) = (rules.deny.len(), rules.hosts.len());
-    rules = rules.with_private_terms(private.as_ref())?;
+    let fleet = private.as_ref().and_then(|p| p.manifest.privacy.fleet_config.as_deref());
+    let fleet = fleet.map(lords_core::config::expand_home);
+    rules = rules.with_private_terms(private.as_ref()).map_err(|full| {
+        // Which list failed, told by reading the deny-list again: no message is parsed.
+        let deny = private.as_ref().map(|p| p.root.join("privacy").join("deny.txt"));
+        let brief = match (&deny, &fleet) {
+            (Some(d), _)
+                if lords_core::fsguard::read_string(d)
+                    .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound) =>
+            {
+                format!("{} can't be read", d.display())
+            }
+            (_, Some(f)) => format!("the fleet config {} can't be read or isn't TOML", f.display()),
+            _ => "the private stack's deny-list or fleet config can't be read".to_string(),
+        };
+        RulesError { brief, full }
+    })?;
     if let Some(p) = &private {
         let n = rules.deny.len() - deny;
         if n > 0 {
             let at = p.root.join("privacy").join("deny.txt");
             sources.push(format!("deny-list: {} ({})", at.display(), count(n, "term", "terms")));
         }
-        if let Some(f) = &p.manifest.privacy.fleet_config {
+        if let Some(at) = &fleet {
             let n = rules.hosts.len() - hosts;
-            let at = lords_core::config::expand_home(f);
             sources.push(format!("fleet: {} ({})", at.display(), count(n, "host", "hosts")));
         }
     }
@@ -1570,11 +1598,13 @@ fn privacy_rules(
     Ok(PrivacyRules { rules, secrets_only, why, stack, sources })
 }
 
-/// `privacy --explain`: what `privacy` with the same flags checks here, and whether a commit and a push here reach the
-/// privacy hooks (the probe `lords check` runs). It scans nothing, changes nothing in the repo and prints no term
-/// (self-service audit, journey 7).
-fn explain_privacy(cwd: &Path, c: &PrivacyRules) -> Result<bool, String> {
+/// `privacy --explain`: what a stack repo's privacy hooks (`--by-stack`) check here, or `privacy --secrets-only` where
+/// that is given (review r1, R1-03). It only reads: it scans nothing, runs no hook (one may change files: R1-01), and
+/// prints paths, counts and categories, never a term or a file's text (self-service audit, journey 7).
+fn explain_privacy(c: &PrivacyRules, secrets_only: bool) -> Result<bool, String> {
     use privacy::CheckoutStack;
+    let models = if secrets_only { "--secrets-only" } else { "--by-stack, a stack repo's hooks" };
+    println!("models: lords privacy {models}");
     let stack = match &c.stack {
         None => "not looked for (no --by-stack or --secrets-only)".to_string(),
         Some(CheckoutStack::None) => "none".to_string(),
@@ -1594,18 +1624,9 @@ fn explain_privacy(cwd: &Path, c: &PrivacyRules) -> Result<bool, String> {
     for n in &c.rules.notes {
         println!("note: {n}");
     }
-    let top = git::toplevel(cwd).ok_or("not in a git repo")?;
-    let home = sync::default_home()?;
-    let commit = hooks::privacy_dispatch(&top, &home);
-    if commit.is_empty() {
-        println!("commit: reaches the privacy hooks ({})", hooks::PRIVACY.join(", "));
-    } else {
-        println!("commit: not verified: {}", commit.join("; "));
-    }
-    match hooks::push_dispatch(&top, &home) {
-        Ok(()) => println!("push: reaches the privacy pre-push"),
-        Err(e) => println!("push: not verified: {e}"),
-    }
+    println!(
+        "hooks: not verified here: `lords check` probes whether a commit and a push reach the privacy hooks, by running them"
+    );
     Ok(true)
 }
 
@@ -1620,10 +1641,13 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
     let private_stack = a.value("--private-stack")?.map(PathBuf::from);
     let explain = a.flag("--explain");
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let composed = privacy_rules(&cwd, by_stack, secrets_only, public_stack, private_stack)?;
+    // `--explain` models the stack hooks unless `--secrets-only` is given (review r1, R1-03).
+    let by_stack = by_stack || (explain && !secrets_only);
+    let composed = privacy_rules(&cwd, by_stack, secrets_only, public_stack, private_stack)
+        .map_err(|e| if explain { e.brief } else { e.full })?;
     if explain {
         a.done()?;
-        return explain_privacy(&cwd, &composed);
+        return explain_privacy(&composed, secrets_only);
     }
     if let Some(why) = &composed.why {
         eprintln!("lords privacy: {why}");
