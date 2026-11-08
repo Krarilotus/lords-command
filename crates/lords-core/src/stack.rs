@@ -155,6 +155,70 @@ pub struct Manifest {
     /// What `lords sync --safe-only` applies besides what is always safe (design: Sync, the safe-only stage).
     #[serde(default)]
     pub safe_only: Option<SafeOnly>,
+    /// How a delivery runs, and how long every sync that applies waits for another (design: Sync, delivery).
+    #[serde(default)]
+    pub delivery: Option<Delivery>,
+}
+
+/// stack.toml `[delivery]` (F8, design note Harness/notes/2026-11-07-lords-f8-delivery.md §5; the owner, 7 Nov: "no
+/// harded coded shit that will bite later"). Every limit a delivery has is here, with its default.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Delivery {
+    /// Which stores' commits start a delivery (their post-commit hook); none switches the trigger off.
+    pub on_commit: Vec<Store>,
+    /// How long a delivery, or any sync that applies, waits for a running one; also the longest a swap is tried again
+    /// while a reader blocks it.
+    pub lock_wait_secs: u64,
+    /// Plans and applies in all, when one ends with the ledger changed under it or its new worktree not ready.
+    pub attempts: u32,
+    /// The pause before another attempt for a new worktree that isn't ready.
+    pub retry_pause_secs: u64,
+    /// From a delivery's start: no attempt, plan or place starts past it, and the lock wait ends at it.
+    pub deadline_secs: u64,
+    /// How long one git read of a store may take before it is stopped.
+    pub store_git_secs: u64,
+    /// How long a delivery waits for the state file's lock, and tries the state file's rename while a reader blocks it.
+    pub state_lock_secs: u64,
+    /// Whether a whole delivery first imports memory and retires ended entries, each as its own store commit.
+    pub store_work: bool,
+    /// The state file, relative to the tool home, in plain parts.
+    pub state: String,
+}
+
+impl Default for Delivery {
+    fn default() -> Delivery {
+        Delivery {
+            on_commit: vec![Store::Public, Store::Private],
+            lock_wait_secs: 120,
+            attempts: 3,
+            retry_pause_secs: 2,
+            deadline_secs: 600,
+            store_git_secs: 30,
+            state_lock_secs: 10,
+            store_work: true,
+            state: "state/delivery.json".into(),
+        }
+    }
+}
+
+impl Delivery {
+    pub fn lock_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.lock_wait_secs)
+    }
+
+    /// The state file's parts below the tool home; refused unless each is one plain name.
+    pub fn state_parts(&self) -> Result<Vec<fsguard::Part>, String> {
+        self.state.split('/').map(fsguard::Part::new).collect()
+    }
+}
+
+/// A store, as `[delivery] on_commit` names it.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Store {
+    Public,
+    Private,
 }
 
 /// stack.toml `[safe_only]` (D13; the owner, 7 Nov: "make thigns more configurable").
@@ -219,6 +283,15 @@ impl Stacks {
             .find_map(|s| s.manifest.safe_only.clone())
             .unwrap_or_default()
     }
+
+    /// The delivery settings: the private stack's, else the public stack's, else the defaults.
+    pub fn delivery(&self) -> Delivery {
+        self.private
+            .iter()
+            .chain([&self.public])
+            .find_map(|s| s.manifest.delivery.clone())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -257,6 +330,34 @@ impl Stack {
                 manifest_path.display(),
                 w[0]
             ));
+        }
+        // No two targets at one path, or one inside the other: an item of both could be applied for one and held for
+        // the other (D24; F8, design note C8).
+        let at: Vec<(&str, String)> = manifest
+            .targets
+            .iter()
+            .map(|t| (t.name.as_str(), crate::ledger::key(&crate::config::expand_home(&t.path))))
+            .collect();
+        for (i, (a, pa)) in at.iter().enumerate() {
+            for (b, pb) in &at[i + 1..] {
+                let inside =
+                    |x: &str, y: &str| y.starts_with(&format!("{}/", x.trim_end_matches('/')));
+                if pa == pb || inside(pa, pb) || inside(pb, pa) {
+                    return Err(format!(
+                        "{}: targets `{a}` and `{b}` are at one path, or one lies inside the other; give each its own",
+                        manifest_path.display()
+                    ));
+                }
+            }
+        }
+        if let Some(d) = &manifest.delivery {
+            d.state_parts().map_err(|e| {
+                format!(
+                    "{}: [delivery] state = {:?}: a path below the tool home, in plain parts ({e})",
+                    manifest_path.display(),
+                    d.state
+                )
+            })?;
         }
         let mut stack =
             Stack { root: root.to_path_buf(), manifest, entries: Vec::new(), problems: Vec::new() };

@@ -26,12 +26,12 @@ fn file(repo: &Path) -> Result<PathBuf, String> {
 }
 
 /// The key of the ledger's record of `file`'s entry.
-fn key(file: &Path) -> String {
+pub(super) fn key(file: &Path) -> String {
     ledger::key(&file.join(SECTION))
 }
 
 /// The entry in `file` alone (`git config --file … -z`), or `None` where it has none.
-fn entries(file: &Path) -> Result<Option<Vec<u8>>, String> {
+pub(super) fn entries(file: &Path) -> Result<Option<Vec<u8>>, String> {
     let (dir, f) = (file.parent().unwrap_or(file), file.to_string_lossy());
     let args = ["config", "--file", &f, "-z", "--get-regexp", PATTERN];
     Ok(if git::status(dir, &args)? { Some(git::bytes(dir, &args)?) } else { None })
@@ -62,8 +62,18 @@ fn put(file: &Path, command: &str) -> Result<(), String> {
     git_file(file, &[&format!("{SECTION}.event"), "post-checkout"])
 }
 
+/// The hook's command as this build writes it with `label`: the post-checkout script as a function, so the hook's
+/// arguments, which Git appends as `"$@"`, are its own.
+pub(super) fn command_for(lords_exe: &Path, args: &SyncArgs, home: &Path, label: &str) -> String {
+    let script = post_checkout_script(lords_exe, args, home, label, false);
+    format!(
+        "lords_post_checkout() {{\n{}}}\nlords_post_checkout",
+        script.strip_prefix("#!/bin/sh\n").unwrap_or(&script)
+    )
+}
+
 /// The command of Lords' entry (`entries`); Lords' entry always has one.
-fn command_of(entry: &[u8]) -> String {
+pub(super) fn command_of(entry: &[u8]) -> String {
     let text = String::from_utf8_lossy(entry).into_owned();
     let found = text.split('\0').find_map(|e| e.strip_prefix(&format!("{SECTION}.command\n")));
     found.unwrap_or_default().to_string()
@@ -140,12 +150,7 @@ pub(super) fn install(
     };
     let before = fsguard::read(&file)?;
     let label = probe_label();
-    let script = post_checkout_script(lords_exe, args, home, &label, false);
-    // A function, so the hook's arguments, which Git appends as `"$@"`, are its own.
-    let command = format!(
-        "lords_post_checkout() {{\n{}}}\nlords_post_checkout",
-        script.strip_prefix("#!/bin/sh\n").unwrap_or(&script)
-    );
+    let command = command_for(lords_exe, args, home, &label);
     let done = put(&file, &command)
         .and_then(|()| post_checkout_reaches_new_worktree(repo, home, &label))
         .and_then(|()| {

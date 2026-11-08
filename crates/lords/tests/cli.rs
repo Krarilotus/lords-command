@@ -504,6 +504,7 @@ fn compose_prints_what_a_harness_reads() {
 /// A repo `r` (one commit) declared in a private stack with one rule, worktrees under `wts`; the hook installed.
 fn repo_with_post_checkout(env: &Env) -> (PathBuf, PathBuf, PathBuf) {
     let (repo, wts, stacks) = post_checkout_repo(env);
+    managed(env, &stacks);
     let o = install_post_checkout(env, &repo, &stacks);
     assert!(o.status.success(), "{}", text(&o));
     let log = repo_log(&repo);
@@ -552,6 +553,15 @@ fn post_checkout_repo(env: &Env) -> (PathBuf, PathBuf, [String; 4]) {
         private.display().to_string(),
     ];
     (repo, d.join("wts"), stacks)
+}
+
+/// Repo `r` synced once by hand, as a repo Lords manages is: its git exclude, which its worktrees share, holds Lords'
+/// lines. A new worktree's delivery is safe-only (F8, brief item 2) and never edits that owner file (D13 R1), so a repo
+/// never synced holds its new worktrees, named in the delivery's state.
+fn managed(env: &Env, stacks: &[String; 4]) {
+    let args: Vec<&str> = stacks.iter().map(String::as_str).collect();
+    let o = env.lords(env.dir.path(), &[&["sync", "--repo", "r", "--apply"][..], &args].concat());
+    assert!(o.status.success(), "{}", text(&o));
 }
 
 fn repo_log(repo: &Path) -> PathBuf {
@@ -737,6 +747,7 @@ fn new_worktree_gets_its_place_file(env: &Env, repo: &Path, wts: &Path, name: &s
 fn the_post_checkout_install_goes_through_a_local_dispatcher_that_forwards() {
     let env = Env::new();
     let (repo, wts, stacks) = post_checkout_repo(&env);
+    managed(&env, &stacks);
     let guard = real_dispatcher(&env.dir.path().join("guard"));
     let guard_path = guard.to_str().unwrap();
     env.git(&repo, &["config", "core.hooksPath", guard_path]);
@@ -769,6 +780,7 @@ fn the_post_checkout_install_goes_through_a_local_dispatcher_that_forwards() {
 fn the_post_checkout_install_goes_through_a_global_dispatcher_and_a_previous_hooks_path() {
     let env = Env::new();
     let (repo, wts, stacks) = post_checkout_repo(&env);
+    managed(&env, &stacks);
     let guard = real_dispatcher(&env.dir.path().join("guard"));
     env.git(&repo, &["config", "--global", "core.hooksPath", guard.to_str().unwrap()]);
     let o = install_post_checkout(&env, &repo, &stacks);
@@ -1032,6 +1044,7 @@ fn owners_note(repo: &Path) {
 fn a_hooks_dir_that_isnt_reached_gets_a_config_hook_instead() {
     let env = Env::new();
     let (repo, wts, stacks) = post_checkout_repo(&env);
+    managed(&env, &stacks);
     fs::create_dir_all(repo.join(".githooks")).unwrap();
     fs::write(repo.join(".githooks/pre-commit"), "#!/bin/sh\nexit 0\n").unwrap();
     env.git(&repo, &["add", "-A"]);

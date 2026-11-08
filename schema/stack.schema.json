@@ -128,6 +128,22 @@
       },
       "additionalProperties": false
     },
+    "delivery": {
+      "type": "object",
+      "description": "how a delivery runs (a store commit's, a new worktree's, `lords deliver`), and how long every sync that applies waits for another",
+      "properties": {
+        "on_commit": { "type": "array", "items": { "enum": ["public", "private"] }, "default": ["public", "private"], "description": "which stores' commits start a delivery through their post-commit hook; [] switches the trigger off" },
+        "lock_wait_secs": { "type": "integer", "minimum": 0, "default": 120, "description": "how long a delivery, or any sync that applies, waits for a running one; also the longest a swap is tried again while a reader blocks it" },
+        "attempts": { "type": "integer", "minimum": 1, "default": 3, "description": "plans and applies in all, when one ends with the ledger changed under it or its new worktree not ready" },
+        "retry_pause_secs": { "type": "integer", "minimum": 0, "default": 2, "description": "the pause before another attempt for a new worktree that isn't ready" },
+        "deadline_secs": { "type": "integer", "minimum": 1, "default": 600, "description": "from a delivery's start: no attempt, plan or place starts past it" },
+        "store_git_secs": { "type": "integer", "minimum": 1, "default": 30, "description": "how long one git read of a store may take before it is stopped" },
+        "state_lock_secs": { "type": "integer", "minimum": 0, "default": 10, "description": "how long a delivery waits for the state file's lock, and tries the state file's rename while a reader blocks it" },
+        "store_work": { "type": "boolean", "default": true, "description": "whether a whole delivery first imports memory and retires ended entries, each as its own store commit, which starts no delivery" },
+        "state": { "type": "string", "default": "state/delivery.json", "description": "the delivery's state file, relative to the tool home, in plain parts" }
+      },
+      "additionalProperties": false
+    },
     "child_role": { "type": "string", "description": "the role a native subagent (one a session starts itself) starts as: each place's `.lords/child.md` carries that role's lines its place's file doesn't, which the `child` guard gives it" },
     "require_core": { "type": "boolean", "default": false, "description": "`check` refuses an entry of this stack that has neither a core line nor `start: detail` (intent, memory and in-repo skills need none)" }
   },

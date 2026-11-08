@@ -402,6 +402,8 @@ fn import_stores(
         }
         let defaults = dest.join(DEFAULTS);
         let mut wrote_defaults = false;
+        // Each file this import writes, the hash of what it wrote, and whether git held one there before (`put_back`).
+        let mut written: Vec<(PathBuf, Vec<u8>, bool)> = Vec::new();
         if write && !defaults.exists() {
             let audience =
                 if s.audience.is_empty() { "all".to_string() } else { s.audience.join(", ") };
@@ -411,6 +413,7 @@ fn import_stores(
             );
             git_keeps(&defaults)?;
             stack_write(&private.root, &defaults, text.as_bytes())?;
+            written.push((defaults.clone(), text.as_bytes().to_vec(), false));
             wrote_defaults = true;
         }
         let mut rep =
@@ -439,6 +442,7 @@ fn import_stores(
                     if write {
                         git_keeps(&target)?;
                         stack_write(&private.root, &target, incoming.as_bytes())?;
+                        written.push((target.clone(), incoming.as_bytes().to_vec(), false));
                     }
                     rep.added.push(name);
                 }
@@ -450,6 +454,7 @@ fn import_stores(
                         if write {
                             git_keeps(&target)?;
                             stack_write(&private.root, &target, merged.as_bytes())?;
+                            written.push((target.clone(), merged.as_bytes().to_vec(), true));
                         }
                         rep.changed.push(name);
                     }
@@ -469,12 +474,67 @@ fn import_stores(
                 rep.added.len(),
                 rep.changed.len()
             );
-            rep.commit = git::commit(&private.root, &[rel(&private.root, &dest)], &msg)?;
+            match git::commit(&private.root, &[rel(&private.root, &dest)], &msg) {
+                Ok(c) => rep.commit = c,
+                Err(e) => {
+                    // A refused commit takes its files back (D6), so the store is as it was and nothing waits on it
+                    // (F8, design note C7: a delivery imports with no one looking).
+                    let back = put_back(&private.root, &dest, &written);
+                    return Err(format!(
+                        "store `{}`: its import's commit failed ({e}); {back}",
+                        s.name
+                    ));
+                }
+            }
         }
         rep.wrote |= write && (!rep.added.is_empty() || !rep.changed.is_empty());
         reports.push(rep);
     }
     Ok(reports)
+}
+
+/// One store's import after its commit failed (D6): its paths unstaged, then each file it wrote that still holds what
+/// it wrote back as HEAD has it (git held it unmodified before, `git_keeps`), or gone where it was new; a file edited
+/// since stays as it is, and is named (sol-loop r1 S1). Each is compared and swapped in one step (`fsguard`'s
+/// compare-and-swap), so a save that lands meanwhile is never lost (r2 S1). What became of them, in words.
+fn put_back(root: &Path, dest: &Path, written: &[(PathBuf, Vec<u8>, bool)]) -> String {
+    let mut kept = Vec::new();
+    let done = (|| -> Result<(), String> {
+        let arg = |p: &Path| rel(root, p).to_string_lossy().replace('\\', "/");
+        git::run(root, &["reset", "-q", "--", &arg(dest)])?;
+        for (p, wrote, tracked) in written {
+            let place = stack_place(root, p)?;
+            let back = match tracked {
+                // HEAD's version as a checkout writes it (its filters applied), in place of exactly what was written.
+                true => git::bytes(root, &["cat-file", "--filters", &format!("HEAD:./{}", arg(p))])
+                    .and_then(|head| fsguard::replace_file_if(&place, wrote, &head)),
+                false => fsguard::move_aside(&place).and_then(|aside| {
+                    match fsguard::read(aside.path()) {
+                        Ok(Some(b)) if b == *wrote => aside.delete(),
+                        _ => Err(aside.back_after("changed since the import wrote it".into())),
+                    }
+                }),
+            };
+            if let Err(e) = back {
+                kept.push(format!("{} ({e})", p.display()));
+            }
+        }
+        Ok(())
+    })();
+    let kept = match kept.is_empty() {
+        true => String::new(),
+        false => format!(
+            ", but for {}, changed since the import wrote it and left as it is",
+            kept.join(", ")
+        ),
+    };
+    match done {
+        Ok(()) => format!("its files are back as they were{kept}"),
+        Err(e) => format!(
+            "its files couldn't all be put back ({e}){kept}; `git status` in {} shows what is left",
+            root.display()
+        ),
+    }
 }
 
 // ---------------------------------------------------------------- promote

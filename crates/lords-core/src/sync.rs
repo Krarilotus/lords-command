@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 mod place_uninstall;
+mod places;
 mod safety;
 mod target_uninstall;
 
@@ -202,6 +203,9 @@ pub(crate) enum ConflictKind {
     /// Every other conflict: a place that is missing or can't be read, a path that isn't the tool's, a config clash.
     #[default]
     Other,
+    /// The one place a plan was asked for (`Options::place`) isn't a checkout or worktree of its repo yet: a new
+    /// worktree still being made (F8, D22).
+    NotReady,
 }
 
 /// Where an item acts, as fsguard's changes take it.
@@ -348,10 +352,27 @@ pub struct Plan {
     /// What `Stage::SafeOnly` left out; `None` for any other stage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub held: Option<Held>,
+    /// How long an apply of this plan waits for the apply lock, and for a reader that blocks one of its swaps
+    /// (`[delivery] lock_wait_secs`).
+    #[serde(skip)]
+    pub lock_wait: LockWait,
+    /// Each declared repo's post-checkout hook, as this build writes it (F8, C3): what `sync --apply` installs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<crate::hooks::RepoHook>,
     /// The declared repos and workspaces this plan's scope doesn't cover (`repo app`, `workspace notes`): what
     /// `--user` or `--repo` leaves out, so "in sync" is never read as every place (gap 4b, S6).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub out_of_scope: Vec<String>,
+}
+
+/// `Plan::lock_wait`: the stacks' `[delivery] lock_wait_secs`, or its default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LockWait(pub std::time::Duration);
+
+impl Default for LockWait {
+    fn default() -> LockWait {
+        LockWait(stack::Delivery::default().lock_wait())
+    }
 }
 
 /// What applying a plan releases besides its installs and updates: paths it removes, and ledger records it forgets
@@ -545,6 +566,9 @@ pub struct Options {
     /// The Codex an apply that writes Codex's hooks asks to trust Lords' own and reads trust back from (design note
     /// 2026-11-02-lords-codex-trust); none by default, and then every hook of that file is named as not known trusted.
     pub codex: crate::codex_trust::Codex,
+    /// With `place`: it is a worktree `git worktree add` just made (its post-checkout hook), so a safe-only plan counts
+    /// it as a place Lords manages, and its creates are safe (F8, D-4).
+    pub new_worktree: bool,
 }
 
 /// `~/.lords-command`, the tool's own dir on this machine.
@@ -2110,6 +2134,17 @@ pub(crate) fn checkouts(repo: &stack::Repo) -> Result<Checkouts, String> {
     }
     Ok((out, skipped, stale))
 }
+/// Whether `dir` lies under one of the repo's `worktree_roots` (every dir does where it names none), as `checkouts`
+/// decides it for a worktree git lists.
+fn under_roots(repo: &stack::Repo, dir: &Path) -> bool {
+    let d = norm(dir);
+    repo.worktree_roots.is_empty()
+        || repo
+            .worktree_roots
+            .iter()
+            .map(|r| norm(&expand_home(r)))
+            .any(|r| d == r || d.starts_with(&format!("{}/", r.trim_end_matches('/'))))
+}
 
 /// How far a `--repo` selector reaches (gap 4b, design note 2026-11-08-lords-gap4b-selectors S5): `uninstall` takes
 /// a key only, in any case, since a path there could name one worktree yet remove the whole repo's copies.
@@ -2253,6 +2288,7 @@ fn left_out(manifest: &stack::Manifest, opts: &Options) -> Vec<String> {
             .collect(),
     }
 }
+
 /// Where sync writes a place's files: a repo (its checkouts and worktrees) or a workspace (one dir, no git).
 struct Place<'a> {
     label: String,
@@ -2769,10 +2805,23 @@ fn repo_items(
     if let Some(one) = only_path {
         paths.retain(|p| same_place(p.path(), one));
         if paths.is_empty() {
-            pl.plan.notes.push(format!(
-                "repo {name}: {} is none of its checkouts or worktrees under worktree_roots",
-                display(one)
-            ));
+            // Skipped on purpose: a worktree git lists outside the repo's worktree roots, or a dir outside them.
+            if skipped.iter().any(|s| same_place(s, one)) || !under_roots(repo, one) {
+                pl.plan.notes.push(format!(
+                    "repo {name}: {} is none of its checkouts or worktrees under worktree_roots",
+                    display(one)
+                ));
+                return;
+            }
+            // Under its roots, but no checkout or worktree git lists yet: a new worktree still being made (F8, D22).
+            let mut item = conflict(
+                &format!("repo {name}"),
+                one,
+                "not a checkout or worktree of this repo yet (a new worktree still being made?)",
+            );
+            item.conflict = ConflictKind::NotReady;
+            item.places = vec![PlaceId::Dir(one.to_path_buf())];
+            pl.plan.items.push(item);
             return;
         }
     }
@@ -2834,15 +2883,18 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
     }
     // One place's uninstall has its own planner: nothing is wanted there, and the ledger alone decides (PI-13).
     // Their items are typed too, as the last step (D13); an uninstall creates nothing, so no place is new to it.
+    let lock_wait = LockWait(stacks.delivery().lock_wait());
     if opts.uninstall && opts.place.is_some() {
         let mut p = place_uninstall::plan(stacks, private, opts)?;
         safety::classify(&mut p, &BTreeSet::new(), &[]);
+        p.lock_wait = lock_wait;
         return Ok(p);
     }
     // One dropped target's uninstall too: the stack no longer says where it was (D21).
     if opts.uninstall && opts.target.is_some() {
         let mut p = target_uninstall::plan(stacks, private, opts)?;
         safety::classify(&mut p, &BTreeSet::new(), &[]);
+        p.lock_wait = lock_wait;
         return Ok(p);
     }
     let ledger = Ledger::load(&opts.home)?;
@@ -2853,6 +2905,7 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
             home: opts.home.clone(),
             ledger_revision: ledger.revision(),
             codex: opts.codex.clone(),
+            lock_wait,
             out_of_scope: left_out(&private.manifest, opts),
             ..Plan::default()
         },
@@ -3047,12 +3100,61 @@ pub fn plan(stacks: &Stacks, opts: &Options) -> Result<Plan, String> {
         )),
     }
     pl.plan.complete = complete;
+    // Each declared repo's post-checkout hook, as this build writes it (F8, C3): `sync --apply` installs what isn't.
+    if !opts.uninstall && !opts.user_only && opts.place.is_none() {
+        pl.plan.hooks = repo_hooks(stacks, private, opts, &pl.ledger);
+    }
+    // A new worktree, from its post-checkout hook, is a place Lords manages for its own plan (F8, D-4).
+    let mut managed = safety::managed(&pl.ledger);
+    if let (true, Some(one), Some(repo)) = (opts.new_worktree, &opts.place, &opts.repo) {
+        if let Some(Ok((roots, _, _))) = pl.checkouts.get(repo) {
+            managed.extend(
+                roots.iter().filter(|r| same_place(r.path(), one)).map(|r| ledger::key(r.path())),
+            );
+        }
+    }
     // The planner's last step, after every change to an item's action (D13): nothing types it again.
-    safety::classify(&mut pl.plan, &safety::managed(&pl.ledger), &stacks.safe_only().applies);
+    safety::classify(&mut pl.plan, &managed, &stacks.safe_only().applies);
     if opts.stage == Stage::SafeOnly {
         safety::safe_only(&mut pl.plan);
     }
     Ok(pl.plan)
+}
+
+/// The post-checkout hook of each declared repo in scope that has worktrees and a checkout (F8, C3), as
+/// `hooks::post_checkout_state` finds it against what sync writes there: the guard copy (D-3) running `deliver` with
+/// these stacks into this home. Read only. A checkout git can't read is left out: the plan's own conflict for it says
+/// why.
+fn repo_hooks(
+    stacks: &Stacks,
+    private: &Stack,
+    opts: &Options,
+    ledger: &Ledger,
+) -> Vec<crate::hooks::RepoHook> {
+    let Ok(exe) = guard_place(&opts.home) else { return Vec::new() };
+    let mut hooks = Vec::new();
+    for (name, repo) in &private.manifest.repos {
+        if opts.repo.as_deref().is_some_and(|r| r != name) || !repo.worktrees {
+            continue;
+        }
+        // One hook per git common dir its declared checkouts have: every independent clone's worktrees get it (sol-loop
+        // r1 S6).
+        let mut seen = BTreeSet::new();
+        for checkout in repo.checkouts.iter().map(|c| expand_home(c)) {
+            let Ok(common) = crate::hooks::common_dir(&checkout) else { continue };
+            if !seen.insert(ledger::key(&common)) {
+                continue;
+            }
+            let args = crate::hooks::sync_args(stacks, name);
+            let Ok(state) =
+                crate::hooks::post_checkout_state(&checkout, ledger, exe.path(), &args, &opts.home)
+            else {
+                continue;
+            };
+            hooks.push(crate::hooks::RepoHook { repo: name.clone(), checkout, state });
+        }
+    }
+    hooks
 }
 
 /// The install stage (design-simplification-r6, staged first use): of a plan, only tool-owned paths and each
@@ -3102,29 +3204,83 @@ fn staged(plan: &mut Plan) {
 /// installation), and the readers that must not see one mid-swap (the child guard): `apply.lock` in the tool's home,
 /// held by an OS lock that ends with its holder however it ends (`fsguard::Lock`; fix check r2, FC5), waited for up to
 /// `secs` seconds, the deadline checked before each attempt. Released when dropped.
-pub(crate) struct ApplyLock(#[allow(dead_code)] fsguard::Lock);
+pub struct ApplyLock(#[allow(dead_code)] fsguard::Lock);
 
 impl ApplyLock {
     pub(crate) fn take(home: &Path, secs: u64) -> Result<ApplyLock, String> {
+        match ApplyLock::wait(home, std::time::Duration::from_secs(secs))? {
+            Ok(lock) => Ok(lock),
+            Err(busy) => Err(busy),
+        }
+    }
+
+    /// The lock, waiting at most `wait` for another holder (F8, C5); `Ok(Err(why))` when that holder keeps it past
+    /// then, naming it; `Err` when the lock can't be tried at all.
+    pub fn wait(
+        home: &Path,
+        wait: std::time::Duration,
+    ) -> Result<Result<ApplyLock, String>, String> {
         let root = Root::home(home)?;
         root.create()?;
         let lock = root.join(&[Part::new("apply.lock")?]);
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        let until = std::time::Instant::now() + wait;
         let step = std::time::Duration::from_millis(200);
         loop {
             match fsguard::try_lock(&lock, &format!("pid {}", crate::process::id()))? {
-                fsguard::TryLock::Held(l) => return Ok(ApplyLock(l)),
+                fsguard::TryLock::Held(l) => return Ok(Ok(ApplyLock(l))),
                 fsguard::TryLock::Busy(_) if std::time::Instant::now() + step < until => {
                     std::thread::sleep(step);
                 }
                 fsguard::TryLock::Busy(holder) => {
-                    return Err(format!(
+                    return Ok(Err(format!(
                         "another apply holds {} ({holder}); this build's lock ends with its holder, so one in an earlier build's form (\"pid N\") is that build's: if none is running, delete that file",
                         lock.path().display(),
-                    ))
+                    )))
                 }
             }
         }
+    }
+}
+
+/// Where a safe-only apply is (F8): for tests that must reach a point between two of its changes without timing, as
+/// an owner's edit, a reader or a kill would.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// A delivery's plan is made, under the lock it applies with; nothing is written yet.
+    Planned,
+    /// Every item of one place is checked and its new version staged beside it; nothing at its paths has changed.
+    Staged,
+    /// One item of the place is in, and its ledger record saved.
+    Swapped,
+    /// A path a stopped transaction recorded was found to hold its recorded hash, and is about to be removed; the path
+    /// given is that path (F8 sol-loop r1, S1).
+    Compared,
+    /// A staged version is about to be made at the path given, its fresh name beside a place's path (sol-loop r1, S2).
+    Creating,
+}
+
+/// Why `apply_held` changed nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// The ledger changed since the plan (a writer outside the lock): plan again (F8, D22).
+    LedgerChanged,
+    Other(String),
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::LedgerChanged => f.write_str(
+                "the ledger changed since the plan (another sync?); plan again (nothing was changed)",
+            ),
+            Refused::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<String> for Refused {
+    fn from(e: String) -> Refused {
+        Refused::Other(e)
     }
 }
 
@@ -3220,6 +3376,8 @@ pub struct Applied {
     pub done: Vec<String>,
     pub backups: Option<PathBuf>,
     pub codex: Vec<String>,
+    /// A safe-only apply's places whose check or write failed: each put back whole and held, with why (F8, C4).
+    pub held: Vec<HeldPlace>,
 }
 
 fn stale(item: &Item, what: &str) -> String {
@@ -3435,9 +3593,44 @@ pub fn apply(plan: &Plan) -> Result<Applied, String> {
 pub fn apply_between(plan: &Plan, mut installed: impl FnMut(&Path)) -> Result<Applied, String> {
     // The refusal rules a dry run reports too (`Plan::applies`).
     plan.applies().map_err(|e| format!("{e} (nothing was changed)"))?;
+    if !plan.items.iter().any(|i| i.changes() && i.action != Action::RetireEntry) {
+        return Ok(Applied::default());
+    }
+    // One lock over everything this apply changes, waited for as the stacks set (F8, C5); every check first, then the
+    // changes (rm-guard review r1, R7). Apply never writes the guard copy (`lords guard install` does).
+    let lock = ApplyLock::wait(&plan.home, plan.lock_wait.0)??;
+    applied_under(plan, &lock, &mut installed, &mut |_, _| {}).map_err(|e| e.to_string())
+}
+
+/// `apply` under a lock the caller holds since before it planned (F8, C5): so no other writer can have changed what the
+/// plan read. A safe-only plan is written place by place, each whole or not at all (`places`).
+pub fn apply_held(plan: &Plan, lock: &ApplyLock) -> Result<Applied, Refused> {
+    apply_held_between(plan, lock, &mut |_, _| {})
+}
+
+/// `apply_held`, calling `between` at each `Step` with the place it concerns.
+#[doc(hidden)]
+pub fn apply_held_between(
+    plan: &Plan,
+    lock: &ApplyLock,
+    between: &mut dyn FnMut(Step, &Path),
+) -> Result<Applied, Refused> {
+    applied_under(plan, lock, &mut |_| {}, between)
+}
+
+/// `apply`'s checks and changes, under the apply lock `_lock`.
+fn applied_under(
+    plan: &Plan,
+    _lock: &ApplyLock,
+    installed: &mut dyn FnMut(&Path),
+    between: &mut dyn FnMut(Step, &Path),
+) -> Result<Applied, Refused> {
+    plan.applies().map_err(|e| format!("{e} (nothing was changed)"))?;
     let changing: Vec<&Item> =
         plan.items.iter().filter(|i| i.changes() && i.action != Action::RetireEntry).collect();
-    if changing.is_empty() {
+    // A safe-only plan goes on with nothing to change too: its apply clears and reports what stopped runs left beside
+    // its paths (F8 review r1, R1-03).
+    if changing.is_empty() && plan.held.is_none() {
         return Ok(Applied::default());
     }
     // The place an item acts on is the one the plan built for its path: an item altered since doesn't apply.
@@ -3448,21 +3641,19 @@ pub fn apply_between(plan: &Plan, mut installed: impl FnMut(&Path)) -> Result<Ap
             Dest::None => None,
         };
         if at.is_some_and(|a| ledger::key(a) != ledger::key(&i.path)) {
-            return Err(format!(
+            return Err(Refused::Other(format!(
                 "{}: not the place the plan built for it; plan again (nothing was changed)",
                 i.path.display()
-            ));
+            )));
         }
     }
-    // One lock over everything this apply changes; every check first, then the changes (rm-guard review r1, R7). Apply
-    // never writes the guard copy (`lords guard install` does).
-    let _lock = ApplyLock::take(&plan.home, 60)?;
     let mut ledger = Ledger::load(&plan.home)?;
     if ledger.revision() != plan.ledger_revision {
-        return Err(
-            "the ledger changed since the plan (another sync?); plan again (nothing was changed)"
-                .into(),
-        );
+        return Err(Refused::LedgerChanged);
+    }
+    // A safe-only plan (D13) is written place by place, each place checked and put back whole on its own (F8, C4).
+    if plan.held.is_some() {
+        return places::apply(plan, &mut ledger, between).map_err(Refused::Other);
     }
     // The ledger covers only tool-owned paths; a plan is current only if its tool destinations and the owner files it
     // changes are as it saw them too (rm-guard fix checks r2, r3, R7). Checked here, under the lock, before anything
@@ -3473,10 +3664,10 @@ pub fn apply_between(plan: &Plan, mut installed: impl FnMut(&Path)) -> Result<Ap
     for i in changing.iter().filter(|i| i.class == Class::Owner) {
         let now = fsguard::read_text(&i.path)?.map(|t| fsguard::sha(t.as_bytes()));
         if now != i.have {
-            return Err(format!(
+            return Err(Refused::Other(format!(
                 "{} changed since the plan (another sync?); plan again (nothing was changed)",
                 i.path.display()
-            ));
+            )));
         }
     }
     for i in &changing {
@@ -3497,15 +3688,8 @@ pub fn apply_between(plan: &Plan, mut installed: impl FnMut(&Path)) -> Result<Ap
     let mut run = Run::new(&plan.home)?;
     let mut applied = Applied::default();
     let mut wrote = Vec::new();
-    let result = apply_items(
-        &changing,
-        plan,
-        &mut run,
-        &mut ledger,
-        &mut applied,
-        &mut wrote,
-        &mut installed,
-    );
+    let result =
+        apply_items(&changing, plan, &mut run, &mut ledger, &mut applied, &mut wrote, installed);
     // Codex's trust for each of its hooks files written, whatever came after it (design note
     // 2026-11-02-lords-codex-trust, I1).
     for item in wrote {
@@ -3521,14 +3705,15 @@ pub fn apply_between(plan: &Plan, mut installed: impl FnMut(&Path)) -> Result<Ap
         applied.codex.extend(lines);
     }
     applied.backups = run.dir.as_ref().map(|d| d.path().to_path_buf());
-    match result {
+    let applied = match result {
         Err(e) if !applied.codex.is_empty() => Err(format!(
             "{e}; and {} Codex hook(s) not trusted: {}",
             applied.codex.len(),
             applied.codex.join("; ")
         )),
         r => r.map(|()| applied),
-    }
+    };
+    applied.map_err(Refused::Other)
 }
 
 /// `apply`'s changes, item by item; `wrote` gets each Codex hooks file written.
@@ -4047,6 +4232,10 @@ pub fn import_and_apply_between(
     between: impl FnOnce(),
 ) -> Result<Applied, String> {
     let stacks = Stacks::load(public, private)?;
+    let settings = stacks.delivery();
+    // One writer from the first plan to the last change (F8, C5; D23): a plan that will be applied is never made beside
+    // another writer's half-done apply, and a delivery its own store commits start waits for this one.
+    let lock = ApplyLock::wait(&opts.home, settings.lock_wait())??;
     let first = plan(&stacks, opts)?;
     if let Some(c) = first.items.iter().find(|i| i.action == Action::Conflict) {
         return Err(format!(
@@ -4059,7 +4248,6 @@ pub fn import_and_apply_between(
     let mut done = Vec::new();
     // The install stage imports and retires nothing.
     if opts.stage == Stage::Full {
-        let _lock = ApplyLock::take(&opts.home, 60)?;
         if let Some(p) = &stacks.private {
             if !p.manifest.memory_stores.is_empty() {
                 for r in crate::ops::import(p, None, true)? {
@@ -4078,14 +4266,72 @@ pub fn import_and_apply_between(
             ));
         }
     }
-    // A fresh plan, always: what a plan read reaches beyond the stacks (a tracked `AGENTS.md`, the git index), and any
-    // of it can change while this waited for the lock; apply checks only each item's destination and the ledger
-    // (sync perf review r1, R2). Planning is about 30 s on the real stacks since this branch.
-    let last = plan(&Stacks::load(public, private)?, opts)?;
-    let mut applied = apply(&last)?;
+    // A fresh plan, always, under the same lock: what a plan read reaches beyond the stacks (a tracked `AGENTS.md`, the
+    // git index), and any of it can change after the first plan; apply checks only each item's destination and the
+    // ledger (sync perf review r1, R2).
+    let stacks = Stacks::load(public, private)?;
+    let last = plan(&stacks, opts)?;
+    let mut applied = apply_held(&last, &lock).map_err(|e| e.to_string())?;
     done.append(&mut applied.done);
+    // Each declared repo's post-checkout hook, from the guard copy (F8, C3, D-3); then what this resolved leaves the
+    // delivery's state (D5). Neither changes what was applied.
+    let hooks = match opts.stage {
+        Stage::Full => repo_hooks_in(&last, &stacks, &opts.home, &lock),
+        _ => Vec::new(),
+    };
+    for (h, r) in &hooks {
+        let what = crate::deliver::hook_what(h);
+        done.push(match r {
+            Ok(line) => format!("{what}: {line}"),
+            Err(why) => format!("{what}: not installed: {why}"),
+        });
+    }
+    if opts.stage == Stage::Full {
+        if let Err(e) = crate::deliver::settle_by_hand(&opts.home, &settings, &last, &hooks, true) {
+            done.push(format!("the delivery state couldn't be updated: {e}"));
+        }
+    }
     applied.done = done;
     Ok(applied)
+}
+
+/// `sync --apply`'s repo hooks (F8, C3): each the plan found missing or in an earlier form is installed from the guard
+/// copy, while the copy answers `deliver`'s protocol, under the caller's lock: one line each, or why not.
+fn repo_hooks_in(
+    plan: &Plan,
+    stacks: &Stacks,
+    home: &Path,
+    lock: &ApplyLock,
+) -> Vec<(crate::hooks::RepoHook, Result<String, String>)> {
+    use crate::hooks::HookState;
+    let todo: Vec<&crate::hooks::RepoHook> = plan
+        .hooks
+        .iter()
+        .filter(|h| matches!(h.state, HookState::Missing | HookState::Outdated))
+        .collect();
+    if todo.is_empty() {
+        return Vec::new();
+    }
+    let copy = guard_place(home).and_then(|c| {
+        match crate::process::deliver_protocol(c.path()) {
+            Ok(Some(n)) if n == crate::deliver::PROTOCOL => Ok(c),
+            Ok(_) => Err(format!(
+                "the guard copy doesn't run `deliver` (protocol {}): run `lords guard install`, then sync again",
+                crate::deliver::PROTOCOL
+            )),
+            Err(e) => Err(format!("{e}: run `lords guard install`, then sync again")),
+        }
+    });
+    todo.into_iter()
+        .map(|h| {
+            let r = copy.clone().and_then(|c| {
+                let args = crate::hooks::sync_args(stacks, &h.repo);
+                crate::hooks::install_post_checkout_held(&h.checkout, c.path(), &args, home, lock)
+                    .map(|i| format!("installed in {}", i.hook.display()))
+            });
+            (h.clone(), r)
+        })
+        .collect()
 }
 
 /// Whether every line of `tracked` appears in `file`, in order (other lines may come between).

@@ -88,8 +88,50 @@ pub fn paths(stacks: &Stacks, ask: &Ask) -> Vec<Row> {
             Err(why) => row(false, path, why),
         });
     }
-    rows.extend(role_rows(stacks, &ask.home));
+    // Where delivery is set up, what it held or failed (F8, C6; K5; §15 M5).
+    let delivery = crate::deliver::status(stacks, &ask.home);
+    rows.extend(role_rows(stacks, &ask.home, &delivery));
+    rows.extend(delivery_rows(&delivery));
     rows
+}
+
+fn stale(path: String, why: String) -> Row {
+    Row { state: "stale", path, why, in_use: true }
+}
+
+/// One `stale` row when every place is (the last whole delivery failed, none ran, its state is missing, or a store's
+/// committed stack moved past it), and one per held place, item of no place, repo hook and piece of store work, each
+/// with what resolves it. `stale` is never `complete`. Where delivery was never set up, nothing is judged.
+fn delivery_rows(d: &crate::deliver::Status) -> Vec<Row> {
+    let crate::deliver::Status::Read(s, every) = d else { return Vec::new() };
+    let mut rows = Vec::new();
+    if let Some(why) = every {
+        rows.push(stale("delivery, every place".into(), why.clone()));
+    }
+    for p in &s.places {
+        let why = format!("{}; resolve with `{}`", reasons(p), p.command);
+        rows.push(stale(format!("delivery, {}", p.place), why));
+    }
+    for i in &s.everything {
+        rows.push(stale(
+            "delivery, every place".into(),
+            format!("{} {}: {}", i.reason, i.path, i.note),
+        ));
+    }
+    for n in s.hooks.iter().chain(&s.store_work) {
+        let why = format!("{}; resolve with `{}`", n.why, n.command);
+        rows.push(stale(format!("delivery, {}", n.what), why));
+    }
+    rows
+}
+
+/// A held place's items, as `reason path: note`.
+fn reasons(p: &crate::deliver::StatePlace) -> String {
+    let one = |i: &crate::deliver::StateItem| {
+        let note = if i.note.is_empty() { String::new() } else { format!(": {}", i.note) };
+        format!("{} {}{note}", i.reason, i.path)
+    };
+    p.items.iter().map(one).collect::<Vec<_>>().join("; ")
 }
 
 /// The live sessions' cwds (`guard::live_session_cwds`), each resolved (`resolved`), so an alias names its place
@@ -198,8 +240,11 @@ fn codex_trusts(ask: &Ask, file: &Path, lords: &[trust::Lords]) -> Result<String
 /// where the role guard couldn't give the role's start, decided by the guard's own `guard::deliverable` (F10-FC1-02:
 /// the installed start and that harness's place file, never a recomposition); or one complete row. The checkouts and
 /// worktrees are sync's own (`sync::checkouts`, sol-loop r2 S1); a repo whose can't be listed is a row of its own,
-/// incomplete. `home`: the tool home, whose session records mark places in use.
-fn role_rows(stacks: &Stacks, home: &Path) -> Vec<Row> {
+/// incomplete. `home`: the tool home, whose session records mark places in use. Where delivery is set up (`delivery`),
+/// a place it held is a `stale` row for every role there, and every role gets one when every place is stale, an item
+/// of no place is held, or a held place lies in no place dir (a target): the complete row comes only when a role has no
+/// other row (F8 review r1, F8-R1-02).
+fn role_rows(stacks: &Stacks, home: &Path, delivery: &crate::deliver::Status) -> Vec<Row> {
     use crate::fsguard::InDir;
     let Some(private) = &stacks.private else { return Vec::new() };
     let mut rows = Vec::new();
@@ -261,6 +306,33 @@ fn role_rows(stacks: &Stacks, home: &Path) -> Vec<Row> {
                         in_use: *in_use,
                         ..row(false, path, format!("{why}: sync the place"))
                     });
+                }
+            }
+        }
+        if let crate::deliver::Status::Read(s, every) = delivery {
+            let all = format!("T3-delegated as {role}");
+            if let Some(why) = every {
+                refused.push(stale(all.clone(), why.clone()));
+            }
+            for i in &s.everything {
+                refused
+                    .push(stale(all.clone(), format!("held everywhere: {} {}", i.reason, i.path)));
+            }
+            for p in &s.places {
+                let why =
+                    format!("{} is held: {}; resolve with `{}`", p.place, reasons(p), p.command);
+                let key = crate::deliver::place_key(&p.place);
+                let mut any = false;
+                for (label, dir, _, in_use) in &dirs {
+                    let d = crate::ledger::key(dir);
+                    if key == d || key.starts_with(&format!("{d}/")) {
+                        let r = stale(format!("{all}, {label}"), why.clone());
+                        refused.push(Row { in_use: *in_use, ..r });
+                        any = true;
+                    }
+                }
+                if !any {
+                    refused.push(stale(all.clone(), why));
                 }
             }
         }

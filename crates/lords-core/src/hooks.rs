@@ -18,8 +18,30 @@ pub mod config;
 pub const MARKER: &str = "# lords-command: privacy check";
 
 /// The hooks the tool installs: the only names a `hooks:` ledger record may have.
-pub const NAMES: [&str; 5] =
-    ["pre-commit", "pre-merge-commit", "commit-msg", "pre-push", "post-checkout"];
+pub const NAMES: [&str; 6] =
+    ["pre-commit", "pre-merge-commit", "commit-msg", "pre-push", "post-checkout", "post-commit"];
+
+/// A declared repo's post-checkout hook, as a plan finds it (F8, C3): what `sync --apply` installs or replaces.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RepoHook {
+    pub repo: String,
+    /// The checkout it is installed from: the repo's first declared one.
+    pub checkout: PathBuf,
+    pub state: HookState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", content = "why", rename_all = "kebab-case")]
+pub enum HookState {
+    /// Lords' hook, as this build writes it.
+    Current,
+    /// None recorded: `sync --apply` installs it.
+    Missing,
+    /// Lords' hook, unchanged since it was written, in another form than this build's: `sync --apply` replaces it.
+    Outdated,
+    /// Recorded, but changed since Lords wrote it, or it can't be read: never written, only named.
+    Changed(String),
+}
 
 /// The privacy hooks, which a commit or an automatic merge commit runs; `lords check` verifies each by its probe.
 pub const PRIVACY: [&str; 3] = ["pre-commit", "pre-merge-commit", "commit-msg"];
@@ -278,15 +300,29 @@ fn own_hooks_dir(repo: &Path) -> Result<Root, String> {
     Ok(dir)
 }
 
-/// Installs the privacy hooks (`PRIVACY`); `home` holds the ledger that records them and the probe's files. A hook
-/// there that isn't the tool's stops them all, unless `force`, which moves each one to a new `<name>.bak-<date>`
-/// first.
+/// Installs the privacy hooks (`PRIVACY`), and in a stack repo its pre-push and post-commit (`post_commit_script`, with
+/// no stacks of its own: its `lords` reads config.txt); `home` holds the ledger that records them and the probe's files.
+/// A hook there that isn't the tool's stops them all, unless `force`, which moves each one to a new
+/// `<name>.bak-<date>` first.
 pub fn install(
     repo: &Path,
     lords_exe: &Path,
     secrets_only: bool,
     force: bool,
     home: &Path,
+) -> Result<Vec<Installed>, String> {
+    let none = SyncArgs { repo: String::new(), public_stack: None, private_stack: None };
+    install_with(repo, lords_exe, secrets_only, force, home, &none)
+}
+
+/// `install`, with the stacks a stack repo's post-commit delivers from (`stacks`; its `repo` isn't read).
+pub fn install_with(
+    repo: &Path,
+    lords_exe: &Path,
+    secrets_only: bool,
+    force: bool,
+    home: &Path,
+    stacks: &SyncArgs,
 ) -> Result<Vec<Installed>, String> {
     let dir = hooks_dir(repo)?;
     let _lock = ApplyLock::take(home, 60)?;
@@ -302,6 +338,7 @@ pub fn install(
     ];
     if stack {
         hooks.push(("pre-push", pre_push_script(lords_exe, secrets_only, home)));
+        hooks.push(("post-commit", post_commit_script(lords_exe, home, stacks)));
     }
     let mut foreign = Vec::new();
     for (name, _) in &hooks {
@@ -344,6 +381,59 @@ pub fn install(
     Ok(installed)
 }
 
+// ---------------------------------------------------------------- post-commit
+
+pub const DELIVER_MARKER: &str = "# lords-command: delivery after a store commit";
+
+/// ` --public-stack '…' --private-stack '…'` for the stacks `args` names, or nothing.
+fn stack_flags(args: &SyncArgs) -> String {
+    let mut flags = String::new();
+    if let Some(p) = &args.public_stack {
+        flags.push_str(&format!(" --public-stack {}", quoted(p)));
+    }
+    if let Some(p) = &args.private_stack {
+        flags.push_str(&format!(" --private-stack {}", quoted(p)));
+    }
+    flags
+}
+
+/// A stack repo's post-commit hook (F8, design note C1): a commit to the store reaches every place with nobody running
+/// a command (`lords deliver --on-commit`, which delivers only for a store `[delivery] on_commit` lists, and only when
+/// the stores moved). It never fails or slows the commit: it acts only in the store's own checkout (a linked
+/// worktree's commit is no commit to the store), never for a delivery's own commit (`deliver::MARKER`), runs in the
+/// background, bounds nothing itself (the delivery bounds its waits), and only logs, to
+/// `<git common dir>/lords-post-commit.log`.
+fn post_commit_script(lords_exe: &Path, home: &Path, stacks: &SyncArgs) -> String {
+    format!(
+        r#"#!/bin/sh
+{DELIVER_MARKER} (installed by `lords hooks install`).
+# Never fails or slows a commit: only the store's own checkout, never a delivery's own commit, in the background, logged.
+[ -n "${{{marker}:-}}" ] && exit 0
+{{ read -r gitdir; read -r common; }} <<EOF
+$(git rev-parse --path-format=absolute --git-dir --git-common-dir 2>/dev/null)
+EOF
+[ -n "$common" ] && [ "$gitdir" = "$common" ] || exit 0
+exe={exe}
+log="$common/lords-post-commit.log"
+top="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ ! -f "$exe" ]; then
+  echo "$(date '+%F %T') $top: lords not found at $exe; nothing delivered" >>"$log" 2>/dev/null
+  exit 0
+fi
+(
+  echo "$(date '+%F %T') $top: lords deliver" >>"$log"
+  "$exe" deliver --on-commit "$top" --home {home}{stacks} >>"$log" 2>&1
+  echo "$(date '+%F %T') $top: lords deliver exit $?" >>"$log"
+) </dev/null >/dev/null 2>&1 &
+exit 0
+"#,
+        marker = crate::deliver::MARKER,
+        exe = quoted(lords_exe),
+        home = quoted(home),
+        stacks = stack_flags(stacks),
+    )
+}
+
 // ---------------------------------------------------------------- post-checkout
 
 pub const SYNC_MARKER: &str = "# lords-command: place files for a new worktree";
@@ -362,11 +452,13 @@ fn quoted(p: &Path) -> String {
     format!("'{}'", p.to_string_lossy().replace('\\', "/").replace('\'', "'\\''"))
 }
 
-/// A post-checkout hook that writes a new worktree's place files (orchestrator, 25 Oct). It never fails or slows
-/// the checkout: it acts only when the old HEAD is all zeros (`git worktree add`), runs sync in the background
-/// under a time limit, and only logs (to `<git common dir>/lords-post-checkout.log`); a hook that was here before
-/// runs first, and its exit status is the hook's (`chain`; a config hook has no such neighbour). It answers the install's
-/// probe first, with `label` (`probe_label`), and does nothing else then (`probe_lines`; D14, design note H5).
+/// A post-checkout hook that delivers a new worktree's place files (orchestrator, 25 Oct; F8, design note C3): it runs
+/// `lords deliver --new-worktree` for the worktree, the safe-only delivery of that one place, which bounds its own waits
+/// and records what it held. It never fails or slows the checkout: it acts only when the old HEAD is all zeros (`git
+/// worktree add`), runs in the background, and only logs (to `<git common dir>/lords-post-checkout.log`); a hook that
+/// was here before runs first, and its exit status is the hook's (`chain`; a config hook has no such neighbour). It
+/// answers the install's probe first, with `label` (`probe_label`), and does nothing else then (`probe_lines`; D14,
+/// design note H5).
 pub fn post_checkout_script(
     lords_exe: &Path,
     args: &SyncArgs,
@@ -380,17 +472,10 @@ pub fn post_checkout_script(
     } else {
         String::new()
     };
-    let mut stacks = String::new();
-    if let Some(p) = &args.public_stack {
-        stacks.push_str(&format!(" --public-stack {}", quoted(p)));
-    }
-    if let Some(p) = &args.private_stack {
-        stacks.push_str(&format!(" --private-stack {}", quoted(p)));
-    }
     format!(
         r#"#!/bin/sh
-{SYNC_MARKER} (installed by `lords hooks install --post-checkout`).
-# Never fails or slows a checkout: only a new worktree (old HEAD all zeros), in the background, time-boxed, logged.
+{SYNC_MARKER} (installed by `lords sync --apply` or `lords hooks install --post-checkout`).
+# Never fails or slows a checkout: only a new worktree (old HEAD all zeros), in the background, logged.
 {probe}status=0
 {chain}case "$1" in
   "" | *[!0]*) exit $status ;;
@@ -402,19 +487,98 @@ if [ ! -f "$exe" ]; then
   echo "$(date '+%F %T') $place: lords not found at $exe; no place files written" >>"$log" 2>/dev/null
   exit $status
 fi
-limit=""
-command -v timeout >/dev/null 2>&1 && limit="timeout 120"
 (
-  echo "$(date '+%F %T') $place: lords sync" >>"$log"
-  $limit "$exe" sync --repo {repo} --place "$place" --apply{stacks} >>"$log" 2>&1 \
-    || echo "$(date '+%F %T') $place: lords sync failed (exit $?)" >>"$log"
+  echo "$(date '+%F %T') $place: lords deliver" >>"$log"
+  "$exe" deliver --repo {repo} --place "$place" --new-worktree --home {home}{stacks} >>"$log" 2>&1
+  echo "$(date '+%F %T') $place: lords deliver exit $?" >>"$log"
 ) </dev/null >/dev/null 2>&1 &
 exit $status
 "#,
         exe = quoted(lords_exe),
         repo = quoted(Path::new(&args.repo)),
+        home = quoted(home),
+        stacks = stack_flags(args),
         probe = probe_lines(home, label),
     )
+}
+
+/// The probe label a Lords post-checkout script answers with (`probe_label`), read back from its text.
+fn label_in(script: &str) -> Option<String> {
+    let (_, rest) = script.split_once("lords-hook-probe:$probe:")?;
+    let label = rest.split('"').next()?;
+    label.starts_with("post-checkout-").then(|| label.to_string())
+}
+
+/// What sync writes into a declared repo's post-checkout (F8, C3, D-3): the guard copy delivers the new worktree,
+/// from the stacks sync ran with, into `home`.
+pub fn sync_args(stacks: &crate::stack::Stacks, repo: &str) -> SyncArgs {
+    SyncArgs {
+        repo: repo.to_string(),
+        public_stack: Some(stacks.public.root.clone()),
+        private_stack: stacks.private.as_ref().map(|p| p.root.clone()),
+    }
+}
+
+/// A checkout's git common dir, absolute: where its hooks and config are, shared by its worktrees.
+pub fn common_dir(checkout: &Path) -> Result<PathBuf, String> {
+    let common = git::run(checkout, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    Ok(PathBuf::from(common.trim()))
+}
+
+/// Where a declared repo's post-checkout hook stands against what this build writes there with `exe` and `args`
+/// (C3): read only. Lords' hook is found by its ledger record, in the hooks dir or as a config hook (D14b), and must
+/// still hold what the record says; its text, but for the probe label it was made with, is then this build's or not.
+/// One that can't be read is `Changed`, with why (sol-loop r1 S10). An error only where git can't tell the checkout's
+/// common dir: the checkout's own conflict in the plan then says why.
+pub fn post_checkout_state(
+    checkout: &Path,
+    ledger: &Ledger,
+    exe: &Path,
+    args: &SyncArgs,
+    home: &Path,
+) -> Result<HookState, String> {
+    let common = common_dir(checkout)?;
+    let found = (|| -> Result<HookState, String> {
+        let cfg = common.join("config");
+        if config::recorded(checkout, ledger)? {
+            let recorded = ledger.owned.get(&config::key(&cfg)).map(|o| o.sha.clone());
+            return Ok(match config::entries(&cfg)? {
+                Some(e) if Some(fsguard::sha(&e)) == recorded => {
+                    let have = config::command_of(&e);
+                    match label_in(&have) {
+                        Some(l) if have == config::command_for(exe, args, home, &l) => {
+                            HookState::Current
+                        }
+                        _ => HookState::Outdated,
+                    }
+                }
+                _ => HookState::Changed(format!(
+                    "{} in {} changed since Lords wrote it",
+                    config::SECTION,
+                    cfg.display()
+                )),
+            });
+        }
+        let hook = common.join("hooks").join("post-checkout");
+        let Some(o) = ledger.get(&hook) else { return Ok(HookState::Missing) };
+        Ok(match fsguard::read(&hook)? {
+            // Lords' own, gone: put in again, as where none was recorded.
+            None => HookState::Missing,
+            Some(b) if fsguard::sha(&b) == o.sha => {
+                let have = String::from_utf8_lossy(&b).into_owned();
+                match label_in(&have) {
+                    Some(l) if have == post_checkout_script(exe, args, home, &l, true) => {
+                        HookState::Current
+                    }
+                    _ => HookState::Outdated,
+                }
+            }
+            Some(_) => {
+                HookState::Changed(format!("{} changed since Lords wrote it", hook.display()))
+            }
+        })
+    })();
+    Ok(found.unwrap_or_else(|e| HookState::Changed(format!("can't be read ({e})"))))
 }
 
 /// What a post-checkout hook answers a probe with: its name and a token made for this install alone, so no other hook
@@ -438,6 +602,18 @@ pub fn install_post_checkout(
     args: &SyncArgs,
     home: &Path,
 ) -> Result<Installed, String> {
+    let lock = ApplyLock::take(home, 60)?;
+    install_post_checkout_held(repo, lords_exe, args, home, &lock)
+}
+
+/// `install_post_checkout` under the apply lock its caller holds (`sync --apply`, F8 C3).
+pub fn install_post_checkout_held(
+    repo: &Path,
+    lords_exe: &Path,
+    args: &SyncArgs,
+    home: &Path,
+    _lock: &ApplyLock,
+) -> Result<Installed, String> {
     let unseen = routing_includes(repo)?;
     if !unseen.is_empty() {
         return Err(format!(
@@ -445,7 +621,6 @@ pub fn install_post_checkout(
             unseen.join("; ")
         ));
     }
-    let _lock = ApplyLock::take(home, 60)?;
     let ledger = Ledger::load(home)?;
     if config::recorded(repo, &ledger)? {
         let why = "Lords' config hook is this repo's route (its ledger record)".to_string();

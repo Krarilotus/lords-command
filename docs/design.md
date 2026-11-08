@@ -271,10 +271,11 @@ the hook's own arguments (`guard child --home DIR`, event `LordsGuardProbe`), wi
 names `lords guard install`; sync never installs the copy itself.
 
 **New worktrees.** `lords hooks install --post-checkout` writes the repo's own `.git/hooks/post-checkout` (the
-common dir, so every worktree runs it). On a new worktree (old HEAD all zeros) it runs `lords sync --repo X --place
-<worktree> --apply` in the background, time-boxed, and only logs (`<common dir>/lords-post-checkout.log`); any
-other checkout returns at once. A hook that was there before runs first and keeps its exit status. `--place`
-writes that one worktree's files, without importing or retiring.
+common dir, so every worktree runs it), and `sync --apply` installs or updates it in each declared repo with
+worktrees. On a new worktree (old HEAD all zeros) it runs the guard copy's `deliver --new-worktree` in the
+background (Delivery, below), which logs to `<common dir>/lords-post-checkout.log` and records any place it held in
+the delivery's state; any other checkout returns at once. A hook that was there before runs first and keeps its exit
+status.
 
 **Shadowed `AGENTS.md`.** Claude reads an ancestor dir's `CLAUDE.local.md` and then skips a nested repo's own
 `AGENTS.md` (docs/load-order.md). `check` lists every worktree that gets no files of its own but lies inside a place
@@ -477,6 +478,29 @@ work. It exits 1 while a place is held. The stack's `[safe_only] applies` names 
 nothing; `"new-place"` (files where nothing is, in a declared place the ledger records nothing in) is the one value it
 accepts. A destination several places share, a checkout's git exclude that its worktrees read too, is never applied
 this way: its wanted edit holds every place that reads it.
+
+**Delivery** (F8). A commit in a store's own checkout reaches every place with nobody running a command: `lords hooks
+install` gives a stack repo a post-commit hook that starts `lords deliver --on-commit` in the background (never in a
+linked worktree, never for a delivery's own commits, which run with `LORDS_DELIVERING` set). A delivery takes the apply
+lock before it plans, refuses a store whose stack dir holds anything uncommitted, imports memory and retires ended
+entries as their own commits, then plans `--safe-only` for the whole machine and applies it place by place: each
+place's items are checked again and staged beside their paths, then swapped in one by one (a file by one rename over
+it, never absent), and a check or write that fails puts the place's earlier items back, so a place is fully current or
+untouched. A place's dirs go before its files. Every name a transaction makes beside a path goes first into
+`place-transaction.json` in the tool home, with the hash it will hold; a later apply removes only what that record
+lists and still holds it, and anything else with Lords' sibling name holds its place (`left-beside`) and is kept as
+it is. On Windows every file a place publishes or replaces is held open with delete sharing from before its first swap
+to its end, so a reader that doesn't share delete is found before anything is written, and can't come between a swap
+and its undo. `sync --apply` gives each declared repo with worktrees a post-checkout hook that runs the guard copy's
+`deliver --new-worktree` for a new worktree: the same safe-only path for that one place, whose creates count as safe
+there; a place git doesn't list yet is tried again after a pause. Whatever a delivery held, or why it failed, goes into
+one state file in the tool home, with the sync by hand that resolves each place, and `lords paths` shows it: a held
+place is stale for every role there, and every role is stale while the stores moved past the last delivery. Every
+sync that applies plans under the lock it applies with, so none plans against another's half-done apply. The stack's
+`[delivery]` sets which stores' commits deliver (`on_commit`), the lock wait, the attempts and their pause, the
+deadline no attempt or plan starts past, the limits of a store's git read and of the state file's lock, whether a
+delivery does store work, and where the state file is. Two targets
+at one path, or one inside the other, don't load.
 
 **The changeover, once and with a human:** the 3a place files, the old `~/.codex/skills` copies and any other path
 from before the ledger are listed by `lords adopt --list`. Adopting a file records it only if it is byte for byte what

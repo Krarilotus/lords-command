@@ -3,7 +3,7 @@
 //! (`classify`), from facts it checked; `Stage::SafeOnly` then keeps only what is safe, place by place (`safe_only`).
 //! Nothing else decides either, and no note is ever read to decide.
 
-use super::{Action, Change, Class, ConflictKind, Dest, Item, Plan};
+use super::{Action, Change, Class, ConflictKind, Dest, Item, Plan, Unit};
 use crate::fsguard::Root;
 use crate::ledger;
 use crate::stack::SafeAlso;
@@ -48,6 +48,15 @@ pub enum Hold {
     IncompleteView,
     /// An ended temporary entry, retired with a commit in its stack: store work, which holds no place.
     Retirement,
+    /// The one place a plan was asked for isn't a checkout or worktree of its repo yet: a new worktree still being made
+    /// (F8, D22). A delivery tries it again.
+    NotReady,
+    /// A check or write at apply that failed, after the plan typed the place safe: the place was put back whole (F8,
+    /// C4). Never the planner's.
+    WriteRefused,
+    /// A path with Lords' sibling name beside a place's file that no place transaction recorded making, or one it
+    /// recorded that no longer holds what it recorded: kept as it is, for its owner to look at (F8 review r1, R1-01).
+    LeftBeside,
     /// Not typed by the planner (`Item::new`'s default): held, never applied.
     Unclassified,
 }
@@ -72,6 +81,9 @@ impl std::fmt::Display for Hold {
             Hold::PlaceStillThere => "place-still-there",
             Hold::IncompleteView => "incomplete-view",
             Hold::Retirement => "retirement",
+            Hold::NotReady => "not-ready",
+            Hold::WriteRefused => "write-refused",
+            Hold::LeftBeside => "left-beside",
             Hold::Unclassified => "unclassified",
         })
     }
@@ -134,6 +146,8 @@ pub struct HeldItem {
 pub struct HeldPlace {
     pub place: PlaceId,
     pub items: Vec<HeldItem>,
+    /// The sync by hand that resolves it (F8, D5): its dry run says what each item wants, then `--apply`.
+    pub sync: String,
 }
 
 /// What `Stage::SafeOnly` left out (`Plan::held`).
@@ -151,6 +165,31 @@ impl Held {
     /// Whether any place is held (the CLI's exit 1). Store work holds none.
     pub fn holds(&self) -> bool {
         !self.places.is_empty() || !self.everything.is_empty()
+    }
+}
+
+/// The sync by hand that resolves a held place (F8, D5): its dry run says what each item wants, then `--apply`. The
+/// place's repo or workspace comes from the items' units, else from a record's scope (a forget's).
+pub(crate) fn sync_command(place: &PlaceId, items: &[&Item]) -> String {
+    let unit = items.iter().find_map(|i| {
+        i.units.first().cloned().or_else(|| {
+            let base = i.scope.split('/').next().unwrap_or("");
+            match base.split_once(':') {
+                Some(("repo", n)) => Some(Unit::Repo(n.to_string())),
+                Some(("workspace", n)) => Some(Unit::Workspace(n.to_string())),
+                Some(("target", n)) => Some(Unit::Target(n.to_string())),
+                _ => None,
+            }
+        })
+    });
+    let quoted = |p: &Path| format!("'{}'", crate::adapters::slashes(p).replace('\'', "'\\''"));
+    match (place, unit) {
+        (PlaceId::Target(_), _) | (_, Some(Unit::Target(_))) => "lords sync --user".into(),
+        (PlaceId::Dir(_), Some(Unit::Workspace(n))) => format!("lords sync --repo {n}"),
+        (PlaceId::Dir(d), Some(Unit::Repo(n))) => {
+            format!("lords sync --repo {n} --place {}", quoted(d))
+        }
+        (PlaceId::Dir(_), None) => "lords sync".into(),
     }
 }
 
@@ -216,6 +255,7 @@ fn class_of(i: &Item, managed: &BTreeSet<String>, also: &[SafeAlso], complete: b
             ConflictKind::ModifiedCopy => Hold::ChangedCopy,
             ConflictKind::OverLimit => Hold::OverLimit,
             ConflictKind::Other => Hold::Conflict,
+            ConflictKind::NotReady => Hold::NotReady,
         }),
         // A copy its owner changed that the stacks no longer want: it stays, and its record would go.
         Action::Forget if !i.gone => need(Hold::ChangedCopy),
@@ -244,7 +284,8 @@ pub(crate) fn safe_only(plan: &mut Plan) {
             held.everything.push(it);
         } else {
             for p in &i.places {
-                let place = HeldPlace { place: p.clone(), items: Vec::new() };
+                let sync = sync_command(p, &[i]);
+                let place = HeldPlace { place: p.clone(), items: Vec::new(), sync };
                 places.entry(p.key()).or_insert(place).items.push(it.clone());
             }
         }

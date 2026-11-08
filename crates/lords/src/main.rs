@@ -23,7 +23,7 @@ usage:
   lords privacy --message FILE [--staged] [--secrets-only]   a commit message (the commit-msg hook)
   lords privacy --history [--private-stack DIR]   every commit's message and patch (the pre-push check)
   lords privacy FILE...
-  lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit, pre-merge-commit and commit-msg hooks; in a stack repo also `check --stack` and a pre-push
+  lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit, pre-merge-commit and commit-msg hooks; in a stack repo also `check --stack`, a pre-push and a post-commit that runs `deliver`
   lords hash PATH
   lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--stage install] [--json] [--apply] [--deadline-ms N]
     (a write of Codex's hooks: trusts Lords' own through Codex's app-server, names each hook that isn't trusted, exit 1)
@@ -34,6 +34,10 @@ usage:
     that one only, as --place does; a scoped plan ends naming the places it leaves out.
     uninstall --repo takes the key only)
   lords sync --restore BACKUP_DIR   undo one apply's owner-file edits, each only while it holds what sync wrote
+  lords deliver [--on-commit DIR | --repo NAME --place DIR --new-worktree] [--home DIR]   the stores' committed
+    entries into every place (or one new worktree), safe-only, under the apply lock, place by place; what it held, or
+    why it failed, goes into the state file `lords paths` reads (exit 0 nothing held, 1 held, 2 failed). The stores'
+    post-commit and each repo's post-checkout hook run it. --protocol: the protocol this copy speaks
   lords uninstall [--user | --repo NAME] [--apply]   remove the tool's paths that still match its ledger
   lords uninstall --repo NAME --place DIR [--apply] [--json]   one checkout or worktree's recorded copies
     (a changed copy is kept with its record; exit 0 no record of the place remains, 1 one does, 2 refused or stopped)
@@ -41,7 +45,8 @@ usage:
     sync wrote, with their records (a changed copy is kept with its record; exit codes as for --place)
   lords adopt [--list | PATH...]   record paths from before the ledger that hold exactly what sync writes there
   lords set-aside PATH... [--yes]   move paths that aren't the tool's into a new backup dir
-  (sync, uninstall, adopt, set-aside: --home DIR, the tool's own dir; default ~/.lords-command)
+  (sync, deliver, uninstall, adopt, set-aside: --home DIR, the tool's own dir; default ~/.lords-command)
+  (sync --apply also installs each declared repo's post-checkout hook, which runs `deliver` for a new worktree)
   lords hooks install --post-checkout [--repo DIR]   a new worktree gets its place files (`sync --place`)
   lords compose [--repo NAME [--role ROLE | --child | --child-whole]] [--adapter ID] [--json]   what a harness reads there, with sources
   lords show ID   an entry's whole text, which its core line stands for at start (without frontmatter)
@@ -617,6 +622,66 @@ fn print_held(plan: &sync::Plan, held: &sync::Held) {
     }
 }
 
+/// `lords deliver` (deliver.rs; F8): what changed, then each held place, repo hook, failure and piece of store work
+/// with the command that resolves it, and where the state file is. Exit 0 with nothing held, 1 with a place or a repo's
+/// hook held, 2 when the delivery failed (the state file says why, too).
+fn cmd_deliver(mut a: Args) -> Result<bool, String> {
+    use lords_core::deliver;
+    if a.flag("--protocol") {
+        a.done()?;
+        println!("lords deliver {}", deliver::PROTOCOL);
+        return Ok(true);
+    }
+    // The commits a delivery makes itself (its store work) start no delivery: its stores' post-commit hook, which every
+    // such commit runs, exits at once with this set (design note C7).
+    std::env::set_var(deliver::MARKER, "1");
+    let home = tool_home(&mut a)?;
+    let on_commit = a.value("--on-commit")?.map(PathBuf::from);
+    let repo = a.value("--repo")?;
+    let place = a.value("--place")?.map(PathBuf::from);
+    let new_worktree = a.flag("--new-worktree");
+    let p = paths(&mut a)?;
+    a.done()?;
+    let mut opts = match (repo, place, new_worktree) {
+        (Some(r), Some(d), true) => deliver::Options::worktree(&home, &r, &d),
+        (None, None, false) => deliver::Options::whole(&home),
+        _ => return Err("--repo, --place and --new-worktree go together: one new worktree".into()),
+    };
+    if on_commit.is_some() && opts.worktree.is_some() {
+        return Err("--on-commit is a store commit's delivery, of the whole machine".into());
+    }
+    opts.on_commit = on_commit;
+    let r = deliver::run(&p.public, p.private.as_deref(), &opts)?;
+    for line in &r.done {
+        println!("{line}");
+    }
+    let s = &r.state;
+    for h in &s.places {
+        println!("held {}: {}", h.place, h.command);
+        for i in &h.items {
+            let note = if i.note.is_empty() { String::new() } else { format!(": {}", i.note) };
+            println!("   {}  {}{note}", i.reason, i.path);
+        }
+    }
+    for i in &s.everything {
+        println!("held everywhere: {}  {}: {}", i.reason, i.path, i.note);
+    }
+    for n in s.hooks.iter().chain(&s.store_work) {
+        println!("held {}: {}; {}", n.what, n.why, n.command);
+    }
+    if r.not_a_trigger {
+        println!("not delivered: [delivery] on_commit doesn't list this store");
+    } else if r.unchanged {
+        println!(
+            "delivered already: the stores' committed stacks are as the last delivery found them"
+        );
+    } else {
+        println!("delivered: {} change(s); {} place(s) held", r.done.len(), s.places.len());
+    }
+    println!("state: {}", r.file.display());
+    Ok(!r.holds())
+}
+
 /// A plan of the current config for every target and place: what `restore` and `set-aside` check paths against.
 fn whole_plan(a: &mut Args, home: PathBuf) -> Result<sync::Plan, String> {
     let p = paths(a)?;
@@ -693,6 +758,15 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         target: None,
         stage,
         codex,
+        new_worktree: false,
+    };
+    // An apply of one place or of a safe-only plan writes this very plan: it is made under the lock it applies with,
+    // so no other writer's half-done apply is in it (F8, C5; D23). A full apply's own plans are made under its lock
+    // (`import_and_apply`); the one shown here is the dry run's.
+    let settings = stacks.delivery();
+    let lock = match apply && (opts.place.is_some() || safe_only) {
+        true => Some(sync::ApplyLock::wait(&opts.home, settings.lock_wait())??),
+        false => None,
     };
     let plan = sync::plan(&stacks, &opts)?;
     if json {
@@ -727,13 +801,35 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         }
         return Ok(whole);
     }
-    // One worktree (its post-checkout hook): only its files, no import or retiring, which commit to the stack. Nor
-    // does a safe-only plan: it lists that store work instead, and holds what isn't safe (D13).
-    let applied = match (&opts.place, safe_only) {
-        (Some(_), _) | (None, true) => sync::apply(&plan)?,
-        (None, false) => sync::import_and_apply(&p.public, p.private.as_deref(), &opts)?,
+    // One worktree: only its files, no import or retiring, which commit to the stack. Nor does a safe-only plan: it
+    // lists that store work instead, holds what isn't safe (D13), and writes place by place; what it held goes into the
+    // delivery's state where delivery is set up (F8, D5).
+    let applied = match lock {
+        Some(lock) => {
+            let applied = sync::apply_held(&plan, &lock).map_err(|e| e.to_string())?;
+            match (safe_only, opts.stage) {
+                (true, _) => {
+                    lords_core::deliver::settle_safe_only(&opts.home, &settings, &plan, &applied)?
+                }
+                // The place a held entry names is resolved by this very command (sol-loop r1 S7); an install stage
+                // removes nothing and skips a place with a conflict, so it resolves nothing (r2 S12).
+                (false, sync::Stage::Full) => {
+                    lords_core::deliver::settle_by_hand(&opts.home, &settings, &plan, &[], false)?
+                }
+                (false, _) => {}
+            }
+            applied
+        }
+        None => sync::import_and_apply(&p.public, p.private.as_deref(), &opts)?,
     };
     print_applied(&applied);
+    for h in &applied.held {
+        println!("\nheld {}, put back whole: {}", h.place, h.sync);
+        for i in &h.items {
+            println!("   {}  {}: {}", i.reason, i.path.display(), i.note);
+        }
+    }
+    let whole = whole && applied.held.is_empty();
     // A Codex hook that doesn't run never reads as success either (design note 2026-11-02-lords-codex-trust, §2.3).
     Ok(whole && applied.codex.is_empty())
 }
@@ -1092,6 +1188,17 @@ fn print_plan(plan: &sync::Plan) {
 note: {n}"
         );
     }
+    // Each declared repo's post-checkout hook that isn't as this build writes it (F8, C3; sol-loop r1 S11).
+    for h in &plan.hooks {
+        use lords_core::hooks::HookState;
+        let (repo, at) = (&h.repo, h.checkout.display());
+        match &h.state {
+            HookState::Current => {}
+            HookState::Missing => println!("\npost-checkout of repo {repo} ({at}): missing; `--apply` installs it from the guard copy"),
+            HookState::Outdated => println!("\npost-checkout of repo {repo} ({at}): an earlier form; `--apply` replaces it"),
+            HookState::Changed(why) => println!("\npost-checkout of repo {repo} ({at}): {why}; left as it is"),
+        }
+    }
     let count =
         |f: &dyn Fn(&sync::Action) -> bool| plan.items.iter().filter(|i| f(&i.action)).count();
     println!(
@@ -1336,9 +1443,20 @@ fn cmd_hooks(mut a: Args) -> Result<bool, String> {
         }
         return Ok(true);
     }
+    // A stack repo's post-commit delivers from the stacks given here, else config.txt's (F8, C1).
+    let cfg = Config::discover();
+    let public = a.value("--public-stack")?.map(PathBuf::from).or(cfg.public);
+    let private = a.value("--private-stack")?.map(PathBuf::from).or(cfg.private);
     a.done()?;
+    let abs = |p: PathBuf| std::path::absolute(&p).unwrap_or(p);
+    let stacks = hooks::SyncArgs {
+        repo: String::new(),
+        public_stack: public.map(abs),
+        private_stack: private.map(abs),
+    };
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let installed = hooks::install(&repo, &exe, secrets_only, force, &sync::default_home()?)?;
+    let home = sync::default_home()?;
+    let installed = hooks::install_with(&repo, &exe, secrets_only, force, &home, &stacks)?;
     for r in &installed {
         println!("installed {}", r.hook.display());
         if let Some(b) = &r.backup {
@@ -1529,6 +1647,7 @@ fn main() -> ExitCode {
         "hooks" => cmd_hooks(a),
         "hash" => cmd_hash(a),
         "sync" => cmd_sync(a),
+        "deliver" => cmd_deliver(a),
         "compose" => cmd_compose(a),
         "show" => cmd_show(a),
         "uninstall" => cmd_uninstall(a),

@@ -127,6 +127,14 @@ pub(crate) fn guard_protocol(
     Ok(answer.filter(|_| status.success()))
 }
 
+/// The protocol of `lords deliver` in the guard copy (`deliver::PROTOCOL`), as `deliver --protocol` answers it (F8,
+/// D-3): `None` when it answers anything else, as a copy from before F8 does (no such command).
+pub(crate) fn deliver_protocol(guard_copy: &Path) -> Result<Option<u32>, String> {
+    let (status, out) = run_guard(guard_copy, &["deliver", "--protocol"], b"", "deliver protocol")?;
+    let answer = out.trim().strip_prefix("lords deliver ").and_then(|n| n.parse().ok());
+    Ok(answer.filter(|_| status.success()))
+}
+
 /// The guards the guard copy runs, as `guard --guards` lists them (`guard::GUARDS`; D20): `None` when it lists none, as
 /// a copy from before that list answers (the rm usage note, nothing on stdout), or answers anything else.
 pub(crate) fn guard_list(guard_copy: &Path) -> Result<Option<Vec<String>>, String> {
