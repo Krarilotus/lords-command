@@ -510,8 +510,11 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     let explicit_private = a.words.iter().any(|w| w == "--private-stack");
     let mut p = paths(&mut a)?;
     a.done()?;
+    // The stores as configured: where installs read them, so what the start check composes and compares (gap 11).
+    let configured = (p.public.clone(), p.private.clone());
     // `--public` and `--stack` check the repo they run in (its hooks), not whatever config.txt points at.
     let top = std::env::current_dir().ok().and_then(|d| git::toplevel(&d));
+    let committing = top.clone();
     if (public_only || stack_only) && !explicit {
         if let Some(stack) =
             top.as_ref().map(|t| t.join("stack")).filter(|s| s.join("stack.toml").is_file())
@@ -551,7 +554,10 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
     // `--stack`: the entries only, without drift (the slow part) or the hook probe, for a stack repo's pre-commit.
     let findings = if stack_only {
-        check::check_stack(&stacks, &rules)
+        let mut f = check::check_stack(&stacks, &rules);
+        let limit = std::time::Duration::from_secs(stacks.delivery().store_git_secs);
+        f.extend(start_check(committing.as_deref(), &configured, limit, json));
+        f
     } else {
         let mut f = check::check(&stacks, &rules);
         f.extend(drift(&stacks));
@@ -563,6 +569,86 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
         println!("{} public and {} private entries", n(Visibility::Public), n(Visibility::Private));
     }
     Ok(!check::has_errors(&findings, strict))
+}
+
+/// The stores' commit check of the starts one hook gives (gap 11, `admission`): in a store's checkout `top`, what the
+/// commit makes of each place's `child.md` and `start-<role>.md`, against the other store as committed. A refusal, an
+/// other store that can't be read as committed, and any failure to check are errors, so the commit stops. Admitted,
+/// it says how long each start is at most, unless `json`. Outside a store's checkout, or with no private store
+/// configured (no place is declared), there is nothing to check.
+fn start_check(
+    top: Option<&Path>,
+    configured: &(PathBuf, Option<PathBuf>),
+    limit: std::time::Duration,
+    json: bool,
+) -> Vec<Finding> {
+    use lords_core::admission::{self, Inputs, Outcome};
+    use lords_core::stack::Store;
+    let (Some(top), (public, Some(private))) = (top, configured) else { return Vec::new() };
+    let (store, stack) = if top.join("stack").join("stack.toml").is_file() {
+        (Store::Public, "stack")
+    } else if top.join("stack.toml").is_file() {
+        (Store::Private, ".")
+    } else {
+        return Vec::new();
+    };
+    let home = match sync::default_home() {
+        Ok(h) => h,
+        Err(e) => {
+            return vec![Finding::error("start-check", format!("the starts can't be checked: {e}"))]
+        }
+    };
+    let today = ops::today();
+    let i =
+        Inputs { checkout: top, stack, store, public, private, home: &home, today: &today, limit };
+    let max = sync::CHILD_START_CHARS;
+    match admission::admit(&i) {
+        Ok(Outcome::Unchanged | Outcome::NoPlaces) => Vec::new(),
+        Ok(Outcome::Admitted(counts)) => {
+            if !json {
+                println!("starts, the longest of each: {}", longest(&counts, max));
+            }
+            Vec::new()
+        }
+        Ok(Outcome::Refused(counts)) => counts
+            .iter()
+            .filter(|c| c.refused())
+            .map(|c| {
+                let was = match c.old {
+                    Some(0) | None => "not there before".to_string(),
+                    Some(n) => format!("{n} before"),
+                };
+                // A child's start is its child role's: say whose (sol-loop r1, S2).
+                let file = match c.file == sync::CHILD_FILE {
+                    true => format!("{} ({})", c.file, c.role),
+                    false => c.file.clone(),
+                };
+                Finding::error(
+                    "start-limit",
+                    format!(
+                        "{}: {} would be {} characters ({was}), past the {max} one hook gives a session at its start; a commit may not make a start past that grow: shorten what this commit adds to it, or other entries it holds",
+                        c.place, file, c.new
+                    ),
+                )
+            })
+            .collect(),
+        Ok(Outcome::Unclean(why)) => vec![Finding::error("start-check", why)],
+        Err(e) => vec![Finding::error("start-check", format!("the starts can't be checked: {e}"))],
+    }
+}
+
+/// Each start's longest size across the places, with the place: `start-orchestrator.md 9,456 of 9,500 (repo x)`.
+fn longest(counts: &[lords_core::admission::Count], max: usize) -> String {
+    let mut most: std::collections::BTreeMap<&str, &lords_core::admission::Count> =
+        Default::default();
+    for c in counts {
+        if most.get(c.file.as_str()).is_none_or(|m| c.new > m.new) {
+            most.insert(&c.file, c);
+        }
+    }
+    let parts: Vec<String> =
+        most.values().map(|c| format!("{} {} of {max} ({})", c.file, c.new, c.place)).collect();
+    parts.join(", ")
 }
 
 fn drift(stacks: &Stacks) -> Vec<Finding> {

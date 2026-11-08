@@ -542,6 +542,13 @@ fn post_checkout_repo(env: &Env) -> (PathBuf, PathBuf, [String; 4]) {
         "---\nid: rule.r\nkind: rule\ntitle: r\naudience: [all]\nroles: [coder]\nscope: global\nstatus: active\nvisibility: private\norigin:\n  type: own\n---\nTest before merging.\n",
     )
     .unwrap();
+    // The stores are git repos with their entries committed, as real stores are: a new worktree's delivery takes what
+    // they committed (gap 11, 3c), as a whole delivery does.
+    for store in [&public, &private] {
+        assert!(env.git(store, &["init", "-q"]).status.success());
+        env.git(store, &["add", "-A"]);
+        assert!(env.git(store, &["commit", "-q", "-m", "store"]).status.success());
+    }
     let repo = env.repo();
     fs::write(repo.join("README.md"), "a repo\n").unwrap();
     env.git(&repo, &["add", "-A"]);

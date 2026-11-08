@@ -301,6 +301,9 @@ pub struct Stack {
     pub entries: Vec<Entry>,
     /// Problems found while loading (schema, placement, unreadable files).
     pub problems: Vec<Finding>,
+    /// The committed tree it was loaded from (`Stacks::load_captured`), which sync reads a skill's files from too;
+    /// `None` for a stack loaded from its dir on disk.
+    pub(crate) captured: Option<std::sync::Arc<crate::capture::Captured>>,
 }
 
 impl Stack {
@@ -310,9 +313,14 @@ impl Stack {
 
     /// Loads a stack. Fails only when `stack.toml` is missing or invalid; entry problems are collected.
     pub fn load(root: &Path) -> Result<Stack, String> {
+        Self::load_from(root, &Fs)
+    }
+
+    /// Loads the stack at `root` from `src`: every file, dir listing and kind the loader asks about comes from it.
+    pub(crate) fn load_from(root: &Path, src: &dyn Source) -> Result<Stack, String> {
         let manifest_path = root.join(MANIFEST);
-        let text = fsguard::read_string(&manifest_path)
-            .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+        let text =
+            src.read(&manifest_path).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
         let value: Value =
             toml::from_str(&text).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
         let errs = schema::stack_errors(&value);
@@ -359,13 +367,18 @@ impl Stack {
                 )
             })?;
         }
-        let mut stack =
-            Stack { root: root.to_path_buf(), manifest, entries: Vec::new(), problems: Vec::new() };
+        let mut stack = Stack {
+            root: root.to_path_buf(),
+            manifest,
+            entries: Vec::new(),
+            problems: Vec::new(),
+            captured: None,
+        };
         if stack.visibility() == Visibility::Public {
             stack.check_public_manifest(&manifest_path);
         }
-        for (dir, scope) in layer_dirs(root)? {
-            stack.load_layer(&dir, &scope);
+        for (dir, scope) in layer_dirs(src, root)? {
+            stack.load_layer(src, &dir, &scope);
         }
         // A dir that couldn't be read leaves the stack incomplete: it doesn't load (R5-04's class, decision 4).
         if let Some(p) = stack.problems.iter().find(|p| p.code == UNREADABLE) {
@@ -375,8 +388,8 @@ impl Stack {
     }
 
     /// A dir's children, sorted; an error is recorded as an `unreadable` problem, which fails the load.
-    fn children(&mut self, dir: &Path) -> Vec<PathBuf> {
-        match sorted_children(dir) {
+    fn children(&mut self, src: &dyn Source, dir: &Path) -> Vec<PathBuf> {
+        match sorted_children_in(src, dir) {
             Ok(v) => v,
             Err(e) => {
                 self.problems.push(Finding::error(UNREADABLE, e).at(dir, None));
@@ -386,8 +399,8 @@ impl Stack {
     }
 
     /// A dir's plain files, as `all_files`; an error is recorded as an `unreadable` problem.
-    fn files_of(&mut self, dir: &Path) -> Vec<PathBuf> {
-        match all_files(dir) {
+    fn files_of(&mut self, src: &dyn Source, dir: &Path) -> Vec<PathBuf> {
+        match all_files_in(src, dir) {
             Ok(v) => v,
             Err(e) => {
                 self.problems.push(Finding::error(UNREADABLE, e).at(dir, None));
@@ -411,10 +424,10 @@ impl Stack {
         }
     }
 
-    fn load_layer(&mut self, dir: &Path, scope: &Scope) {
-        for child in self.children(dir) {
+    fn load_layer(&mut self, src: &dyn Source, dir: &Path, scope: &Scope) {
+        for child in self.children(src, dir) {
             let name = file_name(&child);
-            if child.is_file() {
+            if src.is_file(&child) {
                 self.problems.push(
                     Finding::warning("layout", format!("a file directly in a layer dir: {name}"))
                         .at(&child, None),
@@ -428,9 +441,9 @@ impl Stack {
                 continue;
             };
             if kind == Kind::Skill {
-                for skill in self.children(&child) {
-                    if skill.is_dir() {
-                        self.load_skill(&skill, scope);
+                for skill in self.children(src, &child) {
+                    if src.is_dir(&skill) {
+                        self.load_skill(src, &skill, scope);
                     } else {
                         self.problems.push(
                             Finding::warning("layout", "a file directly in skills/")
@@ -439,30 +452,30 @@ impl Stack {
                     }
                 }
             } else {
-                self.load_kind_dir(&child, kind, scope);
+                self.load_kind_dir(src, &child, kind, scope);
             }
         }
     }
 
-    fn load_kind_dir(&mut self, dir: &Path, kind: Kind, scope: &Scope) {
-        let defaults = match read_yaml_file(&dir.join(DEFAULTS)) {
+    fn load_kind_dir(&mut self, src: &dyn Source, dir: &Path, kind: Kind, scope: &Scope) {
+        let defaults = match read_yaml_file(src, &dir.join(DEFAULTS)) {
             Ok(v) => v.map(|(m, _)| m),
             Err(e) => {
                 self.problems.push(Finding::error("schema", e).at(dir.join(DEFAULTS), None));
                 return;
             }
         };
-        for child in self.children(dir) {
+        for child in self.children(src, dir) {
             let name = file_name(&child);
             let not_entry = name == DEFAULTS
                 || name == ".gitkeep"
                 || (defaults.is_some() && INDEX_FILES.contains(&name.as_str()));
-            if child.is_dir() {
-                self.load_kind_dir(&child, kind, scope);
+            if src.is_dir(&child) {
+                self.load_kind_dir(src, &child, kind, scope);
             } else if not_entry {
                 continue;
             } else if name.ends_with(".md") {
-                self.load_markdown(&child, kind, scope, defaults.as_ref());
+                self.load_markdown(src, &child, kind, scope, defaults.as_ref());
             } else {
                 self.problems.push(
                     Finding::warning("layout", format!("not an entry: {name}")).at(&child, None),
@@ -473,12 +486,13 @@ impl Stack {
 
     fn load_markdown(
         &mut self,
+        src: &dyn Source,
         file: &Path,
         kind: Kind,
         scope: &Scope,
         defaults: Option<&Map<String, Value>>,
     ) {
-        let text = match fsguard::read_string(file) {
+        let text = match src.read(file) {
             Ok(t) => t,
             Err(e) => {
                 self.problems.push(Finding::error("read", e.to_string()).at(file, None));
@@ -521,9 +535,9 @@ impl Stack {
         );
     }
 
-    fn load_skill(&mut self, dir: &Path, scope: &Scope) {
+    fn load_skill(&mut self, src: &dyn Source, dir: &Path, scope: &Scope) {
         let sidecar = dir.join(SIDECAR);
-        let (meta, meta_text) = match read_yaml_file(&sidecar) {
+        let (meta, meta_text) = match read_yaml_file(src, &sidecar) {
             Ok(Some(m)) => m,
             Ok(None) => {
                 self.problems.push(
@@ -537,7 +551,7 @@ impl Stack {
             }
         };
         let skill_file = dir.join(SKILL_FILE);
-        let body = match fsguard::read_string(&skill_file) {
+        let body = match src.read(&skill_file) {
             Ok(t) => t,
             Err(_) => {
                 self.problems
@@ -553,7 +567,7 @@ impl Stack {
                     .at(&sidecar, None),
             );
         }
-        let files = self.files_of(dir);
+        let files = self.files_of(src, dir);
         let version = crate::model::version(&[meta_text.as_bytes(), body.as_bytes()]);
         self.push_entry(meta, Kind::Skill, scope, &sidecar, &skill_file, body, 1, files, version);
     }
@@ -663,7 +677,8 @@ impl Stack {
                 let is_tracked = |file: &Path| {
                     tracked.iter().any(|t| crate::ledger::key(t) == crate::ledger::key(file))
                 };
-                let dirs = self.children(&checkout.join(rel));
+                // A repo's own skills are read from its checkout, whatever the stack's source: they are the repo's.
+                let dirs = self.children(&Fs, &checkout.join(rel));
                 for dir in dirs.into_iter().filter(|d| is_tracked(&d.join(SKILL_FILE))) {
                     let file = dir.join(SKILL_FILE);
                     // Only shown in the skills index: an unreadable SKILL.md shows no hook (inventory: lossy).
@@ -711,7 +726,7 @@ impl Stack {
                         description: text("description"),
                         metadata: None,
                     };
-                    let files = self.files_of(&dir);
+                    let files = self.files_of(&Fs, &dir);
                     self.entries.push(Entry {
                         meta,
                         scope: Scope::Repo(name.clone()),
@@ -825,8 +840,8 @@ fn parse_yaml(text: &str) -> Result<Map<String, Value>, String> {
 /// A YAML file's mapping, and the text it was read from.
 type YamlFile = (Map<String, Value>, String);
 
-fn read_yaml_file(path: &Path) -> Result<Option<YamlFile>, String> {
-    match fsguard::read_string(path) {
+fn read_yaml_file(src: &dyn Source, path: &Path) -> Result<Option<YamlFile>, String> {
+    match src.read(path) {
         Ok(t) => {
             parse_yaml(&t).map(|m| Some((m, t))).map_err(|e| format!("{}: {e}", path.display()))
         }
@@ -835,20 +850,20 @@ fn read_yaml_file(path: &Path) -> Result<Option<YamlFile>, String> {
     }
 }
 
-fn layer_dirs(root: &Path) -> Result<Vec<(PathBuf, Scope)>, String> {
+fn layer_dirs(src: &dyn Source, root: &Path) -> Result<Vec<(PathBuf, Scope)>, String> {
     let mut out = vec![(root.join("global"), Scope::Global)];
-    for p in sorted_children(&root.join("project"))? {
-        if p.is_dir() {
+    for p in sorted_children_in(src, &root.join("project"))? {
+        if src.is_dir(&p) {
             out.push((p.clone(), Scope::Project(file_name(&p))));
         }
     }
-    for r in sorted_children(&root.join("repo"))? {
-        if r.is_dir() {
+    for r in sorted_children_in(src, &root.join("repo"))? {
+        if src.is_dir(&r) {
             out.push((r.clone(), Scope::Repo(file_name(&r))));
         }
     }
-    for w in sorted_children(&root.join("workspace"))? {
-        if w.is_dir() {
+    for w in sorted_children_in(src, &root.join("workspace"))? {
+        if src.is_dir(&w) {
             out.push((w.clone(), Scope::Workspace(file_name(&w))));
         }
     }
@@ -858,9 +873,56 @@ fn layer_dirs(root: &Path) -> Result<Vec<(PathBuf, Scope)>, String> {
 /// The code of a problem that a dir or file of the stack couldn't be read: the stack doesn't load.
 pub const UNREADABLE: &str = "unreadable";
 
+/// Where the loader reads a stack from (gap 11, the captured-source refactor): its dir on disk (`Fs`), or one tree a
+/// store committed (`capture::Captured`), which has no way back to the disk. Every read, listing and kind the loader
+/// asks about a stack's files goes through one; a declared repo's own skills are read from its checkout (`Fs`)
+/// whatever the stack's source.
+pub(crate) trait Source {
+    /// A file's text; an error of kind `NotFound` where nothing is there.
+    fn read(&self, path: &Path) -> std::io::Result<String>;
+    /// A dir's children, in no order; none for a dir that isn't there, an error for one that can't be listed.
+    fn list(&self, dir: &Path) -> Result<Vec<PathBuf>, String>;
+    /// Whether a dir is at `path`, as `Path::is_dir` tells (on disk a link to a dir is one).
+    fn is_dir(&self, path: &Path) -> bool;
+    /// Whether a plain file is at `path`, as `Path::is_file` tells.
+    fn is_file(&self, path: &Path) -> bool;
+    /// As `fsguard::link_at`.
+    fn link_at(&self, path: &Path) -> Result<bool, String>;
+    /// As `fsguard::kind_here`.
+    fn kind_here(&self, path: &Path) -> Result<fsguard::Kind, String>;
+}
+
+/// The stack as its dir on disk holds it: the loader's reads as they were before there was a `Source`.
+pub(crate) struct Fs;
+
+impl Source for Fs {
+    fn read(&self, path: &Path) -> std::io::Result<String> {
+        fsguard::read_string(path)
+    }
+    fn list(&self, dir: &Path) -> Result<Vec<PathBuf>, String> {
+        fsguard::list_dir(dir)
+    }
+    fn is_dir(&self, path: &Path) -> bool {
+        path.is_dir()
+    }
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
+    fn link_at(&self, path: &Path) -> Result<bool, String> {
+        fsguard::link_at(path)
+    }
+    fn kind_here(&self, path: &Path) -> Result<fsguard::Kind, String> {
+        fsguard::kind_here(path)
+    }
+}
+
 /// A dir's children, sorted; none for a dir that isn't there, an error for one that can't be listed.
 pub fn sorted_children(dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut v = fsguard::list_dir(dir)?;
+    sorted_children_in(&Fs, dir)
+}
+
+fn sorted_children_in(src: &dyn Source, dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut v = src.list(dir)?;
     v.sort();
     Ok(v)
 }
@@ -869,13 +931,17 @@ pub fn sorted_children(dir: &Path) -> Result<Vec<PathBuf>, String> {
 /// ends (Sol review, finding 18). Anything that can't be listed or told apart is an error, never skipped (r5,
 /// R5-04's class).
 pub fn all_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    all_files_in(&Fs, dir)
+}
+
+fn all_files_in(src: &dyn Source, dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
-    for c in sorted_children(dir)? {
-        if fsguard::link_at(&c)? {
+    for c in sorted_children_in(src, dir)? {
+        if src.link_at(&c)? {
             continue;
         }
-        match fsguard::kind_here(&c)? {
-            fsguard::Kind::Dir => out.extend(all_files(&c)?),
+        match src.kind_here(&c)? {
+            fsguard::Kind::Dir => out.extend(all_files_in(src, &c)?),
             fsguard::Kind::File => out.push(c),
             fsguard::Kind::Missing => {}
         }
@@ -905,15 +971,51 @@ pub struct Stacks {
 
 impl Stacks {
     pub fn load(public: &Path, private: Option<&Path>) -> Result<Stacks, String> {
-        let public = Stack::load(public)?;
+        let private = private.map(|p| move || Stack::load(p));
+        Self::load_with(|| Stack::load(public), private, true)
+    }
+
+    /// The two stacks as their stores committed them (`capture::Captured`), read from nothing else. `repo_skills`:
+    /// whether the declared repos' own skills are indexed from their checkouts, as `load` does; a start doesn't take
+    /// them (gap 11 design note §0c.4), so the store commit check leaves them out.
+    pub fn load_captured(
+        public: crate::capture::Captured,
+        private: Option<crate::capture::Captured>,
+        repo_skills: bool,
+    ) -> Result<Stacks, String> {
+        fn kept(c: crate::capture::Captured) -> Result<Stack, String> {
+            let mut s = Stack::load_from(c.root(), &c)?;
+            s.captured = Some(std::sync::Arc::new(c));
+            Ok(s)
+        }
+        Self::load_with(|| kept(public), private.map(|p| move || kept(p)), repo_skills)
+    }
+
+    /// The committed tree `e`'s files are read from, where its stack was loaded from one and the entry is the
+    /// stack's own (a declared repo's skill is its checkout's).
+    pub(crate) fn captured_for(
+        &self,
+        e: &Entry,
+    ) -> Option<std::sync::Arc<crate::capture::Captured>> {
+        let own = !matches!(e.meta.origin, crate::model::Origin::InRepo { .. });
+        self.stack(e.stack).and_then(|s| s.captured.clone()).filter(|_| own)
+    }
+
+    /// Loads the public stack, checks it, then the private one, in that order (whose error comes first).
+    fn load_with(
+        public: impl FnOnce() -> Result<Stack, String>,
+        private: Option<impl FnOnce() -> Result<Stack, String>>,
+        repo_skills: bool,
+    ) -> Result<Stacks, String> {
+        let public = public()?;
         if public.visibility() != Visibility::Public {
             return Err(format!(
                 "{}: the public stack's stack.toml says visibility = private",
                 public.root.display()
             ));
         }
-        let mut private = private.map(Stack::load).transpose()?;
-        if let Some(p) = private.as_mut() {
+        let mut private = private.map(|load| load()).transpose()?;
+        if let Some(p) = private.as_mut().filter(|_| repo_skills) {
             p.index_repo_skills();
         }
         if let Some(p) = &private {

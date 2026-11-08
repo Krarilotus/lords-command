@@ -527,7 +527,11 @@ fn only_agents(e: &Entry, audience: &[Audience]) -> Option<String> {
 }
 
 pub fn applicable<'a>(stacks: &'a Stacks, ctx: &Context) -> Vec<&'a Entry> {
-    let today = crate::ops::today();
+    applicable_on(stacks, ctx, &crate::ops::today())
+}
+
+/// `applicable` on the date `today` (`YYYY-MM-DD`): one date for compositions that are compared (gap 11, §0d.5).
+pub fn applicable_on<'a>(stacks: &'a Stacks, ctx: &Context, today: &str) -> Vec<&'a Entry> {
     stacks
         .entries()
         .filter(|e| e.active())
@@ -535,7 +539,7 @@ pub fn applicable<'a>(stacks: &'a Stacks, ctx: &Context) -> Vec<&'a Entry> {
         .filter(|e| in_layers(e, &ctx.layers) && reaches(e, &ctx.audience))
         .filter(|e| for_role(e, ctx))
         // An ended temporary entry is never composed (it is retired at the next sync).
-        .filter(|e| crate::temporary::ended(e, stacks, &today).is_none())
+        .filter(|e| crate::temporary::ended(e, stacks, today).is_none())
         .collect()
 }
 
@@ -575,6 +579,12 @@ pub fn live_index_problem(m: &crate::stack::MemoryStore) -> Option<String> {
 }
 
 pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
+    compose_on(stacks, ctx, &crate::ops::today())
+}
+
+/// `compose` on the date `today`, which decides which temporary entries have ended (gap 11, §0d.5: a start and its
+/// baseline are composed on one date).
+pub fn compose_on(stacks: &Stacks, ctx: &Context, today: &str) -> Composed {
     let mut development: Vec<String> = stacks
         .all()
         .flat_map(|s| s.manifest.roles.iter())
@@ -591,7 +601,8 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
         }
         _ => false,
     };
-    let all: Vec<&Entry> = applicable(stacks, ctx).into_iter().filter(|e| !live_store(e)).collect();
+    let all: Vec<&Entry> =
+        applicable_on(stacks, ctx, today).into_iter().filter(|e| !live_store(e)).collect();
     let overridden: BTreeSet<&str> =
         all.iter().flat_map(|e| e.meta.overrides.iter().map(String::as_str)).collect();
     let live: Vec<&Entry> = all.into_iter().filter(|e| !overridden.contains(e.id())).collect();
@@ -766,7 +777,10 @@ pub fn compose(stacks: &Stacks, ctx: &Context) -> Composed {
             (None, Some(t)) => lines.push(format!("({t})")),
             (None, None) => {}
         }
-        for (i, l) in e.body.trim_matches('\n').lines().enumerate() {
+        // One text whichever line endings the file was checked out with (gap 11 r6, R5-F1): with CRLF a leading blank
+        // line is "\r\n", which `trim_matches('\n')` keeps, so normalize first, as `core_lines::show` does.
+        let body = e.body.replace("\r\n", "\n");
+        for (i, l) in body.trim_matches('\n').lines().enumerate() {
             lines.push(l.trim_end_matches('\r').to_string());
             out.sources.push(Source {
                 line: lines.len(),
