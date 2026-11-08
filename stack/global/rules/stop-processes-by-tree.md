@@ -7,7 +7,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "Stop by the process's own PID and tree, never command-line text. After stopping a looping, submitting or committing script, check no children survived and nothing it released started its next step."
+core: "Boundary: stop a process by its own PID and tree, never by command-line text; after stopping a looping, submitting or committing script, check that no child survived and nothing it released started its next step."
 visibility: public
 evidence:
 - summary: Stopping a background shell task left its looping script running; a live script was also declared dead because the shell's process list shows no arguments.

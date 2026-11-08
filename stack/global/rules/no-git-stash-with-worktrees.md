@@ -7,7 +7,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "Never use git stash (push, pop, apply, drop) in a repository with several worktrees. Set changes aside by copying the file elsewhere or committing it to a throwaway branch."
+core: "Boundary: no git stash (push, pop, apply, drop) in a repository with several worktrees, which share one stash list; set a change aside by copying the file or committing it to a throwaway branch."
 visibility: public
 origin:
   type: own

@@ -7,7 +7,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "Never rewrite or force-push pushed commits without the owner's explicit word for that repository and those commits. Unpushed branches may be rewritten before their first push."
+core: "Boundary: never rewrite or force-push pushed commits without the owner's explicit word for that repository and those commits; a branch may be rewritten before its first push."
 visibility: public
 origin:
   type: own
