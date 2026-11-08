@@ -476,7 +476,7 @@ fn transact(
         let deadline = Instant::now() + wait;
         let swapped = swap(&mut changes[k], ledger, home, deadline);
         if let Err(why) = swapped.and_then(|()| record_made(home, changes, wait)) {
-            let undone = undo(changes, ledger, home, wait, between);
+            let undone = undo(changes, ledger, home, between);
             drop(holding);
             return Err(match undone {
                 Ok(()) => Stop::Held(why),
@@ -723,17 +723,16 @@ fn swap(c: &mut Change, ledger: &mut Ledger, home: &Path, deadline: Instant) -> 
 /// there, and is dropped where it is only a second name of the file still at the path; a created path that holds what
 /// this put there goes; each put back gets its ledger record as it was. A path holding anything else is its owner's
 /// edit since, and stays, with the new record, for the next plan to hold; an old version a swap checked goes beside it,
-/// one it hadn't stays, which holds the place at the next transaction. Every item is tried, a rename blocked by a
-/// reader until `wait`; the error lists what couldn't be put back.
+/// one it hadn't stays, which holds the place at the next transaction. Each path put back or removed is held from its
+/// hash to the change (`fsguard::replace_if`, `remove_own`), so no owner's write in between is lost. Every item is
+/// tried; the error lists what couldn't be put back.
 fn undo(
     changes: &mut [Change],
     ledger: &mut Ledger,
     home: &Path,
-    wait: Duration,
     between: &mut dyn FnMut(Step, &Path),
 ) -> Result<(), String> {
     let mut left = Vec::new();
-    let deadline = Instant::now() + wait;
     for c in changes.iter_mut().rev() {
         let dir = matches!(c.op, Op::ReplaceDir | Op::CreateDir);
         let have = c.item.have.clone().unwrap_or_default();
@@ -763,10 +762,16 @@ fn undo(
                     fsguard::move_to(&b, &at)?;
                     true
                 }
+                // The published file goes only while it is still what this put there, held from the hash to the
+                // replacement (sol-loop r2, S4); an owner's write in between is kept, with the new record.
                 (Op::ReplaceFile, Some(b)) if ours => {
-                    between(Step::Compared, at.path());
-                    fsguard::rename_over(&b, &at, deadline)?;
-                    true
+                    let aside = fsguard::sibling(&at, "old")?;
+                    let path = at.path().to_path_buf();
+                    let compared = &mut || between(Step::Compared, &path);
+                    match fsguard::replace_if(&at, &b, &aside, &c.new, compared)? {
+                        fsguard::Removal::Gone => true,
+                        fsguard::Removal::Kept(_) => false,
+                    }
                 }
                 (Op::ReplaceDir, Some(b)) if ours => {
                     let aside = c.names.aside.clone().ok_or("no name for the aside")?;

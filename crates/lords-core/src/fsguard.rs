@@ -1008,7 +1008,7 @@ pub fn delete_if(
         Ok(()) => Ok(Removal::Kept(why)),
         Err(e) => Err(format!("{why}; and it couldn't go back ({e}): it is at {}", to.display())),
     };
-    let files = match files_under(to, dir) {
+    let (files, dirs) = match files_under(to, dir) {
         Ok(f) => f,
         Err(e) => return back(e),
     };
@@ -1038,40 +1038,101 @@ pub fn delete_if(
         }
     }
     compared();
-    // Each file goes while it is held; the dirs once the holdings are dropped.
+    // Only what was compared goes (sol-loop r2, S1): each file while it is held; then each dir, deepest first, and only
+    // while empty, never recursively. An entry that appeared after the comparison stops it: what is left, the new
+    // entry with it, goes back to `p` and is kept.
     for f in &files {
         fs::remove_file(f).map_err(|e| format!("{}: {e}", f.display()))?;
     }
     drop(held);
-    if dir {
-        delete_tree_at(to)?;
+    for d in dirs.iter().rev() {
+        if let Err(e) = fs::remove_dir(d) {
+            return back(format!(
+                "{}: something was added in it after it was compared ({e}), so it is kept",
+                path.display()
+            ));
+        }
     }
     Ok(Removal::Gone)
 }
 
-/// The files at or under `p` (a file, or a dir's every file, following no link).
-fn files_under(p: &Path, dir: bool) -> Result<Vec<PathBuf>, String> {
+/// Puts the file `with` at `p` in place of the file there, only while that one holds `sha`, keeping it out of any
+/// writer's reach from the hash to the replacement as `delete_if` does (sol-loop r2, S4): `p`'s file is moved to
+/// `aside` (an `old` name, so a reader that finds `p` absent knows a replacement is under way) and held, hashed,
+/// `compared` runs, then `with` moves to `p` and the held file is removed. A file holding anything else, or one a
+/// writer holds, goes back. If something appeared at `p` meanwhile, that stays and the held file is removed, so
+/// nothing of anyone's is lost: `Kept`, with `with` where it was.
+pub fn replace_if(
+    p: &Contained,
+    with: &Contained,
+    aside: &Contained,
+    sha: &str,
+    compared: &mut dyn FnMut(),
+) -> Result<Removal, String> {
+    let (path, to) = (&p.path, &aside.path);
+    if kind(path)? != Kind::File {
+        return Ok(Removal::Kept(format!("{}: not a file now, so it is kept", path.display())));
+    }
+    if let Err(e) = move_to_at(path, to) {
+        return Ok(Removal::Kept(e));
+    }
+    let back = |why: String| match move_back_at(to, path) {
+        Ok(()) => Ok(Removal::Kept(why)),
+        Err(e) => Err(format!("{why}; and it couldn't go back ({e}): it is at {}", to.display())),
+    };
+    let held = match hold_unwritable(to) {
+        Ok(h) => h,
+        Err(e) => return back(e),
+    };
+    match fs::read(to).map(|b| self::sha(&b)) {
+        Ok(now) if now == sha => {}
+        Ok(_) => {
+            drop(held);
+            return back(format!("{}: it holds something else now, so it is kept", path.display()));
+        }
+        Err(e) => {
+            drop(held);
+            return back(format!("{}: {e}", to.display()));
+        }
+    }
+    compared();
+    if let Err(e) = move_to_at(&with.path, path) {
+        // Something is at `p` now, put there after the comparison: it stays, and the held file (what this replaced)
+        // goes, since it holds exactly `sha`.
+        fs::remove_file(to).map_err(|e| format!("{}: {e}", to.display()))?;
+        drop(held);
+        return Ok(Removal::Kept(format!("{e}; what is at {} now is kept", path.display())));
+    }
+    fs::remove_file(to).map_err(|e| format!("{}: {e}", to.display()))?;
+    drop(held);
+    Ok(Removal::Gone)
+}
+
+/// The files at or under `p`, and the dirs (`p` first, each before what is in it): a file alone, or a dir's whole
+/// tree, following no link.
+fn files_under(p: &Path, dir: bool) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
     if !dir {
-        return Ok(vec![p.to_path_buf()]);
+        return Ok((vec![p.to_path_buf()], Vec::new()));
     }
     read_tree(p)?;
-    fn walk(d: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    fn walk(d: &Path, files: &mut Vec<PathBuf>, dirs: &mut Vec<PathBuf>) -> Result<(), String> {
+        dirs.push(d.to_path_buf());
         for e in fs::read_dir(d).map_err(|e| format!("{}: {e}", d.display()))? {
             let p = e.map_err(|e| e.to_string())?.path();
             let m = fs::symlink_metadata(&p).map_err(|e| format!("{}: {e}", p.display()))?;
             if is_link(&m) {
                 return Err(format!("{} became a link; stopped", p.display()));
             } else if m.is_dir() {
-                walk(&p, out)?;
+                walk(&p, files, dirs)?;
             } else {
-                out.push(p);
+                files.push(p);
             }
         }
         Ok(())
     }
-    let mut out = Vec::new();
-    walk(p, &mut out)?;
-    Ok(out)
+    let (mut files, mut dirs) = (Vec::new(), Vec::new());
+    walk(p, &mut files, &mut dirs)?;
+    Ok((files, dirs))
 }
 
 /// A file held open so no writer can open it (Windows: read and delete access, sharing read and delete only), or
