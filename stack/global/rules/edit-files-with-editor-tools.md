@@ -7,7 +7,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "To keep text, encodings and line endings intact, write and edit files with the harness's editor tools rather than shell redirection."
+core: "Write and edit files with the harness's editor tools, not shell redirection, which can mangle encodings and line endings."
 visibility: public
 origin:
   type: own

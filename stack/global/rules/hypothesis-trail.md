@@ -7,7 +7,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "To avoid retrying dead ends, an investigation of more than one try keeps a trail, one line per hypothesis (thought, test, result, status), disproven ones too; read it before the next try, and when it's hard, record the next angle and keep going."
+core: "An investigation of more than one try keeps a trail, one line per hypothesis (thought, test, result, status), disproven ones too; read it before the next try, and when it's hard, record the next angle and keep going."
 visibility: public
 origin:
   type: own
