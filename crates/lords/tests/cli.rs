@@ -581,11 +581,10 @@ fn a_new_worktree_gets_its_place_files_from_the_post_checkout_hook() {
     // A hook that was there first: it is chained, not replaced.
     let hooks = env.dir.path().join("repo/.git/hooks");
     fs::create_dir_all(&hooks).unwrap();
-    fs::write(
-        hooks.join("post-checkout"),
+    write_script(
+        &hooks.join("post-checkout"),
         "#!/bin/sh\necho ran >> \"$(git rev-parse --git-common-dir)/before.log\"\n",
-    )
-    .unwrap();
+    );
     let (repo, wts, log) = repo_with_post_checkout(&env);
     assert!(hooks.join("post-checkout.before-lords").is_file(), "the old hook is kept");
 
@@ -671,6 +670,29 @@ fn real_dispatcher(dir: &Path) -> PathBuf {
     dir.join("hooks")
 }
 
+/// Whether this git runs hooks from config (`hook.<name>.command`, Git 2.54 and later), which Lords' config hook needs
+/// (`hooks/config.rs`). Older git (2.43 on the Linux test host, D27) answers `git hook list` with its usage, exit 129,
+/// and Lords refuses a config hook there, naming the version: the config-hook tests then check that refusal, and that
+/// it changes nothing, in place of the config hook's own answers.
+fn git_has_config_hooks(env: &Env, repo: &Path) -> bool {
+    env.git(repo, &["hook", "list", "post-checkout"]).status.code() != Some(129)
+}
+
+/// On a git without config hooks: the refusal names the Git version a config hook needs.
+fn refused_for_its_git(has_config_hooks: bool, out: &str) -> bool {
+    !has_config_hooks && out.contains("2.54")
+}
+
+/// Writes a hook script at `p`, executable off Windows, as an owner's hook is for git to run it (D27).
+fn write_script(p: &Path, text: &str) {
+    fs::write(p, text).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 /// An owner's post-checkout hook: it logs that it ran, in the git common dir's `before.log`.
 const OWNERS_HOOK: &str =
     "#!/bin/sh\necho ran >> \"$(git rev-parse --git-common-dir)/before.log\"\n";
@@ -720,7 +742,7 @@ fn the_post_checkout_install_goes_through_a_local_dispatcher_that_forwards() {
     env.git(&repo, &["config", "core.hooksPath", guard_path]);
     fs::write(repo.join(".git/user.inc"), "[user]\n\tname = Linked\n").unwrap();
     env.git(&repo, &["config", "includeIf.gitdir:**/worktrees/.path", "user.inc"]);
-    fs::write(repo.join(".git/hooks/post-checkout"), OWNERS_HOOK).unwrap();
+    write_script(&repo.join(".git/hooks/post-checkout"), OWNERS_HOOK);
     let dispatcher = fs::read(env.dir.path().join("guard/dispatch.sh")).unwrap();
 
     let o = install_post_checkout(&env, &repo, &stacks);
@@ -795,7 +817,7 @@ fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
     let inc = format!("[core]\n\thooksPath = {}\n", empty.display()).replace('\\', "/");
     fs::write(repo.join(".git/linked-hooks.inc"), inc).unwrap();
     let hooks = repo.join(".git/hooks");
-    fs::write(hooks.join("post-checkout"), OWNERS_HOOK).unwrap();
+    write_script(&hooks.join("post-checkout"), OWNERS_HOOK);
     let before = listing(&hooks);
     let ledger = d.join("home/.lords-command/state/ledger.toml");
     let recorded = fs::read(&ledger).unwrap();
@@ -840,8 +862,12 @@ fn a_hooks_path_that_doesnt_reach_the_hook_is_refused_and_changes_nothing() {
         let out = text(&o);
         eprintln!("{name}: {out}");
         assert!(!o.status.success(), "{name}: must be refused: {out}");
-        assert!(out.contains(says) && out.contains("post-checkout"), "{name}: {out}");
-        assert!(name == "include" || out.contains("set already (global"), "{name}: {out}");
+        let old_git = refused_for_its_git(git_has_config_hooks(&env, &repo), &out);
+        assert!(old_git || out.contains(says) && out.contains("post-checkout"), "{name}: {out}");
+        assert!(
+            old_git || name == "include" || out.contains("set already (global"),
+            "{name}: {out}"
+        );
         assert_eq!(local_config(&repo), local, "{name}: the local config is as it was");
         assert_eq!(listing(&hooks), before, "{name}: the hooks dir is as it was");
         assert_eq!(fs::read(&ledger).unwrap(), recorded, "{name}: the ledger is as it was");
@@ -936,8 +962,11 @@ fn a_refused_reinstall_keeps_the_tools_earlier_hook() {
 
     let o = install_post_checkout(&env, &repo, &copied_stacks(&env, "2"));
     let out = text(&o);
+    let old_git = refused_for_its_git(git_has_config_hooks(&env, &repo), &out);
     assert!(
-        !o.status.success() && !out.contains("back failed") && out.contains("stands in"),
+        !o.status.success()
+            && !out.contains("back failed")
+            && (old_git || out.contains("stands in")),
         "{out}"
     );
     assert_eq!((listing(&hooks), fs::read(&ledger).unwrap(), local_config(&repo)), before);
@@ -954,7 +983,7 @@ fn a_reinstall_whose_ledger_cant_be_saved_changes_nothing() {
     let env = Env::new();
     let (repo, _wts, stacks) = post_checkout_repo(&env);
     let hooks = repo.join(".git/hooks");
-    fs::write(hooks.join("post-checkout"), OWNERS_HOOK).unwrap();
+    write_script(&hooks.join("post-checkout"), OWNERS_HOOK);
     let o = install_post_checkout(&env, &repo, &stacks);
     assert!(o.status.success(), "{}", text(&o));
     let ledger = env.dir.path().join("home/.lords-command/state/ledger.toml");
@@ -1017,6 +1046,12 @@ fn a_hooks_dir_that_isnt_reached_gets_a_config_hook_instead() {
 
     let o = install_post_checkout(&env, &repo, &stacks);
     let out = text(&o);
+    if !git_has_config_hooks(&env, &repo) {
+        // No config hook on this git: refused, naming the version, with nothing changed.
+        assert!(!o.status.success() && refused_for_its_git(false, &out), "{out}");
+        assert_eq!((listing(&hooks), local_config(&repo)), before);
+        return;
+    }
     assert!(
         o.status.success() && out.contains("relative") && out.contains("lords-post-checkout"),
         "{out}"
@@ -1088,13 +1123,20 @@ fn a_config_hook_that_cant_be_proven_is_refused_and_changes_nothing() {
         ("includeIf.gitdir:**/worktrees/.path", "hooks.inc", "includeif.gitdir"),
         ("hook.post-checkout.enabled", "false", "nor a config hook: `git hook run"),
     ];
+    let config_hooks = git_has_config_hooks(&env, &repo);
     for (key, value, says) in cases {
         env.git(&repo, &["config", key, value]);
         let before = state();
         let o = install_post_checkout(&env, &repo, &stacks);
-        assert!(!o.status.success() && text(&o).contains(says), "{key}: {}", text(&o));
+        let out = text(&o);
+        let said = out.contains(says) || refused_for_its_git(config_hooks, &out);
+        assert!(!o.status.success() && said, "{key}: {out}");
         assert_eq!(state(), before, "{key}: as it was");
         env.git(&repo, &["config", "--unset", key]);
+    }
+    // The rest is over Lords' own config hook, which this git can't run.
+    if !config_hooks {
+        return;
     }
 
     assert!(install_post_checkout(&env, &repo, &stacks).status.success());
@@ -1462,6 +1504,57 @@ fn the_guard_fails_open_when_it_cant_write() {
         drop(child.stdout.take());
         assert_eq!(child.wait().unwrap().code(), Some(0), "{args:?} with a closed stdout");
     }
+}
+
+// Spec (D27, the master thread 8 Nov 12:11: "On Linux, `lords guard install` should succeed"; witness: Linux fleet
+// `lords-test-linux-594a5551-1794135478-267523`, "Permission denied (os error 13)" on the staged copy): off Windows,
+// `guard install` succeeds and leaves a guard copy that is executable and answers.
+#[cfg(unix)]
+#[test]
+fn guard_install_leaves_a_copy_that_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let home = env.dir.path().join("tool-home");
+    let o = env.lords(env.dir.path(), &["guard", "install", "--home", home.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", text(&o));
+    let copy = fs::read_dir(home.join("bin"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("lords-guard")))
+        .unwrap_or_else(|| panic!("no guard copy in {}", home.join("bin").display()));
+    let mode = fs::metadata(&copy).unwrap().permissions().mode();
+    assert!(mode & 0o111 != 0, "{} is {mode:o}", copy.display());
+    let o = env
+        .cmd(copy.to_str().unwrap(), env.dir.path())
+        .args(["guard", "--guards"])
+        .output()
+        .unwrap();
+    assert!(o.status.success() && text(&o).contains("rm"), "{}", text(&o));
+}
+
+// Spec (D27, the master thread 8 Nov 12:11: "a non-executable chained hook should be skipped", as git skips a hook
+// that isn't executable; witness: "post-checkout: 12: …/post-checkout.before-lords: Permission denied"): a repo's
+// earlier post-checkout hook without its executable bit is chained but not run, the checkout says nothing of it, and
+// the new worktree still gets its place file.
+#[cfg(unix)]
+#[test]
+fn a_chained_hook_that_isnt_executable_is_skipped_as_git_skips_it() {
+    let env = Env::new();
+    let hooks = env.dir.path().join("repo/.git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    // Mode 0644, as `fs::write` leaves it: git itself wouldn't run this hook.
+    fs::write(hooks.join("post-checkout"), OWNERS_HOOK).unwrap();
+    let (repo, wts, log) = repo_with_post_checkout(&env);
+    assert!(hooks.join("post-checkout.before-lords").is_file(), "the old hook is kept");
+    let wt = wts.join("one");
+    let o = env.git(&repo, &["worktree", "add", "-q", "-b", "one", wt.to_str().unwrap()]);
+    assert!(o.status.success() && !text(&o).contains("Permission denied"), "{}", text(&o));
+    assert!(
+        appears(&wt.join("CLAUDE.local.md")),
+        "log: {}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert!(!repo.join(".git/before.log").exists(), "a hook git wouldn't run isn't run");
 }
 
 // Spec: rm-guard fix check r5, R10 (witness: `lords guard install --r5-invalid-option` with its stderr reader closed

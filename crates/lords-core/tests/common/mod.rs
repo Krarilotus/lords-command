@@ -53,10 +53,17 @@ impl Fixture {
         self.dir.path().join(rel)
     }
 
+    /// Writes `text` at `rel`; a script (`#!`) gets its executable bits off Windows, as a hook needs for git to run it
+    /// (D27: git skips a hook that isn't executable).
     pub fn write(&self, rel: &str, text: &str) -> PathBuf {
         let p = self.path(rel);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(&p, text).unwrap();
+        #[cfg(unix)]
+        if text.starts_with("#!") {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         p
     }
 

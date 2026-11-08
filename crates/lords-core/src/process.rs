@@ -209,7 +209,7 @@ pub fn codex_ask(
         }
     };
     drop(stdin);
-    drop(tree);
+    tree.end();
     let _ = child.kill();
     let _ = child.wait();
     answer
@@ -441,7 +441,7 @@ fn bounded(mut c: Command, stdin: Option<Vec<u8>>, deadline: Duration) -> Result
         match child.try_wait().map_err(|e| e.to_string())? {
             Some(s) => break s,
             None if started.elapsed() >= deadline => {
-                drop(tree);
+                tree.end();
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(format!("no answer within its deadline ({} s)", deadline.as_secs()));
@@ -450,7 +450,7 @@ fn bounded(mut c: Command, stdin: Option<Vec<u8>>, deadline: Duration) -> Result
         }
     };
     // Whatever the child started ends now, so the pipes close.
-    drop(tree);
+    tree.end();
     let grace = Duration::from_millis(500);
     let stdout = out.recv_timeout(grace).map_err(|_| "its output wasn't closed".to_string())?;
     let stderr = err.recv_timeout(grace).unwrap_or_default();
@@ -797,7 +797,7 @@ impl Tunnel {
 impl Drop for Tunnel {
     fn drop(&mut self) {
         if let Some((mut child, tree)) = self.child.take() {
-            drop(tree);
+            tree.end();
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -854,6 +854,13 @@ mod tree {
         }
     }
 
+    impl Tree {
+        /// Ends every process in the job now (closing the job kills them), where the caller says so.
+        pub fn end(self) {
+            drop(self);
+        }
+    }
+
     impl Drop for Tree {
         fn drop(&mut self) {
             // SAFETY: the job handle this value owns, closed once.
@@ -873,6 +880,9 @@ mod tree {
         pub fn holding(_: &std::process::Child) -> Result<Tree, String> {
             Ok(Tree)
         }
+
+        /// Nothing to end here: no job holds the child's processes (D27).
+        pub fn end(self) {}
     }
 }
 
