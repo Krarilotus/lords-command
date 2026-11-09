@@ -12,7 +12,7 @@ basis:
 - quote: "make sure it won't happen again and take extra caution with such things"
   date: 2026-10-25
   by: owner
-  source: "recorded only in this entry; not found in his intent files (corpus audit 8 Nov, U1)"
+  source: "recorded in the rule corpus, not reproduced in his intent register; its original source is not independently verified (corpus audit 8 Nov, U1)"
 evidence:
 - summary: An agent removed its own temp file with a pattern delete in a shared temp directory on another person's account; the pattern also matched other programs' temp files there, so what it removed is unknown
   date: 2026-10-25

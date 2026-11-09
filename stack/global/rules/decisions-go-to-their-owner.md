@@ -13,15 +13,15 @@ basis:
 - quote: "They shoudl target the correct owners of correct decisions, if they have to say sth about thigns they can and interfere or even check up on thigns and other threads themselves."
   date: 2026-10-30
   by: owner
-  source: "recorded only in this entry; not found in his intent files (corpus audit 8 Nov, U1)"
+  source: "recorded in the rule corpus, not reproduced in his intent register; its original source is not independently verified (corpus audit 8 Nov, U1)"
 - quote: "It should never happen that a message gets relayed 2-3 times between the owners over other relay owners all the time, that just makes thigns HARd and conflicting and information is lost"
   date: 2026-10-30
   by: owner
-  source: "recorded only in this entry; not found in his intent files (corpus audit 8 Nov, U1)"
+  source: "recorded in the rule corpus, not reproduced in his intent register; its original source is not independently verified (corpus audit 8 Nov, U1)"
 - quote: "don't play relay all the time let the agent talk itself to the fleet owner if needed"
   date: 2026-10-30
   by: owner
-  source: "recorded only in this entry; not found in his intent files (corpus audit 8 Nov, U1)"
+  source: "recorded in the rule corpus, not reproduced in his intent register; its original source is not independently verified (corpus audit 8 Nov, U1)"
 evidence:
 - summary: "Questions for a tool's owner went through a third agent, which cost turns and lost detail. Once, a correction arrived before the message it corrected."
   date: 2026-10-30

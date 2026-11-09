@@ -15,7 +15,7 @@ basis:
 - quote: "when there is big uncertainty about industry standards, we shouldn't assume it, thats kinda like a rule as well, we should then have 1-2 research tasks setup in markdown codeblocks to spin off"
   date: 2026-10-20
   by: owner
-  source: "recorded only in this entry; not found in his intent files (corpus audit 8 Nov, U1)"
+  source: "recorded in the rule corpus, not reproduced in his intent register; its original source is not independently verified (corpus audit 8 Nov, U1)"
 evidence:
 - summary: The owner wants the extra knowledge and surrounding context, to check designs from first principles, not only to confirm a chosen design
   date: 2026-10-19

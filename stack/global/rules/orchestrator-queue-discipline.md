@@ -17,11 +17,11 @@ basis:
 - quote: "One thing i would like is, that Orchestrators have the ability to take messages in t3 threads all together instead of going one by one, and that way the queue gets empty every time, and all thigns can be handled and also compounting effects will work beter that way."
   date: 2026-10-30
   by: owner
-  source: "recorded only in this entry; not found in his intent files (corpus audit 8 Nov, U1)"
+  source: "recorded in the rule corpus, not reproduced in his intent register; its original source is not independently verified (corpus audit 8 Nov, U1)"
 - quote: "it would both - save tokens - give compounding information because information is less likely to get stale"
   date: 2026-10-30
   by: owner
-  source: "recorded only in this entry; not found in his intent files (corpus audit 8 Nov, U1)"
+  source: "recorded in the rule corpus, not reproduced in his intent register; its original source is not independently verified (corpus audit 8 Nov, U1)"
 - quote: "and it seems the rules for taking in the whole queue not one message at a time when you decide to end your turn and take the next subagent has still not managed to penetrate and actually land, make sure to add that proper"
   date: 2026-10-30
   by: owner

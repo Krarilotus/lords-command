@@ -13,11 +13,11 @@ basis:
 - quote: 'check what others do for the same type of problem'
   date: 2026-10-20
   by: owner
-  source: "recorded only in this entry; not found in his intent files (corpus audit 8 Nov, U1)"
+  source: "recorded in the rule corpus, not reproduced in his intent register; its original source is not independently verified (corpus audit 8 Nov, U1)"
 - quote: 'we should again look how industry lead does it, so i don''t see me answering these questions really. These are no really new ideas, new in the sense they are recent yes but not new by me'
   date: 2026-10-20
   by: owner
-  source: "recorded only in this entry; not found in his intent files (corpus audit 8 Nov, U1)"
+  source: "recorded in the rule corpus, not reproduced in his intent register; its original source is not independently verified (corpus audit 8 Nov, U1)"
 evidence:
 - summary: The owner had to decide the same trade-off three times; an orchestrator asked again for machine access the owner had already granted.
   date: 2026-10-24
