@@ -464,3 +464,28 @@ fn a_public_check_takes_no_configured_private_allowance() {
     assert!(!o.status.success(), "refused: {}", text(&o));
     assert!(text(&o).contains("path: `alice`"), "names the hit: {}", text(&o));
 }
+
+// Spec (sol-loop r2, S1: "`privacy --message --explain --sentinelvalueq` falls through to ordinary handling, and
+// `Args::done` echoes `--sentinelvalueq`. Recognise explain mode before consuming any option's value ... add that
+// malformed-argument row asserting refusal with the sentinel absent from both stdout and stderr. Better still, make
+// `Args::done` itself never echo an argument's text"; design note privacy-own-allow, attack items 35 and 36): that
+// command line, and any command's leftover argument, are refused without the argument's text. Every row runs before
+// the refusals are asserted.
+#[test]
+fn no_argument_is_echoed() {
+    let sentinel = "sentinelvalueq";
+    let option = format!("--{sentinel}");
+    let env = Env::new();
+    let repo = checkout(&env, "repo", true, "");
+    let rows: [(&str, Vec<&str>); 2] = [
+        ("privacy --message --explain", vec!["privacy", "--message", "--explain", &option]),
+        ("check", vec!["check", &option]),
+    ];
+    let outputs: Vec<_> = rows.iter().map(|(row, args)| (*row, env.lords(&repo, args))).collect();
+    for (row, o) in &outputs {
+        assert!(!text(o).contains(sentinel), "{row}: not echoed: {}", text(o));
+    }
+    for (row, o) in &outputs {
+        assert!(!o.status.success(), "{row}: refused: {}", text(o));
+    }
+}
