@@ -423,3 +423,44 @@ fn explain_prints_no_content_from_a_broken_file() {
     assert!(!out.contains(sentinel), "visibility: no content: {out}");
     assert!(o.status.success() && out.contains("can't be told"), "visibility: Unknown: {out}");
 }
+
+// Spec (sol-loop r1, S1: "With `.git/config` holding `core.bare = sentinelvalueq`, Git's diagnostic quotes the value;
+// `checkout_stack` keeps it ... `a.done()` also echoes unexpected arguments. Make explain's discovery and argument
+// diagnostics content-free (category plus permitted path), with sentinel tests for both"; design note
+// privacy-own-allow, attack items 28 and 29): where git's own error quotes a config value, `privacy --explain` says the
+// stack can't be told and prints no sentinel; an argument it doesn't take is refused without being echoed.
+#[test]
+fn explain_echoes_neither_git_nor_an_argument() {
+    let sentinel = "sentinelvalueq";
+    let env = Env::new();
+    let repo = checkout(&env, "repo", true, "");
+    let config = repo.join(".git/config");
+    let before = fs::read_to_string(&config).unwrap();
+    write(&config, &format!("{before}[core]\n\tbare = {sentinel}\n"));
+    let o = env.lords(&repo, &["privacy", "--explain"]);
+    let out = text(&o);
+    assert!(!out.contains(sentinel), "git's words: no content: {out}");
+    assert!(o.status.success() && out.contains("can't be told"), "git's words: Unknown: {out}");
+
+    let env = Env::new();
+    let repo = checkout(&env, "repo", true, "");
+    let o = env.lords(&repo, &["privacy", "--explain", sentinel]);
+    let out = text(&o);
+    assert!(!out.contains(sentinel), "an argument: not echoed: {out}");
+    assert!(!o.status.success(), "an argument: refused: {out}");
+}
+
+// Spec (sol-loop r1, S2: "`public_rules` keeps `.with_private(private)`, which imports the private allow-list. `check
+// --public` reaches it ... use restriction-only composition at all three, with a public-check refusal test"; design
+// note privacy-own-allow, attack item 31): `check --public` without `--by-stack`, in a public stack repo whose tree holds
+// a user path that only the configured private stack's allow-list would accept, refuses, naming the hit.
+#[test]
+fn a_public_check_takes_no_configured_private_allowance() {
+    let env = Env::new();
+    env.configure("", "alice\n", "", Some("[host.alpha]\n"));
+    let repo =
+        env.repo("repo", &[("stack/stack.toml", PUBLIC), ("notes.md", &format!("{}\n", detail()))]);
+    let o = env.lords(&repo, &["check", "--public"]);
+    assert!(!o.status.success(), "refused: {}", text(&o));
+    assert!(text(&o).contains("path: `alice`"), "names the hit: {}", text(&o));
+}
