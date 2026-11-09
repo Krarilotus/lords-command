@@ -489,3 +489,36 @@ fn no_argument_is_echoed() {
         assert!(!o.status.success(), "{row}: refused: {}", text(o));
     }
 }
+
+// Spec (sol-loop r3, S1: "`Args::value` takes another option as a value. With `lords privacy --private-stack --explain
+// --sentinelvalueq`, the sentinel becomes the path, and the load-error formatter prints it verbatim ... Same class, fix
+// it at its owner: no error prints a user-supplied value ... `sync --stage SENTINEL` ... invalid panel ports ... Load
+// errors name the flag and the kind of failure, never the path"; design note privacy-own-allow, attack items 39-41):
+// each of these is refused, and the value given appears in neither stream: an option where a value goes, a stage, a
+// port, a command, an entry id, and a private stack's path that isn't there. Every row runs before anything is
+// asserted, and every row that echoes is listed.
+#[test]
+fn no_error_repeats_a_value() {
+    let sentinel = "sentinelvalueq";
+    let option = format!("--{sentinel}");
+    let env = Env::new();
+    let repo = checkout(&env, "repo", true, "");
+    let rows: [(&str, Vec<&str>); 6] = [
+        ("an option as a value", vec!["privacy", "--private-stack", "--explain", &option]),
+        ("sync --stage", vec!["sync", "--stage", sentinel]),
+        ("panel serve --port", vec!["panel", "serve", "--port", sentinel]),
+        ("a command", vec![sentinel]),
+        ("show", vec!["show", sentinel]),
+        ("check --private-stack", vec!["check", "--private-stack", sentinel]),
+    ];
+    let outputs: Vec<_> = rows.iter().map(|(row, args)| (*row, env.lords(&repo, args))).collect();
+    let echoed: Vec<_> = outputs
+        .iter()
+        .filter(|(_, o)| text(o).contains(sentinel))
+        .map(|(row, o)| format!("{row}: {}", text(o)))
+        .collect();
+    assert!(echoed.is_empty(), "no value repeated, but: {echoed:#?}");
+    for (row, o) in &outputs {
+        assert!(!o.status.success(), "{row}: refused: {}", text(o));
+    }
+}
