@@ -917,3 +917,30 @@ fn an_unborn_private_checkout_is_still_private() {
     let o = env.lords(&repo, &["check", "--public", "--by-stack"]);
     assert!(o.status.success() && text(&o).contains("private"), "{}", text(&o));
 }
+
+// Spec (the Lords whole-project review of 9 Nov, delivery: "Privacy hooks interpolate executable paths inside shell
+// double quotes … Legal path characters such as `$` or backticks can be interpreted"; "reuse the existing literal-quoting
+// helper"): hooks installed for a `lords` in a folder whose name holds `$x` and a backtick run that `lords`, as named, so
+// a clean commit goes through.
+#[test]
+fn a_hook_runs_its_lords_by_the_path_as_named() {
+    let env = Env::new();
+    let repo = env.repo("repo", &[("README.md", "a repo\n")]);
+    let dir = env.path("a$x`y");
+    fs::create_dir_all(&dir).unwrap();
+    // A stand-in that answers every call with exit 0. Linked, not copied, off Windows: a file this test just wrote can
+    // still be held open there by another test's child, and wouldn't run (ETXTBSY).
+    let stub = Path::new(env!("CARGO_BIN_EXE_lords-old-guard-stub"));
+    let exe = dir.join(stub.file_name().unwrap());
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(stub, &exe).unwrap();
+    #[cfg(not(unix))]
+    fs::copy(stub, &exe).unwrap();
+    let home = env.path("home/.lords-command");
+    fs::create_dir_all(&home).unwrap();
+    lords_core::hooks::install(&repo, &exe, false, false, &home).unwrap();
+    write(&repo.join("notes.md"), "a clean line\n");
+    env.ok_git(&repo, &["add", "notes.md"]);
+    let o = env.git(&repo, &["commit", "-q", "-m", "clean"]);
+    assert!(o.status.success(), "{}", text(&o));
+}
