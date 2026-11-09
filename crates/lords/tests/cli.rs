@@ -257,7 +257,13 @@ fn a_broken_private_stack_fails_the_check() {
     .unwrap();
     let o =
         env.lords(&repo, &["privacy", "--staged", "--private-stack", private.to_str().unwrap()]);
-    assert!(!o.status.success() && text(&o).contains("no-fleet.toml"), "{}", text(&o));
+    // Named by its role, not its path: the master, 9 Nov 02:36, "Load errors name the flag and the kind of failure,
+    // never the path" (design note privacy-own-allow, sol-loop r4).
+    let out = text(&o);
+    assert!(
+        !o.status.success() && out.contains("fleet config") && !out.contains("no-fleet.toml"),
+        "{out}"
+    );
     fs::write(&fleet, "[host.alpha]\n").unwrap();
     let o =
         env.lords(&repo, &["privacy", "--staged", "--private-stack", private.to_str().unwrap()]);

@@ -819,7 +819,9 @@ fn check_by_stack_keeps_the_configured_private_deny_and_fleet_terms() {
     let repo = checkout_saying(&env, "repo", false, "clean", "");
     let o = env.lords(&repo, &["check", "--public", "--by-stack"]);
     assert!(!o.status.success(), "a missing fleet config: refused: {}", text(&o));
-    assert!(text(&o).contains("fleet.toml"), "names it: {}", text(&o));
+    // Named by its role, not its path (the master, 9 Nov 02:36; design note privacy-own-allow, sol-loop r4).
+    let out = text(&o);
+    assert!(out.contains("fleet config") && !out.contains("fleet.toml"), "names it: {out}");
 }
 
 // Spec (D28-R5-01: "include configured-public-allow isolation"; design note d28-alias, r5 attack items 1 and 3):
