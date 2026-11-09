@@ -503,20 +503,25 @@ fn no_argument_is_echoed() {
 // it at its owner: no error prints a user-supplied value ... `sync --stage SENTINEL` ... invalid panel ports ... Load
 // errors name the flag and the kind of failure, never the path"; design note privacy-own-allow, attack items 39-41):
 // each of these is refused, and the value given appears in neither stream: an option where a value goes, a stage, a
-// port, a command, an entry id, and a private stack's path that isn't there. Every row runs before anything is
-// asserted, and every row that echoes is listed.
+// port, a command, a path given as `--repo`, and a private stack's path that isn't there. An entry id or a repo name
+// typed as a lookup key may be echoed (the master, 9 Nov, after 03:39: "A repo/workspace name or an entry id the user
+// just typed as a lookup key may be echoed"; design note privacy-own-allow, attack items 44-46), so the `show` row is
+// now a `--repo` path. Every row runs before anything is asserted, and every row that echoes is listed.
 #[test]
 fn no_error_repeats_a_value() {
     let sentinel = "sentinelvalueq";
     let option = format!("--{sentinel}");
     let env = Env::new();
+    // Stacks configured, so `sync --repo` reaches the selection that names what it was given.
+    env.configure("", "", "", Some("[host.alpha]\n"));
     let repo = checkout(&env, "repo", true, "");
+    let repo_path = format!("{sentinel}/x");
     let rows: [(&str, Vec<&str>); 6] = [
         ("an option as a value", vec!["privacy", "--private-stack", "--explain", &option]),
         ("sync --stage", vec!["sync", "--stage", sentinel]),
         ("panel serve --port", vec!["panel", "serve", "--port", sentinel]),
         ("a command", vec![sentinel]),
-        ("show", vec!["show", sentinel]),
+        ("sync --repo, a path", vec!["sync", "--repo", &repo_path]),
         ("check --private-stack", vec!["check", "--private-stack", sentinel]),
     ];
     let outputs: Vec<_> = rows.iter().map(|(row, args)| (*row, env.lords(&repo, args))).collect();
