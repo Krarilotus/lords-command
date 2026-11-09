@@ -42,7 +42,7 @@ usage:
     --repo NAME, one repo or workspace by its stack.toml key in any case; a path in a checkout or worktree names
     that one only, as --place does; a scoped plan ends naming the places it leaves out.
     uninstall --repo takes the key only)
-  lords sync --restore BACKUP_DIR   undo one apply's owner-file edits, each only while it holds what sync wrote
+  lords sync --restore BACKUP_DIR   undo one apply's owner-file edits, each only while it holds what sync wrote; what it takes goes into BACKUP_DIR/restored, never deleted
   lords deliver [--on-commit DIR | --repo NAME --place DIR --new-worktree] [--home DIR]   the stores' committed
     entries into every place (or one new worktree), safe-only, under the apply lock, place by place; what it held, or
     why it failed, goes into the state file `lords paths` reads (exit 0 nothing held, 1 held, 2 failed). The stores'
