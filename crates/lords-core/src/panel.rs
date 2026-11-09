@@ -323,7 +323,10 @@ fn local_findings(p: &Paths) -> FindingsView {
     let found = match Stacks::load(&p.public, p.private.as_deref()) {
         Err(e) => vec![Finding::error("load", e)],
         Ok(stacks) => {
-            match Rules::public().with_allow_from(&p.public).with_private(stacks.private.as_ref()) {
+            match Rules::public()
+                .with_allow_from(&p.public)
+                .with_private_terms(stacks.private.as_ref())
+            {
                 Err(e) => vec![Finding::error("privacy-scope", e)],
                 Ok(rules) => {
                     let mut found = check::check(&stacks, &rules);

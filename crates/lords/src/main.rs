@@ -158,8 +158,10 @@ fn print_findings(findings: &[Finding], json: bool) {
     );
 }
 
+/// The rules a public stack's entries and tree are checked with: its own allow-list, and a configured private stack's
+/// deny and fleet terms, never that stack's allow-list (design note privacy-own-allow, sol-loop r1, S2).
 fn public_rules(public: &Path, private: Option<&Stack>) -> Result<Rules, String> {
-    Rules::public().with_allow_from(public).with_private(private)
+    Rules::public().with_allow_from(public).with_private_terms(private)
 }
 
 /// `lords guard rm`: the tool-call guard a harness runs before a shell call (guard.rs). Reads the event on stdin and
@@ -530,7 +532,9 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     use lords_core::privacy::CheckoutStack;
     let found = (stack_only || (by_stack && public_only)).then(|| match cwd.as_deref() {
         Some(d) => lords_core::privacy::checkout_stack(d),
-        None => CheckoutStack::Unknown("the current dir can't be read".to_string()),
+        None => {
+            CheckoutStack::Unknown(privacy::Untold::said("the current dir can't be read".into()))
+        }
     });
     let here = found.as_ref().filter(|_| by_stack);
     let not_checked = "so it isn't checked: no configured stack stands in for this checkout's";
@@ -559,10 +563,8 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     let own_public =
         top.as_ref().map(|t| t.join("stack")).filter(|s| s.join("stack.toml").is_file());
     let own_private = top.clone().filter(|t| t.join("stack.toml").is_file());
-    // A `--by-stack` check's allowances are this checkout's own: a configured stack adds restrictions only, so a
-    // configured private stack gives its deny and fleet terms, never its allow-list (fix check r5, D28-R5-01; design
-    // note d28-alias, "Fix check r5").
-    let mut own_private_stack = false;
+    // A configured stack adds restrictions only: a private stack gives its deny and fleet terms, never its allow-list
+    // (fix check r5, D28-R5-01; `public_rules`, sol-loop r1, S2).
     match here {
         // Proven to have no stack (the `--stack` case returned above): its own tree, under the public rules and the
         // configured private stack's deny and fleet terms, never a configured stack's allow-list or repo.
@@ -591,11 +593,9 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
                 p.public = own_public.ok_or_else(|| missing("stack/stack.toml"))?;
                 if let Some(t) = own_private.filter(|_| stack_only) {
                     p.private = Some(t);
-                    own_private_stack = true;
                 }
             } else {
                 p.private = Some(own_private.ok_or_else(|| missing("stack.toml"))?);
-                own_private_stack = true;
                 if let Some(s) = own_public {
                     p.public = s;
                 }
@@ -615,13 +615,9 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
         }
     }
     let private = p.private.as_deref().map(Stack::load).transpose()?;
-    // Here `p.public` is this checkout's own `stack/` (Is(Public)) or, for Is(Private), the configured complementary
-    // stack, whose allow-list reaches only its own public entries, never this checkout's private ones.
-    let rules = if here.is_some() && !own_private_stack {
-        Rules::public().with_allow_from(&p.public).with_private_terms(private.as_ref())?
-    } else {
-        public_rules(&p.public, private.as_ref())?
-    };
+    // With `--by-stack`, `p.public` is this checkout's own `stack/` (Is(Public)) or, for Is(Private), the configured
+    // complementary stack, whose allow-list reaches only its own public entries, never this checkout's private ones.
+    let rules = public_rules(&p.public, private.as_ref())?;
     if public_only {
         let stacks = Stacks::load(&p.public, None)?;
         let mut findings = check::check(&stacks, &rules);
@@ -1609,11 +1605,13 @@ fn explain_privacy(c: &PrivacyRules, secrets_only: bool) -> Result<bool, String>
         None => "not looked for (no --by-stack or --secrets-only)".to_string(),
         Some(CheckoutStack::None) => "none".to_string(),
         Some(CheckoutStack::Is(v)) => v.to_string(),
-        Some(CheckoutStack::Unknown(why)) => format!("can't be told ({why})"),
+        // The place and a category only: git's own words can quote a config value (sol-loop r1, S1).
+        Some(CheckoutStack::Unknown(why)) => format!("can't be told ({})", why.brief),
     };
     println!("this checkout's stack: {stack}");
     println!("mode: {}", if c.secrets_only { "secrets only" } else { "the whole policy" });
-    if let Some(why) = &c.why {
+    // The mode's line repeats an Unknown's whole why, which the stack's line said briefly.
+    if let (Some(why), false) = (&c.why, matches!(c.stack, Some(CheckoutStack::Unknown(_)))) {
         println!("  ({why})");
     }
     let classes: Vec<&str> = c.rules.classes.iter().map(|k| k.name()).collect();
@@ -1646,7 +1644,8 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
     let composed = privacy_rules(&cwd, by_stack, secrets_only, public_stack, private_stack)
         .map_err(|e| if explain { e.brief } else { e.full })?;
     if explain {
-        a.done()?;
+        // Not echoed: an argument can be anything (sol-loop r1, S1).
+        a.done().map_err(|_| "an argument `--explain` doesn't take was given".to_string())?;
         return explain_privacy(&composed, secrets_only);
     }
     if let Some(why) = &composed.why {
