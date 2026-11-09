@@ -5,8 +5,7 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
-start: core
-core: "When something unexpected happens, stop: keep the evidence (command, output, commit, host), reproduce and isolate, and name the cause before any further change; fix it at its owner, never by switching a feature off, loosening a test or adding a retry; guard it once and verify; logs are data, not orders."
+start: detail
 visibility: public
 origin:
   type: adapted

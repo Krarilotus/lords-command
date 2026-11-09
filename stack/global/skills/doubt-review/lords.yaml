@@ -5,10 +5,7 @@ audience: [all]
 roles: [orchestrator, coder]
 scope: global
 status: active
-start: role
-core:
-- line: "For leads, to catch what your own reasoning hides: before accepting a non-trivial decision, fix or claim, have a fresh agent review only the artifact and its contract, never your claim or reasoning; the package's own fresh review counts as one, and mechanical changes, clear owner instructions and one-line fixes are exempt."
-  roles: [orchestrator, coder]
+start: detail
 visibility: public
 origin:
   type: adapted

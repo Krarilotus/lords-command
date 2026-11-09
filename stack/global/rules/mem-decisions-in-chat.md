@@ -6,10 +6,7 @@ audience: [all]
 roles: [orchestrator]
 scope: global
 status: active
-start: role
-core:
-- line: "To make the owner's decisions easy: bring them in chat as self-contained numbered items (why, options, recommendation), with no forward references and no file to read; fold interdependent choices into one proposal with recommendations as defaults, asking only what changes its direction; when gathering design intent, ask one brief question per turn and keep the rest in the open-questions record."
-  roles: [orchestrator]
+start: detail
 visibility: public
 basis:
 - quote: "I want to only decide line by line offered to me through you in chat … I can't be bothered to check different documents all over the place, that's for your organization with the subagents."

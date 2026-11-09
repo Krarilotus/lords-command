@@ -6,8 +6,7 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
-start: core
-core: "So the interface speaks for itself: every screen word must help the user; no explanatory paragraphs, system or eyebrow labels, slogans, rhetorical questions or repeats, and when in doubt cut it. Extend existing views rather than redesign for decoration; check outputs before showing them. Error and accessibility text the user needs stays."
+start: detail
 visibility: public
 basis:
 - quote: "the UI must speak for itself — a slick version"

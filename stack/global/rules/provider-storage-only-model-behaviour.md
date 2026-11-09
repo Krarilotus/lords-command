@@ -6,8 +6,7 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
-start: core
-core: "Lords Command is the unified base for all agents, whatever the provider. Only behaviour specific to one model and needed to adjust it there lives in that provider's own storage."
+start: detail
 visibility: public
 origin:
   type: own

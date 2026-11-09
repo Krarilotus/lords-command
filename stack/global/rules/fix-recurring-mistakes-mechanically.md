@@ -6,8 +6,7 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
-start: core
-core: "To make a class of mistake impossible instead of patched: fix it at the owner of its invariant, strongest form first (architecture, types, a checked file or lint, a test, prose last), and propose the mechanical form; a call-site fix states why the owner can't hold it. Use each change stage's owning tool, not a private pipeline, launcher, pass stamp or workaround beside it."
+start: detail
 visibility: public
 evidence:
 - summary: "(from rule.one-tool-per-stage, merged 9 Nov) Per-agent pipeline scripts, private launchers and duplicate deploy tools each re-solved the same stage and diverged."

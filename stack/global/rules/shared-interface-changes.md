@@ -6,8 +6,7 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
-start: core
-core: "Before changing a type, signature or contract another package uses, tell its owner and the orchestrator with a concrete proposal. Each shared type has one owner; others ask it for changes."
+start: detail
 visibility: public
 origin:
   type: own

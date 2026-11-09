@@ -6,8 +6,7 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
-start: core
-core: "To stop blind retries: before rerunning a failed job, gate, proof, hook or review, keep its raw output and name and fix its cause, without generalising beyond it (a small bounded repair, or a diagnostic rerun that says what it tests, is fine). A second same-cause failure goes with evidence to the cause's owner. Never invent evidence, or weaken or skip a required check (a hook, gate, guard or test the change must pass) to get past it."
+start: detail
 visibility: public
 basis:
 - quote: 'not running the same tasks and gates in loops that failed previously'

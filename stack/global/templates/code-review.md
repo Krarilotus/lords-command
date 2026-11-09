@@ -6,12 +6,7 @@ audience: [all]
 roles: [orchestrator, coder, reviewer]
 scope: global
 status: active
-start: role
-core:
-- line: "To get independent evidence without review growth: one fresh full review per package on a committed, evidenced head, effort by the project's model policy and the task's risk; after a BLOCK, fix checks cover the diff since and the listed blockers, raise nothing new unless a fix brings it, and go to the orchestrator after two that block; a second full round needs disclosure or data-loss risk and the orchestrator's OK."
-  roles: [orchestrator, coder, reviewer]
-- line: "Reviewers read the bar and its approved exceptions (never blocking on one), the design note and prior rounds; stay read-only in a disposable worktree; mark each probe run or not run; report the verdict first, then classed findings with scenarios, prior closure and merge-tree and signature risks, in correctness wording."
-  roles: [orchestrator, coder, reviewer]
+start: detail
 visibility: public
 evidence:
 - summary: Review rounds caught real deadlocks, but fix checks that widened scope ran to 9-11 rounds; a provider's safety filter ended a review worded in attack terms.

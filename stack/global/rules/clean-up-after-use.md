@@ -6,8 +6,7 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
-start: core
-core: "To keep shared disks and hosts usable: stop your containers once unused, remove your disposable resources after last use and a worktree's build outputs when its phase ends, and keep images, data and caches planned work reuses. Share verified datasets instead of preparing them again; fix a recurring leak at its producer."
+start: detail
 visibility: public
 evidence:
 - summary: One job leaked 275 GB of per-process test stores on a shared host; disk overflow recurred several times.

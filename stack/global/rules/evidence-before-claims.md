@@ -6,8 +6,7 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
-start: core
-core: "To keep claims checkable: \"passes\", \"fixed\", \"no loss\" or \"done\" cite the command, exit code and log or job id, and the result names what produced it (commit and clean tree, toolchain, flags, input hashes, host; raw output kept); code claims name file and line, unrun is \"not run\", and submitted, run, passed and delivered stay apart. Reuse a verified result as it is, never relabelled; a published number is a hypothesis until measured here."
+start: detail
 visibility: public
 origin:
   type: own

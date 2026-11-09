@@ -6,10 +6,7 @@ audience: [all]
 roles: [orchestrator, coder, helper]
 scope: global
 status: active
-start: role
-core:
-- line: "To check designs from first principles: where the state of the art is uncertain, give the owner one or two neutral, self-contained research prompts on the problem and its neighbouring fields (skill.research-prompt), each pasted in chat as its own code block with its file in one line; keep out-of-scope findings and flag those that challenge a committed design."
-  roles: [orchestrator, coder, helper]
+start: detail
 visibility: public
 basis:
 - quote: "when there is big uncertainty about industry standards, we shouldn't assume it, thats kinda like a rule as well, we should then have 1-2 research tasks setup in markdown codeblocks to spin off"

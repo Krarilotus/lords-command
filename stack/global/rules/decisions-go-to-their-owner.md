@@ -6,8 +6,7 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
-start: core
-core: "To lose nothing in relay: send decisions, questions and findings straight to their owner's thread (the owner table names it; else ask your lead who) and take the answer directly, never through a third agent. Choices inside your lead's task go to your lead; your result goes to whoever tasked you. Reading other threads and speaking up with evidence move no authority."
+start: detail
 visibility: public
 basis:
 - quote: "They shoudl target the correct owners of correct decisions, if they have to say sth about thigns they can and interfere or even check up on thigns and other threads themselves."

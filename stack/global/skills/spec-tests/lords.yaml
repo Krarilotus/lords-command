@@ -5,8 +5,7 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
-start: core
-core: "So a test proves specified behaviour: state its input, observable result and source first, check the outcome independently of the code, and report fail-without and pass-with (prefer test-first evidence; separate commits are optional). Never delete, skip or loosen an existing test to make a change pass; one that looks wrong goes to the orchestrator."
+start: detail
 visibility: public
 origin:
   type: adapted

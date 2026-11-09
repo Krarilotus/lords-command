@@ -6,8 +6,7 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
-start: core
-core: "To stay reachable: wait in the background and end the turn, not in a foreground sleep or poll loop; never edit a script a running background task executes (write a new file)."
+start: detail
 visibility: public
 evidence:
 - summary: Agents in foreground poll loops could not receive the orchestrator's messages for hours.

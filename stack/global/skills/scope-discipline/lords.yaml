@@ -5,10 +5,7 @@ audience: [all]
 roles: [orchestrator, coder, helper]
 scope: global
 status: active
-start: role
-core:
-- line: "To keep changes reviewable: before editing, say what changes and what stays out; touch only what the task needs, reusing at the owner; check and commit small slices, refactors apart from behaviour changes; list what you noticed but didn't touch; if scope grows, ask the orchestrator once with a concrete proposal instead of widening silently."
-  roles: [orchestrator, coder, helper]
+start: detail
 visibility: public
 origin:
   type: adapted

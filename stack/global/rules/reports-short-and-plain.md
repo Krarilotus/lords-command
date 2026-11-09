@@ -6,8 +6,7 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
-start: core
-core: "Report the outcome in plain words, decisions with owners and recommendations, change ids, checks, material findings, blockers, risks and uncertainty. Link full evidence in the project's indexed evidence home; omit routine narration and duplicate completion notices."
+start: detail
 visibility: public
 basis:
 - quote: "I don'T see why we put an arbitrary number on it, that came out of nowhere an should be raised as an issue, there must be a better design there out there that already covers that"

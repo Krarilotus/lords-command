@@ -7,7 +7,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "To finish what was agreed: keep its outcome, blockers and boundary in view; list worthwhile work you notice instead of widening into it, and end an investigation in adoption, a revision, rejection or an explicit deferral. A brief gives task, scope and needed context and points to rules instead of restating them."
+core: "Keep the agreed outcome and boundary; list unrelated findings without fixing them. A brief names the task, scope and context and points to rules."
 visibility: public
 evidence:
 - summary: Review fix checks that widened scope ran to 9-11 rounds; preparation work expanded without reducing uncertainty.

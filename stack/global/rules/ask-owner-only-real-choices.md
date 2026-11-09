@@ -7,7 +7,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "To spend the owner's attention only on what is his: check recorded intent first and never re-ask a settled choice; adopt the field leaders' established answer to a design question; ask only his underivable choices (domain intent, scope, project trade-offs), with options and a recommendation. Within your authority, decide; a failure is a fact to diagnose, not a question."
+core: "Check recorded intent before asking. Decide within your authority; ask the owner only for underivable choices, with options and a recommendation."
 visibility: public
 basis:
 - quote: 'check what others do for the same type of problem'

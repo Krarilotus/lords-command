@@ -6,8 +6,7 @@ audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
-start: core
-core: "So what runs is what was reviewed: code lives as plain source at its owner, and what is built and measured is exactly the repo's source; no encoded, packed or run-time-generated code and no build-time source patching (reviewed generators: see the entry)."
+start: detail
 visibility: public
 basis:
 - quote: "Everything has its place and needs to make semantic sense."
