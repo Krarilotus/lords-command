@@ -110,7 +110,10 @@ fn show_prints_the_body_without_frontmatter() {
 
 // Spec (the brief, inputs to attack: "`lords show` for an unknown id, a retired id, and an id that exists in both
 // stores"): each prints nothing on stdout, says why on stderr and fails: an unknown id; a retired one, naming its
-// successor; an ended one; an id two entries hold, naming both files, so neither is taken for the other.
+// successor; an ended one; an id two entries hold, naming both files, so neither is taken for the other. The two
+// files are named under their stacks' places, `<argument 3>` (`--public-stack`) and `<argument 5>` (`--private-stack`),
+// since a stack's directory is a path, which no error repeats (the master, 9 Nov: "paths stay redacted; the private
+// stack's location must never be echoed, so stack directories are not keys"; design note privacy-own-allow).
 #[test]
 fn show_refuses_an_unknown_retired_ended_or_doubled_id() {
     let d = stacks();
@@ -118,7 +121,7 @@ fn show_refuses_an_unknown_retired_ended_or_doubled_id() {
         ("rule.none", &["no entry `rule.none`"]),
         ("rule.gone", &["retired", "rule.next"]),
         ("rule.ended", &["ended"]),
-        ("rule.twice", &["2 entries", "pub", "priv"]),
+        ("rule.twice", &["2 entries", "<argument 3>", "<argument 5>"]),
     ];
     for (id, says) in cases {
         let o = show(&d, id);
@@ -127,6 +130,9 @@ fn show_refuses_an_unknown_retired_ended_or_doubled_id() {
         assert_eq!(stdout, "", "{id}: nothing on stdout");
         for s in *says {
             assert!(stderr.contains(s), "{id}: `{s}` in {stderr}");
+        }
+        if *id == "rule.twice" {
+            assert_eq!(stderr.matches("twice.md").count(), 2, "both files named: {stderr}");
         }
     }
 }
