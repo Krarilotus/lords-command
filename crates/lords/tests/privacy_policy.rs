@@ -643,3 +643,61 @@ fn the_guard_notes_a_failure_without_its_text() {
         text(&o)
     );
 }
+
+// Spec (sol-loop r5, S11: "`check` bypasses `Fail` through drift findings. A malformed ledger exposes its TOML
+// diagnostic; a valid private manifest containing an unknown target adapter exposes that target's name and adapter.
+// Raw import failures also enter findings through `plan.notes`"; the master, 06:50: "All three get typed categories at
+// the boundary"; design note privacy-own-allow, attack item 55): a full `check` with a ledger that doesn't parse, with
+// a private target whose name and adapter are no harness's, and with a private repo whose name is in a plan note,
+// repeats none of that text on either stream. Every row runs before anything is asserted.
+#[test]
+fn checks_drift_names_no_plan_failure_text() {
+    let sentinel = "sentinelvalueq";
+    let target = format!(
+        "[[targets]]\nname = \"{sentinel}name\"\nadapter = \"{sentinel}adapter\"\nkind = \"settings\"\npath = \"~/.t/settings.json\"\n"
+    );
+    let rows: [(&str, String, String); 3] = [
+        ("a ledger that doesn't parse", String::new(), format!("{sentinel} = [\n")),
+        ("a target no harness is", target, String::new()),
+        ("a repo in a plan note", format!("[repos.{sentinel}repo]\n"), String::new()),
+    ];
+    let outputs: Vec<_> = rows
+        .iter()
+        .map(|(row, extra, ledger)| {
+            let env = Env::new();
+            env.configure("", "", "", Some("[host.alpha]\n"));
+            let manifest = env.path("privstack/stack.toml");
+            let before = fs::read_to_string(&manifest).unwrap();
+            write(&manifest, &format!("{before}{extra}"));
+            if !ledger.is_empty() {
+                write(&env.path("home/.lords-command/state/ledger.toml"), ledger);
+            }
+            let repo = checkout(&env, "repo", false, "");
+            (*row, env.lords(&repo, &["check"]))
+        })
+        .collect();
+    let repeated: Vec<_> = outputs
+        .iter()
+        .filter(|(_, o)| text(o).contains(sentinel))
+        .map(|(row, o)| format!("{row}: {}", text(o)))
+        .collect();
+    assert!(repeated.is_empty(), "no plan text, but: {repeated:#?}");
+}
+
+// Spec (sol-loop r5, S13: "discovery marks filesystem errors as trusted `Untold::said`. A locked or unreadable checkout
+// manifest therefore puts the complete IO diagnostic into `brief` ... Fix: categorise disk failures before
+// constructing `Untold`"; design note privacy-own-allow, attack item 56): in a checkout whose dir holds the sentinel and
+// whose `stack/stack.toml` on disk is a dir, `privacy --explain` says the stack can't be told and repeats no path.
+#[test]
+fn a_manifest_that_cant_be_read_is_named_without_its_path() {
+    let sentinel = "sentinelvalueq";
+    let env = Env::new();
+    let repo = checkout(&env, &format!("{sentinel}-repo"), true, "");
+    let manifest = repo.join("stack/stack.toml");
+    fs::remove_file(&manifest).unwrap();
+    fs::create_dir(&manifest).unwrap();
+    let o = env.lords(&repo, &["privacy", "--explain"]);
+    let out = text(&o);
+    assert!(!out.contains(sentinel), "no path: {out}");
+    assert!(o.status.success() && out.contains("can't be told"), "{out}");
+}

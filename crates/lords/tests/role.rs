@@ -246,6 +246,26 @@ fn a_start_is_given_only_beside_its_harnesss_place_file() {
     assert!(!told.contains("REVIEWER START.") && told.lines().count() == 1, "{told}");
 }
 
+// Spec (sol-loop r5, S1: "`guard role --adapter sentinelvalueq`, with a marked role start present, embeds 'no harness
+// `sentinelvalueq` is known' in stdout JSON ... render typed, content-free diagnostics in both guard JSON and notes";
+// design note privacy-own-allow, attack item 53): with a marked start and a harness no adapter is, the prompt is told
+// in one line naming its role file, and neither stream repeats the harness given.
+#[test]
+fn an_unknown_harness_is_named_not_repeated() {
+    let sentinel = "sentinelvalueq";
+    let p = Place::new();
+    let ev = serde_json::json!({"hook_event_name": "UserPromptSubmit", "session_id": "s1",
+        "cwd": p.cwd(), "prompt": "Role: reviewer\nReview it.", "transcript_path": "x"});
+    let home = p.tool_home();
+    let args = ["guard", "role", "--home", home.to_str().unwrap(), "--adapter", sentinel];
+    let o = run(&p.home(), &p.cwd(), &args, &ev.to_string(), &[]);
+    let all =
+        format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(!all.contains(sentinel), "not repeated: {all}");
+    let told = context(&o).unwrap_or_default();
+    assert!(told.contains("role-reviewer.md") && told.lines().count() == 1, "{told}");
+}
+
 // Spec (design note D6, as for the child guard, fix check r2, FC4): asked with the hook's arguments (its tool home and
 // its harness, F10-R1-03) and the probe event, the guard answers its role protocol, 1.
 #[test]
