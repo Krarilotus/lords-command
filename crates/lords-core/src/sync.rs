@@ -3909,7 +3909,9 @@ impl<'a> Record<'a> {
 }
 
 /// Undoes one apply's owner-file edits from its backup dir, last first: a file gets its old bytes back, and a file
-/// apply created goes, each only while it still holds exactly what sync wrote (Sol review r2, R2-03). A path moved
+/// apply created goes, each only while it still holds exactly what sync wrote (Sol review r2, R2-03). It deletes
+/// nothing: what it takes from a path (a created file, an edited file's sync version) moves into the backup dir's
+/// `restored/`, where a writer that held it open still writes (R6-01), and its step line names where. A path moved
 /// there by `set-aside` comes back where nothing is. Every line must re-derive under `plan`, the current config
 /// (design review, point 3): an edit's file one the config names now, a set-aside path within one of the plan's
 /// verified roots, and an edited file one whose attributes as they are now sync may replace (rule C, as apply). If
@@ -3917,6 +3919,17 @@ impl<'a> Record<'a> {
 /// bytes are in the backup; the tool never guesses or skips a line (Sol review r7, R7-06/R7-07). Tool-owned paths aren't restored: sync regenerates them, or
 /// `lords uninstall` removes them. Returns one line per step.
 pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
+    restore_between(plan, backup_dir, &mut |_| {})
+}
+
+/// `restore`, calling `between` with each path it is about to put back or remove, once that path has been checked:
+/// for tests that must reach the moment between the check and the change, as a writer would.
+#[doc(hidden)]
+pub fn restore_between(
+    plan: &Plan,
+    backup_dir: &Path,
+    between: &mut dyn FnMut(&Path),
+) -> Result<Vec<String>, String> {
     let home = Root::home(&plan.home)?;
     let bdir = home.below(backup_dir).ok_or_else(|| {
         format!(
@@ -4014,9 +4027,18 @@ pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
     }
     let _lock = ApplyLock::take(&plan.home, 60)?;
     let mut done = Vec::new();
-    for (path, step) in undo {
+    // Restore deletes nothing (the master's BLOCK R6-01, 9 Nov: "restore never destroys bytes written after sync"):
+    // a file it takes from its path goes into the backup dir's `restored/`, the file object itself, so what a writer
+    // holding it open writes later is kept there too (design note 2026-11-09-lords-restore-keeps-bytes-design.md).
+    let restored = bdir.child(Part::new("restored")?);
+    for (n, (path, step)) in undo.into_iter().enumerate() {
         let holds = |sha: &str| -> Result<bool, String> {
             Ok(fsguard::read(&path)?.is_some_and(|b| fsguard::sha(&b) == sha))
+        };
+        let keep_at = || -> Result<Contained, String> {
+            let name =
+                path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            Ok(restored.child(Part::new(&format!("{n}-{name}"))?))
         };
         let step = match step {
             Undo::Edit { owner, name, written, attrs } if holds(&written)? => {
@@ -4026,15 +4048,30 @@ pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
                 })?;
                 // Checked again as it is replaced, like apply (rule C; R7-06).
                 fsguard::attrs(&path)?.keep().map_err(|e| format!("{}: {e}", path.display()))?;
-                let aside = fsguard::move_aside(&owner)?;
-                if fsguard::read(aside.path())?.is_some_and(|b| fsguard::sha(&b) == written) {
+                between(&path);
+                // A move that fails moves nothing: the file stays at its path, reported.
+                let aside = match fsguard::move_aside_into(&owner, &keep_at()?) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        done.push(format!(
+                            "kept {} (it couldn't go into the backup: {e})",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                };
+                // What is aside goes back on any error before it is replaced (sol-loop r1, B1).
+                let read = fsguard::read(aside.path()).map_err(|e| aside.back_after(e))?;
+                if read.is_some_and(|b| fsguard::sha(&b) == written) {
                     // The owner file's attributes as apply found them (Sol review r4, R4-03).
                     if let Err(e) = fsguard::put_file_as(&owner, &old, Some(&attrs)) {
-                        aside.back()?;
-                        return Err(e);
+                        return Err(aside.back_after(e));
                     }
-                    aside.delete()?;
-                    format!("restored {}", path.display())
+                    format!(
+                        "restored {}; what sync had written is kept at {}",
+                        path.display(),
+                        aside.path().display()
+                    )
                 } else {
                     aside.back()?;
                     format!("kept {} (changed while restoring)", path.display())
@@ -4051,8 +4088,31 @@ pub fn restore(plan: &Plan, backup_dir: &Path) -> Result<Vec<String>, String> {
                 )
             }
             Undo::Created { owner, written } if holds(&written)? => {
-                fsguard::move_aside(&owner)?.delete()?;
-                format!("removed {}", path.display())
+                between(&path);
+                // Checked again once it is aside, like an edit's undo: a write since the check comes back (the Lords
+                // whole-project review, 9 Nov). A move that fails moves nothing: the file stays, reported.
+                let aside = match fsguard::move_aside_into(&owner, &keep_at()?) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        done.push(format!(
+                            "kept {} (it couldn't go into the backup: {e})",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                };
+                // What is aside goes back on any error (sol-loop r1, B1).
+                let read = fsguard::read(aside.path()).map_err(|e| aside.back_after(e))?;
+                if read.is_some_and(|b| fsguard::sha(&b) == written) {
+                    format!(
+                        "removed {}; what it held is kept at {}",
+                        path.display(),
+                        aside.path().display()
+                    )
+                } else {
+                    aside.back()?;
+                    format!("kept {} (changed while restoring)", path.display())
+                }
             }
             Undo::Aside { to, from } => match fsguard::kind(to.path())? {
                 fsguard::Kind::Missing => {

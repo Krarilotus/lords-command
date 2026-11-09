@@ -445,6 +445,8 @@ a reparse point, a bit Windows adds later) refuses the item before anything move
 old file back. Backups are numbered files with a
 manifest naming each original path, the hash sync wrote and the file's attributes. `restore` puts a file back, with
 its attributes (R4-03), only while it still holds exactly what sync wrote; anything else is left and reported. It
+deletes nothing: what it takes from a path moves, the file object itself, into the backup dir's `restored/` (so what
+a writer holding it open writes later is kept there, R6-01), and a file that can't move there stays and is reported. It
 checks the file's attributes as they are now by the same allowlist as apply, and a manifest line that doesn't
 parse completely (every field of its kind: an absolute path, a backup name, a 64-hex-digit hash, the attributes),
 like one that doesn't re-derive under the current config, refuses the whole restore before any change; no line is

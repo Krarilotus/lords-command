@@ -1737,6 +1737,15 @@ pub fn move_aside(p: &impl Place) -> Result<Aside, String> {
     Ok(Aside { at, from: p.place().to_path_buf() })
 }
 
+/// Moves `p` to `to`, where nothing is (into a backup dir, say), so that it can go back from there: the file object
+/// itself moves, so a writer holding it open still writes into it, and nothing is ever deleted (the master's BLOCK
+/// R6-01, 9 Nov; design note Harness/notes/2026-11-09-lords-restore-keeps-bytes-design.md). Nothing is overwritten,
+/// and on any error nothing has moved.
+pub fn move_aside_into(p: &impl Place, to: &Contained) -> Result<Aside, String> {
+    move_to_at(p.place(), &to.path)?;
+    Ok(Aside { at: to.path.clone(), from: p.place().to_path_buf() })
+}
+
 /// Moves a file or dir to a new place (into a backup); nothing is overwritten.
 pub fn move_to(from: &impl Place, to: &Contained) -> Result<(), String> {
     move_to_at(from.place(), &to.path)
