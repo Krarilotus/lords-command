@@ -315,6 +315,50 @@ fn restore_keeps_a_created_file_written_while_it_restores() {
     assert_eq!(fs::read_to_string(&file).ok().as_deref(), Some("my own words\n"), "{steps:?}");
 }
 
+// Spec (sol-loop r1 of the package, B1: "Read errors after moving the file aside leave its original path missing … `?`
+// returns without `aside.back()`"; "Add a regression asserting that an error leaves the original file present"): when
+// restore can't read what it moved aside (here someone put a dir with their file where the target was, between its
+// check and its move), it stops with an error and puts it back where it was, nothing left beside it: for a file apply
+// created, and for one it edited.
+#[test]
+fn a_restore_that_cannot_read_what_it_moved_aside_puts_it_back() {
+    for before in [None, Some("OLD\n")] {
+        let f = Fixture::new();
+        f.write("pub/global/rules/r.md", &entry("rule.r", "global", "public", "", "Rule text.\n"));
+        let file = f.path("out/new.md");
+        if let Some(old) = before {
+            f.write("out/new.md", old);
+        }
+        declare(&f, &format!("[[targets]]\nname = \"t\"\nadapter = \"codex\"\nkind = \"instructions\"\npath = '{}'\n", file.display()));
+        let backups = sync::apply(&sync::plan(&f.stacks(), &f.opts()).unwrap())
+            .unwrap()
+            .backups
+            .expect("a backup");
+        let plan = sync::plan(&f.stacks(), &f.opts()).unwrap();
+        let mut swapped = false;
+        let steps = sync::restore_between(&plan, &backups, &mut |p| {
+            if p == file {
+                fs::remove_file(&file).unwrap();
+                fs::create_dir(&file).unwrap();
+                fs::write(file.join("inside.md"), "theirs\n").unwrap();
+                swapped = true;
+            }
+        });
+        assert!(swapped, "{before:?}: the restore reached the file: {steps:?}");
+        assert!(steps.is_err(), "{before:?}: {steps:?}");
+        assert_eq!(
+            fs::read_to_string(file.join("inside.md")).ok().as_deref(),
+            Some("theirs\n"),
+            "{before:?}: put back: {steps:?}"
+        );
+        let beside: Vec<String> = fs::read_dir(f.path("out"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(beside, ["new.md"], "{before:?}: nothing left beside it");
+    }
+}
+
 // ---------------------------------------------------------------- guarantee 7: the effective hooks
 
 fn public_repo(f: &Fixture) {
