@@ -21,11 +21,16 @@ pub fn session(
     if thread.is_none_or(str::is_empty) {
         return Ok(false);
     }
-    let pid = claude_pid.ok_or("no CLAUDE_PID")?;
+    let pid = claude_pid.ok_or(NO_PID)?;
     // Not repeated: the guard's note carries this line, and a harness shows it (sol-loop r4, S1).
-    let pid = pid.parse::<u32>().map_err(|_| "CLAUDE_PID isn't a process id".to_string())?;
+    let pid = pid.parse::<u32>().map_err(|_| NOT_A_PID.to_string())?;
     Ok(launched_with_t3_tools(&argv_of(pid)?))
 }
+
+/// `session`'s own lines, which name nothing they were given: the helper guard's note may carry them as they are,
+/// matched by equality, and puts any other error, a process's, behind its own category (sol-loop r5, S1).
+pub const NO_PID: &str = "no CLAUDE_PID";
+pub const NOT_A_PID: &str = "CLAUDE_PID isn't a process id";
 
 /// Whether `argv` holds `T3_FLAG`, its two arguments side by side, before `--`, which ends the options (sol-loop r1,
 /// S2). Any other spelling of the flag goes quiet (A11).

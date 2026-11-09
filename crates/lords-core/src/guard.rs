@@ -1700,10 +1700,12 @@ pub fn deliverable(
     if !start.contains(crate::compose::BEGIN) {
         return Err(format!("no {} here", crate::sync::start_file(role)));
     }
+    // The why goes into the start's JSON, which the session reads: our words only, never the harness given or an IO
+    // error's text (design note privacy-own-allow, sol-loop r5, S1). `place` is an adapter's own file name.
     if let Some(id) = adapter {
         let place = crate::adapters::get(id)
             .map(|a| a.repo_file())
-            .ok_or_else(|| format!("no harness `{id}` is known"))?;
+            .ok_or_else(|| "the harness the hook names isn't known".to_string())?;
         match crate::fsguard::read_text(&lords.parent().unwrap_or(lords).join(place)) {
             Ok(Some(t)) if t.contains(crate::compose::BEGIN) => {}
             Ok(_) => {
@@ -1711,7 +1713,7 @@ pub fn deliverable(
                     "no Lords {place} here, which carries what the start leaves out"
                 ))
             }
-            Err(e) => return Err(format!("its {place} can't be read: {e}")),
+            Err(_) => return Err(format!("its {place} can't be read")),
         }
     }
     let text = child_context(start);
@@ -1736,8 +1738,8 @@ fn role_lines(cwd: &Path, home: &Path, role: &str, adapter: Option<&str>) -> Opt
             deliverable(&lords, &text, role, adapter)
                 .unwrap_or_else(|why| not_given(why, lords.join(&file).display().to_string())),
         ),
-        Err(e) => Some(not_given(
-            format!("it can't be read: {e}"),
+        Err(_) => Some(not_given(
+            "it can't be read".to_string(),
             format!("{file}` in this place's `{}` dir", crate::sync::ROLE_DIR),
         )),
     }

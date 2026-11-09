@@ -4374,10 +4374,22 @@ pub fn drift_findings(stacks: &Stacks, home: &Path) -> Vec<crate::Finding> {
                     out.push(Finding::error("memory-live", why).at(compose::live_index(m), None));
                 }
             }
-            out.extend(plan.notes.iter().map(|n| Finding::info("sync-note", n.clone())));
+            // `check` runs in the hooks: its findings name what failed, never a note's or the plan error's text, which
+            // can name a private repo, a ledger's path or an import's failure (design note privacy-own-allow, sol-loop
+            // r5, S11). `lords sync`, interactive, shows them.
+            if !plan.notes.is_empty() {
+                let n = plan.notes.len();
+                out.push(Finding::info(
+                    "sync-note",
+                    format!("the sync plan has {n} note(s); `lords sync` shows them"),
+                ));
+            }
             out
         }
-        Err(e) => vec![Finding::warning("drift", format!("no sync plan: {e}"))],
+        Err(_) => vec![Finding::warning(
+            "drift",
+            "no sync plan: the ledger, a target or the stacks don't load or fit; `lords sync` says why",
+        )],
     }
 }
 

@@ -634,14 +634,20 @@ pub fn checkout_stack(dir: &Path) -> CheckoutStack {
     let mut copies: Vec<(String, Result<Visibility, Untold>)> = Vec::new();
     for rel in MANIFESTS {
         let path = top.join(rel);
+        // A disk failure's text names the path and the OS's words: a category, before `Untold` is built (sol-loop r5,
+        // S13). `exactly_listed`'s alias line names only canonical names, and is the tool's own.
+        let unread = |e: String| Untold::git("can't be read", e);
         let text = match fsguard::kind(&path) {
             Ok(fsguard::Kind::Missing) => continue,
             Ok(_) => exactly_listed(&top, rel).and_then(|()| {
-                fsguard::read_text(&path).and_then(|t| t.ok_or_else(|| "gone".to_string()))
+                fsguard::read_text(&path)
+                    .map_err(unread)
+                    .and_then(|t| t.ok_or_else(|| said("gone".to_string())))
             }),
-            Err(e) => Err(e),
+            Err(e) => Err(unread(e)),
         };
-        copies.push((format!("{rel} on disk"), text.and_then(|t| visibility_of(&t)).map_err(said)));
+        let visibility = text.and_then(|t| visibility_of(&t).map_err(said));
+        copies.push((format!("{rel} on disk"), visibility));
     }
     // Each blob read once: HEAD's copy and the staged one are mostly the same object.
     let mut blobs = std::collections::BTreeMap::new();
@@ -710,16 +716,17 @@ pub fn checkout_stack(dir: &Path) -> CheckoutStack {
 /// file read at `top/rel` is the canonical one, not one a short name, another case, a trailing dot or space or an
 /// ignorable code point reaches (design note d28-alias, the disk rule). No filesystem's aliasing is modelled: a name
 /// that opens but isn't listed is an error, so discovery is `Unknown`.
-fn exactly_listed(top: &Path, rel: &str) -> Result<(), String> {
+fn exactly_listed(top: &Path, rel: &str) -> Result<(), Untold> {
     let mut dir = top.to_path_buf();
     let mut shown = "the checkout's top".to_string();
     for name in rel.split('/') {
-        let names = fsguard::list_dir(&dir)?;
+        let names =
+            fsguard::list_dir(&dir).map_err(|e| Untold::git("its dir can't be listed", e))?;
         if !names.iter().any(|p| p.file_name() == Some(std::ffi::OsStr::new(name))) {
-            return Err(format!(
+            return Err(Untold::said(format!(
                 "opens, but {shown} lists no entry named exactly {name:?}, so another name reaches it (a short name, \
                  another case, a trailing dot or space): name it exactly {rel}"
-            ));
+            )));
         }
         dir.push(name);
         shown = format!("{name}/");
