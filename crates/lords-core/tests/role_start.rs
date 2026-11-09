@@ -107,6 +107,18 @@ fn each_role_gets_a_start_of_what_the_place_file_leaves_out() {
         assert!(!orchestrator.contains(never), "{never} not in:\n{orchestrator}");
     }
     assert_eq!(planned_in(&p, &dir, "start-product.md"), "", "no start for product");
+    // An orchestrator, 9 Nov 03:29: "Drop only text that the pointer's file already carries in full": what a start
+    // leaves out, its role's file still has, so a session that lost its start finds every line of its role there.
+    for (role, left_out) in [
+        ("orchestrator", &["Every role's line.", "The lead's half.", "The verdicts line."][..]),
+        ("reviewer", &["Every role's line.", "The verdicts line."][..]),
+        ("coder", &["Every role's line."][..]),
+    ] {
+        let file = planned_in(&p, &dir, &format!("role-{role}.md"));
+        for line in left_out {
+            assert!(file.contains(line), "{line} in role-{role}.md:\n{file}");
+        }
+    }
 }
 
 // Spec (the owner, 8 Nov, intent.owner-decisions-2026-11-08 item 11, his agreed reading: "absolute boundaries stay
