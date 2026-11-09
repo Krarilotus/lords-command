@@ -86,6 +86,50 @@ else the public stack is <this git repo>/stack.
 check --public scans every file of the public repo (tracked and untracked, not ignored) and the public
 stack alone; it is the pre-push check.";
 
+/// An error line as `lords` prints it: each word in `given` (the words after the command) that isn't one of the tool's
+/// own (a token of `USAGE`) is replaced by `<argument N>`, its place, in each form a path of it takes (`/` or `\`, and
+/// the absolute path `paths()` makes). So no error repeats a value given on the command line, a private term or path
+/// included, whichever command or core error formats it (design note privacy-own-allow, sol-loop r3, S1). Only whole
+/// words are replaced, never part of another word, and the longest match wins where two overlap.
+fn redact(line: &str, given: &[String]) -> String {
+    let ours = |w: &str| {
+        USAGE.split(|c: char| c.is_whitespace() || "[]|()`,.:;=<>".contains(c)).any(|t| t == w)
+    };
+    let in_word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+    for (i, w) in given.iter().enumerate().filter(|(_, w)| !w.is_empty() && !ours(w)) {
+        let mut forms = vec![w.clone(), w.replace('/', "\\"), w.replace('\\', "/")];
+        if let Ok(abs) = std::path::absolute(w) {
+            let abs = abs.display().to_string();
+            forms.extend([abs.replace('/', "\\"), abs.replace('\\', "/"), abs]);
+        }
+        for form in forms.iter().filter(|f| !f.is_empty()) {
+            for (s, _) in line.match_indices(form.as_str()) {
+                let e = s + form.len();
+                if !in_word(line[..s].chars().next_back()) && !in_word(line[e..].chars().next()) {
+                    spans.push((s, e, i + 1));
+                }
+            }
+        }
+    }
+    spans.sort_by_key(|&(s, e, _)| (std::cmp::Reverse(e - s), s));
+    let mut kept: Vec<(usize, usize, usize)> = Vec::new();
+    for sp in spans {
+        if kept.iter().all(|k| sp.1 <= k.0 || sp.0 >= k.1) {
+            kept.push(sp);
+        }
+    }
+    kept.sort();
+    let (mut out, mut at) = (String::new(), 0);
+    for (s, e, n) in kept {
+        out.push_str(&line[at..s]);
+        out.push_str(&format!("<argument {n}>"));
+        at = e;
+    }
+    out.push_str(&line[at..]);
+    out
+}
+
 struct Args {
     words: Vec<String>,
     /// The words as given, so `done` can name a leftover's place.
@@ -108,6 +152,11 @@ impl Args {
         if i + 1 >= self.words.len() {
             return Err(format!("{name} needs a value"));
         }
+        // An option where the value goes is no value: taken as one, it would turn up in an error as a path (sol-loop r3,
+        // S1). Named by our own flag only.
+        if self.words[i + 1].starts_with("--") {
+            return Err(format!("{name} needs a value, and the word after it is an option"));
+        }
         let v = self.words.remove(i + 1);
         self.words.remove(i);
         Ok(Some(v))
@@ -116,6 +165,11 @@ impl Args {
     fn positional(&mut self) -> Option<String> {
         let i = self.words.iter().position(|w| !w.starts_with("--"))?;
         Some(self.words.remove(i))
+    }
+
+    /// `line` with every word given after the command replaced by its place (`redact`).
+    fn redact(&self, line: &str) -> String {
+        redact(line, &self.given)
     }
 
     /// A leftover word is named by its place and kind, never by its text: an argument can be anything, a private term
@@ -907,7 +961,7 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         }
         None | Some("full") => sync::Stage::Full,
         Some("install") => sync::Stage::Install,
-        Some(other) => return Err(format!("--stage {other}: `install` or `full`")),
+        Some(_) => return Err("--stage takes `install` or `full`".into()),
     };
     let apply = a.flag("--apply");
     let json = a.flag("--json");
@@ -1559,10 +1613,12 @@ fn privacy_rules(
     }
     // A configured private stack that doesn't load fails the check: its deny and fleet lists would be skipped.
     let private = match &cfg.private {
-        Some(root) => Some(Stack::load(root).map_err(failed(format!(
-            "the private stack at {} doesn't load: its stack.toml can't be read, isn't TOML or doesn't fit the schema",
-            root.display()
-        )))?),
+        // The flag and the kind of failure, never the path (sol-loop r3, S1).
+        Some(root) => Some(Stack::load(root).map_err(failed(
+            "the private stack (--private-stack, else config.txt's `private`) doesn't load: its stack.toml can't be \
+             read, isn't TOML or doesn't fit the schema"
+                .into(),
+        ))?),
         None => None,
     };
     // A configured private stack only adds restrictions, whatever the flags: its allow-list is no other repo's (D28 r6,
@@ -1580,9 +1636,12 @@ fn privacy_rules(
                 if lords_core::fsguard::read_string(d)
                     .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound) =>
             {
-                format!("{} can't be read", d.display())
+                "the private stack's privacy/deny.txt can't be read".to_string()
             }
-            (_, Some(f)) => format!("the fleet config {} can't be read or isn't TOML", f.display()),
+            (_, Some(_)) => {
+                "the fleet config the private stack's stack.toml names can't be read or isn't TOML"
+                    .to_string()
+            }
             _ => "the private stack's deny-list or fleet config can't be read".to_string(),
         };
         RulesError { brief, full }
@@ -1964,7 +2023,7 @@ fn cmd_show(mut a: Args) -> Result<bool, String> {
             Ok(true)
         }
         Err(why) => {
-            say_err(&format!("lords show: {why}"));
+            say_err(&a.redact(&format!("lords show: {why}")));
             Ok(false)
         }
     }
@@ -1990,6 +2049,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let cmd = words.remove(0);
+    let given = words.clone();
     let a = Args::new(words);
     let result = match cmd.as_str() {
         "check" => cmd_check(a),
@@ -2009,13 +2069,14 @@ fn main() -> ExitCode {
         "sizes" => cmd_sizes(a),
         "paths" => cmd_paths(a),
         "panel" => panel::cmd(a),
-        other => Err(format!("unknown command `{other}`\n\n{USAGE}")),
+        // Not echoed: the first word can be anything (sol-loop r3, S1).
+        _ => Err(format!("the first word isn't a command\n\n{USAGE}")),
     };
     match result {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
         Err(e) => {
-            eprintln!("lords: {e}");
+            eprintln!("lords: {}", redact(&e, &given));
             ExitCode::from(2)
         }
     }

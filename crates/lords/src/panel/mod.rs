@@ -37,7 +37,7 @@ pub fn cmd(mut a: Args) -> Result<bool, String> {
 /// `lords panel serve [--port N]`: until the process ends.
 fn serve(mut a: Args) -> Result<bool, String> {
     let port = match a.value("--port")? {
-        Some(p) => p.parse::<u16>().map_err(|_| format!("--port {p}: a port number"))?,
+        Some(p) => p.parse::<u16>().map_err(|_| "--port takes a port number".to_string())?,
         None => SERVER_PORT,
     };
     let p = crate::paths(&mut a)?;
