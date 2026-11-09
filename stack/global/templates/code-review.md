@@ -8,9 +8,9 @@ scope: global
 status: active
 start: role
 core:
-- line: "One full package round: fresh agent, committed/evidenced head; medium for deltas/docs/tooling, high for product/shared-process controllers, highest for disclosure/data-loss/concurrency/crash. After BLOCK check diff since reviewed head, listed blockers and fails-without tests; new blockers only from fixes; hand off after two blocking fix checks; second independent rounds need disclosure/data-loss risk and orchestrator OK."
+- line: "To get independent evidence without review growth: one fresh full review per package on a committed, evidenced head, effort by risk (highest for disclosure, data loss, concurrency, crash); after a BLOCK, fix checks cover the diff since and the listed blockers, raise nothing new unless a fix brings it, and go to the orchestrator after two that block; a second full round needs disclosure or data-loss risk and the orchestrator's OK."
   roles: [orchestrator, coder, reviewer]
-- line: "Read bar/exceptions, design note/prior reviews; never block approved exceptions; detached disposable worktree, no timing/jobs/commits/pushes/author-tree edits; label probes command/exit or not run, give exact build commands if unable. Report verdict, classed scenarios, prior closure, current-target merge-tree and type/signature risks with correctness wording; ticket nonblockers, route other findings, remove tree/report space."
+- line: "Reviewers read the bar and its approved exceptions (never blocking on one), the design note and prior rounds; stay read-only in a disposable worktree; mark each probe run or not run; report the verdict first, then classed findings with scenarios, prior closure and merge-tree and signature risks, in correctness wording."
   roles: [orchestrator, coder, reviewer]
 visibility: public
 evidence:
@@ -20,6 +20,9 @@ origin:
   type: own
 topics: [review, prompts]
 ---
+**Purpose:** an independent read that finds real faults before merge, without rounds that grow on their own (fix
+checks that widened scope once ran to 9–11 rounds).
+
 **When.** A round starts once the head is committed and every claim has its evidence (command, exit code, log). Each
 round is a fresh reviewer agent; never continue a review in the old thread. Effort: medium for a delta, tooling or
 docs; high for product code; the highest where a finding could be disclosure or data loss, or for a concurrency or
@@ -56,3 +59,8 @@ unneeded infrastructure.
 invariance", "isolation"), not attack terms. If a provider flags a review as a security risk, check that it really is
 a defensive review of your own code, then restart it on a new agent with the same scope, the partial evidence and
 correctness wording.
+
+**When to depart:** a fix check that sees a new blocking-class fault outside the fixes (a wrong answer, disclosure,
+data loss, a crash) reports it to the orchestrator as a finding with its scenario instead of staying silent; the
+orchestrator decides whether it joins this package. A project's own review template may set its builds and jobs
+(for example fleet proof jobs) in place of item 7's "no jobs".

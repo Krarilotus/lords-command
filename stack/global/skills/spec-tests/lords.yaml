@@ -6,7 +6,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "Before a test, state its specified input/result and source; if none, ask or state user behaviour; use independent outcomes, rewrite tautologies; never delete, skip or loosen an existing test to pass. Report fail-without/pass-with; test-before-fix commits are default; mutation is a fallback only for tests written after their fix; report why the test came after; send wrong tests to the orchestrator."
+core: "So a test proves specified behaviour: state its input, observable result and source first, check the outcome independently of the code, and report fail-without and pass-with (the test committed before its fix by default; mutation only as a stated fallback). Never delete, skip or loosen an existing test to make a change pass; one that looks wrong goes to the orchestrator."
 visibility: public
 origin:
   type: adapted
@@ -15,5 +15,5 @@ origin:
   path: skills/test-driven-development/SKILL.md
   licence: MIT
   copyright: Copyright (c) 2025 Addy Osmani
-  changes: "Reframed from TDD (398 lines) to tests of specified behaviour: a spec line per test, a required red check, a tautology list; drops the pyramid, browser testing and stack discovery. The red check's default is a test committed before its fix (owner, 25 Oct: mutation runs are expensive and slow); mutation after the fact only as a stated fallback."
+  changes: "Reframed from TDD (398 lines) to tests of specified behaviour: a spec line per test, a required red check, a tautology list; drops the pyramid, browser testing and stack discovery. The red check's default is a test committed before its fix, because mutation runs are expensive and slow; mutation after the fact only as a stated fallback. (Until 9 Nov this reason was attributed to the owner, 25 Oct; the 8 Nov corpus audit (U2) found no such words in his intent files, so it is the default's own reason. His 2 Nov 'agreed' covers the answer-first red check, a different edit.)"
 topics: [testing]

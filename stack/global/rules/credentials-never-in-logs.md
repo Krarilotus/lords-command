@@ -7,7 +7,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "Treat webhook URLs, tokens and keys as credentials: never echo, log, store or commit them, and never pass one service's credentials to another."
+core: "Boundary: webhook URLs, tokens and keys are credentials: never echo, log, store or commit one, and never pass one service's credentials to another."
 visibility: public
 origin:
   type: own

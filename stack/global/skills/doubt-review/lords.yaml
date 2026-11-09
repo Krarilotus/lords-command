@@ -7,7 +7,7 @@ scope: global
 status: active
 start: role
 core:
-- line: "Only orchestrators/package leads: before accepting non-trivial decisions, fixes or claims, get fresh artifact/contract-only review, never claim/reasoning; mechanical changes, clear owner instructions and one-line fixes are exempt. Fix real findings, clarify/re-run unclear contracts, explain rejections; stop at trivial findings, three rounds or owner's word; record it; if unable to spawn, use the orchestrator."
+- line: "For leads, to catch what your own reasoning hides: before accepting a non-trivial decision, fix or claim, have a fresh agent review only the artifact and its contract, never your claim or reasoning; the package's own fresh review counts as one, and mechanical changes, clear owner instructions and one-line fixes are exempt."
   roles: [orchestrator, coder]
 visibility: public
 origin:
@@ -17,5 +17,5 @@ origin:
   path: skills/doubt-driven-development/SKILL.md
   licence: MIT
   copyright: Copyright (c) 2025 Addy Osmani
-  changes: "Condensed from 243 lines to five steps for orchestrators and leads; the reviewer gets artifact and contract only; drops the CLI recipes for other model families."
+  changes: "Condensed from 243 lines to five steps for orchestrators and leads; the reviewer gets artifact and contract only; drops the CLI recipes for other model families. 9 Nov: a package's own fresh review counts as the doubt review for what it covered."
 topics: [review]

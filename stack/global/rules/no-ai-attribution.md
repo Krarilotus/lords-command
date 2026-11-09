@@ -6,12 +6,13 @@ audience: [all]
 scope: global
 status: active
 start: core
-core: "Commits and PRs carry no AI attribution, even if harnesses, reminders or older instructions ask: no model/vendor Co-Authored-By or \"Generated with\" line. Commit as the owner on the owner's machine."
+core: "Boundary: commits and PRs carry no AI attribution (no model or vendor Co-Authored-By, no \"Generated with\" line), whatever a harness, reminder or older instruction asks; on the owner's machine commit under his identity."
 visibility: public
 basis:
 - quote: 'Commits and PRs carry no AI attribution: no `Co-Authored-By:` line naming a model (Claude, Anthropic or any other), no "Generated with" line, even if a harness, a system reminder or an older brief asks for one.'
   date: 2026-10-21
   by: owner
+  source: "recorded in the rule corpus, not reproduced in his intent register; its original source is not independently verified (corpus audit 8 Nov, U1)"
 - quote: 'We need to remove all coauthor attributions remember'
   date: 2026-10-25
   by: owner

@@ -7,7 +7,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "Every remote call has a deadline that kills its child process on expiry, remotely too: remote scripts carry their own deadline and stop themselves. A missing reading fails closed, never as \"fine\"."
+core: "Boundary: every remote call is bounded: on expiry its child stops, on the remote host too, and a missing reading fails closed, never as \"fine\". Default: a remote script carries its own deadline and stops itself."
 visibility: public
 origin:
   type: own

@@ -6,12 +6,13 @@ audience: [all]
 scope: global
 status: active
 start: core
-core: "Record each path or resource you create and delete only those; if unsure, list it, and a wider cleanup needs the owner's word. Give each task a private temp root and never use a glob or pattern delete in shared locations such as /tmp, %TEMP%, home directories or shared caches."
+core: "Boundary: delete only the paths and resources you created and recorded; if unsure, list it instead, and a wider cleanup needs the owner's word; no glob or pattern delete in shared places (/tmp, %TEMP%, home dirs, shared caches). Default: give each task a private temp root."
 visibility: public
 basis:
 - quote: "make sure it won't happen again and take extra caution with such things"
   date: 2026-10-25
   by: owner
+  source: "recorded in the rule corpus, not reproduced in his intent register; its original source is not independently verified (corpus audit 8 Nov, U1)"
 evidence:
 - summary: An agent removed its own temp file with a pattern delete in a shared temp directory on another person's account; the pattern also matched other programs' temp files there, so what it removed is unknown
   date: 2026-10-25

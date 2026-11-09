@@ -7,7 +7,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "Never wait inside a turn with a foreground sleep or poll loop; run the wait in the background and end the turn. Never edit a script that a running background task executes; write a new file."
+core: "To stay reachable: wait in the background and end the turn, not in a foreground sleep or poll loop; never edit a script a running background task executes (write a new file)."
 visibility: public
 evidence:
 - summary: Agents in foreground poll loops could not receive the orchestrator's messages for hours.
@@ -16,6 +16,11 @@ origin:
   type: own
 topics: [process, delegation]
 ---
-Never wait inside a turn with a foreground sleep or poll loop (on a lock, a job or a review): run the wait as a
-background task and end the turn, so its completion wakes you and messages can reach you. Never edit a script that a
-running background task executes; write a new file.
+**Purpose:** an agent blocked in a wait can't receive messages; agents in poll loops were unreachable for hours.
+
+**Default:** don't wait inside a turn with a foreground sleep or poll loop (on a lock, a job or a review): run the
+wait as a background task and end the turn, so its completion wakes you and messages can reach you. Never edit a
+script that a running background task executes; write a new file.
+
+**When to depart:** a short, bounded foreground wait (seconds, with a deadline) is fine when nothing else can go on
+meanwhile.

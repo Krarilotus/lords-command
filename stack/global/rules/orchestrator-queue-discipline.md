@@ -8,7 +8,7 @@ scope: global
 status: active
 start: role
 core:
-- line: "Owner messages first next turn; at turn start/end drain own queue: read full text, cancel read text-only/completions, promote attachments only, singly with no parallel call; also read finished children's full latest runs against last acted runs, never poll running children. Resolve requests in one batch/message per agent; read busy state then one steer holding current work; read-then-cancel means taken, judge delivery by answer."
+- line: "To answer the owner first and handle work as one batch: owner messages first next turn; at turn start and end empty your queue (read each item whole, cancel text-only items and completions once read, promote only attachments, one at a time) and read finished children's latest runs, never polling running ones; one message per agent, one steer to a busy one."
   roles: [orchestrator]
 - line: "Delegate work that separates cleanly, needs an independent review or would fill your context; stay free for the owner."
   roles: [orchestrator]
@@ -17,9 +17,11 @@ basis:
 - quote: "One thing i would like is, that Orchestrators have the ability to take messages in t3 threads all together instead of going one by one, and that way the queue gets empty every time, and all thigns can be handled and also compounting effects will work beter that way."
   date: 2026-10-30
   by: owner
+  source: "recorded in the rule corpus, not reproduced in his intent register; its original source is not independently verified (corpus audit 8 Nov, U1)"
 - quote: "it would both - save tokens - give compounding information because information is less likely to get stale"
   date: 2026-10-30
   by: owner
+  source: "recorded in the rule corpus, not reproduced in his intent register; its original source is not independently verified (corpus audit 8 Nov, U1)"
 - quote: "and it seems the rules for taking in the whole queue not one message at a time when you decide to end your turn and take the next subagent has still not managed to penetrate and actually land, make sure to add that proper"
   date: 2026-10-30
   by: owner
@@ -37,7 +39,10 @@ origin:
   type: own
 topics: [delegation, process]
 ---
-Answer an owner message in the next turn, before anything queued. Take everything that waits for you at once, at the
+**Purpose:** the owner's messages come first, and taking everything at once saves tokens and keeps information from
+going stale (owner, 30 Oct).
+
+**Default:** answer an owner message in the next turn, before anything queued. Take everything that waits for you at once, at the
 start of a turn and again before its final reply, so the queue is empty when the turn ends: list your own thread's
 queue (`t3_queue list`), read every truncated item in full, cancel each text-only item once its text is in hand, and
 promote only an item that carries an attachment (a `t3-context://` marker), since a cancel would drop it. Promote one
@@ -50,3 +55,9 @@ and close each request with its disposition, not merely because it was read. To 
 send one steer that holds whatever it is doing, never several corrections. Delegate work that separates cleanly from
 yours, needs a review not anchored on your own reading, or would fill your context; keep enough attention free to answer
 the owner promptly.
+
+The queue steps follow T3's current delivery behaviour (read returns full text; only an attachment needs a promotion);
+when T3 changes it, its docs win over these steps.
+
+**When to depart:** an urgent item (one that stops harm or unblocks the owner) is handled at once, outside the batch;
+say so in the batch answer.

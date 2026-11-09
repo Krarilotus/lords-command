@@ -6,16 +6,17 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "Assess owner/level, raise misplaced work with evidence; never work around its owner; reuse modular tools; price runs × duration × cores/RAM, smallest check, full suite once at gate. Base estimates/asks/rates on measured runs (~1.5×), mark/replace guesses; at each introspection/turn end compare costs to declared/prior costs, fix >2× misses at source; report owner/level and rebuild verdict."
+core: "To make waste visible: for anything that repeats or spends shared resources, and at each turn end, put the work at its owner and level (raise misplaced work, never work around its owner), reuse modular tools, price it from measured runs (runs × time × cores/RAM, about 1.5× margin; guesses marked), run the smallest check that decides and the full suite once at the gate, and fix a cost over 2× off at its source."
 visibility: public
 basis:
 - quote: "check why the skills don't prevent such a waste, is there no proper skill for checking fr the correct ownership level and abstraction and going for makign sure to have functional and modular design, does that not icnlude the benchmarking and efficiency in the process itself? If not, try to reframe the skill more concise and focussed and make sure it also applies to introspection and that agents actually make sure to also question their own design and strive for efficiency through the whole stack"
   date: 2026-10-31
   by: owner
+  source: "recorded in the rule corpus, not reproduced in his intent register; its original source is not independently verified (corpus audit 8 Nov, U1)"
 evidence:
 - summary: "On the night of 30-31 Oct, declared estimates were 5-40 times the measured runs and asks 6 times the use, one static gate ran 70 times in about 5 hours, duplicate jobs at older commits were cancelled by hand, and a release missed its own config step. The owner-and-level verdict and the measuring rules existed, but only as intent or report lines judged afterwards; no skill fired when an agent designed or ran something repeated."
   date: 2026-10-31
 origin:
   type: own
 topics: [design, performance, process, review]
-links: [rule.reports-short-and-plain, rule.one-tool-per-stage, rule.fix-recurring-mistakes-mechanically, rule.measure-before-believing, intent.organisation-principles]
+links: [rule.reports-short-and-plain, rule.fix-recurring-mistakes-mechanically, rule.evidence-before-claims, intent.organisation-principles]
