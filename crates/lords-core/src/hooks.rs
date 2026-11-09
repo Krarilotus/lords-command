@@ -18,8 +18,15 @@ pub mod config;
 pub const MARKER: &str = "# lords-command: privacy check";
 
 /// The hooks the tool installs: the only names a `hooks:` ledger record may have.
-pub const NAMES: [&str; 6] =
-    ["pre-commit", "pre-merge-commit", "commit-msg", "pre-push", "post-checkout", "post-commit"];
+pub const NAMES: [&str; 7] = [
+    "pre-commit",
+    "pre-merge-commit",
+    "commit-msg",
+    "pre-push",
+    "post-checkout",
+    "post-commit",
+    "post-merge",
+];
 
 /// A declared repo's post-checkout hook, as a plan finds it (F8, C3): what `sync --apply` installs or replaces.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -115,12 +122,13 @@ fn staged_script(
     stack: bool,
     home: &Path,
 ) -> String {
-    let exe = lords_exe.to_string_lossy().replace('\\', "/");
+    // Quoted literally: a `$` or backtick in a legal path is never expanded (the Lords whole-project review, 9 Nov).
+    let exe = quoted(lords_exe);
     let flag = mode_flag(secrets_only, stack);
     let stack = if stack {
         format!(
             "# A stack repo: this checkout's entries, as `lords check` sees them (none where it has no stack).\n\
-             \"{exe}\" check --stack --by-stack || exit $?\n"
+             {exe} check --stack --by-stack || exit $?\n"
         )
     } else {
         // A checkout that has a stack only since these hooks were installed pushes unchecked until they are installed
@@ -145,7 +153,7 @@ fn staged_script(
          \x20   sh \"$top/{COMMIT_CHECK}\" || exit $?\n\
          fi\n\
          {stack}\
-         exec \"{exe}\" privacy --staged{flag}\n",
+         exec {exe} privacy --staged{flag}\n",
         probe = probe_lines(home, hook),
     )
 }
@@ -155,10 +163,10 @@ fn staged_script(
 /// `--by-stack` skips in a private checkout (D28 r2, C5). It answers a probe like the commit hooks, so a push can tell
 /// that it is there and dispatches (review r1 R4).
 fn pre_push_script(lords_exe: &Path, home: &Path) -> String {
-    let exe = lords_exe.to_string_lossy().replace('\\', "/");
+    let exe = quoted(lords_exe);
     format!(
         "#!/bin/sh\n{MARKER} of the history to push (installed by `lords hooks install`).\n{}\
-         \"{exe}\" privacy --history --by-stack || exit $?\nexec \"{exe}\" check --public --by-stack\n",
+         {exe} privacy --history --by-stack || exit $?\nexec {exe} check --public --by-stack\n",
         probe_lines(home, "pre-push")
     )
 }
@@ -180,10 +188,10 @@ fn shares_a_stack(repo: &Path) -> bool {
 
 /// The commit-msg hook: git passes the message file as `$1`.
 pub fn commit_msg_script(lords_exe: &Path, secrets_only: bool, stack: bool, home: &Path) -> String {
-    let exe = lords_exe.to_string_lossy().replace('\\', "/");
+    let exe = quoted(lords_exe);
     let flag = mode_flag(secrets_only, stack);
     format!(
-        "#!/bin/sh\n{MARKER} of the commit message (installed by `lords hooks install`).\n{probe}exec \"{exe}\" privacy --message \"$1\"{flag}\n",
+        "#!/bin/sh\n{MARKER} of the commit message (installed by `lords hooks install`).\n{probe}exec {exe} privacy --message \"$1\"{flag}\n",
         probe = probe_lines(home, "commit-msg"),
     )
 }
@@ -360,8 +368,8 @@ fn own_hooks_root(repo: &Path) -> Result<Root, String> {
     Root::hooks(&Root::checkout(Path::new(top.trim()))?)
 }
 
-/// Installs the privacy hooks (`PRIVACY`), and in a stack repo its pre-push and post-commit (`post_commit_script`, with
-/// no stacks of its own: its `lords` reads config.txt); `home` holds the ledger that records them and the probe's files.
+/// Installs the privacy hooks (`PRIVACY`), and in a stack repo its pre-push, post-commit and post-merge
+/// (`post_commit_script`, with no stacks of its own: its `lords` reads config.txt); `home` holds the ledger that records them and the probe's files.
 /// A hook there that isn't the tool's stops them all, unless `force`, which moves each one to a new
 /// `<name>.bak-<date>` first.
 pub fn install(
@@ -401,6 +409,8 @@ pub fn install_with(
     if stack {
         hooks.push(("pre-push", pre_push_script(lords_exe, home)));
         hooks.push(("post-commit", post_commit_script(lords_exe, home, stacks)));
+        // git runs post-merge, not post-commit, for a merge commit (a `--no-ff` merge included).
+        hooks.push(("post-merge", post_commit_script(lords_exe, home, stacks)));
     }
     let mut foreign = Vec::new();
     for (name, _) in &hooks {

@@ -1,6 +1,8 @@
 //! Temporary entries (owner, 25 Oct: "we don't poison the context with them forever as being temporary in the
-//! past"). An entry ends on its `until` date, when the status it watches reaches the end state, or when its review
-//! date passes unrenewed. An ended entry is never composed; `check` reports it and `sync --apply` retires it.
+//! past"). An entry ends on its `until` date or when the status it watches reaches the end state; an ended entry is
+//! never composed, `check` reports it and `sync --apply` retires it. Its review date ends nothing (an orchestrator,
+//! 9 Nov: "A calendar date shouldn't switch off a safety or authority condition"): once it passes, `check` reports
+//! the review as due until the date is moved or the entry ends.
 
 use crate::model::{Entry, Kind};
 use crate::stack::Stacks;
@@ -23,10 +25,13 @@ pub fn ended(e: &Entry, stacks: &Stacks, today: &str) -> Option<String> {
             return Some(format!("{} is {}", w.status, w.state));
         }
     }
-    if today > t.review_by.as_str() {
-        return Some(format!("review date {} passed unrenewed", t.review_by));
-    }
     None
+}
+
+/// A temporary entry's review date, when it has passed by `today` (YYYY-MM-DD).
+pub fn review_due<'a>(e: &'a Entry, today: &str) -> Option<&'a str> {
+    let t = e.meta.temporary.as_ref()?;
+    (today > t.review_by.as_str()).then_some(t.review_by.as_str())
 }
 
 /// The one short clause composed text carries for a live temporary entry.

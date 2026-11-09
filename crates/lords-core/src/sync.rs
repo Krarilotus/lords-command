@@ -2417,9 +2417,35 @@ fn child_composed_on(
     start: compose::ChildStart,
     today: &str,
 ) -> Composed {
-    let mut ctx = role_context(layers, role, home);
+    let mut ctx = role_context(layers.clone(), role, home);
     ctx.child = Some(start);
+    if start != compose::ChildStart::Whole {
+        // What the place's files show beside the start, in every harness the place has (design note
+        // 2026-11-08-lords-delivery-once, D2a): its default role's lines, where each file shows them, and its default
+        // role's whole entries, where each carries them inline. The start leaves those out.
+        let names = place_adapter_names(stacks, &layers);
+        let adapters = place_adapters(&names);
+        let all = |f: &dyn Fn(&dyn Adapter) -> bool| {
+            !adapters.is_empty() && adapters.iter().all(|a| f(*a))
+        };
+        ctx.default_role = place_default_role(stacks, &layers);
+        ctx.default_role_lines =
+            all(&|a| stacks.place_files(a.id()).default_role_lines.unwrap_or(true));
+        ctx.default_role_inline = all(&|a| a.default_role_inline());
+    }
     compose::compose_on(stacks, &ctx, today)
+}
+
+/// The harnesses a place's files are written for (stack.toml `adapters`), by name.
+fn place_adapter_names(stacks: &Stacks, layers: &Layers) -> Vec<String> {
+    let Some(private) = stacks.private.as_ref() else { return Vec::new() };
+    let manifest = &private.manifest;
+    match layers {
+        Layers::Repo { repo, .. } => manifest.repos.get(repo).map(|r| r.adapters.clone()),
+        Layers::Workspace { name, .. } => manifest.workspaces.get(name).map(|w| w.adapters.clone()),
+        Layers::Global => None,
+    }
+    .unwrap_or_default()
 }
 
 /// A start one hook gives a session in a place, as install writes it in the place's role dir and the stores' commit

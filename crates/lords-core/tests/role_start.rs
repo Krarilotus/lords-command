@@ -69,9 +69,12 @@ fn a_plan_composes_the_starts_on_its_own_date() {
 }
 
 // Spec (F10, the Lords owner's spec: "a top-level session starts with its role's lines, not only the place's default
-// role"; design note D2): each declared role but `product` (product runs read no place file) gets `.lords/start-<role>.md`,
-// which names the role as given at launch and the role file, and carries the role's lines for only some roles and its
-// whole entries with no class; never a line every role has, nor anything of a role it doesn't bind.
+// role"; design note D2; and design note 2026-11-08-lords-delivery-once D2a, which the owner approved on 9 Nov: the start
+// carries only what the place's files don't): each declared role but `product` (product runs read no place file) gets
+// `.lords/start-<role>.md`, which names the role as given at launch, and carries the role's lines for only some roles and
+// its whole entries with no class, leaving out what the place's files already show it: a line every role has, and a line
+// that names the place's default role (here the orchestrator), which those files show labelled; never anything of a role
+// it doesn't bind.
 #[test]
 fn each_role_gets_a_start_of_what_the_place_file_leaves_out() {
     let (f, checkout) = place();
@@ -81,23 +84,96 @@ fn each_role_gets_a_start_of_what_the_place_file_leaves_out() {
     for want in [
         "You start as a reviewer here",
         "at launch",
-        "role-reviewer.md",
-        "- rule.verdicts: The verdicts line.",
         "- rule.tests: The tests line.",
         "The reviewer's half.",
         "REVIEWER-WHOLE-BODY",
     ] {
         assert!(reviewer.contains(want), "{want} in:\n{reviewer}");
     }
-    for never in ["Every role's line.", "The coder's line.", "The lead's half.", "ALL-BODY"] {
+    for never in [
+        "Every role's line.",
+        "The coder's line.",
+        "The lead's half.",
+        "ALL-BODY",
+        "The verdicts line.",
+    ] {
         assert!(!reviewer.contains(never), "{never} not in:\n{reviewer}");
     }
     let coder = planned_in(&p, &dir, "start-coder.md");
     assert!(coder.contains("The coder's line.") && coder.contains("The tests line."), "{coder}");
     assert!(!coder.contains("The verdicts line.") && !coder.contains("REVIEWER-WHOLE"), "{coder}");
     let orchestrator = planned_in(&p, &dir, "start-orchestrator.md");
-    assert!(orchestrator.contains("The lead's half."), "{orchestrator}");
+    for never in ["The lead's half.", "The verdicts line."] {
+        assert!(!orchestrator.contains(never), "{never} not in:\n{orchestrator}");
+    }
     assert_eq!(planned_in(&p, &dir, "start-product.md"), "", "no start for product");
+    // An orchestrator, 9 Nov 03:29: "Drop only text that the pointer's file already carries in full": what a start
+    // leaves out, its role's file still has, so a session that lost its start finds every line of its role there.
+    for (role, left_out) in [
+        ("orchestrator", &["Every role's line.", "The lead's half.", "The verdicts line."][..]),
+        ("reviewer", &["Every role's line.", "The verdicts line."][..]),
+        ("coder", &["Every role's line."][..]),
+    ] {
+        let file = planned_in(&p, &dir, &format!("role-{role}.md"));
+        for line in left_out {
+            assert!(file.contains(line), "{line} in role-{role}.md:\n{file}");
+        }
+    }
+}
+
+// Spec (the owner, 8 Nov, intent.owner-decisions-2026-11-08 item 11, his agreed reading: "absolute boundaries stay
+// absolute: his reserved decisions, credentials, history rewrites and the safety of the machines; every other rule is …
+// a guideline, not a protocol followed mechanically; an agent that departs from a rule says what it did and why"; and 9
+// Nov: rules "not super strict and guiding the agents not limiting their creative thinking"): the place's files and every
+// start with lines of its own say so (one without is only its intro, beside the place's file), none calls every line
+// binding, and no launched start sends the session to read its whole role file.
+#[test]
+fn the_rules_read_as_guidance_and_the_boundaries_stay_absolute() {
+    let (f, checkout) = place();
+    let p = plan(&f.stacks(), &f.opts()).unwrap();
+    let dir = checkout.join(".lords");
+    let place_file = |name: &str| {
+        p.items
+            .iter()
+            .find(|i| i.path == checkout.join(name))
+            .and_then(|i| i.proposed.clone())
+            .unwrap_or_default()
+    };
+    let mut texts = vec![
+        ("CLAUDE.local.md".to_string(), place_file("CLAUDE.local.md")),
+        ("AGENTS.override.md".to_string(), place_file("AGENTS.override.md")),
+    ];
+    for role in ["orchestrator", "coder", "helper", "reviewer"] {
+        let name = format!("start-{role}.md");
+        texts.push((name.clone(), planned_in(&p, &dir, &name)));
+    }
+    for (name, text) in &texts {
+        assert!(!text.is_empty(), "{name} planned");
+        assert!(!text.contains("binds") && !text.contains("bind you"), "{name}:\n{text}");
+        // A start with no lines of its own is only its intro, beside the place's file that says it (here the helper's,
+        // all of whose lines the place's file has, and the orchestrator's, the default role's, which the place's file
+        // shows: D2a); every other one carries lines and says it itself.
+        let lined = text.lines().any(|l| l.starts_with("- "));
+        let intro_only = ["start-helper.md", "start-orchestrator.md"].contains(&name.as_str());
+        assert_eq!(lined, !intro_only, "{name} with lines of its own:\n{text}");
+        if !lined {
+            continue;
+        }
+        for want in [
+            "Boundaries (",
+            "credentials, history rewrites, machine safety) are absolute",
+            "guidance",
+        ] {
+            assert!(text.contains(want), "{name}: {want}:\n{text}");
+        }
+    }
+    for role in ["orchestrator", "coder", "helper", "reviewer"] {
+        let start = planned_in(&p, &dir, &format!("start-{role}.md"));
+        assert!(
+            !start.contains(&format!("role-{role}.md")),
+            "start-{role}.md sends to the role file:\n{start}"
+        );
+    }
 }
 
 /// The core lines a composed file carries: each `- id…: text` line's text after the id and its label.

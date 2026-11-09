@@ -102,7 +102,7 @@ it replaces.
 | `basis` | list of {quote, date, by} | the owner's words behind the entry, where there are any |
 | `evidence` | list of {summary, date, links} | the cases behind the entry (incidents, measurements); kept beside it, never composed, so the rule stays a short principle; links are checked |
 | `origin` | own; adapted or inherited with repo, commit, path, licence (+ `changes` for adapted); imported with the store and file; in-repo with repo, path and hash | inherited means verbatim; in-repo: a skill tracked in a repo (`skills = [...]` on the repo), indexed where it is, never linked, copied or moved, and listed in that repo's files |
-| `temporary` | {until: date \| when: {status, state}, review_by, reason} | a temporary entry: it ends on `until`, when the status entry it names reaches `state`, or when `review_by` passes unrenewed (renew by moving that date). An ended entry is never composed; `check` warns (`temporary-expired`, fails `--strict`); `sync --apply` retires it with a commit. Composed text labels a live one with its end |
+| `temporary` | {until: date \| when: {status, state}, review_by, reason} | a temporary entry: it ends on `until` or when the status entry it names reaches `state`. An ended entry is never composed; `check` warns (`temporary-expired`, fails `--strict`); `sync --apply` retires it with a commit. A passed `review_by` ends nothing: `check` warns that the review is due (`temporary-review-due`, fails `--strict`) until the date is moved or the entry ends. Composed text labels a live one with its end |
 | `state` | text | status entries only: the current state a `when` condition watches |
 | `topics` | tags from the `topics` list in `stack.toml` | a controlled list (a public entry uses only the public stack's); drive conflict and duplicate detection |
 | `overrides`, `extends` | entry ids | see Layers |
@@ -479,8 +479,8 @@ nothing; `"new-place"` (files where nothing is, in a declared place the ledger r
 accepts. A destination several places share, a checkout's git exclude that its worktrees read too, is never applied
 this way: its wanted edit holds every place that reads it.
 
-**Delivery** (F8). A commit in a store's own checkout reaches every place with nobody running a command: `lords hooks
-install` gives a stack repo a post-commit hook that starts `lords deliver --on-commit` in the background (never in a
+**Delivery** (F8). A commit or merge in a store's own checkout reaches every place with nobody running a command: `lords
+hooks install` gives a stack repo a post-commit and a post-merge hook (git runs only the latter for a merge) that start `lords deliver --on-commit` in the background (never in a
 linked worktree, never for a delivery's own commits, which run with `LORDS_DELIVERING` set). A delivery takes the apply
 lock before it plans, refuses a store whose stack dir holds anything uncommitted, imports memory and retires ended
 entries as their own commits, then plans `--safe-only` for the whole machine and applies it place by place: each

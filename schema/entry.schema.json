@@ -94,7 +94,7 @@
     },
     "temporary": {
       "type": "object",
-      "description": "a temporary entry: it ends on `until` (a date) or `when` a status entry reaches a state, and is reviewed by `review_by` (renew it by moving that date, or it ends); an ended entry is never composed and is retired by sync",
+      "description": "a temporary entry: it ends only on `until` (a date) or `when` a status entry reaches a state; an ended entry is never composed and is retired by sync. `review_by` ends nothing: once it passes, check warns that the review is due (temporary-review-due) until the date is moved or the entry ends",
       "required": ["review_by", "reason"],
       "anyOf": [{ "required": ["until"] }, { "required": ["when"] }],
       "properties": {

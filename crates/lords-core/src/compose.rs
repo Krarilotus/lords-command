@@ -254,16 +254,22 @@ fn opener_line(ctx: &Context) -> String {
         Some(p) if !ctx.public_only => shown(p, ctx),
         _ => "lords".to_string(),
     };
+    // The owner's agreed reading of 8 Nov (intent.owner-decisions-2026-11-08 item 11): the boundaries stay absolute,
+    // everything else is guidance to follow by its purpose, and an agent that departs from it says so. With the shorter
+    // start intro, no longer than the two lines it replaces: it is in every start, and the orchestrator's has a few
+    // characters to spare.
     format!(
-        "Each line below is the hard line of the entry its id names; the entry's whole text binds. Open it by id before work its subject touches: `{exe} show <id>`."
+        "Each line below is an entry's short form. Boundaries (the owner's reserved decisions, credentials, history rewrites, machine safety) are absolute; the rest is guidance: follow its purpose, say where you depart. Full entry: `{exe} show <id>`."
     )
 }
 
-/// The first line of a native child's start file: its role, and how the place's file it also reads binds it.
+/// The first line of a native child's start file: its role, and how the place's file it also reads applies to it.
+/// A launched start doesn't send the session to its whole role file, since it and the place's file carry every core
+/// line of the role; a native child's still names that file (its spec: tests/core_lines.rs, the native child's start).
 fn child_intro(role: &str, start: ChildStart) -> String {
     match start {
         ChildStart::Beyond => format!(
-            "You start as a {role} here, a native subagent. Besides the place's file you read, these bind you; its lines marked for other roles don't. Your role's whole start file is `role-{role}.md` in the place's `.lords` dir."
+            "You start as a {role} here, a native subagent: these lines and the place's file apply to you, except its lines marked for other roles. Your role's whole start file is `role-{role}.md` in the place's `.lords` dir."
         ),
         ChildStart::Whole => {
             format!("You start as a {role} here, a native subagent: this is your role's whole start.")
@@ -271,7 +277,7 @@ fn child_intro(role: &str, start: ChildStart) -> String {
         ChildStart::Launched => {
             let a = if role.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
             format!(
-                "You start as {a} {role} here, the role named at launch. Besides the place's file you read, these bind you; its lines marked for other roles don't. Your role's whole start file is `role-{role}.md` in the place's `.lords` dir."
+                "You start as {a} {role} here, the role named at launch: these lines and the place's file apply to you, except its lines marked for other roles."
             )
         }
     }
@@ -619,6 +625,13 @@ pub fn compose_on(stacks: &Stacks, ctx: &Context, today: &str) -> Composed {
     // for the child's role alone).
     let every_development = |roles: &[String]| development.iter().all(|r| roles.contains(r));
     let beyond = ctx.child.is_some_and(ChildStart::beside_place_file);
+    // Beside a place's files, what they show of the place's default role is left out too (design note
+    // 2026-11-08-lords-delivery-once, D2a): its lines, labelled there where every one of the place's files shows them
+    // (`default_role_lines`), and its whole entries where every one carries them inline (`default_role_inline`). The
+    // start composer sets these from the place (sync.rs `child_composed_on`).
+    let names_default =
+        |roles: &[String]| ctx.default_role.as_ref().is_some_and(|d| roles.contains(d));
+    let shown_beside = |of: &[String]| ctx.default_role_lines && names_default(of);
     let live: Vec<&Entry> = match ctx.child {
         Some(ChildStart::Beyond | ChildStart::Launched) => live
             .into_iter()
@@ -627,6 +640,7 @@ pub fn compose_on(stacks: &Stacks, ctx: &Context, today: &str) -> Composed {
             .filter(|e| {
                 by_parts(e) || !(e.meta.roles.is_empty() || every_development(&e.meta.roles))
             })
+            .filter(|e| by_parts(e) || !(ctx.default_role_inline && names_default(&e.meta.roles)))
             .collect(),
         Some(ChildStart::Whole) => {
             live.into_iter().filter(|e| e.meta.kind != Kind::Memory).collect()
@@ -658,8 +672,9 @@ pub fn compose_on(stacks: &Stacks, ctx: &Context, today: &str) -> Composed {
     let mut shown_parts: std::collections::BTreeMap<&str, Vec<Part>> = Default::default();
     let mut pointed_parts: Vec<Part> = Vec::new();
     for e in live.iter().copied().filter(|e| by_parts(e)) {
-        for p in
-            parts(e, ctx, &declared).into_iter().filter(|p| !(beyond && every_development(&p.of)))
+        for p in parts(e, ctx, &declared)
+            .into_iter()
+            .filter(|p| !(beyond && (every_development(&p.of) || shown_beside(&p.of))))
         {
             // A skill is listed wherever it applies; a line not for this file's readers leaves its own hook there, and
             // is counted for the role file that has it (repair sol-loop r1, R1).
