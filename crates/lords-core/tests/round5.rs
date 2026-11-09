@@ -359,6 +359,73 @@ fn a_restore_that_cannot_read_what_it_moved_aside_puts_it_back() {
     }
 }
 
+/// Every file below `dir` whose bytes contain `needle`.
+fn holding(dir: &Path, needle: &str) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            found.extend(holding(&p, needle));
+        } else if fs::read(&p).is_ok_and(|b| String::from_utf8_lossy(&b).contains(needle)) {
+            found.push(p);
+        }
+    }
+    found
+}
+
+// Spec (the master's BLOCK of 9 Nov 04:21, R6-01: "a writable handle kept open across the move-aside can change the file
+// after restore's final read, and restore then deletes those bytes"; "restore never destroys bytes written after sync";
+// design note Harness/notes/2026-11-09-lords-restore-keeps-bytes-design.md): someone holds the target open for writing
+// from before restore moves it, and writes through that handle once restore is done, the latest moment after its read.
+// Those bytes are still in a file, in the backup dir restore was given, after the handle closes; restore did its work
+// at the path (a created file is gone from it, an edited one holds its old bytes again). For a file apply created, and
+// for one it edited.
+#[test]
+fn restore_keeps_what_a_writer_writes_after_it_reads() {
+    use std::io::Write;
+    // Each variant is checked on its own, so a red shows both (the review of 04:21: a red that stops on its first
+    // variant is no evidence for the second).
+    let mut lost = Vec::new();
+    for before in [None, Some("OLD\n")] {
+        let f = Fixture::new();
+        f.write("pub/global/rules/r.md", &entry("rule.r", "global", "public", "", "Rule text.\n"));
+        let file = f.path("out/new.md");
+        if let Some(old) = before {
+            f.write("out/new.md", old);
+        }
+        declare(&f, &format!("[[targets]]\nname = \"t\"\nadapter = \"codex\"\nkind = \"instructions\"\npath = '{}'\n", file.display()));
+        let backups = sync::apply(&sync::plan(&f.stacks(), &f.opts()).unwrap())
+            .unwrap()
+            .backups
+            .expect("a backup");
+        let plan = sync::plan(&f.stacks(), &f.opts()).unwrap();
+        let mut writer: Option<fs::File> = None;
+        let steps = sync::restore_between(&plan, &backups, &mut |p| {
+            if p == file {
+                writer = Some(fs::OpenOptions::new().write(true).open(&file).unwrap());
+            }
+        });
+        let mut writer =
+            writer.unwrap_or_else(|| panic!("{before:?}: reached the file: {steps:?}"));
+        writer.write_all(b"late words\n").unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        assert!(steps.is_ok(), "{before:?}: {steps:?}");
+        assert_eq!(
+            fs::read_to_string(&file).ok().as_deref(),
+            before,
+            "{before:?}: restored at its path: {steps:?}"
+        );
+        let kept = holding(&backups, "late words");
+        if kept.len() != 1 {
+            lost.push(format!(
+                "{before:?}: the late bytes in {kept:?}, not one file in the backup dir: {steps:?}"
+            ));
+        }
+    }
+    assert!(lost.is_empty(), "{lost:#?}");
+}
+
 // ---------------------------------------------------------------- guarantee 7: the effective hooks
 
 fn public_repo(f: &Fixture) {
