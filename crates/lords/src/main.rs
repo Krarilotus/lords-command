@@ -88,9 +88,15 @@ stack alone; it is the pre-push check.";
 
 struct Args {
     words: Vec<String>,
+    /// The words as given, so `done` can name a leftover's place.
+    given: Vec<String>,
 }
 
 impl Args {
+    fn new(words: Vec<String>) -> Args {
+        Args { given: words.clone(), words }
+    }
+
     fn flag(&mut self, name: &str) -> bool {
         let before = self.words.len();
         self.words.retain(|w| w != name);
@@ -112,11 +118,18 @@ impl Args {
         Some(self.words.remove(i))
     }
 
+    /// A leftover word is named by its place and kind, never by its text: an argument can be anything, a private term
+    /// included, and an error line can reach a log (design note privacy-own-allow, sol-loop r2, S1).
     fn done(&self) -> Result<(), String> {
-        match self.words.first() {
-            Some(w) => Err(format!("unexpected `{w}`")),
-            None => Ok(()),
-        }
+        let Some(w) = self.words.first() else { return Ok(()) };
+        let at = self
+            .given
+            .iter()
+            .position(|g| g == w)
+            .map(|i| format!(" {}", i + 1))
+            .unwrap_or_default();
+        let kind = if w.starts_with("--") { "an option" } else { "a value" };
+        Err(format!("argument{at} after the command is {kind} it doesn't take"))
     }
 }
 
@@ -1629,6 +1642,8 @@ fn explain_privacy(c: &PrivacyRules, secrets_only: bool) -> Result<bool, String>
 }
 
 fn cmd_privacy(mut a: Args) -> Result<bool, String> {
+    // First, before any option takes its value, so no value can swallow it (sol-loop r2, S1).
+    let explain = a.flag("--explain");
     let staged = a.flag("--staged");
     let history = a.flag("--history");
     let secrets_only = a.flag("--secrets-only");
@@ -1637,15 +1652,19 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
     let message = a.value("--message")?;
     let public_stack = a.value("--public-stack")?.map(PathBuf::from);
     let private_stack = a.value("--private-stack")?.map(PathBuf::from);
-    let explain = a.flag("--explain");
+    if explain && (staged || history || message.is_some()) {
+        return Err(
+            "--explain scans nothing, so it takes no --staged, --history or --message".into()
+        );
+    }
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     // `--explain` models the stack hooks unless `--secrets-only` is given (review r1, R1-03).
     let by_stack = by_stack || (explain && !secrets_only);
     let composed = privacy_rules(&cwd, by_stack, secrets_only, public_stack, private_stack)
         .map_err(|e| if explain { e.brief } else { e.full })?;
     if explain {
-        // Not echoed: an argument can be anything (sol-loop r1, S1).
-        a.done().map_err(|_| "an argument `--explain` doesn't take was given".to_string())?;
+        // `done` names no argument's text (sol-loop r2, S1).
+        a.done()?;
         return explain_privacy(&composed, secrets_only);
     }
     if let Some(why) = &composed.why {
@@ -1964,14 +1983,14 @@ fn main() -> ExitCode {
     // fix check r2, R8).
     if words.first().is_some_and(|w| w == "guard") {
         words.remove(0);
-        return cmd_guard(Args { words });
+        return cmd_guard(Args::new(words));
     }
     if words.is_empty() || words.iter().any(|w| w == "--help" || w == "-h") {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
     let cmd = words.remove(0);
-    let a = Args { words };
+    let a = Args::new(words);
     let result = match cmd.as_str() {
         "check" => cmd_check(a),
         "import" => cmd_import(a),
