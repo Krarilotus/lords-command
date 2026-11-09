@@ -479,8 +479,8 @@ nothing; `"new-place"` (files where nothing is, in a declared place the ledger r
 accepts. A destination several places share, a checkout's git exclude that its worktrees read too, is never applied
 this way: its wanted edit holds every place that reads it.
 
-**Delivery** (F8). A commit in a store's own checkout reaches every place with nobody running a command: `lords hooks
-install` gives a stack repo a post-commit hook that starts `lords deliver --on-commit` in the background (never in a
+**Delivery** (F8). A commit or merge in a store's own checkout reaches every place with nobody running a command: `lords
+hooks install` gives a stack repo a post-commit and a post-merge hook (git runs only the latter for a merge) that start `lords deliver --on-commit` in the background (never in a
 linked worktree, never for a delivery's own commits, which run with `LORDS_DELIVERING` set). A delivery takes the apply
 lock before it plans, refuses a store whose stack dir holds anything uncommitted, imports memory and retires ended
 entries as their own commits, then plans `--safe-only` for the whole machine and applies it place by place: each

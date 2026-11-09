@@ -27,7 +27,7 @@ usage:
   lords privacy FILE...
     (--by-stack: the mode of this checkout's stack, secrets only where every copy of its manifest says private, else the
     whole policy; --secrets-only holds only where this checkout has no stack or a private one)
-  lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit, pre-merge-commit and commit-msg hooks; in a stack repo also `check --stack`, a pre-push and a post-commit that runs `deliver`
+  lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit, pre-merge-commit and commit-msg hooks; in a stack repo also `check --stack`, a pre-push, and a post-commit and post-merge that run `deliver`
     (a stack repo's hooks check with --by-stack, so each checkout by its own stack; --secrets-only is for a repo without one)
   lords hash PATH
   lords sync [--user | --repo NAME [--place DIR]] [--adapter ID] [--stage install] [--json] [--apply] [--deadline-ms N]
@@ -42,7 +42,7 @@ usage:
   lords deliver [--on-commit DIR | --repo NAME --place DIR --new-worktree] [--home DIR]   the stores' committed
     entries into every place (or one new worktree), safe-only, under the apply lock, place by place; what it held, or
     why it failed, goes into the state file `lords paths` reads (exit 0 nothing held, 1 held, 2 failed). The stores'
-    post-commit and each repo's post-checkout hook run it. --protocol: the protocol this copy speaks
+    post-commit and post-merge and each repo's post-checkout hook run it. --protocol: the protocol this copy speaks
   lords uninstall [--user | --repo NAME] [--apply]   remove the tool's paths that still match its ledger
   lords uninstall --repo NAME --place DIR [--apply] [--json]   one checkout or worktree's recorded copies
     (a changed copy is kept with its record; exit 0 no record of the place remains, 1 one does, 2 refused or stopped)
