@@ -90,14 +90,16 @@ stack alone; it is the pre-push check.";
 /// own (a token of `USAGE`) is replaced by `<argument N>`, its place, in each form a path of it takes (`/` or `\`, and
 /// the absolute path `paths()` makes). So no error repeats a value given on the command line, a private term or path
 /// included, whichever command or core error formats it (design note privacy-own-allow, sol-loop r3, S1). Only whole
-/// words are replaced, never part of another word, and the longest match wins where two overlap.
-fn redact(line: &str, given: &[String]) -> String {
+/// words are replaced, never part of another word, and the longest match wins where two overlap. A word in `keys`, a
+/// lookup key `Args::key` read, is left as it is.
+fn redact(line: &str, given: &[String], keys: &[String]) -> String {
     let ours = |w: &str| {
         USAGE.split(|c: char| c.is_whitespace() || "[]|()`,.:;=<>".contains(c)).any(|t| t == w)
     };
     let in_word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
     let mut spans: Vec<(usize, usize, usize)> = Vec::new();
-    for (i, w) in given.iter().enumerate().filter(|(_, w)| !w.is_empty() && !ours(w)) {
+    let redacted = |w: &&String| !w.is_empty() && !ours(w) && !keys.contains(w);
+    for (i, w) in given.iter().enumerate().filter(|(_, w)| redacted(w)) {
         let mut forms = vec![w.clone(), w.replace('/', "\\"), w.replace('\\', "/")];
         if let Ok(abs) = std::path::absolute(w) {
             let abs = abs.display().to_string();
@@ -134,11 +136,35 @@ struct Args {
     words: Vec<String>,
     /// The words as given, so `done` can name a leftover's place.
     given: Vec<String>,
+    /// The lookup keys read (`key`, `positional_key`), which an error may name: shared with `main`, which prints the
+    /// command's error after the command has taken its `Args`.
+    keys: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
 }
 
 impl Args {
     fn new(words: Vec<String>) -> Args {
-        Args { given: words.clone(), words }
+        Args { given: words.clone(), words, keys: Default::default() }
+    }
+
+    /// The one rule for what an error may repeat (the master, 9 Nov: "A repo/workspace name or an entry id the user just
+    /// typed as a lookup key may be echoed"; design note privacy-own-allow, the key exemption): a key the user looks
+    /// something up by, in the form of a name, no `/` or `\`. A path, given where a key may go (`--repo` takes a path
+    /// inside a place), stays redacted.
+    fn as_key(&self, v: String) -> String {
+        if !v.contains(['/', '\\']) {
+            self.keys.borrow_mut().push(v.clone());
+        }
+        v
+    }
+
+    /// `value`, for a lookup key: a repo or workspace name.
+    fn key(&mut self, name: &str) -> Result<Option<String>, String> {
+        Ok(self.value(name)?.map(|v| self.as_key(v)))
+    }
+
+    /// `positional`, for a lookup key: an entry id.
+    fn positional_key(&mut self) -> Option<String> {
+        self.positional().map(|v| self.as_key(v))
     }
 
     fn flag(&mut self, name: &str) -> bool {
@@ -169,7 +195,7 @@ impl Args {
 
     /// `line` with every word given after the command replaced by its place (`redact`).
     fn redact(&self, line: &str) -> String {
-        redact(line, &self.given)
+        redact(line, &self.given, &self.keys.borrow())
     }
 
     /// A leftover word is named by its place and kind, never by its text: an argument can be anything, a private term
@@ -891,7 +917,7 @@ fn cmd_deliver(mut a: Args) -> Result<bool, String> {
     std::env::set_var(deliver::MARKER, "1");
     let home = tool_home(&mut a)?;
     let on_commit = a.value("--on-commit")?.map(PathBuf::from);
-    let repo = a.value("--repo")?;
+    let repo = a.key("--repo")?;
     let place = a.value("--place")?.map(PathBuf::from);
     let new_worktree = a.flag("--new-worktree");
     let p = paths(&mut a)?;
@@ -966,7 +992,7 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
     let apply = a.flag("--apply");
     let json = a.flag("--json");
     let user_only = a.flag("--user");
-    let repo = a.value("--repo")?;
+    let repo = a.key("--repo")?;
     let adapter = a.value("--adapter")?;
     let place = a.value("--place")?.map(PathBuf::from);
     let deadline = match a.value("--deadline-ms")? {
@@ -1196,7 +1222,7 @@ fn uninstall_place(a: &mut Args, dir: &Path, run: &mut PlaceRun) -> Result<bool,
     let home = tool_home(a)?;
     let apply = a.flag("--apply");
     let user_only = a.flag("--user");
-    run.repo = a.value("--repo")?;
+    run.repo = a.key("--repo")?;
     let p = paths(a)?;
     a.done()?;
     if run.repo.is_none() {
@@ -1309,7 +1335,7 @@ fn cmd_uninstall(mut a: Args) -> Result<bool, String> {
     let home = tool_home(&mut a)?;
     let apply = a.flag("--apply");
     let user_only = a.flag("--user");
-    let repo = a.value("--repo")?;
+    let repo = a.key("--repo")?;
     let p = paths(&mut a)?;
     a.done()?;
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
@@ -1892,7 +1918,7 @@ fn cmd_compose(mut a: Args) -> Result<bool, String> {
     } else {
         a.flag("--child").then_some(lords_core::compose::ChildStart::Beyond)
     };
-    let place = a.value("--repo")?;
+    let place = a.key("--repo")?;
     let role = a.value("--role")?;
     let adapter_id = a.value("--adapter")?.unwrap_or_else(|| "codex".into());
     let p = paths(&mut a)?;
@@ -2013,7 +2039,7 @@ fn cmd_paths(mut a: Args) -> Result<bool, String> {
 /// `lords show <id>`: the whole text on stdout; a refusal (no such entry, two of them, retired or ended) on stderr,
 /// exit 1.
 fn cmd_show(mut a: Args) -> Result<bool, String> {
-    let id = a.positional().ok_or("show needs an id")?;
+    let id = a.positional_key().ok_or("show needs an id")?;
     let p = paths(&mut a)?;
     a.done()?;
     let stacks = Stacks::load(&p.public, p.private.as_deref())?;
@@ -2051,6 +2077,7 @@ fn main() -> ExitCode {
     let cmd = words.remove(0);
     let given = words.clone();
     let a = Args::new(words);
+    let keys = a.keys.clone();
     let result = match cmd.as_str() {
         "check" => cmd_check(a),
         "import" => cmd_import(a),
@@ -2076,7 +2103,7 @@ fn main() -> ExitCode {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
         Err(e) => {
-            eprintln!("lords: {}", redact(&e, &given));
+            eprintln!("lords: {}", redact(&e, &given, &keys.borrow()));
             ExitCode::from(2)
         }
     }
