@@ -103,7 +103,8 @@ fn each_role_gets_a_start_of_what_the_place_file_leaves_out() {
 // absolute: his reserved decisions, credentials, history rewrites and the safety of the machines; every other rule is …
 // a guideline, not a protocol followed mechanically; an agent that departs from a rule says what it did and why"; and 9
 // Nov: rules "not super strict and guiding the agents not limiting their creative thinking"): the place's files and every
-// start say so, and none calls every line binding or sends the session to read its whole role file.
+// start with lines of its own say so (one without is only its intro, beside the place's file), none calls every line
+// binding, and no launched start sends the session to read its whole role file.
 #[test]
 fn the_rules_read_as_guidance_and_the_boundaries_stay_absolute() {
     let (f, checkout) = place();
@@ -126,6 +127,14 @@ fn the_rules_read_as_guidance_and_the_boundaries_stay_absolute() {
     }
     for (name, text) in &texts {
         assert!(!text.is_empty(), "{name} planned");
+        assert!(!text.contains("binds") && !text.contains("bind you"), "{name}:\n{text}");
+        // A start with no lines of its own is only its intro, beside the place's file that says it (here the helper's:
+        // every line of the helper's is in the place's file); every other one carries lines and says it itself.
+        let lined = text.lines().any(|l| l.starts_with("- "));
+        assert_eq!(lined, name != "start-helper.md", "{name} with lines of its own:\n{text}");
+        if !lined {
+            continue;
+        }
         for want in [
             "Boundaries (",
             "credentials, history rewrites, machine safety) are absolute",
@@ -133,7 +142,6 @@ fn the_rules_read_as_guidance_and_the_boundaries_stay_absolute() {
         ] {
             assert!(text.contains(want), "{name}: {want}:\n{text}");
         }
-        assert!(!text.contains("binds") && !text.contains("bind you"), "{name}:\n{text}");
     }
     for role in ["orchestrator", "coder", "helper", "reviewer"] {
         let start = planned_in(&p, &dir, &format!("start-{role}.md"));

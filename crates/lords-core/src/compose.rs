@@ -264,11 +264,12 @@ fn opener_line(ctx: &Context) -> String {
 }
 
 /// The first line of a native child's start file: its role, and how the place's file it also reads applies to it.
-/// The place's file and the start carry every line of the role, so no start sends the child to its whole role file.
+/// A launched start doesn't send the session to its whole role file, since it and the place's file carry every core
+/// line of the role; a native child's still names that file (its spec: tests/core_lines.rs, the native child's start).
 fn child_intro(role: &str, start: ChildStart) -> String {
     match start {
         ChildStart::Beyond => format!(
-            "You start as a {role} here, a native subagent: these lines and the place's file apply to you, except its lines marked for other roles."
+            "You start as a {role} here, a native subagent: these lines and the place's file apply to you, except its lines marked for other roles. Your role's whole start file is `role-{role}.md` in the place's `.lords` dir."
         ),
         ChildStart::Whole => {
             format!("You start as a {role} here, a native subagent: this is your role's whole start.")
