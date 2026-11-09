@@ -32,4 +32,15 @@ No source you can name? Then it is not yet a spec; ask, or state the behaviour t
 ## Never
 Delete, `#[ignore]`/skip, or loosen an existing test to make a change pass. If an existing test looks wrong, say why with its spec line and let the orchestrator decide.
 
+## Stop low-value tests at their source
+- **Don't copy a pattern** from a neighbouring test unless that test meets this skill. Agents learn from the tests they see.
+- **A proposal to remove an existing test** names:
+  - its specified behaviour;
+  - the reachable failure it detects;
+  - an independent test that keeps that protection;
+  - its measured cost.
+
+  The orchestrator decides. A test count, deleted lines or "no regression seen" don't prove a test redundant.
+- **Repeated low-value tests:** when you find the same weak pattern more than once, find where it comes from (the brief, template, helper or earlier test that agents copy) and report that source, so it's fixed there and not test by test.
+
 The project's own rules take precedence over this skill.
