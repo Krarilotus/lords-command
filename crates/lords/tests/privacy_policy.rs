@@ -501,27 +501,22 @@ fn no_argument_is_echoed() {
 // Spec (sol-loop r3, S1: "`Args::value` takes another option as a value. With `lords privacy --private-stack --explain
 // --sentinelvalueq`, the sentinel becomes the path, and the load-error formatter prints it verbatim ... Same class, fix
 // it at its owner: no error prints a user-supplied value ... `sync --stage SENTINEL` ... invalid panel ports ... Load
-// errors name the flag and the kind of failure, never the path"; design note privacy-own-allow, attack items 39-41):
-// each of these is refused, and the value given appears in neither stream: an option where a value goes, a stage, a
-// port, a command, a path given as `--repo`, and a private stack's path that isn't there. An entry id or a repo name
-// typed as a lookup key may be echoed (the master, 9 Nov, after 03:39: "A repo/workspace name or an entry id the user
-// just typed as a lookup key may be echoed"; design note privacy-own-allow, attack items 44-46), so the `show` row is
-// now a `--repo` path. Every row runs before anything is asserted, and every row that echoes is listed.
+// errors name the flag and the kind of failure, never the path"; design note privacy-own-allow, attack items 39-41 and
+// 50): on the surfaces whose output can travel, each of these is refused, and the value given appears in neither
+// stream: an option where a value goes, a port, a command, and a private stack's path that isn't there. Every row runs
+// before anything is asserted, and every row that echoes is listed.
 #[test]
 fn no_error_repeats_a_value() {
     let sentinel = "sentinelvalueq";
     let option = format!("--{sentinel}");
     let env = Env::new();
-    // Stacks configured, so `sync --repo` reaches the selection that names what it was given.
-    env.configure("", "", "", Some("[host.alpha]\n"));
     let repo = checkout(&env, "repo", true, "");
-    let repo_path = format!("{sentinel}/x");
-    let rows: [(&str, Vec<&str>); 6] = [
+    // Only the surfaces whose output can travel (the master, 9 Nov 05:31, the invariant re-scoped; design note
+    // privacy-own-allow, attack item 50): r3's `sync` rows are out of scope, and may name what they were given.
+    let rows: [(&str, Vec<&str>); 4] = [
         ("an option as a value", vec!["privacy", "--private-stack", "--explain", &option]),
-        ("sync --stage", vec!["sync", "--stage", sentinel]),
         ("panel serve --port", vec!["panel", "serve", "--port", sentinel]),
         ("a command", vec![sentinel]),
-        ("sync --repo, a path", vec!["sync", "--repo", &repo_path]),
         ("check --private-stack", vec!["check", "--private-stack", sentinel]),
     ];
     let outputs: Vec<_> = rows.iter().map(|(row, args)| (*row, env.lords(&repo, args))).collect();
@@ -534,4 +529,115 @@ fn no_error_repeats_a_value() {
     for (row, o) in &outputs {
         assert!(!o.status.success(), "{row}: refused: {}", text(o));
     }
+}
+
+// Spec (sol-loop r4, S8: "A private stack's manifest content can reach a parser diagnostic. Render a load or parse
+// failure as 'the private stack's manifest doesn't parse', with no parser text"; design note privacy-own-allow, attack
+// item 47): with a private stack whose stack.toml holds the sentinel inside a longer word, `check --private-stack`, a
+// scan with it configured and a promotion with it configured are each refused, say the private stack's manifest
+// doesn't parse, and repeat none of it. Every row runs before anything is asserted.
+#[test]
+fn a_private_manifest_that_doesnt_parse_is_named_not_quoted() {
+    let sentinel = "sentinelvalueq";
+    let env = Env::new();
+    env.configure("", "", "", Some("[host.alpha]\n"));
+    write(&env.path("privstack/stack.toml"), &format!("{PRIVATE}{sentinel}suffix = [\n"));
+    let repo = checkout(&env, "repo", true, "");
+    write(&repo.join("notes.md"), "clean\n");
+    env.ok_git(&repo, &["add", "notes.md"]);
+    let private = env.path("privstack");
+    let private = private.to_string_lossy();
+    let rows: [(&str, Vec<&str>); 3] = [
+        ("check --private-stack", vec!["check", "--private-stack", &private]),
+        ("privacy --staged", vec!["privacy", "--staged"]),
+        ("promote", vec!["promote", "rule.a"]),
+    ];
+    let outputs: Vec<_> = rows.iter().map(|(row, args)| (*row, env.lords(&repo, args))).collect();
+    let quoted: Vec<_> = outputs
+        .iter()
+        .filter(|(_, o)| text(o).contains(sentinel))
+        .map(|(row, o)| format!("{row}: {}", text(o)))
+        .collect();
+    assert!(quoted.is_empty(), "no manifest text, but: {quoted:#?}");
+    for (row, o) in &outputs {
+        assert!(!o.status.success(), "{row}: refused: {}", text(o));
+        assert!(
+            text(o).contains("the private stack's manifest doesn't parse"),
+            "{row}: {}",
+            text(o)
+        );
+    }
+}
+
+/// `prefix` and then what can't be Unicode: a byte no UTF-8 holds on Unix, a lone surrogate on Windows.
+fn not_unicode(prefix: &str) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let mut bytes = prefix.as_bytes().to_vec();
+        bytes.push(0xff);
+        std::ffi::OsString::from_vec(bytes)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let mut wide: Vec<u16> = prefix.encode_utf16().collect();
+        wide.push(0xD800);
+        std::ffi::OsString::from_wide(&wide)
+    }
+}
+
+// Spec (sol-loop r4, S10: "Read arguments with `args_os()`, and refuse bad Unicode with a content-free error, before any
+// guard or explain handling"; design note privacy-own-allow, attack item 48): an argument that isn't Unicode, holding
+// the sentinel, is refused under `privacy --explain` (exit 2) and noted by `guard rm`, which lets the call through
+// (exit 0), and neither panics nor repeats it.
+#[test]
+fn an_argument_that_isnt_unicode_is_refused_unrepeated() {
+    let sentinel = "sentinelvalueq";
+    let env = Env::new();
+    let repo = checkout(&env, "repo", true, "");
+    let bad = not_unicode(sentinel);
+    let run = |words: &[&str]| {
+        env.cmd(env!("CARGO_BIN_EXE_lords"), &repo).args(words).arg(&bad).output().unwrap()
+    };
+    let rows = [
+        ("privacy --explain", run(&["privacy", "--explain"]), 2),
+        ("guard rm", run(&["guard", "rm"]), 0),
+    ];
+    for (row, o, _) in &rows {
+        assert!(!text(o).contains(sentinel), "{row}: not repeated: {}", text(o));
+    }
+    for (row, o, code) in &rows {
+        assert_eq!(o.status.code(), Some(*code), "{row}: refused, no panic: {}", text(o));
+    }
+}
+
+// Spec (sol-loop r4, S1 for the guard at run time: "errors on those surfaces render as typed diagnostics, a category
+// plus our own flag or role name only, never a wrapped message"; design note privacy-own-allow, attack item 49): the
+// helper guard, given a helper start in a session whose `CLAUDE_PID` is the sentinel, lets the call through with a note
+// that T3's start can't be told, and repeats nothing of what it was given.
+#[test]
+fn the_guard_notes_a_failure_without_its_text() {
+    use std::io::Write;
+    let sentinel = "sentinelvalueq";
+    let env = Env::new();
+    let repo = checkout(&env, "repo", true, "");
+    let mut child = env
+        .cmd(env!("CARGO_BIN_EXE_lords"), &repo)
+        .args(["guard", "helper"])
+        .env("T3CODE_THREAD_ID", "thread")
+        .env("CLAUDE_PID", sentinel)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(br#"{"tool_name":"Agent"}"#).unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert!(!text(&o).contains(sentinel), "not repeated: {}", text(&o));
+    assert!(
+        o.status.success() && text(&o).contains("can't be told"),
+        "noted, let through: {}",
+        text(&o)
+    );
 }
