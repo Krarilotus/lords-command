@@ -4013,11 +4013,12 @@ pub fn restore_between(
                 fsguard::attrs(&path)?.keep().map_err(|e| format!("{}: {e}", path.display()))?;
                 between(&path);
                 let aside = fsguard::move_aside(&owner)?;
-                if fsguard::read(aside.path())?.is_some_and(|b| fsguard::sha(&b) == written) {
+                // What is aside goes back on any error before it is replaced (sol-loop r1, B1).
+                let read = fsguard::read(aside.path()).map_err(|e| aside.back_after(e))?;
+                if read.is_some_and(|b| fsguard::sha(&b) == written) {
                     // The owner file's attributes as apply found them (Sol review r4, R4-03).
                     if let Err(e) = fsguard::put_file_as(&owner, &old, Some(&attrs)) {
-                        aside.back()?;
-                        return Err(e);
+                        return Err(aside.back_after(e));
                     }
                     aside.delete()?;
                     format!("restored {}", path.display())
@@ -4041,8 +4042,10 @@ pub fn restore_between(
                 // Checked again once it is aside, like an edit's undo: a write since the check comes back (the Lords
                 // whole-project review, 9 Nov).
                 let aside = fsguard::move_aside(&owner)?;
-                if fsguard::read(aside.path())?.is_some_and(|b| fsguard::sha(&b) == written) {
-                    aside.delete()?;
+                // What is aside goes back on any error, a removal that stops part way included (sol-loop r1, B1).
+                let read = fsguard::read(aside.path()).map_err(|e| aside.back_after(e))?;
+                if read.is_some_and(|b| fsguard::sha(&b) == written) {
+                    aside.delete_or_back()?;
                     format!("removed {}", path.display())
                 } else {
                     aside.back()?;
