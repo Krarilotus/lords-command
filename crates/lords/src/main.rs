@@ -1767,6 +1767,13 @@ fn explain_privacy(c: &PrivacyRules, secrets_only: bool) -> Result<bool, Fail> {
     Ok(true)
 }
 
+/// A scan that can't run, in our words: the kinds of refusal, never the entry's name or git's (sol-loop r4).
+const STAGED_UNSCANNED: &str = "the staged files can't be scanned, so the commit is refused: a staged gitlink \
+    (submodule) or another entry that isn't a file is refused, and a listing or blob git can't read stops the scan. \
+    Commit a submodule in its own repo, or unstage it";
+const HISTORY_UNSCANNED: &str =
+    "the history can't be scanned, so the push is refused: git couldn't list or read a commit";
+
 fn cmd_privacy(mut a: Args) -> Result<bool, Fail> {
     // First, before any option takes its value, so no value can swallow it (sol-loop r2, S1).
     let explain = a.flag("--explain");
@@ -1802,7 +1809,7 @@ fn cmd_privacy(mut a: Args) -> Result<bool, Fail> {
     if history {
         a.done()?;
         let top = git::toplevel(&cwd).ok_or("not in a git repo")?;
-        let h = privacy::scan_history(&top, &rules)?;
+        let h = privacy::scan_history(&top, &rules).map_err(|_| HISTORY_UNSCANNED)?;
         for x in &h.hits {
             println!(
                 "{} {}:{} {}: `{}`",
@@ -1819,13 +1826,14 @@ fn cmd_privacy(mut a: Args) -> Result<bool, Fail> {
     let mut scan = if staged {
         a.done()?;
         let top = git::toplevel(&cwd).ok_or("not in a git repo")?;
-        privacy::scan_staged(&top, &rules)?
+        privacy::scan_staged(&top, &rules).map_err(|_| STAGED_UNSCANNED)?
     } else {
         let mut scan = privacy::Scan::default();
         let files: Vec<String> = std::iter::from_fn(|| a.positional()).collect();
         a.done()?;
         for f in &files {
-            let bytes = lords_core::fsguard::read_bytes(f).map_err(|e| format!("{f}: {e}"))?;
+            let bytes =
+                lords_core::fsguard::read_bytes(f).map_err(|_| "a file given can't be read")?;
             scan.add(PathBuf::from(f), &bytes, &rules);
         }
         // Named files have no .gitattributes to mark them: one that isn't text is refused.
@@ -1835,7 +1843,8 @@ fn cmd_privacy(mut a: Args) -> Result<bool, Fail> {
     // The message is scanned with the staged or named files too. A commit message has no NUL bytes, and its lossy
     // reading keeps every readable part: never refused.
     if let Some(m) = &message {
-        let bytes = lords_core::fsguard::read_bytes(m).map_err(|e| format!("{m}: {e}"))?;
+        let bytes =
+            lords_core::fsguard::read_bytes(m).map_err(|_| "the message file can't be read")?;
         scan.add(PathBuf::from(m), &bytes, &rules);
     }
     for (p, h) in &scan.hits {

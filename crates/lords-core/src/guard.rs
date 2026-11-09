@@ -1141,7 +1141,7 @@ fn waits(ev: &Value, thread: &str, cli: &Path, deadline: Duration) -> Result<boo
     let args = ["thread", "show", thread, "--json", "--messages", "0"];
     // Said as what failed, never with the CLI's words or the transcript's path (sol-loop r4, S1).
     let show = crate::process::t3_cli(cli, &args, deadline)
-        .map_err(|_| "T3's CLI didn't answer".to_string())?;
+        .map_err(|_| "T3's CLI didn't answer by its deadline, or failed".to_string())?;
     let Some(runs) =
         thread_runs(&show).map_err(|_| "T3's CLI answered something else".to_string())?
     else {

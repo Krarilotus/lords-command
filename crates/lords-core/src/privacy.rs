@@ -623,7 +623,9 @@ pub fn checkout_stack(dir: &Path) -> CheckoutStack {
         Ok(None) => return CheckoutStack::None,
         Err(e) => {
             let why = "git can't tell which checkout this is";
-            return CheckoutStack::Unknown(Untold::git(why, format!("{why} ({e})")));
+            let brief =
+                "git can't tell which checkout this is (its config or the repo can't be read)";
+            return CheckoutStack::Unknown(Untold::git(brief, format!("{why} ({e})")));
         }
     };
     // Each copy's failure: the tool's own lines as they are (`said`); git's words behind a category (`git`).
