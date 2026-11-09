@@ -237,7 +237,7 @@ fn dispatch(repo: &Path, home: &Path, hooks: &[&str]) -> Vec<String> {
     })();
     let (probe, message) = match made {
         Ok(m) => m,
-        Err(e) => return both(e),
+        Err(_) => return both("its probe files can't be made in the tool's home".into()),
     };
     let mut problems = Vec::new();
     for &hook in hooks {
@@ -262,12 +262,13 @@ fn dispatch(repo: &Path, home: &Path, hooks: &[&str]) -> Vec<String> {
                     ));
                 }
             }
-            Err(e) => problems.push(format!("{hook}: not verified ({e})")),
+            // What failed, never git's words: `check` shows these (sol-loop r4).
+            Err(_) => problems.push(format!("{hook}: not verified (git didn't run the hook)")),
         }
     }
     for f in [&probe, &message] {
-        if let Err(e) = fsguard::delete_file(f) {
-            problems.push(format!("the probe's file {} stays: {e}", f.path().display()));
+        if fsguard::delete_file(f).is_err() {
+            problems.push(format!("the probe's file {} stays", f.path().display()));
         }
     }
     problems

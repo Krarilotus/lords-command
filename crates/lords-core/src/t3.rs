@@ -22,7 +22,8 @@ pub fn session(
         return Ok(false);
     }
     let pid = claude_pid.ok_or("no CLAUDE_PID")?;
-    let pid = pid.parse::<u32>().map_err(|_| format!("CLAUDE_PID `{pid}` isn't a process id"))?;
+    // Not repeated: the guard's note carries this line, and a harness shows it (sol-loop r4, S1).
+    let pid = pid.parse::<u32>().map_err(|_| "CLAUDE_PID isn't a process id".to_string())?;
     Ok(launched_with_t3_tools(&argv_of(pid)?))
 }
 

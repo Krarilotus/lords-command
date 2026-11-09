@@ -847,8 +847,9 @@ pub fn checkout_mode(
             (false, Some(format!("this checkout's stack is public, {whole}, not --secrets-only")))
         }
         CheckoutStack::Is(Visibility::Public) => (false, None),
+        // The place and a category only: `privacy` prints this line in every mode (sol-loop r4).
         CheckoutStack::Unknown(why) if by_stack || secrets_only => {
-            (false, Some(format!("{why}, {whole}")))
+            (false, Some(format!("{}, {whole}", why.brief)))
         }
         CheckoutStack::Unknown(_) => (false, None),
     }

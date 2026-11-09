@@ -1118,9 +1118,11 @@ pub fn queue_hook(input: &str, env: &QueueEnv) -> Answer {
                 stdout: json!({"decision": "block", "reason": QUEUE_REASON}).to_string(),
                 note: None,
             },
-            Err(e) => {
+            // A guard's note at run time is the tool's own words: a harness shows it to the session, so no IO, git, T3
+            // CLI or parser text goes in it (design note privacy-own-allow, sol-loop r4, S1).
+            Err(_) => {
                 streak.clear();
-                through(format!("can't count the stops held in a row ({e})"))
+                through("can't count the stops held in a row".into())
             }
         },
         Ok(false) => {
@@ -1137,9 +1139,12 @@ pub fn queue_hook(input: &str, env: &QueueEnv) -> Answer {
 /// Whether something may wait in `thread`'s queue: the CLI's two runs, then the session's transcript.
 fn waits(ev: &Value, thread: &str, cli: &Path, deadline: Duration) -> Result<bool, String> {
     let args = ["thread", "show", thread, "--json", "--messages", "0"];
-    let show =
-        crate::process::t3_cli(cli, &args, deadline).map_err(|e| format!("T3's CLI: {e}"))?;
-    let Some(runs) = thread_runs(&show).map_err(|e| format!("T3's CLI: {e}"))? else {
+    // Said as what failed, never with the CLI's words or the transcript's path (sol-loop r4, S1).
+    let show = crate::process::t3_cli(cli, &args, deadline)
+        .map_err(|_| "T3's CLI didn't answer".to_string())?;
+    let Some(runs) =
+        thread_runs(&show).map_err(|_| "T3's CLI answered something else".to_string())?
+    else {
         return Ok(false);
     };
     if runs.latest == runs.active {
@@ -1148,7 +1153,7 @@ fn waits(ev: &Value, thread: &str, cli: &Path, deadline: Duration) -> Result<boo
     let path = ev["transcript_path"].as_str().ok_or("the event names no transcript")?;
     let mut t = Transcript::new(thread, &runs);
     crate::fsguard::read_lines(path, |l| t.line(l))
-        .map_err(|e| format!("the transcript can't be read ({path}: {e})"))?;
+        .map_err(|_| "the transcript can't be read".to_string())?;
     Ok(t.may_wait())
 }
 
@@ -1428,7 +1433,7 @@ pub fn session_hook(input: &str, env: &RulesEnv) -> Answer {
     sweep_records(&env.home);
     let mut answer = match recorded {
         Ok(()) => quiet(),
-        Err(e) => noted(format!("the session's files aren't recorded ({e})")),
+        Err(_) => noted("the session's files aren't recorded"),
     };
     // The nearest `.lords` at or above the cwd, a dir, found without reading any file in it (F10-SR-02).
     let place = || {
@@ -1473,12 +1478,12 @@ pub fn turn_hook(
             // Said first, saved second: a record that can't be saved keeps the old one, so it is said again
             // (review r1, R4).
             lines.extend(found.line);
-            if let Err(e) = write_record(&found.place, &found.cwd, &found.files) {
-                note = Some(format!("the record isn't saved, so this is said again ({e})"));
+            if write_record(&found.place, &found.cwd, &found.files).is_err() {
+                note = Some("the record isn't saved, so this is said again".to_string());
             }
         }
         Ok(None) => {}
-        Err(e) => note = Some(format!("the rules aren't checked ({e})")),
+        Err(_) => note = Some("the rules aren't checked".to_string()),
     }
     let out = json!({"hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",
@@ -1593,7 +1598,9 @@ pub fn child_hook(input: &str, home: &Path) -> Answer {
     let Some(cwd) = ev["cwd"].as_str() else { return noted("the event names no cwd") };
     let text = match child_text(&ev, Path::new(cwd), home) {
         Ok(t) => t,
-        Err(e) => return noted(format!("no start given ({e})")),
+        Err(_) => return noted(
+            "no start given: the place's start can't be read, or a sync is under way or stopped",
+        ),
     };
     if text.is_empty() {
         return quiet();
