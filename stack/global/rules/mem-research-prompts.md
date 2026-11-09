@@ -31,7 +31,8 @@ links: [skill.research-prompt]
 **Purpose:** an assumed state of the art leads to designs that confirm themselves; the owner wants the surrounding
 knowledge, and he often runs prompts from another device.
 
-**Default:** where the state of the art is uncertain, don't assume it: write one or two deep-research prompts for the owner to run.
+**Default:** before drafting a prompt or a design from scratch, ask the project's existing research (its research
+wiki, where it has one) what is already known. Where the state of the art is still uncertain, don't assume it: write one or two deep-research prompts for the owner to run.
 Frame each around the problem and its neighbouring fields, not around the design already chosen; phrase it neutrally,
 self-contained, and ask for named sources mapped to claims. Paste every drafted prompt or relay in the chat reply as its
 own code block (give the file location in one line), and leave out any report-language line. When digesting reports,
