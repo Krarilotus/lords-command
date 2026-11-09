@@ -451,8 +451,9 @@ fn provenance(stacks: &Stacks, out: &mut Vec<Finding>) {
     }
 }
 
-/// Temporary entries: each `when` watches a real status entry, and one that has ended is reported (sync retires
-/// it). The warning fails under `--strict` like any finding the owner must act on.
+/// Temporary entries: each `when` watches a real status entry, one that has ended is reported (sync retires it), and
+/// so is a live one whose review date passed. Both warnings fail under `--strict` like any finding the owner must act
+/// on.
 pub fn temporaries(stacks: &Stacks, today: &str, out: &mut Vec<Finding>) {
     for e in stacks.entries().filter(|e| e.active()) {
         let Some(t) = &e.meta.temporary else { continue };
@@ -474,6 +475,15 @@ pub fn temporaries(stacks: &Stacks, today: &str, out: &mut Vec<Finding>) {
                 Finding::warning(
                     "temporary-expired",
                     format!("ended ({why}); it is no longer composed, and sync --apply retires it"),
+                )
+                .at(&e.meta_file, None)
+                .entry(e.id()),
+            );
+        } else if let Some(by) = crate::temporary::review_due(e, today) {
+            out.push(
+                Finding::warning(
+                    "temporary-review-due",
+                    format!("its review date {by} passed: renew it (move review_by) or end it; it is still composed until its end condition"),
                 )
                 .at(&e.meta_file, None)
                 .entry(e.id()),
@@ -572,6 +582,9 @@ pub fn public_tree(repo: &Path, rules: &Rules) -> Result<(Scan, Vec<Finding>), S
 pub fn has_errors(findings: &[Finding], strict: bool) -> bool {
     findings.iter().any(|f| {
         f.severity == Severity::Error
-            || (strict && (f.severity == Severity::Candidate || f.code == "temporary-expired"))
+            || (strict
+                && (f.severity == Severity::Candidate
+                    || f.code == "temporary-expired"
+                    || f.code == "temporary-review-due"))
     })
 }

@@ -116,11 +116,19 @@ fn a_status_reaching_its_end_state_ends_a_temporary_entry() {
     assert!(!user_level(&f).contains("Two helpers per lead."));
 }
 
-// Spec (above: "Every temporary entry needs an end condition and a review date"): a review date that passes
-// unrenewed ends the entry, even before its end condition.
+// Spec (an orchestrator, 9 Nov 01:47, replacing "a review date that passes unrenewed ends the entry": "a temporary
+// entry's `review_by` date ends its delivery even when its `when` condition is unmet. At 01:00 the commit-slot
+// boundary and two others silently stopped being delivered … A calendar date shouldn't switch off a safety or
+// authority condition"): only the end condition (`until`, or `when`'s status reaching its state) ends an entry. A
+// review date that passes is reported (`temporary-review-due`, a warning that fails under --strict) while the entry
+// is still composed and sync retires nothing.
 #[test]
-fn an_unrenewed_review_date_ends_a_temporary_entry() {
+fn a_passed_review_date_is_reported_and_the_entry_holds_until_its_end() {
     let f = Fixture::new();
+    f.write(
+        "priv/global/status/triage.md",
+        &entry("status.triage", "global", "private", "state: in-progress\n", "Triage.\n"),
+    );
     f.write(
         "pub/global/rules/r.md",
         &entry(
@@ -131,8 +139,39 @@ fn an_unrenewed_review_date_ends_a_temporary_entry() {
             "Review me.\n",
         ),
     );
-    assert!(has(&f.check(), "temporary-expired", "rule.r"));
-    assert!(!user_level(&f).contains("Review me."));
+    f.write(
+        "priv/global/rules/w.md",
+        &entry(
+            "rule.w",
+            "global",
+            "private",
+            &temp(&format!(
+                "  when:\n    status: status.triage\n    state: done\n  review_by: {PAST}\n"
+            )),
+            "Hold the slot.\n",
+        ),
+    );
+    let found = f.check();
+    for id in ["rule.r", "rule.w"] {
+        assert!(!has(&found, "temporary-expired", id), "{id}: {found:#?}");
+        assert!(has(&found, "temporary-review-due", id), "{id}: {found:#?}");
+    }
+    let due = found.iter().find(|x| x.code == "temporary-review-due").unwrap();
+    assert_eq!(due.severity, Severity::Warning);
+    assert!(
+        !lords_core::check::has_errors(&found, false)
+            && lords_core::check::has_errors(&found, true),
+        "fails only --strict"
+    );
+    let text = user_level(&f);
+    assert!(text.contains("Review me.") && text.contains("Hold the slot."), "{text}");
+    f.git_init("priv");
+    let p = lords_core::sync::plan(&f.stacks(), &f.opts()).unwrap();
+    assert!(
+        !p.items.iter().any(|i| i.action == lords_core::sync::Action::RetireEntry),
+        "sync retires nothing: {:#?}",
+        p.items
+    );
 }
 
 // Spec (schema): a temporary block needs an end condition (until or when), a review date and a reason; `state` is
