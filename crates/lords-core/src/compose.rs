@@ -625,6 +625,13 @@ pub fn compose_on(stacks: &Stacks, ctx: &Context, today: &str) -> Composed {
     // for the child's role alone).
     let every_development = |roles: &[String]| development.iter().all(|r| roles.contains(r));
     let beyond = ctx.child.is_some_and(ChildStart::beside_place_file);
+    // Beside a place's files, what they show of the place's default role is left out too (design note
+    // 2026-11-08-lords-delivery-once, D2a): its lines, labelled there where every one of the place's files shows them
+    // (`default_role_lines`), and its whole entries where every one carries them inline (`default_role_inline`). The
+    // start composer sets these from the place (sync.rs `child_composed_on`).
+    let names_default =
+        |roles: &[String]| ctx.default_role.as_ref().is_some_and(|d| roles.contains(d));
+    let shown_beside = |of: &[String]| ctx.default_role_lines && names_default(of);
     let live: Vec<&Entry> = match ctx.child {
         Some(ChildStart::Beyond | ChildStart::Launched) => live
             .into_iter()
@@ -633,6 +640,7 @@ pub fn compose_on(stacks: &Stacks, ctx: &Context, today: &str) -> Composed {
             .filter(|e| {
                 by_parts(e) || !(e.meta.roles.is_empty() || every_development(&e.meta.roles))
             })
+            .filter(|e| by_parts(e) || !(ctx.default_role_inline && names_default(&e.meta.roles)))
             .collect(),
         Some(ChildStart::Whole) => {
             live.into_iter().filter(|e| e.meta.kind != Kind::Memory).collect()
@@ -664,8 +672,9 @@ pub fn compose_on(stacks: &Stacks, ctx: &Context, today: &str) -> Composed {
     let mut shown_parts: std::collections::BTreeMap<&str, Vec<Part>> = Default::default();
     let mut pointed_parts: Vec<Part> = Vec::new();
     for e in live.iter().copied().filter(|e| by_parts(e)) {
-        for p in
-            parts(e, ctx, &declared).into_iter().filter(|p| !(beyond && every_development(&p.of)))
+        for p in parts(e, ctx, &declared)
+            .into_iter()
+            .filter(|p| !(beyond && (every_development(&p.of) || shown_beside(&p.of))))
         {
             // A skill is listed wherever it applies; a line not for this file's readers leaves its own hook there, and
             // is counted for the role file that has it (repair sol-loop r1, R1).
