@@ -1,7 +1,7 @@
 ---
 id: rule.evidence-before-claims
 kind: rule
-title: Evidence before claims
+title: "Evidence for claims"
 audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global

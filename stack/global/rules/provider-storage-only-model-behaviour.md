@@ -1,7 +1,7 @@
 ---
 id: rule.provider-storage-only-model-behaviour
 kind: rule
-title: Provider storage holds only necessary model-specific behaviour
+title: "Provider storage"
 audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global

@@ -1,7 +1,7 @@
 ---
 id: rule.mem-research-prompts
 kind: rule
-title: Research prompts stay open, stand alone, and are pasted in chat
+title: "Research prompts"
 audience: [all]
 roles: [orchestrator, coder, helper]
 scope: global

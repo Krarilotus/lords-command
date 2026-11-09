@@ -1,7 +1,7 @@
 ---
 id: rule.decisions-go-to-their-owner
 kind: rule
-title: Send each decision to its owner, directly
+title: "Decision routing"
 audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global

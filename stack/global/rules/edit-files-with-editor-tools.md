@@ -1,7 +1,7 @@
 ---
 id: rule.edit-files-with-editor-tools
 kind: rule
-title: Write files with the editor tools
+title: "Editing files"
 audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global

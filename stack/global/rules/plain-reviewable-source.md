@@ -1,7 +1,7 @@
 ---
 id: rule.plain-reviewable-source
 kind: rule
-title: Code lives only as plain, reviewable source in its owning place
+title: "Reviewable source"
 audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global

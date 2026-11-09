@@ -1,7 +1,7 @@
 ---
 id: rule.reports-short-and-plain
 kind: rule
-title: A report is a decision-ready handoff, backed by a durable record
+title: "Reports and evidence home"
 audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global

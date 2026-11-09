@@ -1,7 +1,7 @@
 ---
 id: rule.hypothesis-trail
 kind: rule
-title: Keep a hypothesis trail for investigations
+title: "Investigation trail"
 audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global

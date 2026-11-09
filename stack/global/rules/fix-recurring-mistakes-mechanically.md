@@ -1,7 +1,7 @@
 ---
 id: rule.fix-recurring-mistakes-mechanically
 kind: rule
-title: Fix a recurring mistake at the strongest level
+title: "Fixing recurring mistakes"
 audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global

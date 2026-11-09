@@ -1,7 +1,7 @@
 ---
 id: rule.never-block-a-turn-waiting
 kind: rule
-title: Never block a turn waiting
+title: "Background waits"
 audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global

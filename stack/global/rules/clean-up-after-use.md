@@ -1,7 +1,7 @@
 ---
 id: rule.clean-up-after-use
 kind: rule
-title: Clean up owned containers and build outputs after use
+title: "Resource cleanup"
 audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global

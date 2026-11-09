@@ -1,7 +1,7 @@
 ---
 id: rule.shared-interface-changes
 kind: rule
-title: Tell the owner before changing a shared interface
+title: "Changing shared interfaces"
 audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global

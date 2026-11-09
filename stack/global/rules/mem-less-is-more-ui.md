@@ -1,7 +1,7 @@
 ---
 id: rule.mem-less-is-more-ui
 kind: rule
-title: Less is more, above all in interface text
+title: "UI text"
 audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global

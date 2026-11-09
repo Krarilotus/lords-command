@@ -1,7 +1,7 @@
 ---
 id: rule.mem-decisions-in-chat
 kind: rule
-title: Bring decisions to the owner in chat, as self-contained numbered items
+title: "Presenting owner decisions"
 audience: [all]
 roles: [orchestrator]
 scope: global

@@ -1,7 +1,7 @@
 ---
 id: rule.no-repeated-failures
 kind: rule
-title: No repeated failures; cause first
+title: "Diagnosing failed checks"
 audience: [all]
 roles: [orchestrator, coder, helper, reviewer]
 scope: global
