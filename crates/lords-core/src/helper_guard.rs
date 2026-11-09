@@ -35,6 +35,15 @@ pub fn helper_hook(input: &str, t3: impl FnOnce() -> Result<bool, String>) -> An
             note: None,
         },
         Ok(false) => through(None),
-        Err(e) => through(Some(format!("whether T3 started this session can't be told ({e})"))),
+        // A harness shows the note: `t3::session`'s own lines as they are, anything else (a process's) as a category,
+        // compared by equality, never parsed (design note privacy-own-allow, sol-loop r5, S1).
+        Err(e) => {
+            let why = if e == crate::t3::NO_PID || e == crate::t3::NOT_A_PID {
+                e.as_str()
+            } else {
+                "its process's command line can't be read"
+            };
+            through(Some(format!("whether T3 started this session can't be told ({why})")))
+        }
     }
 }

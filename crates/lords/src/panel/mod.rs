@@ -26,18 +26,20 @@ use std::time::{Duration, Instant};
 const USAGE: &str =
     "usage: lords panel serve [--port N] | lords panel add ALIAS --bridge DIR [--embedded] [--apply]";
 
-pub fn cmd(mut a: Args) -> Result<bool, String> {
+/// The panel CLI fails with the tool's own words only (`Fail`; design note privacy-own-allow, sol-loop r4): its argument
+/// and stack errors say what failed, and any other error's text is dropped at the sink.
+pub fn cmd(mut a: Args) -> Result<bool, crate::Fail> {
     match a.positional().as_deref() {
         Some("serve") => serve(a),
-        Some("add") => add_pc(a),
+        Some("add") => Ok(add_pc(a)?),
         _ => Err(USAGE.into()),
     }
 }
 
 /// `lords panel serve [--port N]`: until the process ends.
-fn serve(mut a: Args) -> Result<bool, String> {
+fn serve(mut a: Args) -> Result<bool, crate::Fail> {
     let port = match a.value("--port")? {
-        Some(p) => p.parse::<u16>().map_err(|_| format!("--port {p}: a port number"))?,
+        Some(p) => p.parse::<u16>().map_err(|_| "--port takes a port number")?,
         None => SERVER_PORT,
     };
     let p = crate::paths(&mut a)?;
@@ -46,8 +48,11 @@ fn serve(mut a: Args) -> Result<bool, String> {
     // Made once, in the tool's home, owner-only; only its file is named, never its text (review r1 R2).
     let home = sync::default_home()?;
     let token = panel::token(&home)?;
-    let listener = http::bind(port)
-        .map_err(|e| format!("127.0.0.1:{port}: {e} (does a panel serve there already?)"))?;
+    let listener = http::bind(port).map_err(|_| {
+        crate::Fail::Said(
+            "the panel's port can't be bound (does a panel serve there already?)".into(),
+        )
+    })?;
     let bound = listener.local_addr().map_err(|e| e.to_string())?;
     say!("lords panel: serving the stacks on {bound}");
     say!("lords panel: requests carry the token in {}", home.join(panel::TOKEN_FILE).display());

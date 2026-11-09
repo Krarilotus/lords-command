@@ -169,11 +169,12 @@ fn privacy_hooks(stacks: &Stacks, home: &Path, out: &mut Vec<Finding>) {
             ));
             return;
         }
-        Err(e) => {
+        // What failed, never git's words: `check` runs in the hooks (design note privacy-own-allow, sol-loop r4).
+        Err(_) => {
             out.push(Finding::warning(
                 "privacy-hooks",
                 format!(
-                    "{}: {}: not verified ({e})",
+                    "{}: {}: not verified (git couldn't tell the repo's top)",
                     root.display(),
                     crate::hooks::PRIVACY.join(", ")
                 ),

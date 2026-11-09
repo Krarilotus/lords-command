@@ -347,6 +347,20 @@ fn when_t3_cant_be_told_the_call_goes_through_with_a_note() {
     assert_eq!(asked, 1);
 }
 
+// Spec (sol-loop r5, S1: "The helper guard also still forwards nested process errors at `helper_guard.rs:39` ... render
+// typed, content-free diagnostics in both guard JSON and notes"; design note privacy-own-allow, attack item 54): when
+// the T3 test fails with any text not its own (here a process's, holding a sentinel), the call goes through with a note
+// that says it can't be told, and the note repeats none of that text.
+#[test]
+fn a_nested_failure_is_noted_without_its_text() {
+    let sentinel = "sentinelvalueq";
+    let failure = format!("process 4242: {sentinel} is gone");
+    let (answer, _) = hook("Agent", json!({"prompt": "p"}), Err(failure));
+    let note = answer.note.clone().unwrap_or_default();
+    assert!(!note.contains(sentinel), "{note}");
+    assert!(answer.stdout.is_empty() && note.contains("can't be told"), "{answer:?}");
+}
+
 // Spec (Microsoft Learn, "Parsing C++ command-line arguments": the examples table and its rules, "Within a quoted
 // string, a pair of double quote marks is interpreted as a single escaped double quote mark", and for the program
 // name, "parts surrounded by double quote marks ... prevent interpretation of a space or tab character as the end of

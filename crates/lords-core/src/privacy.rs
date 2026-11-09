@@ -82,16 +82,9 @@ impl Rules {
         self
     }
 
-    /// Adds the private stack's allow-list (`with_allow_from`), deny-list and fleet hosts (`with_private_terms`).
-    pub fn with_private(self, private: Option<&Stack>) -> Result<Rules, String> {
-        match private {
-            Some(p) => self.with_allow_from(&p.root).with_private_terms(Some(p)),
-            None => self.with_private_terms(None),
-        }
-    }
-
-    /// Adds the private stack's deny-list and fleet hosts, and never its allow-list: the rules a stack that isn't the
-    /// checked checkout's adds, so they only find more (design note d28-alias, fix check r5, D28-R5-01). Without a
+    /// Adds the private stack's deny-list and fleet hosts, and never its allow-list: the only way a private stack enters
+    /// the rules, so they only find more (design note d28-alias, fix check r5, D28-R5-01). No function adds a private
+    /// stack's allow-list to any scan (design note privacy-own-allow, sol-loop r1, S2: `with_private` is gone). Without a
     /// private stack, or a deny-list, that is noted; a deny-list or fleet config that is there but can't be read is an
     /// error, so the check fails closed.
     pub fn with_private_terms(mut self, private: Option<&Stack>) -> Result<Rules, String> {
@@ -572,7 +565,39 @@ pub enum CheckoutStack {
     /// Every copy names this visibility.
     Is(Visibility),
     /// A copy is there, but the mode can't be told from the copies: why, in one line.
-    Unknown(String),
+    Unknown(Untold),
+}
+
+/// Why a checkout's stack can't be told (design note privacy-own-allow, sol-loop r1, S1). `full` is all that was found
+/// out, git's own words included: every scan and hook says it (`Display`). `brief` is the place and a category only:
+/// `privacy --explain` says it, since git's words can quote a config value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Untold {
+    pub brief: String,
+    pub full: String,
+}
+
+impl Untold {
+    /// One of the tool's own lines, which name places and categories only: the same both ways.
+    pub fn said(why: String) -> Untold {
+        Untold { brief: why.clone(), full: why }
+    }
+
+    /// git's own words, `words`, which `brief` keeps behind `category`.
+    fn git(category: &str, words: String) -> Untold {
+        Untold { brief: category.to_string(), full: words }
+    }
+
+    /// The same, at the place `at`.
+    fn at(self, at: &str) -> Untold {
+        Untold { brief: format!("{at}: {}", self.brief), full: format!("{at}: {}", self.full) }
+    }
+}
+
+impl std::fmt::Display for Untold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.full)
+    }
 }
 
 impl CheckoutStack {
@@ -597,27 +622,40 @@ pub fn checkout_stack(dir: &Path) -> CheckoutStack {
         Ok(Some(top)) => top,
         Ok(None) => return CheckoutStack::None,
         Err(e) => {
-            return CheckoutStack::Unknown(format!("git can't tell which checkout this is ({e})"))
+            let why = "git can't tell which checkout this is";
+            let brief =
+                "git can't tell which checkout this is (its config or the repo can't be read)";
+            return CheckoutStack::Unknown(Untold::git(brief, format!("{why} ({e})")));
         }
     };
-    let mut copies: Vec<(String, Result<Visibility, String>)> = Vec::new();
+    // Each copy's failure: the tool's own lines as they are (`said`); git's words behind a category (`git`).
+    let said = Untold::said;
+    let git_read = |e: String| Untold::git("git couldn't read it", e);
+    let mut copies: Vec<(String, Result<Visibility, Untold>)> = Vec::new();
     for rel in MANIFESTS {
         let path = top.join(rel);
+        // A disk failure's text names the path and the OS's words: a category, before `Untold` is built (sol-loop r5,
+        // S13). `exactly_listed`'s alias line names only canonical names, and is the tool's own.
+        let unread = |e: String| Untold::git("can't be read", e);
         let text = match fsguard::kind(&path) {
             Ok(fsguard::Kind::Missing) => continue,
             Ok(_) => exactly_listed(&top, rel).and_then(|()| {
-                fsguard::read_text(&path).and_then(|t| t.ok_or_else(|| "gone".to_string()))
+                fsguard::read_text(&path)
+                    .map_err(unread)
+                    .and_then(|t| t.ok_or_else(|| said("gone".to_string())))
             }),
-            Err(e) => Err(e),
+            Err(e) => Err(unread(e)),
         };
-        copies.push((format!("{rel} on disk"), text.and_then(|t| visibility_of(&t))));
+        let visibility = text.and_then(|t| visibility_of(&t).map_err(said));
+        copies.push((format!("{rel} on disk"), visibility));
     }
     // Each blob read once: HEAD's copy and the staged one are mostly the same object.
     let mut blobs = std::collections::BTreeMap::new();
-    let mut blob = |id: &str| -> Result<Visibility, String> {
-        let found = blobs.entry(id.to_string()).or_insert_with(|| -> Result<Visibility, String> {
-            let bytes = git::bytes(&top, &["cat-file", "blob", id])?;
-            visibility_of(&String::from_utf8(bytes).map_err(|_| "isn't UTF-8 text".to_string())?)
+    let mut blob = |id: &str| -> Result<Visibility, Untold> {
+        let found = blobs.entry(id.to_string()).or_insert_with(|| -> Result<Visibility, Untold> {
+            let bytes = git::bytes(&top, &["cat-file", "blob", id]).map_err(git_read)?;
+            let text = String::from_utf8(bytes).map_err(|_| said("isn't UTF-8 text".into()))?;
+            visibility_of(&text).map_err(said)
         });
         found.clone()
     };
@@ -628,9 +666,11 @@ pub fn checkout_stack(dir: &Path) -> CheckoutStack {
         match git_entry(path, mode) {
             GitEntry::Other => None,
             GitEntry::Manifest => Some((at, blob(id))),
-            GitEntry::Alias(why) => Some((at, Err(why))),
+            GitEntry::Alias(why) => Some((at, Err(said(why)))),
         }
     };
+    // A listing's record git couldn't be parsed as: its path is named, its words are git's.
+    let odd = |listing: &str, rec: &str| git_read(format!("`{listing}` said {rec:?}"));
     let staged = ["ls-files", "-s", "-z", "--full-name"];
     match git::run_index(&top, &staged) {
         Ok(out) => {
@@ -638,14 +678,11 @@ pub fn checkout_stack(dir: &Path) -> CheckoutStack {
                 let (head, path) = rec.split_once('\t').unwrap_or((rec, ""));
                 copies.extend(match head.split(' ').collect::<Vec<_>>().as_slice() {
                     [mode, id, _] => entry(path, mode, id, format!("{path} staged")),
-                    _ => Some((
-                        format!("{path} staged"),
-                        Err(format!("`git ls-files -s` said {rec:?}")),
-                    )),
+                    _ => Some((format!("{path} staged"), Err(odd("git ls-files -s", rec)))),
                 });
             }
         }
-        Err(e) => copies.push(("the index".to_string(), Err(e))),
+        Err(e) => copies.push(("the index".to_string(), Err(git_read(e)))),
     }
     // No HEAD copy only where git proves HEAD unborn; a HEAD naming a commit that can't be read is `Unknown` (fix check
     // r6, R6-01).
@@ -654,9 +691,9 @@ pub fn checkout_stack(dir: &Path) -> CheckoutStack {
             Ok(true) => {}
             Ok(false) => copies.push((
                 "HEAD".to_string(),
-                Err("names an object that isn't a commit git can read".to_string()),
+                Err(said("names an object that isn't a commit git can read".into())),
             )),
-            Err(e) => copies.push(("HEAD".to_string(), Err(e))),
+            Err(e) => copies.push(("HEAD".to_string(), Err(git_read(e)))),
         },
         Ok(true) => match git::run(&top, &["ls-tree", "-r", "-z", "--full-tree", "HEAD"]) {
             Ok(out) => {
@@ -664,16 +701,13 @@ pub fn checkout_stack(dir: &Path) -> CheckoutStack {
                     let (head, path) = rec.split_once('\t').unwrap_or((rec, ""));
                     copies.extend(match head.split(' ').collect::<Vec<_>>().as_slice() {
                         [mode, _, id] => entry(path, mode, id, format!("{path} in HEAD")),
-                        _ => Some((
-                            format!("{path} in HEAD"),
-                            Err(format!("`git ls-tree` said {rec:?}")),
-                        )),
+                        _ => Some((format!("{path} in HEAD"), Err(odd("git ls-tree", rec)))),
                     });
                 }
             }
-            Err(e) => copies.push(("HEAD".to_string(), Err(e))),
+            Err(e) => copies.push(("HEAD".to_string(), Err(git_read(e)))),
         },
-        Err(e) => copies.push(("HEAD".to_string(), Err(e))),
+        Err(e) => copies.push(("HEAD".to_string(), Err(git_read(e)))),
     }
     agreed(copies)
 }
@@ -682,16 +716,17 @@ pub fn checkout_stack(dir: &Path) -> CheckoutStack {
 /// file read at `top/rel` is the canonical one, not one a short name, another case, a trailing dot or space or an
 /// ignorable code point reaches (design note d28-alias, the disk rule). No filesystem's aliasing is modelled: a name
 /// that opens but isn't listed is an error, so discovery is `Unknown`.
-fn exactly_listed(top: &Path, rel: &str) -> Result<(), String> {
+fn exactly_listed(top: &Path, rel: &str) -> Result<(), Untold> {
     let mut dir = top.to_path_buf();
     let mut shown = "the checkout's top".to_string();
     for name in rel.split('/') {
-        let names = fsguard::list_dir(&dir)?;
+        let names =
+            fsguard::list_dir(&dir).map_err(|e| Untold::git("its dir can't be listed", e))?;
         if !names.iter().any(|p| p.file_name() == Some(std::ffi::OsStr::new(name))) {
-            return Err(format!(
+            return Err(Untold::said(format!(
                 "opens, but {shown} lists no entry named exactly {name:?}, so another name reaches it (a short name, \
                  another case, a trailing dot or space): name it exactly {rel}"
-            ));
+            )));
         }
         dir.push(name);
         shown = format!("{name}/");
@@ -761,33 +796,39 @@ fn same_but_case(a: &str, b: &str) -> bool {
         })
 }
 
-/// The visibility a manifest's text names, as the manifest's schema reads it.
+/// The visibility a manifest's text names, as the manifest's schema reads it. Why it can't is said by line only: the
+/// parser's message can hold the text itself, a value in an unknown variant (package review privownallow r1, R1-02).
 fn visibility_of(text: &str) -> Result<Visibility, String> {
     #[derive(serde::Deserialize)]
     struct Head {
         visibility: Option<Visibility>,
     }
-    let head: Head = toml::from_str(text)
-        .map_err(|e| format!("can't be read as a manifest ({})", e.message()))?;
+    let head: Head = toml::from_str(text).map_err(|e| {
+        let line = e.span().and_then(|s| text.get(..s.start)).map(|t| t.matches('\n').count() + 1);
+        match line {
+            Some(n) => format!("can't be read as a manifest (line {n})"),
+            None => "can't be read as a manifest".to_string(),
+        }
+    })?;
     head.visibility.ok_or_else(|| "names no visibility".to_string())
 }
 
 /// The one visibility every copy names, or why there isn't one.
-fn agreed(copies: Vec<(String, Result<Visibility, String>)>) -> CheckoutStack {
+fn agreed(copies: Vec<(String, Result<Visibility, Untold>)>) -> CheckoutStack {
     let mut named = Vec::new();
     for (at, v) in copies {
         match v {
             Ok(v) => named.push((at, v)),
-            Err(e) => return CheckoutStack::Unknown(format!("{at}: {e}")),
+            Err(e) => return CheckoutStack::Unknown(e.at(&at)),
         }
     }
     match named.first() {
         None => CheckoutStack::None,
         Some((_, v)) if named.iter().all(|(_, w)| w == v) => CheckoutStack::Is(*v),
-        Some(_) => CheckoutStack::Unknown(format!(
+        Some(_) => CheckoutStack::Unknown(Untold::said(format!(
             "this checkout's stack manifests disagree ({})",
             named.iter().map(|(at, v)| format!("{at}: {v}")).collect::<Vec<_>>().join("; ")
-        )),
+        ))),
     }
 }
 
@@ -815,8 +856,9 @@ pub fn checkout_mode(
             (false, Some(format!("this checkout's stack is public, {whole}, not --secrets-only")))
         }
         CheckoutStack::Is(Visibility::Public) => (false, None),
+        // The place and a category only: `privacy` prints this line in every mode (sol-loop r4).
         CheckoutStack::Unknown(why) if by_stack || secrets_only => {
-            (false, Some(format!("{why}, {whole}")))
+            (false, Some(format!("{}, {whole}", why.brief)))
         }
         CheckoutStack::Unknown(_) => (false, None),
     }

@@ -87,7 +87,7 @@ fn strip_replaces_only_the_spans() {
 // Spec (Privacy): without a private stack the deny and fleet classes can't run, and that is reported.
 #[test]
 fn a_missing_private_stack_is_reported() {
-    let r = Rules::public().with_private(None).unwrap();
+    let r = Rules::public().with_private_terms(None).unwrap();
     assert_eq!(r.notes.len(), 1);
 }
 

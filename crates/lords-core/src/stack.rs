@@ -316,6 +316,13 @@ impl Stack {
         Self::load_from(root, &Fs)
     }
 
+    /// `load`, failing with the kind of failure only (`ManifestFailure`), for output that can travel (design note
+    /// privacy-own-allow, sol-loop r4, S8): a parser's message quotes the manifest. The kind is found by reading the
+    /// manifest again, on the failure path only, so no message is parsed and a load that works costs nothing more.
+    pub fn load_typed(root: &Path) -> Result<Stack, ManifestFailure> {
+        Self::load(root).map_err(|detail| ManifestFailure { kind: ManifestKind::of(root), detail })
+    }
+
     /// Loads the stack at `root` from `src`: every file, dir listing and kind the loader asks about comes from it.
     pub(crate) fn load_from(root: &Path, src: &dyn Source) -> Result<Stack, String> {
         let manifest_path = root.join(MANIFEST);
@@ -969,10 +976,79 @@ pub struct Stacks {
     pub private: Option<Stack>,
 }
 
+/// What kind of failure stopped a stack's manifest from loading, and nothing of its text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManifestKind {
+    Unreadable,
+    NotToml,
+    /// It parses, but its schema, targets or delivery don't hold.
+    Invalid,
+}
+
+impl ManifestKind {
+    fn of(root: &Path) -> ManifestKind {
+        match crate::fsguard::read_string(root.join(MANIFEST)) {
+            Err(_) => ManifestKind::Unreadable,
+            Ok(text) if toml::from_str::<Value>(&text).is_err() => ManifestKind::NotToml,
+            Ok(_) => ManifestKind::Invalid,
+        }
+    }
+
+    pub fn says(self) -> &'static str {
+        match self {
+            ManifestKind::Unreadable => "can't be read",
+            ManifestKind::NotToml => "doesn't parse",
+            ManifestKind::Invalid => "doesn't fit its schema",
+        }
+    }
+}
+
+/// `Stack::load_typed`'s failure: its kind, and `load`'s whole message as `detail`, which output that can travel never
+/// shows.
+#[derive(Clone, Debug)]
+pub struct ManifestFailure {
+    pub kind: ManifestKind,
+    pub detail: String,
+}
+
+/// `Stacks::load_typed`'s failure: which stack, and how, or that the two load but don't fit together.
+#[derive(Clone, Debug)]
+pub enum StacksFailure {
+    Manifest(Visibility, ManifestKind),
+    /// Each manifest loads, but the pair doesn't: a visibility the wrong way round, or a declared repo's skills.
+    Together,
+}
+
+impl StacksFailure {
+    /// The line output that can travel says: the stack's role and the kind, our words only.
+    pub fn says(&self) -> String {
+        match self {
+            StacksFailure::Manifest(v, k) => format!("the {v} stack's manifest {}", k.says()),
+            StacksFailure::Together => {
+                "the stacks load, but don't fit together (a visibility, or a declared repo's skills)".into()
+            }
+        }
+    }
+}
+
 impl Stacks {
     pub fn load(public: &Path, private: Option<&Path>) -> Result<Stacks, String> {
         let private = private.map(|p| move || Stack::load(p));
         Self::load_with(|| Stack::load(public), private, true)
+    }
+
+    /// `load`, failing with which stack and the kind only (`StacksFailure`; sol-loop r4, S8). On the failure path only,
+    /// each manifest is tried again to tell which one failed.
+    pub fn load_typed(public: &Path, private: Option<&Path>) -> Result<Stacks, StacksFailure> {
+        Self::load(public, private).map_err(|_| {
+            if let Err(f) = Stack::load_typed(public) {
+                return StacksFailure::Manifest(Visibility::Public, f.kind);
+            }
+            match private.map(Stack::load_typed) {
+                Some(Err(f)) => StacksFailure::Manifest(Visibility::Private, f.kind),
+                _ => StacksFailure::Together,
+            }
+        })
     }
 
     /// The two stacks as their stores committed them (`capture::Captured`), read from nothing else. `repo_skills`:

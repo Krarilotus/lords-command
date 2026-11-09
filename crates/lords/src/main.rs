@@ -26,7 +26,11 @@ usage:
   lords privacy --history [--private-stack DIR] [--secrets-only | --by-stack]   every commit's message and patch (the pre-push check)
   lords privacy FILE...
     (--by-stack: the mode of this checkout's stack, secrets only where every copy of its manifest says private, else the
-    whole policy; --secrets-only holds only where this checkout has no stack or a private one)
+    whole policy; --secrets-only holds only where this checkout has no stack or a private one. The allow-list is this
+    checkout's own stack/privacy/allow.txt, plus, without --by-stack, the configured public stack's; a configured
+    private stack adds only its deny and fleet terms)
+  lords privacy --explain [--secrets-only]   what a stack repo's privacy hooks (--by-stack) check here, or --secrets-only:
+    the mode and each list with its path and count; it only reads: no hook is run, no term or file text is printed
   lords hooks install [--repo DIR] [--secrets-only] [--force]   the pre-commit, pre-merge-commit and commit-msg hooks; in a stack repo also `check --stack`, a pre-push, and a post-commit and post-merge that run `deliver`
     (a stack repo's hooks check with --by-stack, so each checkout by its own stack; --secrets-only is for a repo without one)
   lords hash PATH
@@ -82,21 +86,102 @@ else the public stack is <this git repo>/stack.
 check --public scans every file of the public repo (tracked and untracked, not ignored) and the public
 stack alone; it is the pre-push check.";
 
+/// How a command whose output can travel fails (design note privacy-own-allow, sol-loop r4: the privacy hooks run
+/// `check` and `privacy` on commit and push, and `promote` and the panel show their output): only the tool's own words
+/// reach a sink. `Said` is a line built from those words alone, a category with our own flag or role name; each place
+/// that makes one is one. Any other error, a parser's, an IO call's, git's or a value given, converts to `Other`, which
+/// drops its text, so no wrapped message can reach stderr by construction. `Shown` is an interactive command's own
+/// error, shown as before (`sync`, `show`, `guard install` and the rest).
+enum Fail {
+    Said(String),
+    Other,
+    Shown(String),
+}
+
+impl Fail {
+    /// The line `main` prints for `cmd`.
+    fn says(&self, cmd: &str) -> String {
+        match self {
+            Fail::Said(s) | Fail::Shown(s) => s.clone(),
+            Fail::Other => format!(
+                "{cmd} failed: an input couldn't be read or checked; its message isn't shown, since it could repeat \
+                 that input's text"
+            ),
+        }
+    }
+}
+
+impl From<String> for Fail {
+    fn from(_: String) -> Fail {
+        Fail::Other
+    }
+}
+
+impl From<&'static str> for Fail {
+    fn from(said: &'static str) -> Fail {
+        Fail::Said(said.to_string())
+    }
+}
+
+impl From<ArgError> for Fail {
+    fn from(e: ArgError) -> Fail {
+        Fail::Said(e.0)
+    }
+}
+
+impl From<lords_core::stack::StacksFailure> for Fail {
+    fn from(f: lords_core::stack::StacksFailure) -> Fail {
+        Fail::Said(f.says())
+    }
+}
+
+/// An argument error: our own flag's name and the kind of mistake, never the text given (sol-loop r2 and r3, S1).
+#[derive(Debug)]
+struct ArgError(String);
+
+impl From<ArgError> for String {
+    fn from(e: ArgError) -> String {
+        e.0
+    }
+}
+
+/// The words after the command, read as the OS gives them: a word that isn't Unicode is refused whole, named by
+/// neither its text nor its bytes (sol-loop r4, S10).
+fn words_given() -> Result<Vec<String>, &'static str> {
+    std::env::args_os()
+        .skip(1)
+        .map(|w| w.into_string().map_err(|_| "an argument isn't valid Unicode"))
+        .collect()
+}
+
 struct Args {
     words: Vec<String>,
+    /// The words as given, so `done` can name a leftover's place.
+    given: Vec<String>,
 }
 
 impl Args {
+    fn new(words: Vec<String>) -> Args {
+        Args { given: words.clone(), words }
+    }
+
     fn flag(&mut self, name: &str) -> bool {
         let before = self.words.len();
         self.words.retain(|w| w != name);
         self.words.len() != before
     }
 
-    fn value(&mut self, name: &str) -> Result<Option<String>, String> {
+    fn value(&mut self, name: &str) -> Result<Option<String>, ArgError> {
         let Some(i) = self.words.iter().position(|w| w == name) else { return Ok(None) };
         if i + 1 >= self.words.len() {
-            return Err(format!("{name} needs a value"));
+            return Err(ArgError(format!("{name} needs a value")));
+        }
+        // An option where the value goes is no value: taken as one, it would turn up in an error as a path (sol-loop r3,
+        // S1). Named by our own flag only.
+        if self.words[i + 1].starts_with("--") {
+            return Err(ArgError(format!(
+                "{name} needs a value, and the word after it is an option"
+            )));
         }
         let v = self.words.remove(i + 1);
         self.words.remove(i);
@@ -108,11 +193,18 @@ impl Args {
         Some(self.words.remove(i))
     }
 
-    fn done(&self) -> Result<(), String> {
-        match self.words.first() {
-            Some(w) => Err(format!("unexpected `{w}`")),
-            None => Ok(()),
-        }
+    /// A leftover word is named by its place and kind, never by its text: an argument can be anything, a private term
+    /// included, and an error line can reach a log (design note privacy-own-allow, sol-loop r2, S1).
+    fn done(&self) -> Result<(), ArgError> {
+        let Some(w) = self.words.first() else { return Ok(()) };
+        let at = self
+            .given
+            .iter()
+            .position(|g| g == w)
+            .map(|i| format!(" {}", i + 1))
+            .unwrap_or_default();
+        let kind = if w.starts_with("--") { "an option" } else { "a value" };
+        Err(ArgError(format!("argument{at} after the command is {kind} it doesn't take")))
     }
 }
 
@@ -121,17 +213,45 @@ struct Paths {
     private: Option<PathBuf>,
 }
 
-fn paths(args: &mut Args) -> Result<Paths, String> {
-    let cfg = Config::load()?;
-    let public = args.value("--public-stack")?.map(PathBuf::from).or(cfg.public).or_else(|| {
+/// Why `paths` found no stacks: config.txt's own error (`Config`, shown by interactive commands only), or our words.
+enum PathsError {
+    Config(String),
+    Said(String),
+}
+
+impl From<PathsError> for String {
+    fn from(e: PathsError) -> String {
+        match e {
+            PathsError::Config(s) | PathsError::Said(s) => s,
+        }
+    }
+}
+
+impl From<PathsError> for Fail {
+    fn from(e: PathsError) -> Fail {
+        match e {
+            PathsError::Config(_) => Fail::Said("config.txt can't be read".into()),
+            PathsError::Said(s) => Fail::Said(s),
+        }
+    }
+}
+
+fn paths(args: &mut Args) -> Result<Paths, PathsError> {
+    let cfg = Config::load().map_err(PathsError::Config)?;
+    let said = |e: ArgError| PathsError::Said(e.0);
+    let given = args.value("--public-stack").map_err(said)?.map(PathBuf::from);
+    let public = given.or(cfg.public).or_else(|| {
         let cwd = std::env::current_dir().ok()?;
         let top = git::toplevel(&cwd)?;
         let s = top.join("stack");
         s.join("stack.toml").is_file().then_some(s)
     });
-    let public =
-        public.ok_or("no public stack: pass --public-stack or set `public` in config.txt")?;
-    let private = args.value("--private-stack")?.map(PathBuf::from).or(cfg.private);
+    let public = public.ok_or_else(|| {
+        PathsError::Said(
+            "no public stack: pass --public-stack or set `public` in config.txt".into(),
+        )
+    })?;
+    let private = args.value("--private-stack").map_err(said)?.map(PathBuf::from).or(cfg.private);
     // Absolute, as sync writes them: every path an agent file shows is then the one a session can open.
     let abs = |p: PathBuf| std::path::absolute(&p).unwrap_or(p);
     Ok(Paths { public: abs(public), private: private.map(abs) })
@@ -154,8 +274,45 @@ fn print_findings(findings: &[Finding], json: bool) {
     );
 }
 
-fn public_rules(public: &Path, private: Option<&Stack>) -> Result<Rules, String> {
-    Rules::public().with_allow_from(public).with_private(private)
+/// The rules a public stack's entries and tree are checked with: its own allow-list, and a configured private stack's
+/// deny and fleet terms, never that stack's allow-list (design note privacy-own-allow, sol-loop r1, S2).
+fn public_rules(public: &Path, private: Option<&Stack>) -> Result<Rules, Fail> {
+    private_terms(Rules::public().with_allow_from(public), private)
+}
+
+/// A configured private stack, loaded where output can travel: a failure says the stack's role and its kind, never
+/// the parser's words, which quote the manifest (sol-loop r4, S8).
+fn load_private(root: Option<&Path>) -> Result<Option<Stack>, Fail> {
+    let said = |f: lords_core::stack::ManifestFailure| {
+        Fail::Said(format!(
+            "the private stack's manifest {} (given by --private-stack or config.txt, or this checkout's own)",
+            f.kind.says()
+        ))
+    };
+    root.map(|r| Stack::load_typed(r).map_err(said)).transpose()
+}
+
+/// `rules` with a private stack's deny and fleet terms (`with_private_terms`), failing with which list it was, told by
+/// reading the deny-list again, so no message is parsed and none is shown (review r1, R1-02; sol-loop r4).
+fn private_terms(rules: Rules, private: Option<&Stack>) -> Result<Rules, Fail> {
+    rules.with_private_terms(private).map_err(|_| {
+        let deny = private.map(|p| p.root.join("privacy").join("deny.txt"));
+        let fleet = private.and_then(|p| p.manifest.privacy.fleet_config.as_ref());
+        let unreadable = |d: &PathBuf| {
+            lords_core::fsguard::read_string(d)
+                .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound)
+        };
+        Fail::Said(match (&deny, fleet) {
+            (Some(d), _) if unreadable(d) => {
+                "the private stack's privacy/deny.txt can't be read".into()
+            }
+            (_, Some(_)) => {
+                "the fleet config the private stack's stack.toml names can't be read or isn't TOML"
+                    .into()
+            }
+            _ => "the private stack's deny-list or fleet config can't be read".into(),
+        })
+    })
 }
 
 /// `lords guard rm`: the tool-call guard a harness runs before a shell call (guard.rs). Reads the event on stdin and
@@ -234,8 +391,8 @@ fn cmd_guard(mut a: Args) -> ExitCode {
     };
     let input = match std::io::read_to_string(std::io::stdin()) {
         Ok(i) => i,
-        Err(e) => {
-            note(&format!("the event can't be read ({e})"));
+        Err(_) => {
+            note("the event can't be read");
             return ExitCode::SUCCESS;
         }
     };
@@ -257,8 +414,8 @@ fn guard_time(a: Args) -> ExitCode {
     }
     let input = match std::io::read_to_string(std::io::stdin()) {
         Ok(i) => i,
-        Err(e) => {
-            note(&format!("the event can't be read ({e})"));
+        Err(_) => {
+            note("the event can't be read");
             return ExitCode::SUCCESS;
         }
     };
@@ -283,8 +440,8 @@ fn guard_helper(a: Args) -> ExitCode {
     }
     let input = match std::io::read_to_string(std::io::stdin()) {
         Ok(i) => i,
-        Err(e) => {
-            note(&format!("the event can't be read ({e})"));
+        Err(_) => {
+            note("the event can't be read");
             return ExitCode::SUCCESS;
         }
     };
@@ -318,8 +475,8 @@ fn guard_rules(which: &str, a: Args) -> ExitCode {
     }
     let input = match std::io::read_to_string(std::io::stdin()) {
         Ok(i) => i,
-        Err(e) => {
-            note(&format!("the event can't be read ({e})"));
+        Err(_) => {
+            note("the event can't be read");
             return ExitCode::SUCCESS;
         }
     };
@@ -387,16 +544,16 @@ fn guard_child(which: &str, mut a: Args) -> ExitCode {
     }
     let input = match std::io::read_to_string(std::io::stdin()) {
         Ok(i) => i,
-        Err(e) => {
-            note(&format!("the event can't be read ({e})"));
+        Err(_) => {
+            note("the event can't be read");
             return ExitCode::SUCCESS;
         }
     };
     // The tool home holds sync's apply lock (guard.rs `child_text`).
     let home = match home.map(Ok).unwrap_or_else(lords_core::sync::default_home) {
         Ok(h) => h,
-        Err(e) => {
-            note(&format!("no start given ({e})"));
+        Err(_) => {
+            note("no start given: no tool home");
             return ExitCode::SUCCESS;
         }
     };
@@ -428,7 +585,7 @@ fn guard_queue(mut a: Args) -> ExitCode {
             note("--deadline-ms takes a number of milliseconds");
             return ExitCode::SUCCESS;
         }
-        Err(e) => {
+        Err(ArgError(e)) => {
             note(&e);
             return ExitCode::SUCCESS;
         }
@@ -439,8 +596,8 @@ fn guard_queue(mut a: Args) -> ExitCode {
     }
     let input = match std::io::read_to_string(std::io::stdin()) {
         Ok(i) => i,
-        Err(e) => {
-            note(&format!("the event can't be read ({e})"));
+        Err(_) => {
+            note("the event can't be read");
             return ExitCode::SUCCESS;
         }
     };
@@ -506,7 +663,16 @@ fn say_err(line: &str) {
     let _ = writeln!(std::io::stderr().lock(), "{line}");
 }
 
-fn cmd_check(mut a: Args) -> Result<bool, String> {
+/// The tree scan of `check --public`, failing with our words only: its own message names files and git's words.
+fn tree_of(repo: &Path, rules: &Rules) -> Result<(lords_core::privacy::Scan, Vec<Finding>), Fail> {
+    check::public_tree(repo, rules).map_err(|_| {
+        Fail::Said(
+            "the checkout's tree can't be scanned: git or one of its files couldn't be read".into(),
+        )
+    })
+}
+
+fn cmd_check(mut a: Args) -> Result<bool, Fail> {
     let public_only = a.flag("--public");
     let stack_only = a.flag("--stack");
     let strict = a.flag("--strict");
@@ -526,13 +692,18 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     use lords_core::privacy::CheckoutStack;
     let found = (stack_only || (by_stack && public_only)).then(|| match cwd.as_deref() {
         Some(d) => lords_core::privacy::checkout_stack(d),
-        None => CheckoutStack::Unknown("the current dir can't be read".to_string()),
+        None => {
+            CheckoutStack::Unknown(privacy::Untold::said("the current dir can't be read".into()))
+        }
     });
     let here = found.as_ref().filter(|_| by_stack);
     let not_checked = "so it isn't checked: no configured stack stands in for this checkout's";
     match here {
+        // The place and a category only: git's own words can quote a config value (sol-loop r4).
         Some(CheckoutStack::Unknown(why)) => {
-            return Err(format!("this checkout's stack can't be told ({why}), {not_checked}"))
+            let line =
+                format!("this checkout's stack can't be told ({}), {not_checked}", why.brief);
+            return Err(Fail::Said(line));
         }
         Some(CheckoutStack::Is(Visibility::Private)) if public_only => {
             println!(
@@ -555,18 +726,19 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     let own_public =
         top.as_ref().map(|t| t.join("stack")).filter(|s| s.join("stack.toml").is_file());
     let own_private = top.clone().filter(|t| t.join("stack.toml").is_file());
-    // A `--by-stack` check's allowances are this checkout's own: a configured stack adds restrictions only, so a
-    // configured private stack gives its deny and fleet terms, never its allow-list (fix check r5, D28-R5-01; design
-    // note d28-alias, "Fix check r5").
-    let mut own_private_stack = false;
+    // A configured stack adds restrictions only: a private stack gives its deny and fleet terms, never its allow-list
+    // (fix check r5, D28-R5-01; `public_rules`, sol-loop r1, S2).
     match here {
         // Proven to have no stack (the `--stack` case returned above): its own tree, under the public rules and the
         // configured private stack's deny and fleet terms, never a configured stack's allow-list or repo.
         Some(CheckoutStack::None) => {
-            let top = top.ok_or_else(|| format!("git names no checkout here, {not_checked}"))?;
-            let private = p.private.as_deref().map(Stack::load).transpose()?;
-            let rules = Rules::public().with_private_terms(private.as_ref())?;
-            let (scan, findings) = check::public_tree(&top, &rules)?;
+            let top = top
+                .ok_or_else(|| Fail::Said(format!("git names no checkout here, {not_checked}")))?;
+            let private = load_private(p.private.as_deref())?;
+            let rules = private_terms(Rules::public(), private.as_ref())?;
+            let (scan, mut findings) = tree_of(&top, &rules)?;
+            // What wasn't checked is said, as `check` says it (D28 r6, R6-F02).
+            findings.extend(rules.notes.iter().map(|n| Finding::info("privacy-scope", n.clone())));
             print_findings(&findings, json);
             if !json {
                 println!(
@@ -579,17 +751,17 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
         }
         Some(CheckoutStack::Is(v)) => {
             let missing = |at: &str| {
-                format!("this checkout's stack is {v}, but {at} isn't on disk, {not_checked}")
+                Fail::Said(format!(
+                    "this checkout's stack is {v}, but {at} isn't on disk, {not_checked}"
+                ))
             };
             if *v == Visibility::Public {
                 p.public = own_public.ok_or_else(|| missing("stack/stack.toml"))?;
                 if let Some(t) = own_private.filter(|_| stack_only) {
                     p.private = Some(t);
-                    own_private_stack = true;
                 }
             } else {
                 p.private = Some(own_private.ok_or_else(|| missing("stack.toml"))?);
-                own_private_stack = true;
                 if let Some(s) = own_public {
                     p.public = s;
                 }
@@ -608,19 +780,15 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
             }
         }
     }
-    let private = p.private.as_deref().map(Stack::load).transpose()?;
-    // Here `p.public` is this checkout's own `stack/` (Is(Public)) or, for Is(Private), the configured complementary
-    // stack, whose allow-list reaches only its own public entries, never this checkout's private ones.
-    let rules = if here.is_some() && !own_private_stack {
-        Rules::public().with_allow_from(&p.public).with_private_terms(private.as_ref())?
-    } else {
-        public_rules(&p.public, private.as_ref())?
-    };
+    let private = load_private(p.private.as_deref())?;
+    // With `--by-stack`, `p.public` is this checkout's own `stack/` (Is(Public)) or, for Is(Private), the configured
+    // complementary stack, whose allow-list reaches only its own public entries, never this checkout's private ones.
+    let rules = public_rules(&p.public, private.as_ref())?;
     if public_only {
-        let stacks = Stacks::load(&p.public, None)?;
+        let stacks = Stacks::load_typed(&p.public, None)?;
         let mut findings = check::check(&stacks, &rules);
         let repo = git::toplevel(&p.public).ok_or("the public stack is not in a git repo")?;
-        let (scan, tree) = check::public_tree(&repo, &rules)?;
+        let (scan, tree) = tree_of(&repo, &rules)?;
         // Entries are scanned as part of the tree; keep one finding per hit.
         findings.retain(|f| f.code != "privacy");
         findings.extend(tree);
@@ -638,7 +806,7 @@ fn cmd_check(mut a: Args) -> Result<bool, String> {
     }
     // Loaded as sync loads them (the repos' own skills are entries too), so check measures what sync writes.
     drop(private);
-    let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    let stacks = Stacks::load_typed(&p.public, p.private.as_deref())?;
     // `--stack`: the entries only, without drift (the slow part) or the hook probe, for a stack repo's pre-commit.
     let findings = if stack_only {
         let mut f = check::check_stack(&stacks, &rules);
@@ -680,7 +848,7 @@ fn start_check(
     let (v, store, stack, manifest) = match found {
         None | Some(CheckoutStack::None) => return Vec::new(),
         Some(CheckoutStack::Unknown(why)) => {
-            return unchecked(format!("this checkout's stack can't be told ({why})"))
+            return unchecked(format!("this checkout's stack can't be told ({})", why.brief))
         }
         Some(CheckoutStack::Is(v @ Visibility::Public)) => {
             (v, Store::Public, "stack", "stack/stack.toml")
@@ -691,12 +859,14 @@ fn start_check(
     if !top.join(manifest).is_file() {
         return unchecked(format!("this checkout's stack is {v}, but {manifest} isn't on disk"));
     }
-    let home = match sync::default_home() {
-        Ok(h) => h,
-        Err(e) => {
-            return vec![Finding::error("start-check", format!("the starts can't be checked: {e}"))]
-        }
+    // Findings of `check` say what failed, never the failure's text (sol-loop r4).
+    let cant = || {
+        vec![Finding::error(
+            "start-check",
+            "the starts can't be checked: the tool's home or the other store couldn't be read",
+        )]
     };
+    let Ok(home) = sync::default_home() else { return cant() };
     let today = ops::today();
     let i =
         Inputs { checkout: top, stack, store, public, private, home: &home, today: &today, limit };
@@ -732,7 +902,7 @@ fn start_check(
             })
             .collect(),
         Ok(Outcome::Unclean(why)) => vec![Finding::error("start-check", why)],
-        Err(e) => vec![Finding::error("start-check", format!("the starts can't be checked: {e}"))],
+        Err(_) => cant(),
     }
 }
 
@@ -892,7 +1062,7 @@ fn cmd_sync(mut a: Args) -> Result<bool, String> {
         }
         None | Some("full") => sync::Stage::Full,
         Some("install") => sync::Stage::Install,
-        Some(other) => return Err(format!("--stage {other}: `install` or `full`")),
+        Some(_) => return Err("--stage takes `install` or `full`".into()),
     };
     let apply = a.flag("--apply");
     let json = a.flag("--json");
@@ -1210,7 +1380,7 @@ fn cmd_uninstall(mut a: Args) -> Result<bool, String> {
     let json = a.flag("--json");
     // A bad `--place` is a refusal too, which `--json` gives as its one object (sol-loop r1 S2).
     let place = match a.value("--place") {
-        Err(e) if json => {
+        Err(ArgError(e)) if json => {
             println!("{}", PlaceRun::default().json(2, Some(&e)));
             return Err(e);
         }
@@ -1452,7 +1622,7 @@ fn cmd_retire(mut a: Args) -> Result<bool, String> {
     Ok(true)
 }
 
-fn cmd_promote(mut a: Args) -> Result<bool, String> {
+fn cmd_promote(mut a: Args) -> Result<bool, Fail> {
     let mode = match (a.flag("--strip"), a.flag("--split")) {
         (true, true) => return Err("--strip or --split, not both".into()),
         (true, false) => Promote::Strip,
@@ -1463,7 +1633,7 @@ fn cmd_promote(mut a: Args) -> Result<bool, String> {
     let p = paths(&mut a)?;
     let id = a.positional().ok_or("promote needs an entry id")?;
     a.done()?;
-    let stacks = Stacks::load(&p.public, p.private.as_deref())?;
+    let stacks = Stacks::load_typed(&p.public, p.private.as_deref())?;
     let rules = public_rules(&p.public, stacks.private.as_ref())?;
     let r = ops::promote(&stacks, &id, mode, &rules, commit)?;
     println!("promoted {id} to {}", r.to.display());
@@ -1479,7 +1649,134 @@ fn cmd_promote(mut a: Args) -> Result<bool, String> {
     Ok(true)
 }
 
-fn cmd_privacy(mut a: Args) -> Result<bool, String> {
+/// What `privacy` checks in `cwd` with these flags: its rules, its mode, this checkout's stack where the mode needs it,
+/// and where each list came from (a path and a count, never a term). The scan and `--explain` both take it from here,
+/// so `--explain` says what a hook checks (design note 2026-11-08-lords-privacy-own-allow).
+struct PrivacyRules {
+    rules: Rules,
+    secrets_only: bool,
+    /// The line to say when the mode isn't the one asked for.
+    why: Option<String>,
+    stack: Option<privacy::CheckoutStack>,
+    sources: Vec<String>,
+}
+
+fn privacy_rules(
+    cwd: &Path,
+    by_stack: bool,
+    secrets_only: bool,
+    public_stack: Option<PathBuf>,
+    private_stack: Option<PathBuf>,
+) -> Result<PrivacyRules, Fail> {
+    // Secrets only only where this checkout's stack allows it, so no caller gives a public checkout that mode (C2).
+    let stack = (by_stack || secrets_only).then(|| privacy::checkout_stack(cwd));
+    let (secrets_only, why) = match &stack {
+        Some(s) => privacy::checkout_mode(s, by_stack, secrets_only),
+        None => (false, None),
+    };
+    let mut sources = Vec::new();
+    if secrets_only {
+        let rules = Rules::secrets_only();
+        return Ok(PrivacyRules { rules, secrets_only, why, stack, sources });
+    }
+    fn count(n: usize, one: &str, many: &str) -> String {
+        format!("{n} {}", if n == 1 { one } else { many })
+    }
+    fn allow_from(rules: Rules, root: &Path, sources: &mut Vec<String>) -> Rules {
+        let before = rules.allow.len();
+        let rules = rules.with_allow_from(root);
+        let n = rules.allow.len() - before;
+        if n > 0 {
+            let at = root.join("privacy").join("allow.txt");
+            sources.push(format!(
+                "allow-list: {} ({})",
+                at.display(),
+                count(n, "entry", "entries")
+            ));
+        }
+        rules
+    }
+    // A config.txt that is there but can't be read fails the check: its private stack would be skipped.
+    let mut cfg = Config::load().map_err(|_| Fail::Said("config.txt can't be read".into()))?;
+    if private_stack.is_some() {
+        cfg.private = private_stack;
+    }
+    if public_stack.is_some() {
+        cfg.public = public_stack;
+    }
+    // A configured private stack that doesn't load fails the check: its deny and fleet lists would be skipped.
+    let private = load_private(cfg.private.as_deref())?;
+    // A configured private stack only adds restrictions, whatever the flags: its allow-list is no other repo's (D28 r6,
+    // R6-F01; review r1, R1-F01). The allowances are this checkout's own, and without `--by-stack` the configured
+    // public stack's too.
+    let mut rules = Rules::public();
+    let (deny, hosts) = (rules.deny.len(), rules.hosts.len());
+    let fleet = private.as_ref().and_then(|p| p.manifest.privacy.fleet_config.as_deref());
+    let fleet = fleet.map(lords_core::config::expand_home);
+    rules = private_terms(rules, private.as_ref())?;
+    if let Some(p) = &private {
+        let n = rules.deny.len() - deny;
+        if n > 0 {
+            let at = p.root.join("privacy").join("deny.txt");
+            sources.push(format!("deny-list: {} ({})", at.display(), count(n, "term", "terms")));
+        }
+        if let Some(at) = &fleet {
+            let n = rules.hosts.len() - hosts;
+            sources.push(format!("fleet: {} ({})", at.display(), count(n, "host", "hosts")));
+        }
+    }
+    if let Some(top) = git::toplevel(cwd) {
+        rules = allow_from(rules, &top.join("stack"), &mut sources);
+    }
+    if let (false, Some(p)) = (by_stack, &cfg.public) {
+        rules = allow_from(rules, p, &mut sources);
+    }
+    Ok(PrivacyRules { rules, secrets_only, why, stack, sources })
+}
+
+/// `privacy --explain`: what a stack repo's privacy hooks (`--by-stack`) check here, or `privacy --secrets-only` where
+/// that is given (review r1, R1-03). It only reads: it scans nothing, runs no hook (one may change files: R1-01), and
+/// prints paths, counts and categories, never a term or a file's text (self-service audit, journey 7).
+fn explain_privacy(c: &PrivacyRules, secrets_only: bool) -> Result<bool, Fail> {
+    use privacy::CheckoutStack;
+    let models = if secrets_only { "--secrets-only" } else { "--by-stack, a stack repo's hooks" };
+    println!("models: lords privacy {models}");
+    let stack = match &c.stack {
+        None => "not looked for (no --by-stack or --secrets-only)".to_string(),
+        Some(CheckoutStack::None) => "none".to_string(),
+        Some(CheckoutStack::Is(v)) => v.to_string(),
+        // The place and a category only: git's own words can quote a config value (sol-loop r1, S1).
+        Some(CheckoutStack::Unknown(why)) => format!("can't be told ({})", why.brief),
+    };
+    println!("this checkout's stack: {stack}");
+    println!("mode: {}", if c.secrets_only { "secrets only" } else { "the whole policy" });
+    if let Some(why) = &c.why {
+        println!("  ({why})");
+    }
+    let classes: Vec<&str> = c.rules.classes.iter().map(|k| k.name()).collect();
+    println!("classes: {}", classes.join(", "));
+    for s in &c.sources {
+        println!("{s}");
+    }
+    for n in &c.rules.notes {
+        println!("note: {n}");
+    }
+    println!(
+        "hooks: not verified here: `lords check` probes whether a commit and a push reach the privacy hooks, by running them"
+    );
+    Ok(true)
+}
+
+/// A scan that can't run, in our words: the kinds of refusal, never the entry's name or git's (sol-loop r4).
+const STAGED_UNSCANNED: &str = "the staged files can't be scanned, so the commit is refused: a staged gitlink \
+    (submodule) or another entry that isn't a file is refused, and a listing or blob git can't read stops the scan. \
+    Commit a submodule in its own repo, or unstage it";
+const HISTORY_UNSCANNED: &str =
+    "the history can't be scanned, so the push is refused: git couldn't list or read a commit";
+
+fn cmd_privacy(mut a: Args) -> Result<bool, Fail> {
+    // First, before any option takes its value, so no value can swallow it (sol-loop r2, S1).
+    let explain = a.flag("--explain");
     let staged = a.flag("--staged");
     let history = a.flag("--history");
     let secrets_only = a.flag("--secrets-only");
@@ -1488,45 +1785,31 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
     let message = a.value("--message")?;
     let public_stack = a.value("--public-stack")?.map(PathBuf::from);
     let private_stack = a.value("--private-stack")?.map(PathBuf::from);
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    // Secrets only only where this checkout's stack allows it, so no caller gives a public checkout that mode (C2).
-    let (secrets_only, why) = if by_stack || secrets_only {
-        privacy::checkout_mode(&privacy::checkout_stack(&cwd), by_stack, secrets_only)
-    } else {
-        (false, None)
-    };
-    if let Some(why) = why {
+    if explain && (staged || history || message.is_some()) {
+        return Err(
+            "--explain scans nothing, so it takes no --staged, --history or --message".into()
+        );
+    }
+    let cwd = std::env::current_dir().map_err(|_| "the current dir can't be read")?;
+    // `--explain` models the stack hooks unless `--secrets-only` is given (review r1, R1-03).
+    let by_stack = by_stack || (explain && !secrets_only);
+    let composed = privacy_rules(&cwd, by_stack, secrets_only, public_stack, private_stack)?;
+    if explain {
+        // `done` names no argument's text (sol-loop r2, S1).
+        a.done()?;
+        return explain_privacy(&composed, secrets_only);
+    }
+    if let Some(why) = &composed.why {
         eprintln!("lords privacy: {why}");
     }
-    let rules = if secrets_only {
-        Rules::secrets_only()
-    } else {
-        // A config.txt that is there but can't be read fails the check: its private stack would be skipped.
-        let mut cfg = Config::load()?;
-        if private_stack.is_some() {
-            cfg.private = private_stack;
-        }
-        if public_stack.is_some() {
-            cfg.public = public_stack;
-        }
-        // A configured private stack that doesn't load fails the check: its deny and fleet lists would be skipped.
-        let private = cfg.private.as_deref().map(Stack::load).transpose()?;
-        let mut rules = Rules::public().with_private(private.as_ref())?;
-        if let Some(top) = git::toplevel(&cwd) {
-            rules = rules.with_allow_from(&top.join("stack"));
-        }
-        if let Some(p) = &cfg.public {
-            rules = rules.with_allow_from(p);
-        }
-        rules
-    };
+    let rules = composed.rules;
     for n in &rules.notes {
         eprintln!("lords privacy: {n}");
     }
     if history {
         a.done()?;
         let top = git::toplevel(&cwd).ok_or("not in a git repo")?;
-        let h = privacy::scan_history(&top, &rules)?;
+        let h = privacy::scan_history(&top, &rules).map_err(|_| HISTORY_UNSCANNED)?;
         for x in &h.hits {
             println!(
                 "{} {}:{} {}: `{}`",
@@ -1543,13 +1826,14 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
     let mut scan = if staged {
         a.done()?;
         let top = git::toplevel(&cwd).ok_or("not in a git repo")?;
-        privacy::scan_staged(&top, &rules)?
+        privacy::scan_staged(&top, &rules).map_err(|_| STAGED_UNSCANNED)?
     } else {
         let mut scan = privacy::Scan::default();
         let files: Vec<String> = std::iter::from_fn(|| a.positional()).collect();
         a.done()?;
         for f in &files {
-            let bytes = lords_core::fsguard::read_bytes(f).map_err(|e| format!("{f}: {e}"))?;
+            let bytes =
+                lords_core::fsguard::read_bytes(f).map_err(|_| "a file given can't be read")?;
             scan.add(PathBuf::from(f), &bytes, &rules);
         }
         // Named files have no .gitattributes to mark them: one that isn't text is refused.
@@ -1559,7 +1843,8 @@ fn cmd_privacy(mut a: Args) -> Result<bool, String> {
     // The message is scanned with the staged or named files too. A commit message has no NUL bytes, and its lossy
     // reading keeps every readable part: never refused.
     if let Some(m) = &message {
-        let bytes = lords_core::fsguard::read_bytes(m).map_err(|e| format!("{m}: {e}"))?;
+        let bytes =
+            lords_core::fsguard::read_bytes(m).map_err(|_| "the message file can't be read")?;
         scan.add(PathBuf::from(m), &bytes, &rules);
     }
     for (p, h) in &scan.hits {
@@ -1827,44 +2112,57 @@ fn cmd_hash(mut a: Args) -> Result<bool, String> {
 }
 
 fn main() -> ExitCode {
-    let mut words: Vec<String> = std::env::args().skip(1).collect();
+    // Before anything else, the guard included: a word that isn't Unicode is named by neither text nor bytes (S10).
+    let mut words = match words_given() {
+        Ok(w) => w,
+        Err(said) => {
+            let guard = std::env::args_os().nth(1).is_some_and(|w| w == "guard");
+            eprintln!("lords: {said}");
+            // The guard never fails a call: it notes and lets it through.
+            return if guard { ExitCode::SUCCESS } else { ExitCode::from(2) };
+        }
+    };
     // The guard answers a harness, so it has its own exit codes and help, before anything else (cmd_guard; rm-guard
     // fix check r2, R8).
     if words.first().is_some_and(|w| w == "guard") {
         words.remove(0);
-        return cmd_guard(Args { words });
+        return cmd_guard(Args::new(words));
     }
     if words.is_empty() || words.iter().any(|w| w == "--help" || w == "-h") {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
     let cmd = words.remove(0);
-    let a = Args { words };
+    let a = Args::new(words);
+    // The surfaces whose output can travel fail as `Fail` (design note privacy-own-allow, sol-loop r4); the others are
+    // interactive and show their own errors.
+    let shown = |r: Result<bool, String>| r.map_err(Fail::Shown);
     let result = match cmd.as_str() {
         "check" => cmd_check(a),
-        "import" => cmd_import(a),
-        "retire" => cmd_retire(a),
         "promote" => cmd_promote(a),
         "privacy" => cmd_privacy(a),
-        "hooks" => cmd_hooks(a),
-        "hash" => cmd_hash(a),
-        "sync" => cmd_sync(a),
-        "deliver" => cmd_deliver(a),
-        "compose" => cmd_compose(a),
-        "show" => cmd_show(a),
-        "uninstall" => cmd_uninstall(a),
-        "adopt" => cmd_adopt(a),
-        "set-aside" => cmd_set_aside(a),
-        "sizes" => cmd_sizes(a),
-        "paths" => cmd_paths(a),
         "panel" => panel::cmd(a),
-        other => Err(format!("unknown command `{other}`\n\n{USAGE}")),
+        "import" => shown(cmd_import(a)),
+        "retire" => shown(cmd_retire(a)),
+        "hooks" => shown(cmd_hooks(a)),
+        "hash" => shown(cmd_hash(a)),
+        "sync" => shown(cmd_sync(a)),
+        "deliver" => shown(cmd_deliver(a)),
+        "compose" => shown(cmd_compose(a)),
+        "show" => shown(cmd_show(a)),
+        "uninstall" => shown(cmd_uninstall(a)),
+        "adopt" => shown(cmd_adopt(a)),
+        "set-aside" => shown(cmd_set_aside(a)),
+        "sizes" => shown(cmd_sizes(a)),
+        "paths" => shown(cmd_paths(a)),
+        // Not echoed: the first word can be anything (sol-loop r3, S1).
+        _ => Err(Fail::Said(format!("the first word isn't a command\n\n{USAGE}"))),
     };
     match result {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
-        Err(e) => {
-            eprintln!("lords: {e}");
+        Err(f) => {
+            eprintln!("lords: {}", f.says(&cmd));
             ExitCode::from(2)
         }
     }

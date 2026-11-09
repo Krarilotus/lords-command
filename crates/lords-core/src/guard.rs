@@ -1118,9 +1118,11 @@ pub fn queue_hook(input: &str, env: &QueueEnv) -> Answer {
                 stdout: json!({"decision": "block", "reason": QUEUE_REASON}).to_string(),
                 note: None,
             },
-            Err(e) => {
+            // A guard's note at run time is the tool's own words: a harness shows it to the session, so no IO, git, T3
+            // CLI or parser text goes in it (design note privacy-own-allow, sol-loop r4, S1).
+            Err(_) => {
                 streak.clear();
-                through(format!("can't count the stops held in a row ({e})"))
+                through("can't count the stops held in a row".into())
             }
         },
         Ok(false) => {
@@ -1137,9 +1139,12 @@ pub fn queue_hook(input: &str, env: &QueueEnv) -> Answer {
 /// Whether something may wait in `thread`'s queue: the CLI's two runs, then the session's transcript.
 fn waits(ev: &Value, thread: &str, cli: &Path, deadline: Duration) -> Result<bool, String> {
     let args = ["thread", "show", thread, "--json", "--messages", "0"];
-    let show =
-        crate::process::t3_cli(cli, &args, deadline).map_err(|e| format!("T3's CLI: {e}"))?;
-    let Some(runs) = thread_runs(&show).map_err(|e| format!("T3's CLI: {e}"))? else {
+    // Said as what failed, never with the CLI's words or the transcript's path (sol-loop r4, S1).
+    let show = crate::process::t3_cli(cli, &args, deadline)
+        .map_err(|_| "T3's CLI didn't answer by its deadline, or failed".to_string())?;
+    let Some(runs) =
+        thread_runs(&show).map_err(|_| "T3's CLI answered something else".to_string())?
+    else {
         return Ok(false);
     };
     if runs.latest == runs.active {
@@ -1148,7 +1153,7 @@ fn waits(ev: &Value, thread: &str, cli: &Path, deadline: Duration) -> Result<boo
     let path = ev["transcript_path"].as_str().ok_or("the event names no transcript")?;
     let mut t = Transcript::new(thread, &runs);
     crate::fsguard::read_lines(path, |l| t.line(l))
-        .map_err(|e| format!("the transcript can't be read ({path}: {e})"))?;
+        .map_err(|_| "the transcript can't be read".to_string())?;
     Ok(t.may_wait())
 }
 
@@ -1428,7 +1433,7 @@ pub fn session_hook(input: &str, env: &RulesEnv) -> Answer {
     sweep_records(&env.home);
     let mut answer = match recorded {
         Ok(()) => quiet(),
-        Err(e) => noted(format!("the session's files aren't recorded ({e})")),
+        Err(_) => noted("the session's files aren't recorded"),
     };
     // The nearest `.lords` at or above the cwd, a dir, found without reading any file in it (F10-SR-02).
     let place = || {
@@ -1473,12 +1478,12 @@ pub fn turn_hook(
             // Said first, saved second: a record that can't be saved keeps the old one, so it is said again
             // (review r1, R4).
             lines.extend(found.line);
-            if let Err(e) = write_record(&found.place, &found.cwd, &found.files) {
-                note = Some(format!("the record isn't saved, so this is said again ({e})"));
+            if write_record(&found.place, &found.cwd, &found.files).is_err() {
+                note = Some("the record isn't saved, so this is said again".to_string());
             }
         }
         Ok(None) => {}
-        Err(e) => note = Some(format!("the rules aren't checked ({e})")),
+        Err(_) => note = Some("the rules aren't checked".to_string()),
     }
     let out = json!({"hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",
@@ -1593,7 +1598,9 @@ pub fn child_hook(input: &str, home: &Path) -> Answer {
     let Some(cwd) = ev["cwd"].as_str() else { return noted("the event names no cwd") };
     let text = match child_text(&ev, Path::new(cwd), home) {
         Ok(t) => t,
-        Err(e) => return noted(format!("no start given ({e})")),
+        Err(_) => return noted(
+            "no start given: the place's start can't be read, or a sync is under way or stopped",
+        ),
     };
     if text.is_empty() {
         return quiet();
@@ -1693,10 +1700,12 @@ pub fn deliverable(
     if !start.contains(crate::compose::BEGIN) {
         return Err(format!("no {} here", crate::sync::start_file(role)));
     }
+    // The why goes into the start's JSON, which the session reads: our words only, never the harness given or an IO
+    // error's text (design note privacy-own-allow, sol-loop r5, S1). `place` is an adapter's own file name.
     if let Some(id) = adapter {
         let place = crate::adapters::get(id)
             .map(|a| a.repo_file())
-            .ok_or_else(|| format!("no harness `{id}` is known"))?;
+            .ok_or_else(|| "the harness the hook names isn't known".to_string())?;
         match crate::fsguard::read_text(&lords.parent().unwrap_or(lords).join(place)) {
             Ok(Some(t)) if t.contains(crate::compose::BEGIN) => {}
             Ok(_) => {
@@ -1704,7 +1713,7 @@ pub fn deliverable(
                     "no Lords {place} here, which carries what the start leaves out"
                 ))
             }
-            Err(e) => return Err(format!("its {place} can't be read: {e}")),
+            Err(_) => return Err(format!("its {place} can't be read")),
         }
     }
     let text = child_context(start);
@@ -1729,8 +1738,8 @@ fn role_lines(cwd: &Path, home: &Path, role: &str, adapter: Option<&str>) -> Opt
             deliverable(&lords, &text, role, adapter)
                 .unwrap_or_else(|why| not_given(why, lords.join(&file).display().to_string())),
         ),
-        Err(e) => Some(not_given(
-            format!("it can't be read: {e}"),
+        Err(_) => Some(not_given(
+            "it can't be read".to_string(),
             format!("{file}` in this place's `{}` dir", crate::sync::ROLE_DIR),
         )),
     }

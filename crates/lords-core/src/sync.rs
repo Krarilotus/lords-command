@@ -1887,7 +1887,7 @@ fn shadow_notes(private: &Stack, plan: &mut Plan) {
         });
         if !covered {
             plan.notes.push(format!(
-                "{}: {} also loads as an ancestor file under home and hides AGENTS.md in repos sync doesn't manage; a settings target in this profile with exclude = [it] fixes that",
+                "{}: {} also loads as an ancestor file under home and {HIDES_AGENTS_MD}",
                 t.name,
                 shadow.display()
             ));
@@ -4336,6 +4336,11 @@ pub fn place_layers(stacks: &Stacks, place: &str, global: bool) -> Layers {
     }
 }
 
+/// How the AGENTS.md gap note ends: the plan's note gives the target and the file; `check` says only this (S11).
+const HIDES_AGENTS_MD: &str =
+    "hides AGENTS.md in repos sync doesn't manage; a settings target in this profile with \
+    exclude = [it] fixes that";
+
 /// `check`'s view of the user-level targets: a warning for each that differs from a fresh composition, and the
 /// plan's notes (known gaps, pending imports) as info. Nothing without a private stack.
 pub fn drift_findings(stacks: &Stacks, home: &Path) -> Vec<crate::Finding> {
@@ -4374,10 +4379,29 @@ pub fn drift_findings(stacks: &Stacks, home: &Path) -> Vec<crate::Finding> {
                     out.push(Finding::error("memory-live", why).at(compose::live_index(m), None));
                 }
             }
-            out.extend(plan.notes.iter().map(|n| Finding::info("sync-note", n.clone())));
+            // `check` runs in the hooks: its findings name what failed, never a note's or the plan error's text, which
+            // can name a private repo, a ledger's path or an import's failure (design note privacy-own-allow, sol-loop
+            // r5, S11). `lords sync`, interactive, shows them.
+            // The known gap `check` lists (orchestrator D1, 25 Oct), said without the target's name or the file's path.
+            if plan.notes.iter().any(|n| n.ends_with(HIDES_AGENTS_MD)) {
+                out.push(Finding::info(
+                    "agents-md-gap",
+                    format!("a harness's home instructions file also loads as an ancestor file and {HIDES_AGENTS_MD}"),
+                ));
+            }
+            if !plan.notes.is_empty() {
+                let n = plan.notes.len();
+                out.push(Finding::info(
+                    "sync-note",
+                    format!("the sync plan has {n} note(s); `lords sync` shows them"),
+                ));
+            }
             out
         }
-        Err(e) => vec![Finding::warning("drift", format!("no sync plan: {e}"))],
+        Err(_) => vec![Finding::warning(
+            "drift",
+            "no sync plan: the ledger, a target or the stacks don't load or fit; `lords sync` says why",
+        )],
     }
 }
 
