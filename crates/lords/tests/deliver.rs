@@ -191,6 +191,31 @@ fn a_store_commit_reaches_its_places_with_nobody_running_anything() {
     assert!(!read(&w.place()).contains("Rule side."));
 }
 
+// Spec (the same: a store's change reaches its places with nobody running anything; an orchestrator, 9 Nov 01:47: "a
+// --no-ff merge in a store runs no post-commit, so nothing delivered until I ran `lords deliver` by hand"): a merge
+// into the private store's checkout, of a branch committed in a linked worktree, reaches the repo's place file with
+// nobody running anything.
+#[test]
+fn a_merge_in_a_store_reaches_its_places_with_nobody_running_anything() {
+    let w = World::new("");
+    let o = w.lords(w.dir.path(), &["sync", "--apply"]);
+    assert!(read(&w.place()).contains("Rule one."), "{}", text(&o));
+    let o = w.lords(&w.path("priv"), &["hooks", "install", "--secrets-only"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let side = w.path("priv-side");
+    let o =
+        w.git(&w.path("priv"), &["worktree", "add", "-q", "-b", "side", side.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", text(&o));
+    w.rule("Rule two.");
+    fs::copy(w.path("priv/global/rules/r.md"), side.join("global/rules/r.md")).unwrap();
+    w.git(&w.path("priv"), &["checkout", "-q", "--", "global/rules/r.md"]);
+    w.commit("priv-side", "rule two, on a branch");
+    let o = w.git(&w.path("priv"), &["merge", "--no-ff", "-q", "-m", "merge the branch", "side"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(holds_within(&w.place(), "Rule two."), "log: {}", read(&w.log()));
+    settled(&w.log());
+}
+
 // Spec (brief item 5; note C7: "The commit runs with LORDS_DELIVERING set, and the post-commit hook exits at once when
 // it is set. So the import's commit starts no delivery: no loop"): a store commit whose delivery imports an agent's new
 // memory note commits that import in the private store, and the post-commit log shows one delivery, not two.

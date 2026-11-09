@@ -18,8 +18,15 @@ pub mod config;
 pub const MARKER: &str = "# lords-command: privacy check";
 
 /// The hooks the tool installs: the only names a `hooks:` ledger record may have.
-pub const NAMES: [&str; 6] =
-    ["pre-commit", "pre-merge-commit", "commit-msg", "pre-push", "post-checkout", "post-commit"];
+pub const NAMES: [&str; 7] = [
+    "pre-commit",
+    "pre-merge-commit",
+    "commit-msg",
+    "pre-push",
+    "post-checkout",
+    "post-commit",
+    "post-merge",
+];
 
 /// A declared repo's post-checkout hook, as a plan finds it (F8, C3): what `sync --apply` installs or replaces.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -336,8 +343,8 @@ fn own_hooks_root(repo: &Path) -> Result<Root, String> {
     Root::hooks(&Root::checkout(Path::new(top.trim()))?)
 }
 
-/// Installs the privacy hooks (`PRIVACY`), and in a stack repo its pre-push and post-commit (`post_commit_script`, with
-/// no stacks of its own: its `lords` reads config.txt); `home` holds the ledger that records them and the probe's files.
+/// Installs the privacy hooks (`PRIVACY`), and in a stack repo its pre-push, post-commit and post-merge
+/// (`post_commit_script`, with no stacks of its own: its `lords` reads config.txt); `home` holds the ledger that records them and the probe's files.
 /// A hook there that isn't the tool's stops them all, unless `force`, which moves each one to a new
 /// `<name>.bak-<date>` first.
 pub fn install(
@@ -377,6 +384,8 @@ pub fn install_with(
     if stack {
         hooks.push(("pre-push", pre_push_script(lords_exe, home)));
         hooks.push(("post-commit", post_commit_script(lords_exe, home, stacks)));
+        // git runs post-merge, not post-commit, for a merge commit (a `--no-ff` merge included).
+        hooks.push(("post-merge", post_commit_script(lords_exe, home, stacks)));
     }
     let mut foreign = Vec::new();
     for (name, _) in &hooks {
