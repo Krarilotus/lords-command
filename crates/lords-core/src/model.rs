@@ -173,7 +173,7 @@ pub struct EndsWhen {
 }
 
 /// A temporary entry's end (owner, 25 Oct: temporary rules must not "poison the context … forever"): a date or a
-/// status condition, and a review date by which it is renewed or it ends.
+/// status condition, and a review date after which `check` reports the review as due (it ends nothing).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Temporary {
