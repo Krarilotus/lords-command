@@ -8,7 +8,7 @@ scope: global
 status: active
 start: role
 core:
-- line: "To get independent evidence without review growth: one fresh full review per package on a committed, evidenced head, effort by risk (highest for disclosure, data loss, concurrency, crash); after a BLOCK, fix checks cover the diff since and the listed blockers, raise nothing new unless a fix brings it, and go to the orchestrator after two that block; a second full round needs disclosure or data-loss risk and the orchestrator's OK."
+- line: "To get independent evidence without review growth: one fresh full review per package on a committed, evidenced head, effort by the project's model policy and the task's risk; after a BLOCK, fix checks cover the diff since and the listed blockers, raise nothing new unless a fix brings it, and go to the orchestrator after two that block; a second full round needs disclosure or data-loss risk and the orchestrator's OK."
   roles: [orchestrator, coder, reviewer]
 - line: "Reviewers read the bar and its approved exceptions (never blocking on one), the design note and prior rounds; stay read-only in a disposable worktree; mark each probe run or not run; report the verdict first, then classed findings with scenarios, prior closure and merge-tree and signature risks, in correctness wording."
   roles: [orchestrator, coder, reviewer]
@@ -24,9 +24,9 @@ topics: [review, prompts]
 checks that widened scope once ran to 9–11 rounds).
 
 **When.** A round starts once the head is committed and every claim has its evidence (command, exit code, log). Each
-round is a fresh reviewer agent; never continue a review in the old thread. Effort: medium for a delta, tooling or
-docs; high for product code; the highest where a finding could be disclosure or data loss, or for a concurrency or
-crash design. Tooling that kills, pauses or admits processes on shared machines gets full rounds like product code.
+round is a fresh reviewer agent; never continue a review in the old thread. Use the project's model and effort policy.
+Otherwise choose effort by uncertainty and risk: lower for mechanical work, higher for disclosure, data loss,
+concurrency or crash risks. Tooling that kills, pauses or admits processes on shared machines gets full rounds like product code.
 
 **One full round per package.** After a BLOCK the next call is a fix check: scoped to the diff since the reviewed head
 and the listed blocking findings, it verifies each fix and its fails-without test and raises nothing new unless a fix

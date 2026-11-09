@@ -7,7 +7,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "To give the reader their next step: report a result, blocker or decision request, not progress, in plain words, outcome first, then decisions with owner and recommendation, change ids, checks and open risks; blockers and uncertainty are never cut for brevity. Full evidence goes in one indexed record in Harness/notes, linked; no repeated completion notices or narrated routine."
+core: "Report the outcome in plain words, decisions with owners and recommendations, change ids, checks, material findings, blockers, risks and uncertainty. Link full evidence in the project's indexed evidence home; omit routine narration and duplicate completion notices."
 visibility: public
 basis:
 - quote: "I don'T see why we put an arbitrary number on it, that came out of nowhere an should be raised as an issue, there must be a better design there out there that already covers that"
@@ -37,7 +37,7 @@ never cut to make it shorter. Length follows the decision, not a word count.
 
 Full evidence (findings, reasoning, reproductions, logs) goes into one durable record in the **evidence home**, a named
 place each project sets, with stable ids and an index at the top, linked from the report and opened when needed. The
-evidence home is `Harness/notes`, a private repository that syncs itself. Don't repeat an automatic completion notice
+project names its evidence home. Don't repeat an automatic completion notice
 or narrate routine activity.
 
 A hand-over of code or design you built says in a line whether it sits at the right owner and level, and whether you

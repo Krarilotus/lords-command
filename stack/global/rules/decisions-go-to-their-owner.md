@@ -38,6 +38,8 @@ owner, the owner table names it; if nothing does, ask your lead who the owner is
 inside your lead's task goes to your lead. One that belongs to another owner (a shared tool, a host, another project)
 goes to that owner. Your result still goes to whoever gave you the task, with the answer in it.
 
+For shared tools, follow the project's tool-operation and deficiency route before contacting an owner.
+
 You may read other threads and records to check on work that touches yours, and speak up to their owner, with
 evidence, where it does. Reading and speaking up don't move the decision: its owner makes it.
 
