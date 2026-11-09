@@ -7,7 +7,7 @@ roles: [orchestrator, coder, helper, reviewer]
 scope: global
 status: active
 start: core
-core: "To stop blind retries: before rerunning a failed job, gate, proof, hook or review, keep its raw output and name and fix its cause, without generalising beyond it (a small bounded repair, or a diagnostic rerun that says what it tests, is fine). A second same-cause failure goes with evidence to the cause's owner. Never weaken a guard, skip a check or invent evidence."
+core: "To stop blind retries: before rerunning a failed job, gate, proof, hook or review, keep its raw output and name and fix its cause, without generalising beyond it (a small bounded repair, or a diagnostic rerun that says what it tests, is fine). A second same-cause failure goes with evidence to the cause's owner. Never invent evidence, or weaken or skip a required check (a hook, gate, guard or test the change must pass) to get past it."
 visibility: public
 basis:
 - quote: 'not running the same tasks and gates in loops that failed previously'
@@ -30,7 +30,10 @@ cause and fixed that cause, without generalising beyond it; one small, bounded r
 second failure for the same cause stops the retries: hand it, with the evidence, to the cause's owner. The diagnosis
 method is skill.stop-the-line.
 
-**Never** weaken a guard, skip a check or invent evidence to keep work moving: that holds without exception.
+**Never** invent evidence, and never weaken or skip a required check (a hook, a gate, a guard, a test the change must
+pass) to get past it: these protect truthful results and the hooks' boundary, so they don't change by departure. A
+check that is redundant or superseded is changed or removed by its owner, with the reason, as a change to that check;
+that is not skipping it.
 
 **When to depart:** a bounded rerun that reproduces or isolates the cause is diagnosis, not a retry; say what it
 tests. A failure the owner of the host or guard has already explained (a guard kill, a host fault) is rerun as that

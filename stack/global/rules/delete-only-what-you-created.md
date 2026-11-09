@@ -6,7 +6,7 @@ audience: [all]
 scope: global
 status: active
 start: core
-core: "Boundary: delete only the paths and resources you created and recorded; if unsure, list it instead, and a wider cleanup needs the owner's word. No glob or pattern delete in shared places (/tmp, %TEMP%, home dirs, shared caches): give each task a private temp root."
+core: "Boundary: delete only the paths and resources you created and recorded; if unsure, list it instead, and a wider cleanup needs the owner's word; no glob or pattern delete in shared places (/tmp, %TEMP%, home dirs, shared caches). Default: give each task a private temp root."
 visibility: public
 basis:
 - quote: "make sure it won't happen again and take extra caution with such things"
