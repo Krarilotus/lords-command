@@ -393,7 +393,7 @@ fn plain_explain_models_the_stack_hooks() {
 // Spec (R1-02: "a malformed fleet file, a malformed private manifest or an invalid visibility value prints the offending
 // text on `--explain`'s stderr ... Tests: those three inputs with a sentinel term, absent from both stdout and stderr";
 // "Keep refusal and Unknown as they are"; design note privacy-own-allow, r1 attack items 19-21): a fleet config that
-// isn't TOML and a private manifest that isn't either refuse `--explain`, naming the file; a checkout manifest whose
+// isn't TOML and a private manifest that isn't either refuse `--explain`, naming its role, not its path; a checkout manifest whose
 // visibility is no visibility is a stack that can't be told; and the sentinel each holds appears in neither stream.
 #[test]
 fn explain_prints_no_content_from_a_broken_file() {
@@ -405,12 +405,20 @@ fn explain_prints_no_content_from_a_broken_file() {
     let bad = format!("{PRIVATE}{sentinel} = [\n");
     write(&manifest.path("privstack/stack.toml"), &bad);
     let visibility = Env::new();
-    let rows = [("fleet", &fleet, "fleet.toml"), ("manifest", &manifest, "privstack")];
-    for (row, env, names) in rows {
+    // Named by the flag or the file's role, never by its path (the master, 9 Nov 02:36: "Load errors name the flag and
+    // the kind of failure, never the path"; this row named the path until then).
+    let rows = [
+        ("fleet", &fleet, "fleet config", "fleet.toml"),
+        ("manifest", &manifest, "--private-stack", "privstack"),
+    ];
+    for (row, env, names, path) in rows {
         let repo = checkout(env, "repo", true, "");
         let o = env.lords(&repo, &["privacy", "--explain"]);
         let out = text(&o);
-        assert!(!out.contains(sentinel), "{row}: no content: {out}");
+        assert!(
+            !out.contains(sentinel) && !out.contains(path),
+            "{row}: no content, no path: {out}"
+        );
         assert!(
             !o.status.success() && out.contains(names),
             "{row}: refused, naming {names}: {out}"
